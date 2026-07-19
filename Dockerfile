@@ -22,7 +22,8 @@ ARG TARGETARCH
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 
 WORKDIR /app
 

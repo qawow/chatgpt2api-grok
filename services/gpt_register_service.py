@@ -52,7 +52,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "cfd1_domain": "",  # optional override CFD1_DOMAIN for this job
     "push_enabled": True,
     "push_mode": "local",  # local | http
-    "chatgpt2api_base_url": "http://127.0.0.1:8000",
+    # empty → auto (local in-process import; http mode uses container-aware default)
+    "chatgpt2api_base_url": "",
     "chatgpt2api_auth_key": "",  # empty → config.auth_key
     "dry_run": False,
 }
@@ -64,6 +65,18 @@ def _now_iso() -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _default_push_base_url() -> str:
+    """HTTP push target when push_mode=http.
+
+    In Docker the app listens on :80 inside the container; host-mapped 8000 is
+    not visible as 127.0.0.1:8000 from inside. Prefer in-process local import
+    (push_mode=local) so this URL is unused.
+    """
+    if Path("/.dockerenv").exists() or _clean(os.environ.get("CHATGPT2API_IN_DOCKER")):
+        return "http://127.0.0.1:80"
+    return "http://127.0.0.1:8000"
 
 
 def _clamp_int(value: object, default: int, lo: int, hi: int) -> int:
@@ -135,7 +148,7 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     if push_mode not in {"local", "http"}:
         push_mode = "local"
     out["push_mode"] = push_mode
-    out["chatgpt2api_base_url"] = _clean(out.get("chatgpt2api_base_url")) or "http://127.0.0.1:8000"
+    out["chatgpt2api_base_url"] = _clean(out.get("chatgpt2api_base_url")) or _default_push_base_url()
     out["chatgpt2api_auth_key"] = _clean(out.get("chatgpt2api_auth_key"))
     out["dry_run"] = bool(out.get("dry_run"))
     return out
@@ -562,7 +575,7 @@ class GptRegisterService:
         if settings.get("proxy"):
             cmd.extend(["--proxy", str(settings["proxy"])])
 
-        base_url = str(settings.get("chatgpt2api_base_url") or "http://127.0.0.1:8000")
+        base_url = str(settings.get("chatgpt2api_base_url") or _default_push_base_url())
         auth_key = _clean(settings.get("chatgpt2api_auth_key")) or _clean(config.auth_key)
         if settings.get("push_enabled"):
             cmd.append("--push-chatgpt2api")

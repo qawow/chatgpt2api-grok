@@ -84,10 +84,17 @@ curl -s -X POST http://127.0.0.1:8000/api/gpt-register/start \
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
-不要用官方 `ghcr.io/basketikun/chatgpt2api` 镜像。
+不要用官方 `ghcr.io/basketikun/chatgpt2api` 镜像，也不要用默认 `docker-compose.yml` 拉上游镜像。
 
 密钥挂载在 `./data` 下写 `data/gpt_register.env` 即可（容器内 `/app/data/gpt_register.env`）。
-`docker-compose.local.yml` 也会把 `./gpt_free_register` 只读挂进容器，方便本地改注册机后无需反复 COPY。
+
+注意：
+
+- **不要**把空的宿主机 `./gpt_free_register` 挂进容器，否则会盖掉镜像内 builtin engines。  
+  本地改注册机时再临时加：`- ./gpt_free_register:/app/gpt_free_register:ro`
+- 注册机内部 sqlite 默认写 `REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db`（可写 data 卷）
+- 默认 `push_mode=local`：成功账号直接写本进程号池，不依赖 `127.0.0.1:8000`
+- 容器内服务监听 **:80**（host 映射常见 8000/3000 → 80）
 
 ## 数据文件
 

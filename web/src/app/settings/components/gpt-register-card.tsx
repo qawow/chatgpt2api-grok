@@ -43,7 +43,7 @@ const DEFAULT_FORM: GptRegisterSettings = {
   cfd1_domain: "",
   push_enabled: true,
   push_mode: "local",
-  chatgpt2api_base_url: "http://127.0.0.1:8000",
+  chatgpt2api_base_url: "",
   chatgpt2api_auth_key: "",
   has_chatgpt2api_auth_key: false,
   dry_run: false,
@@ -378,11 +378,12 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
               </Field>
-              <Field label="推送 Base URL" hint="本机号池一般保持 127.0.0.1:8000">
+              <Field label="推送 Base URL" hint="默认 push_mode=local 不走 HTTP；http 模式 Docker 内用 :80，宿主机开发用 :8000">
                 <Input
                   value={form.chatgpt2api_base_url}
                   onChange={(e) => setField("chatgpt2api_base_url", e.target.value)}
                   className="h-10 rounded-xl border-stone-200 bg-white"
+                  placeholder="(auto)"
                   disabled={running}
                 />
               </Field>

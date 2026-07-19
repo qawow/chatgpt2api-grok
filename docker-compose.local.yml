@@ -10,11 +10,14 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
-      # Optional live override of builtin registrar (image already contains it)
-      - ./gpt_free_register:/app/gpt_free_register:ro
+      # 不要默认挂载 ./gpt_free_register：宿主机若缺目录，Docker 会挂空目录盖掉镜像内文件。
+      # 本地改注册机时再手动打开：
+      # - ./gpt_free_register:/app/gpt_free_register:ro
     environment:
       STORAGE_BACKEND: sqlite
       DATABASE_URL: sqlite:////app/data/accounts.db
+      # 注册机内部 sqlite（避免写只读镜像层）
+      REGISTER_ENGINES_DATABASE_URL: sqlite:////app/data/register_engines.db
       # GPT free register secrets: put CFD1_* / REGISTER_PROXY* in data/gpt_register.env
       # or export them here, e.g.:
       # CFD1_API_TOKEN: ${CFD1_API_TOKEN:-}

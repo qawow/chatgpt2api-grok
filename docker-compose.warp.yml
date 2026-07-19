@@ -101,9 +101,10 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
-      - ./gpt_free_register:/app/gpt_free_register:ro
+      # 不要默认挂载 ./gpt_free_register，避免空目录盖掉镜像内 builtin engines
     environment:
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}
+      REGISTER_ENGINES_DATABASE_URL: ${REGISTER_ENGINES_DATABASE_URL:-sqlite:////app/data/register_engines.db}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
