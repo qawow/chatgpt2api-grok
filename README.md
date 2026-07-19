@@ -11,13 +11,14 @@
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/g2a-bridge.md">GrokCLI2API 桥</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
+  <a href="./docs/operations.md">运维与调用</a> ·
   <a href="./docs/deployment.md">部署说明</a>
 </p>
 
 > [!IMPORTANT]
-> **这是私有二开仓库，不是官方镜像。**  
+> **这是二开仓库，不是官方镜像。**  
 > 部署时必须用当前源码 **本地构建**（`docker-compose.local.yml`）。  
-> 不要使用 `ghcr.io/basketikun/chatgpt2api:latest` 或默认 `docker compose up` 拉官方镜像，否则会丢掉 Grok / G2A 改动。
+> 不要使用 `ghcr.io/basketikun/chatgpt2api:latest` 或默认 `docker compose up` 拉官方镜像，否则会丢掉 Grok / G2A / GPT 注册改动。
 
 ## 本分支相对上游新增
 
@@ -74,8 +75,9 @@ docker compose -f docker-compose.local.yml up -d --build
 
 - Web / API：`http://localhost:8000`
 - OpenAI 兼容前缀：`http://localhost:8000/v1`
-- 数据目录：`./data`（ChatGPT 号池、Grok 号池、日志、图片等）
+- 数据目录：`./data`（ChatGPT 号池、Grok 号池、日志、图片、注册机配置等）
 - 配置挂载：`./config.json`
+- 容器内监听 **:80**（compose 映射 8000→80）
 
 验证二开接口：
 
@@ -86,6 +88,9 @@ curl -s http://127.0.0.1:8000/api/grok/accounts \
   -H "Authorization: Bearer $KEY"
 
 curl -s http://127.0.0.1:8000/api/g2a/servers \
+  -H "Authorization: Bearer $KEY"
+
+curl -s http://127.0.0.1:8000/api/gpt-register/settings \
   -H "Authorization: Bearer $KEY"
 ```
 
@@ -117,6 +122,15 @@ curl -s -X POST http://127.0.0.1:8000/api/grok/accounts \
 3. 探测连通 → **推送本地 Grok 号池**
 
 说明：远程 `GET /v1/admin/credentials` **不含 token**，只能「本地 → 远程」推送，不能反向拉号。详见 [docs/g2a-bridge.md](./docs/g2a-bridge.md)。
+
+### 6. GPT Free 批量注册（可选）
+
+1. 写 `data/gpt_register.env`（`CFD1_*`、`REGISTER_PROXY*` 等，勿提交 git）  
+2. Web 设置 → **GPT注册** → 填数量等 → 开始  
+3. 或 `POST /api/gpt-register/start`  
+
+成功账号进入 **ChatGPT 号池**。完整调用 / 维护 / 排障见 [docs/gpt-register.md](./docs/gpt-register.md)。  
+总运维手册：[docs/operations.md](./docs/operations.md)。
 
 ### WARP / FlareSolverr 稳定代理部署
 
@@ -241,12 +255,12 @@ environment:
 
 ### GPT Free 批量注册
 
-- 内置模块：`gpt_free_register/`（vendored ChatGPT 协议注册机，无需外部 `/root/any-register-engines`）
+- 内置模块：`gpt_free_register/`（vendored ChatGPT 协议注册机 + Cloudflare D1 邮箱，无需外部 `/root/any-register-engines`）
 - 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填
-- 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`
-- 成功账号进入 **ChatGPT 号池**（不进 Grok）
-- 密钥放 `data/gpt_register.env` 或环境变量
-- 文档：[docs/gpt-register.md](./docs/gpt-register.md)
+- 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`、`/cancel`
+- 成功账号进入 **ChatGPT 号池**（不进 Grok）；默认 `push_mode=local` 进程内入库
+- 密钥放 `data/gpt_register.env` 或环境变量；SOCKS 需 `PySocks`
+- 文档：[docs/gpt-register.md](./docs/gpt-register.md) · 运维：[docs/operations.md](./docs/operations.md)
 
 ### 实验性 / 规划中
 

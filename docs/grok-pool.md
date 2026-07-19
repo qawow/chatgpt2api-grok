@@ -146,6 +146,9 @@ curl -s http://127.0.0.1:8000/v1/grok/chat/completions \
 [Futureppo/grokcli2api-go](https://github.com/Futureppo/grokcli2api-go) 的
 `/v1/admin/credentials`。详见 [g2a-bridge.md](./g2a-bridge.md)。
 
+运维 / 调用总册：[operations.md](./operations.md)。  
+GPT free 注册（写入 ChatGPT 池，与 Grok 无关）：[gpt-register.md](./gpt-register.md)。
+
 ## 代码入口
 
 | 路径 | 作用 |

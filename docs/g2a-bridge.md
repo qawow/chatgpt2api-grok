@@ -85,16 +85,32 @@ grokcli2api-go  /v1/admin/credentials  →  auths/
 ## curl 示例
 
 ```bash
+export KEY='你的 auth-key'
+export BASE='http://127.0.0.1:8000'
+
 # 添加连接
-curl -s -X POST http://127.0.0.1:8000/api/g2a/servers \
+curl -s -X POST "$BASE/api/g2a/servers" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"name":"local","base_url":"http://127.0.0.1:8088","admin_key":"YOUR_ADMIN"}'
 
+# 列表
+curl -s "$BASE/api/g2a/servers" -H "Authorization: Bearer $KEY"
+
+# 探测
+SID='连接 id'
+curl -s -X POST "$BASE/api/g2a/servers/$SID/ping" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d '{}'
+
 # 推送全部本地 Grok 号
-curl -s -X POST http://127.0.0.1:8000/api/g2a/servers/$SID/push \
+curl -s -X POST "$BASE/api/g2a/servers/$SID/push" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"access_tokens":[]}'
+
+# 远程脱敏凭证列表
+curl -s "$BASE/api/g2a/servers/$SID/credentials" -H "Authorization: Bearer $KEY"
 ```
+
+运维总册：[operations.md](./operations.md)。
 
 ## 代码
 

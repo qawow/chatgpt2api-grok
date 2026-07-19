@@ -2,6 +2,11 @@
 
 本文介绍 ChatGPT2API 的常见部署方式，以及后续升级项目时需要保留的数据和执行步骤。
 
+> [!IMPORTANT]
+> **chatgpt2api-grok 二开部署请优先看 [operations.md](./operations.md)。**  
+> 必须使用 `docker-compose.local.yml` **本地构建**，不要默认 `docker compose up` 拉  
+> `ghcr.io/basketikun/chatgpt2api:latest`，否则没有 Grok 号池 / G2A / GPT 注册机。
+
 ## 部署前准备
 
 服务器需要安装：
@@ -23,14 +28,54 @@ git --version
 | 路径 | 作用 |
 | --- | --- |
 | `config.json` | 主配置、后台密钥、代理、图片、备份等配置 |
-| `.env` | Docker compose 环境变量 |
-| `data/` | 账号、日志、图片、任务记录等运行数据 |
+| `.env` | Docker compose 环境变量（warp 等） |
+| `data/` | 账号、日志、图片、任务、注册机密钥与 DB 等运行数据 |
+
+二开额外建议保留：
+
+| 路径 | 作用 |
+| --- | --- |
+| `data/grok_accounts.json` | Grok 号池 |
+| `data/g2a_config.json` | grokcli2api-go 连接 |
+| `data/gpt_register.env` | GPT 注册 CFD1/代理密钥 |
+| `data/gpt_register_config.json` | 注册表单 |
+| `data/register_engines.db` | 注册机 provider 表（可重建） |
 
 升级和迁移时重点保留以上内容。
 
-## 方式一：普通 Docker 部署
+## 方式〇：二开推荐（chatgpt2api-grok）
 
-适合不需要 WARP / FlareSolverr 清障的场景。
+```bash
+git clone https://github.com/qawow/chatgpt2api-grok.git
+cd chatgpt2api-grok
+# 修改 config.json 的 auth-key
+mkdir -p data
+# 可选：配置 GPT 注册密钥
+# cp 你的密钥到 data/gpt_register.env
+
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+访问：
+
+```text
+http://localhost:8000
+http://localhost:8000/v1
+```
+
+验证：
+
+```bash
+export KEY='你的 auth-key'
+curl -s http://127.0.0.1:8000/api/grok/accounts -H "Authorization: Bearer $KEY"
+curl -s http://127.0.0.1:8000/api/gpt-register/settings -H "Authorization: Bearer $KEY"
+```
+
+调用与维护总册：[operations.md](./operations.md) · GPT 注册：[gpt-register.md](./gpt-register.md)。
+
+## 方式一：普通 Docker 部署（上游官方镜像）
+
+适合**不需要**本仓库 Grok / G2A / GPT 注册改动、且不需要 WARP 的场景。
 
 ```bash
 git clone git@github.com:basketikun/chatgpt2api.git

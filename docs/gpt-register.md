@@ -1,132 +1,447 @@
 # GPT Free 批量注册（内置模块）
 
-设置页 **设置 → GPT注册** 调用仓库内 **`gpt_free_register/`** 模块做 ChatGPT free 纯协议注册，成功后写入 **ChatGPT 号池**（`/api/accounts`，不进 Grok 池）。
+设置页 **设置 → GPT注册** 调用仓库内 **`gpt_free_register/`** 模块，对 ChatGPT free 做**纯协议**注册；成功后写入 **ChatGPT 号池**（`/api/accounts` / `data/accounts.json`），**不会**进入 Grok 号池。
 
-不再依赖宿主机上的 `/root/any-register-engines`。
+> 不再依赖宿主机上的 `/root/any-register-engines`。引擎代码已 vendoring 进本仓库。
 
-## 内置位置
+相关入口：
+
+| 方式 | 入口 |
+| --- | --- |
+| Web | 设置 → **GPT注册** |
+| HTTP API | `/api/gpt-register/*`（admin Bearer） |
+| Python | `from gpt_free_register import register_chatgpt_once` |
+| 可选 CLI | `gpt_free_register/engines/register_cli.py`（`run_mode=subprocess`） |
+
+---
+
+## 1. 架构与数据流
+
+```
+Web / API
+   │
+   ▼
+services/gpt_register_service.py     # 批量任务、进度、入库
+   │  run_mode=inprocess（默认）
+   ▼
+gpt_free_register/runner.py          # 单次注册入口、init_db、依赖预检
+   │
+   ▼
+gpt_free_register/engines/           # vendored 注册机（仅 chatgpt）
+   │  protocol + mailbox
+   ▼
+Cloudflare D1 自建邮箱（OTP） + OpenAI 协议注册
+   │  成功拿到 access_token
+   ▼
+account_service.add_account_items    # push_mode=local（默认）
+   │
+   ▼
+data/accounts.json                   # ChatGPT 号池
+```
+
+隔离：
+
+| | ChatGPT 号池 | Grok 号池 |
+|---|---|---|
+| 存储 | `data/accounts.json` | `data/grok_accounts.json` |
+| 管理 | `/api/accounts*` | `/api/grok/accounts*` |
+| 本功能写入 | ✅ | ❌ |
+
+---
+
+## 2. 目录结构
 
 ```
 chatgpt2api/
   gpt_free_register/
     __init__.py
-    runner.py                 # 进程内注册入口
-    engines/                  # vendored 注册机（仅 chatgpt 平台 + core + providers）
+    runner.py                      # 进程内注册入口
+    README.md
+    engines/                       # vendored engines（chatgpt only）
       platforms/chatgpt/
       core/
-      providers/
+      providers/mailbox/           # 含 cloudflare_d1
       infrastructure/
       bootstrap.py
-      register_cli.py         # 可选 CLI / subprocess 模式
+      register_cli.py
+  services/gpt_register_service.py
+  api/gpt_register.py
+  web/src/app/settings/components/gpt-register-card.tsx
+  data/                            # 运行时（gitignore）
+    gpt_register.env               # 推荐放密钥
+    gpt_register_config.json
+    gpt_register_jobs.json
+    register_engines.db            # 注册机 provider/capability 表
+    accounts.json
 ```
 
 默认：
 
-- `engines_dir` = 仓库内 `gpt_free_register/engines`
-- `run_mode` = `inprocess`（同进程调用，不 spawn 外部 Python）
+- `engines_dir` → 仓库内 `gpt_free_register/engines`（Docker 下 `/app/gpt_free_register/engines`）
+- `run_mode` → `inprocess`
+- `push_mode` → `local`（进程内入库，不走 HTTP）
 
-旧配置里的 `/root/any-register-engines` 会在 normalize 时自动迁移到内置路径。
+旧配置里的 `/root/any-register-engines` 或不存在的路径会在 normalize 时自动回退到内置目录。
 
-## 邮箱 / 代理密钥（不要进 git）
+---
 
-把 CFD1 与代理写到下面任一位置（`load_dotenv` 不覆盖已有环境变量）：
+## 3. 快速开始
 
-1. 进程环境变量  
-2. `data/gpt_register.env`（推荐，已被 `data/` gitignore）  
-3. `gpt_free_register/engines/.env`（本地可选，仓库已 ignore `.env`）
-
-示例 `data/gpt_register.env`：
+### 3.1 部署（二开必须本地构建）
 
 ```bash
+git clone https://github.com/qawow/chatgpt2api-grok.git
+cd chatgpt2api-grok
+mkdir -p data
+
+# 编辑 config.json 的 auth-key，或：
+# export CHATGPT2API_AUTH_KEY='your_strong_secret'
+
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+- Web：`http://localhost:8000`
+- 容器内服务端口：**80**（host 映射 8000→80）
+- **不要**用 `ghcr.io/basketikun/chatgpt2api:latest` 或默认 `docker compose up`
+
+### 3.2 配置 CFD1 / 代理密钥
+
+推荐写 `data/gpt_register.env`（已被 `data/` gitignore，**不要提交**）：
+
+```bash
+# data/gpt_register.env
 REGISTER_PROXY_DEFAULT=socks5h://127.0.0.1:40000
+
 CFD1_API_TOKEN=...
 CFD1_ACCOUNT_ID=...
 CFD1_DATABASE_ID=...
 CFD1_DOMAIN=mail.example.com
+# 可选
+# CFD1_LOCAL_PART_PREFIX=xai.
+# CFD1_LOCAL_PART_LENGTH=12
 ```
 
-设置页也可临时覆盖：代理、CFD1 域名等。
+也可用进程环境变量（同名）。加载顺序（**不覆盖**已存在的环境变量）：
 
-## 设置页字段
+1. 进程环境  
+2. `data/gpt_register.env`  
+3. `gpt_free_register/engines/.env`（可选本地）
 
-| 字段 | 说明 |
-| --- | --- |
-| 注册数量 | 1–50 |
-| 并发 | 1–5，默认 1 |
-| 间隔 | 每批之间秒数 |
-| 单号超时 | 单次注册超时（subprocess 用；inprocess 为逻辑超时参考） |
-| 执行器 | `protocol`（推荐） |
-| 邮箱 Provider | 默认 `cloudflare_d1_api` |
-| CFD1 域名覆盖 | 可选 |
-| 出站代理 | 可选；留空读 `REGISTER_PROXY*` |
-| 注册机目录 | 留空=内置；一般不用改 |
-| Python 路径 | 仅 `run_mode=subprocess` 需要 |
+> SOCKS 代理必须安装 **PySocks**（镜像 `uv sync` 已带；缺依赖会在启动任务时预检失败）。
 
-## API（admin Bearer）
+### 3.3 Web 操作
+
+1. 登录管理后台（admin `auth-key`）  
+2. **设置 → GPT注册**  
+3. 填数量 / 并发 / 间隔 / 代理等（多数可留默认）  
+4. **保存配置** → **开始注册**  
+5. 看进度、日志；成功账号出现在 **ChatGPT 号池**
+
+### 3.4 API 操作
+
+所有接口需要：
+
+```http
+Authorization: Bearer <auth-key>
+```
+
+#### 读配置
 
 ```bash
 export KEY='你的 auth-key'
+export BASE='http://127.0.0.1:8000'
 
-curl -s http://127.0.0.1:8000/api/gpt-register/settings \
-  -H "Authorization: Bearer $KEY"
-
-curl -s -X POST http://127.0.0.1:8000/api/gpt-register/start \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"count":1,"concurrency":1}'
+curl -s "$BASE/api/gpt-register/settings" \
+  -H "Authorization: Bearer $KEY" | jq .
 ```
 
-## Docker
-
-镜像构建会 `COPY gpt_free_register ./gpt_free_register`。  
-若仍看到 `/app/gpt_free_register/engines` 不存在，说明当前容器是**旧镜像**，需要重新本地构建：
+#### 写配置
 
 ```bash
+curl -s -X POST "$BASE/api/gpt-register/settings" \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "count": 3,
+    "concurrency": 1,
+    "interval_secs": 5,
+    "executor": "protocol",
+    "mail_provider": "cloudflare_d1_api",
+    "proxy": "socks5h://127.0.0.1:40000",
+    "push_enabled": true,
+    "push_mode": "local",
+    "plan_type": "free"
+  }' | jq .
+```
+
+#### 启动任务（可覆盖本次参数）
+
+```bash
+curl -s -X POST "$BASE/api/gpt-register/start" \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"count":1,"concurrency":1}' | jq .
+```
+
+返回里带 `job.job_id`。
+
+#### 查进度
+
+```bash
+# 列表（最近任务）
+curl -s "$BASE/api/gpt-register/jobs" \
+  -H "Authorization: Bearer $KEY" | jq .
+
+# 单个
+JOB_ID='...'
+curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" \
+  -H "Authorization: Bearer $KEY" | jq .
+```
+
+关注字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `status` | `pending` / `running` / `done` / `failed` / `cancelled` |
+| `completed` / `total` | 进度 |
+| `success` / `failed` / `added` | 成功数 / 失败数 / 入库数 |
+| `items[]` | 每号结果（email / error / added） |
+| `logs[]` | 时间线日志 |
+
+#### 取消任务
+
+```bash
+curl -s -X POST "$BASE/api/gpt-register/jobs/$JOB_ID/cancel" \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{}' | jq .
+```
+
+约束：**同时只允许一个**运行中任务。
+
+### 3.5 Python 进程内调用
+
+```python
+from gpt_free_register import register_chatgpt_once
+
+result = register_chatgpt_once(
+    settings={
+        "mail_provider": "cloudflare_d1_api",
+        "executor": "protocol",
+        "proxy": "socks5h://127.0.0.1:40000",  # 可选
+        "push_enabled": False,                   # 仅注册，不入库
+    },
+    log=print,
+)
+print(result["email"], bool(result.get("token")), result.get("error"))
+```
+
+成功大致形状：
+
+```json
+{
+  "platform": "chatgpt",
+  "email": "user@mail.example.com",
+  "password": "...",
+  "user_id": "...",
+  "token": "<access_token>",
+  "status": "registered",
+  "extra": {
+    "access_token": "...",
+    "refresh_token": "...",
+    "id_token": "...",
+    "session_token": "..."
+  }
+}
+```
+
+---
+
+## 4. 设置字段说明
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `count` | 1 | 注册数量 1–50 |
+| `concurrency` | 1 | 并发 1–5；邮箱/代理不稳时建议 1 |
+| `interval_secs` | 2 | 每批间隔秒 |
+| `timeout_secs` | 600 | 单号超时（subprocess 严格生效） |
+| `executor` | `protocol` | `protocol` / `headless` / `headed`；推荐 protocol |
+| `mail_provider` | `cloudflare_d1_api` | 邮箱 provider |
+| `cfd1_domain` | 空 | 覆盖 `CFD1_DOMAIN` |
+| `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*` |
+| `bind_register_proxy` | true | 入库时把代理绑到账号 |
+| `plan_type` | `free` | 写入号池的 type |
+| `source_type` | 空 | 空则自动（register / codex） |
+| `push_enabled` | true | 成功后是否入库 |
+| `push_mode` | `local` | `local` 进程内入库；`http` 再 POST `/api/accounts` |
+| `chatgpt2api_base_url` | 自动 | 仅 `http` 模式；Docker 内默认 `:80`，宿主机开发 `:8000` |
+| `chatgpt2api_auth_key` | 空 | 空则用本机 `auth-key` |
+| `dry_run` | false | 干跑：注册但不入库 |
+| `engines_dir` | 内置 | 一般留空 |
+| `run_mode` | `inprocess` | `subprocess` 才需要外部 Python |
+| `python_bin` | 空 | 仅 subprocess |
+
+---
+
+## 5. HTTP API 一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/gpt-register/settings` | 读配置（密钥脱敏） |
+| POST | `/api/gpt-register/settings` | 写配置 |
+| POST | `/api/gpt-register/start` | 启动任务（可带覆盖） |
+| GET | `/api/gpt-register/jobs` | 任务列表 |
+| GET | `/api/gpt-register/jobs/{id}` | 任务详情 |
+| POST | `/api/gpt-register/jobs/{id}/cancel` | 取消 |
+
+鉴权：与其它管理接口相同的 admin Bearer。
+
+---
+
+## 6. 运维与维护
+
+### 6.1 日常数据文件
+
+| 文件 | 作用 | 备份 |
+| --- | --- | --- |
+| `data/gpt_register.env` | CFD1 / 代理密钥 | ✅ 机密备份 |
+| `data/gpt_register_config.json` | 表单默认值 | 可选 |
+| `data/gpt_register_jobs.json` | 最近任务（约 20 条） | 可选 |
+| `data/register_engines.db` | provider / capability 表 | 可重建 |
+| `data/accounts.json` | ChatGPT 号池（注册成功写入） | ✅ 重要 |
+
+### 6.2 升级
+
+```bash
+cd chatgpt2api-grok
+git pull
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
-不要用官方 `ghcr.io/basketikun/chatgpt2api` 镜像，也不要用默认 `docker-compose.yml` 拉上游镜像。
+保留：`config.json`、`data/`（含 `gpt_register.env`、号池）。  
+**不要**把空的宿主机 `./gpt_free_register` 挂进容器盖掉镜像内文件。
 
-密钥挂载在 `./data` 下写 `data/gpt_register.env` 即可（容器内 `/app/data/gpt_register.env`）。
+### 6.3 重建注册机 DB
 
-注意：
+若出现 `no such table: provider_definitions` 且自动 init 仍失败：
 
-- **不要**把空的宿主机 `./gpt_free_register` 挂进容器，否则会盖掉镜像内 builtin engines。  
-  本地改注册机时再临时加：`- ./gpt_free_register:/app/gpt_free_register:ro`
-- 注册机内部 sqlite 默认写 `REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db`（可写 data 卷）
-- 首次进程内注册会自动 `init_db()` 并 seed `provider_definitions`；若仍报 `no such table: provider_definitions`，检查该环境变量是否指向只读路径，或删除损坏的 db 后重启
-- 默认 `push_mode=local`：成功账号直接写本进程号池，不依赖 `127.0.0.1:8000`
-- 容器内服务监听 **:80**（host 映射常见 8000/3000 → 80）
+```bash
+# 容器内路径
+rm -f data/register_engines.db
+docker compose -f docker-compose.local.yml restart
+# 下次注册会自动 init_db + seed
+```
 
-## 数据文件
+### 6.4 本地开发热改注册机
 
-| 文件 | 作用 |
-| --- | --- |
-| `data/gpt_register_config.json` | 默认表单 |
-| `data/gpt_register_jobs.json` | 最近任务 |
-| `data/gpt_register.env` | 密钥（推荐） |
+默认镜像已含 `gpt_free_register/`。若要热挂载源码：
 
-## 代码入口
+```yaml
+# docker-compose.local.yml 临时打开：
+volumes:
+  - ./gpt_free_register:/app/gpt_free_register:ro
+```
+
+要求宿主机目录完整（含 `engines/platforms/chatgpt`）。
+
+### 6.5 依赖
+
+`pyproject.toml` / `uv.lock`：
+
+- `curl-cffi`
+- `sqlmodel`
+- `requests`
+- `PySocks`（**SOCKS 代理必需**）
+
+```bash
+uv sync
+# 或
+python -m pip install sqlmodel requests PySocks curl-cffi
+```
+
+### 6.6 健康检查清单
+
+```bash
+export KEY=...
+export BASE=http://127.0.0.1:8000
+
+# 1) 配置可读
+curl -s "$BASE/api/gpt-register/settings" -H "Authorization: Bearer $KEY" | jq '.settings.engines_dir,.settings.run_mode'
+
+# 2) 容器内 engines 存在（Docker）
+docker exec chatgpt2api-local ls /app/gpt_free_register/engines/platforms/chatgpt/plugin.py
+
+# 3) 密钥文件
+test -f data/gpt_register.env && echo 'env ok'
+
+# 4) 号池接口
+curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
+```
+
+### 6.7 常见故障
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `注册机目录不存在: /app/gpt_free_register/engines` | 旧镜像 / 空 volume 盖掉 | `docker compose -f docker-compose.local.yml up -d --build`；勿空挂 `./gpt_free_register` |
+| `no such table: provider_definitions` | 未 init_db 或 DB 只读 | 确认 `REGISTER_ENGINES_DATABASE_URL` 指向 `/app/data/...`；删坏库重启 |
+| `Missing dependencies for SOCKS support` | 无 PySocks | 重建镜像或 `pip install PySocks` |
+| `Cloudflare D1 邮箱缺少配置` | 未配 CFD1 | 写 `data/gpt_register.env` |
+| 注册成功但 `added=0` | dry_run / push 关 / token 空 | 查 `push_enabled`、`dry_run`、任务 `items` |
+| HTTP 推送连不上 | 容器内用了 host 的 `:8000` | 默认用 `push_mode=local`；http 模式 Docker 内用 `:80` |
+| OTP 超时 / 风控 | 域名信誉、代理出口、OpenAI 策略 | 换域名/代理，降并发，看 `logs`/`items` |
+
+---
+
+## 7. Docker 要点
+
+镜像构建会：
+
+```dockerfile
+COPY gpt_free_register ./gpt_free_register
+ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
+```
+
+`docker-compose.local.yml`：
+
+- 挂载 `./data:/app/data`、`./config.json`
+- **默认不挂** `./gpt_free_register`（防止空目录遮盖镜像）
+- 设置 `REGISTER_ENGINES_DATABASE_URL`
+
+密钥：`data/gpt_register.env` → 容器 `/app/data/gpt_register.env`。
+
+---
+
+## 8. 代码入口
 
 | 路径 | 作用 |
 | --- | --- |
-| `gpt_free_register/runner.py` | 进程内单次注册 |
-| `services/gpt_register_service.py` | 批量任务 + 入库 |
+| `gpt_free_register/runner.py` | 单次注册、bootstrap、依赖预检 |
+| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库 |
 | `api/gpt_register.py` | 管理 API |
-| `web/.../gpt-register-card.tsx` | 设置页 |
+| `web/.../gpt-register-card.tsx` | 设置页 UI |
+| `test/test_gpt_register.py` | 单测 |
 
-## 依赖
-
-主项目需：`curl-cffi`、`sqlmodel`、`requests`、`PySocks`（已写入 `pyproject.toml` / `uv.lock`）。
-
-SOCKS 代理（`socks5h://...`）**必须**有 `PySocks`，否则 CFD1 读信会报：
-
-`Missing dependencies for SOCKS support.`
+运行测试：
 
 ```bash
-# 开发环境
-uv sync
-# 或
-python -m pip install sqlmodel requests PySocks
+uv run python -m unittest test.test_gpt_register -v
 ```
 
-Docker 重建镜像后依赖会随 `uv sync --frozen` 装进镜像。
+---
+
+## 9. 安全与合规
+
+- 密钥只放 `data/gpt_register.env` / 环境变量，**禁止**提交 git  
+- 注册与号池仅供个人学习研究；遵守 OpenAI 条款与当地法律  
+- 勿用重要邮箱域名做大规模注册；失败多为风控/OTP 环境问题  
+
+---
+
+## 10. 与其它模块关系
+
+| 模块 | 关系 |
+| --- | --- |
+| ChatGPT 号池 `/api/accounts` | 注册成功默认写入 |
+| Grok 号池 `/api/grok/*` | **无关**，不写入 |
+| G2A `/api/g2a/*` | 只推 Grok 号，与 GPT 注册无关 |
+| CPA / Sub2API | 其它导入通道，互不替代 |
