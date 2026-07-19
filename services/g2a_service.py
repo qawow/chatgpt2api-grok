@@ -42,14 +42,42 @@ def _clean(value: object) -> str:
     return str(value or "").strip()
 
 
+def _normalize_base_url(value: object) -> str:
+    """Normalize grokcli2api-go root.
+
+    Admin paths are absolute under the service root, e.g. /v1/admin/credentials.
+    Users often paste ``http://host:8088/v1`` (OpenAI base); strip trailing /v1
+    so we don't double-prefix. Also strip accidental full admin paths.
+    """
+    base = _clean(value).rstrip("/")
+    if not base:
+        return ""
+    lower = base.lower()
+    for suffix in (
+        "/v1/admin/credentials",
+        "/v1/admin",
+        "/admin/credentials",
+        "/admin",
+        "/v1",
+    ):
+        if lower.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            lower = base.lower()
+            break
+    return base
+
+
 def _normalize_server(raw: dict) -> dict:
     return {
         "id": _clean(raw.get("id")) or _new_id(),
         "name": _clean(raw.get("name")),
-        "base_url": _clean(raw.get("base_url")).rstrip("/"),
+        "base_url": _normalize_base_url(raw.get("base_url")),
         "admin_key": _clean(raw.get("admin_key") or raw.get("secret_key")),
         "enabled": bool(raw.get("enabled", True)),
         "note": _clean(raw.get("note")),
+        # Optional HTTP(S)/SOCKS proxy for this admin connection only.
+        # Empty / missing means direct (ignore process HTTP(S)_PROXY).
+        "proxy": _clean(raw.get("proxy")),
         "created_at": _clean(raw.get("created_at")) or _now_iso(),
         "updated_at": _clean(raw.get("updated_at")) or _now_iso(),
         "last_error": _clean(raw.get("last_error")) or None,
@@ -105,7 +133,15 @@ class G2AConfig:
                     return dict(item)
         return None
 
-    def add_server(self, *, name: str, base_url: str, admin_key: str, note: str = "") -> dict:
+    def add_server(
+        self,
+        *,
+        name: str,
+        base_url: str,
+        admin_key: str,
+        note: str = "",
+        proxy: str = "",
+    ) -> dict:
         server = _normalize_server(
             {
                 "id": _new_id(),
@@ -113,6 +149,7 @@ class G2AConfig:
                 "base_url": base_url,
                 "admin_key": admin_key,
                 "note": note,
+                "proxy": proxy,
                 "enabled": True,
             }
         )
@@ -132,7 +169,7 @@ class G2AConfig:
                 if item["id"] != sid:
                     continue
                 merged = dict(item)
-                for key in ("name", "base_url", "admin_key", "note", "enabled"):
+                for key in ("name", "base_url", "admin_key", "note", "enabled", "proxy"):
                     if key in updates and updates[key] is not None:
                         if key == "admin_key" and not _clean(updates[key]):
                             continue  # empty means keep
@@ -180,16 +217,34 @@ class G2AClientError(RuntimeError):
 
 
 class G2AClient:
-    """HTTP client for one grokcli2api-go admin endpoint."""
+    """HTTP client for one grokcli2api-go admin endpoint.
+
+    Admin traffic defaults to **direct** connection (``trust_env=False`` and
+    ``proxies`` disabled). Process-level ``HTTP_PROXY``/``HTTPS_PROXY`` often
+    point at CONNECT-only forwarders; sending GET/POST through them yields:
+
+        HTTP 405 ... only CONNECT supported
+
+    which is unrelated to grokcli2api-go itself. Optional per-server ``proxy``
+    can re-enable an explicit outbound proxy when the admin host is remote.
+    """
 
     def __init__(self, server: dict, *, timeout: float = 45.0):
-        self.base_url = _clean(server.get("base_url")).rstrip("/")
+        self.base_url = _normalize_base_url(server.get("base_url"))
         self.admin_key = _clean(server.get("admin_key"))
+        self.proxy = _clean(server.get("proxy"))
         self.timeout = timeout
         if not self.base_url:
             raise G2AClientError("server base_url is empty")
         if not self.admin_key:
             raise G2AClientError("server admin_key is empty")
+        self._session = requests.Session()
+        # Never inherit ambient HTTP(S)_PROXY for admin API by default.
+        self._session.trust_env = False
+        if self.proxy:
+            self._session.proxies = {"http": self.proxy, "https": self.proxy}
+        else:
+            self._session.proxies = {"http": None, "https": None}
 
     def _headers(self, *, content_type: str | None = "application/json") -> dict[str, str]:
         headers = {
@@ -204,6 +259,23 @@ class G2AClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path if path.startswith('/') else '/' + path}"
 
+    def _format_http_error(self, status: int, text: str, url: str) -> str:
+        snippet = (text or "").strip().replace("\n", " ")[:280]
+        lower = snippet.lower()
+        if status == 405 and "only connect supported" in lower:
+            return (
+                f"HTTP 405 from {url}: request hit a CONNECT-only proxy "
+                f"(not grokcli2api-go). G2A admin calls now bypass env proxies; "
+                f"check base_url is the service root (e.g. http://host:8088), "
+                f"not a local proxy port. raw={snippet[:160]}"
+            )
+        if status == 404 and ("not found" in lower or "<!doctype" in lower or "<html" in lower):
+            return (
+                f"HTTP 404 from {url}: path missing — use service root as base_url "
+                f"(http://host:8088), admin path is /v1/admin/credentials. raw={snippet[:160]}"
+            )
+        return f"HTTP {status}: {snippet or '(empty body)'}"
+
     def _request(
         self,
         method: str,
@@ -216,10 +288,10 @@ class G2AClient:
     ) -> Any:
         url = self._url(path)
         hdrs = headers if headers is not None else self._headers(
-            content_type=None if files is not None else "application/json"
+            content_type=None if files is not None else ("application/json" if json_body is not None else None)
         )
         try:
-            resp = requests.request(
+            resp = self._session.request(
                 method.upper(),
                 url,
                 headers=hdrs,
@@ -227,13 +299,14 @@ class G2AClient:
                 data=data,
                 files=files,
                 timeout=self.timeout,
+                allow_redirects=True,
             )
         except requests.RequestException as exc:
-            raise G2AClientError(f"network error: {exc}") from exc
+            raise G2AClientError(f"network error talking to {url}: {exc}") from exc
         text = resp.text or ""
         if resp.status_code >= 400:
             raise G2AClientError(
-                f"HTTP {resp.status_code}: {text[:300]}",
+                self._format_http_error(resp.status_code, text, url),
                 status=resp.status_code,
                 body=text[:800],
             )
@@ -250,6 +323,7 @@ class G2AClient:
         return {
             "ok": True,
             "count": len(result.get("items") or []),
+            "base_url": self.base_url,
             "raw_keys": sorted(result.keys()),
         }
 
@@ -259,11 +333,23 @@ class G2AClient:
         return {"items": items, "raw": payload if isinstance(payload, dict) else {"data": payload}}
 
     def upload_credential(self, account: dict[str, Any]) -> dict[str, Any]:
-        """POST cliproxy-compatible JSON body."""
+        """POST cliproxy-compatible JSON body (same as remote --data-binary @auth.json)."""
         body = _account_to_cliproxy_payload(account)
         if not body.get("access_token"):
             raise G2AClientError("account missing access_token")
-        return self._request("POST", "/v1/admin/credentials", json_body=body)
+        # Prefer raw JSON bytes (matches README --data-binary @auth.json).
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = self._headers(content_type="application/json")
+        try:
+            return self._request("POST", "/v1/admin/credentials", data=raw, headers=headers)
+        except G2AClientError as first_exc:
+            # Fallback: multipart file field used by some deploy docs.
+            if first_exc.status not in {400, 415, 422}:
+                raise
+            try:
+                return self.upload_credential_file(raw, filename="auth.json")
+            except G2AClientError:
+                raise first_exc from None
 
     def upload_credential_file(self, content: bytes, filename: str = "auth.json") -> dict[str, Any]:
         headers = self._headers(content_type=None)

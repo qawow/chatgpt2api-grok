@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import accounts, ai, g2a, grok_accounts, image_tasks, system
+from api import accounts, ai, g2a, gpt_register, grok_accounts, image_tasks, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
@@ -46,6 +46,7 @@ def create_app() -> FastAPI:
     app.include_router(accounts.create_router())
     app.include_router(grok_accounts.create_router())
     app.include_router(g2a.create_router())
+    app.include_router(gpt_register.create_router())
     app.include_router(image_tasks.create_router())
     app.include_router(system.create_router(app_version))
 

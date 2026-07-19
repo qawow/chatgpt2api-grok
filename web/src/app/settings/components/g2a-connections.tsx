@@ -54,6 +54,7 @@ export function G2AConnections() {
   const [formBaseUrl, setFormBaseUrl] = useState("");
   const [formAdminKey, setFormAdminKey] = useState("");
   const [formNote, setFormNote] = useState("");
+  const [formProxy, setFormProxy] = useState("");
   const [showSecret, setShowSecret] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -90,6 +91,7 @@ export function G2AConnections() {
     setFormBaseUrl("http://127.0.0.1:8088");
     setFormAdminKey("");
     setFormNote("");
+    setFormProxy("");
     setShowSecret(false);
     setDialogOpen(true);
   };
@@ -100,6 +102,7 @@ export function G2AConnections() {
     setFormBaseUrl(server.base_url || "");
     setFormAdminKey("");
     setFormNote(server.note || "");
+    setFormProxy(server.proxy || "");
     setShowSecret(false);
     setDialogOpen(true);
   };
@@ -121,6 +124,7 @@ export function G2AConnections() {
           base_url: formBaseUrl.trim(),
           admin_key: formAdminKey.trim() || undefined,
           note: formNote.trim(),
+          proxy: formProxy.trim(),
         });
         setServers(data.servers);
         toast.success("连接已更新");
@@ -130,6 +134,7 @@ export function G2AConnections() {
           base_url: formBaseUrl.trim(),
           admin_key: formAdminKey.trim(),
           note: formNote.trim(),
+          proxy: formProxy.trim(),
         });
         setServers(data.servers);
         toast.success("连接已添加");
@@ -260,6 +265,9 @@ export function G2AConnections() {
             远程 <code className="rounded bg-white/70 px-1">GET /v1/admin/credentials</code>{" "}
             只返回脱敏状态，不含 token，因此<strong>不能</strong>从 grokcli2api-go 反向导入本地号池。
             支持方向：本地 Grok 号池 → 远程上传；以及查看/删除远程脱敏凭证。
+            管理请求默认<strong>直连</strong>（忽略系统 HTTP_PROXY），避免误打到只支持 CONNECT 的代理出现 405。
+            base URL 填服务根地址，例如 <code className="rounded bg-white/70 px-1">http://127.0.0.1:8088</code>
+            ，不要填 <code className="rounded bg-white/70 px-1">/v1</code> 或本地代理端口。
           </div>
 
           {isLoading ? (
@@ -291,13 +299,18 @@ export function G2AConnections() {
                           {server.name || server.base_url}
                         </div>
                         <div className="truncate text-xs text-stone-400">{server.base_url}</div>
+                        {server.proxy ? (
+                          <div className="truncate text-xs text-stone-400">proxy: {server.proxy}</div>
+                        ) : (
+                          <div className="truncate text-xs text-stone-400">proxy: 直连（忽略环境代理）</div>
+                        )}
                         <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-stone-500">
                           <Badge variant="secondary" className="rounded-md">
                             {server.has_admin_key ? "Admin Key 已配置" : "缺少 Admin Key"}
                           </Badge>
                           {server.last_ok_at ? <span>上次成功：{server.last_ok_at}</span> : null}
                           {server.last_error ? (
-                            <span className="text-rose-500">错误：{server.last_error}</span>
+                            <span className="break-all text-rose-500">错误：{server.last_error}</span>
                           ) : null}
                         </div>
                       </div>
@@ -426,6 +439,19 @@ export function G2AConnections() {
                 placeholder="用途说明"
                 className="h-11 rounded-xl border-stone-200 bg-white"
               />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">出站代理（可选）</label>
+              <Input
+                value={formProxy}
+                onChange={(event) => setFormProxy(event.target.value)}
+                placeholder="留空=直连；需要时填 http://host:port 或 socks5h://host:port"
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">
+                仅用于访问 grokcli2api-go 管理接口。默认直连，不会走系统 HTTP_PROXY（可避免
+                only CONNECT supported 的 405）。
+              </p>
             </div>
           </div>
           <DialogFooter className="pt-2">

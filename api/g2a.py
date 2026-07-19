@@ -22,6 +22,7 @@ class G2AServerCreateRequest(BaseModel):
     base_url: str = ""
     admin_key: str = ""
     note: str = ""
+    proxy: str = ""
 
 
 class G2AServerUpdateRequest(BaseModel):
@@ -30,10 +31,21 @@ class G2AServerUpdateRequest(BaseModel):
     admin_key: str | None = None
     note: str | None = None
     enabled: bool | None = None
+    proxy: str | None = None
 
 
 class G2APushRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
+
+
+def _remote_http_status(exc: G2AClientError) -> int:
+    """Map remote client errors to our API status.
+
+    Remote 405/502/etc should not be echoed as our route method errors.
+    """
+    if exc.status == 404 and "server not found" in str(exc).lower():
+        return 404
+    return 502
 
 
 def create_router() -> APIRouter:
@@ -53,6 +65,7 @@ def create_router() -> APIRouter:
                 base_url=body.base_url,
                 admin_key=body.admin_key,
                 note=body.note,
+                proxy=body.proxy,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -92,8 +105,7 @@ def create_router() -> APIRouter:
         try:
             result = await run_in_threadpool(g2a_bridge.ping, server_id)
         except G2AClientError as exc:
-            status = exc.status if exc.status and 400 <= exc.status < 600 else 502
-            raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=_remote_http_status(exc), detail={"error": str(exc)}) from exc
         return {
             **result,
             "servers": sanitize_g2a_servers(g2a_config.list_servers()),
@@ -105,8 +117,7 @@ def create_router() -> APIRouter:
         try:
             result = await run_in_threadpool(g2a_bridge.list_remote, server_id)
         except G2AClientError as exc:
-            status = exc.status if exc.status and 400 <= exc.status < 600 else 502
-            raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=_remote_http_status(exc), detail={"error": str(exc)}) from exc
         return {
             "server_id": server_id,
             "items": result.get("items") or [],
@@ -129,8 +140,7 @@ def create_router() -> APIRouter:
                 access_tokens=tokens or None,
             )
         except G2AClientError as exc:
-            status = exc.status if exc.status and 400 <= exc.status < 600 else 502
-            raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=_remote_http_status(exc), detail={"error": str(exc)}) from exc
         return {
             **result,
             "servers": sanitize_g2a_servers(g2a_config.list_servers()),
@@ -146,8 +156,7 @@ def create_router() -> APIRouter:
         try:
             result = await run_in_threadpool(g2a_bridge.delete_remote, server_id, credential_id)
         except G2AClientError as exc:
-            status = exc.status if exc.status and 400 <= exc.status < 600 else 502
-            raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=_remote_http_status(exc), detail={"error": str(exc)}) from exc
         return result
 
     return router

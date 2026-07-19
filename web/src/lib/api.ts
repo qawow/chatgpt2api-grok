@@ -931,6 +931,8 @@ export type G2AServer = {
   has_admin_key: boolean;
   enabled?: boolean;
   note?: string;
+  /** Optional outbound proxy for admin calls only; empty = direct (no env proxy). */
+  proxy?: string;
   last_error?: string | null;
   last_ok_at?: string | null;
   created_at?: string;
@@ -956,6 +958,7 @@ export async function createG2AServer(server: {
   base_url: string;
   admin_key: string;
   note?: string;
+  proxy?: string;
 }) {
   return httpRequest<{ server: G2AServer; servers: G2AServer[] }>("/api/g2a/servers", {
     method: "POST",
@@ -971,6 +974,7 @@ export async function updateG2AServer(
     admin_key?: string;
     note?: string;
     enabled?: boolean;
+    proxy?: string;
   },
 ) {
   return httpRequest<{ server: G2AServer; servers: G2AServer[] }>(`/api/g2a/servers/${serverId}`, {
@@ -1014,5 +1018,97 @@ export async function pushLocalGrokToG2A(serverId: string, accessTokens: string[
 export async function deleteG2ACredential(serverId: string, credentialId: string) {
   return httpRequest<{ ok: boolean }>(`/api/g2a/servers/${serverId}/credentials/${credentialId}`, {
     method: "DELETE",
+  });
+}
+
+// ── GPT Free Register (any-register-engines) ──────────────────────
+
+export type GptRegisterSettings = {
+  engines_dir: string;
+  python_bin: string;
+  count: number;
+  concurrency: number;
+  interval_secs: number;
+  timeout_secs: number;
+  executor: string;
+  mail_provider: string;
+  captcha: string;
+  proxy: string;
+  bind_register_proxy: boolean;
+  plan_type: string;
+  source_type: string;
+  cfd1_domain: string;
+  push_enabled: boolean;
+  push_mode: string;
+  chatgpt2api_base_url: string;
+  chatgpt2api_auth_key?: string;
+  has_chatgpt2api_auth_key?: boolean;
+  dry_run: boolean;
+};
+
+export type GptRegisterJobLog = {
+  at?: string;
+  message?: string;
+};
+
+export type GptRegisterJobItem = {
+  index?: number;
+  ok?: boolean;
+  email?: string | null;
+  error?: string | null;
+  added?: number;
+  has_token?: boolean;
+  push?: unknown;
+};
+
+export type GptRegisterJob = {
+  job_id: string;
+  status: string;
+  created_at?: string;
+  updated_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  settings?: Partial<GptRegisterSettings>;
+  total: number;
+  completed: number;
+  success: number;
+  failed: number;
+  added: number;
+  items?: GptRegisterJobItem[];
+  logs?: GptRegisterJobLog[];
+  error?: string | null;
+  cancel_requested?: boolean;
+};
+
+export async function fetchGptRegisterSettings() {
+  return httpRequest<{ settings: GptRegisterSettings }>("/api/gpt-register/settings");
+}
+
+export async function saveGptRegisterSettings(settings: Partial<GptRegisterSettings>) {
+  return httpRequest<{ settings: GptRegisterSettings }>("/api/gpt-register/settings", {
+    method: "POST",
+    body: settings,
+  });
+}
+
+export async function fetchGptRegisterJobs() {
+  return httpRequest<{ jobs: GptRegisterJob[] }>("/api/gpt-register/jobs");
+}
+
+export async function fetchGptRegisterJob(jobId: string) {
+  return httpRequest<{ job: GptRegisterJob }>(`/api/gpt-register/jobs/${jobId}`);
+}
+
+export async function startGptRegisterJob(overrides: Partial<GptRegisterSettings> = {}) {
+  return httpRequest<{ job: GptRegisterJob }>("/api/gpt-register/start", {
+    method: "POST",
+    body: overrides,
+  });
+}
+
+export async function cancelGptRegisterJob(jobId: string) {
+  return httpRequest<{ job: GptRegisterJob }>(`/api/gpt-register/jobs/${jobId}/cancel`, {
+    method: "POST",
+    body: {},
   });
 }

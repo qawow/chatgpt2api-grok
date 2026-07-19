@@ -53,11 +53,23 @@ grokcli2api-go  /v1/admin/credentials  →  auths/
 
 1. 部署 grokcli2api-go，设置 `GROK_ADMIN_KEY`，确保 `/v1/admin/credentials` 可访问  
 2. chatgpt2api 设置 → **GrokCLI2API** → 添加连接  
-   - 地址：`http://host:8088`  
+   - 地址：服务根，如 `http://host:8088`（**不要**填 `/v1`，也不要填本地 Clash/系统代理端口）  
    - Admin Key：与远程一致  
+   - 出站代理：默认留空（直连）；仅当管理端本身必须走代理时再填  
 3. **探测连通**  
 4. 先保证本地 Grok 号池有账号（`/api/grok/accounts` 或 cliproxy 导入）  
-5. **推送本地 Grok 号池**  
+5. **推送本地 Grok 号池**
+
+## 常见错误：HTTP 405 only CONNECT supported
+
+这不是 grokcli2api-go 返回的业务错误，而是请求被 **CONNECT-only 转发代理**（常见于本机 `HTTP_PROXY`/`HTTPS_PROXY` 指向 Clash/v2ray 的 mixed/HTTP 端口）截走了。
+
+本侧修复：
+
+- G2A 管理请求使用独立 `Session`，**默认 `trust_env=False` 且 `proxies` 清空**，不再继承环境代理  
+- base_url 自动去掉尾部 `/v1`、`/v1/admin/credentials` 等误粘贴后缀  
+- 可选 per-server `proxy` 字段仅在需要时启用出站代理  
+- 远端 405/502 映射为本 API 的 **502**，错误文案会提示 CONNECT-only 代理问题  
 
 ## 与 CPA / 本地 Grok 池的关系
 

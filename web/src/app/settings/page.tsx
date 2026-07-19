@@ -15,6 +15,7 @@ import { ImportBrowserDialog } from "./components/import-browser-dialog";
 import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
 import { G2AConnections } from "./components/g2a-connections";
+import { GptRegisterCard } from "./components/gpt-register-card";
 import { Sub2APIConnections } from "./components/sub2api-connections";
 import { ThirdPartyAppsCard } from "./components/third-party-apps-card";
 import { UserKeysCard } from "./components/user-keys-card";
@@ -30,6 +31,7 @@ const settingsTabs = [
   { value: "cpa", title: "CPA" },
   { value: "sub2api", title: "Sub2API" },
   { value: "g2a", title: "GrokCLI2API" },
+  { value: "gpt-register", title: "GPT注册" },
 ];
 
 function SettingsDataController() {
@@ -117,6 +119,9 @@ function SettingsPageContent() {
         </TabsContent>
         <TabsContent value="g2a">
           <G2AConnections />
+        </TabsContent>
+        <TabsContent value="gpt-register">
+          <GptRegisterCard />
         </TabsContent>
       </Tabs>
       <CPAPoolDialog />

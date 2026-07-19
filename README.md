@@ -10,6 +10,7 @@
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/g2a-bridge.md">GrokCLI2API 桥</a> ·
+  <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/deployment.md">部署说明</a>
 </p>
 
@@ -27,6 +28,7 @@
 | 生图分流 | `model=grok-2-image` / `grok-imagine` 走 Grok 池；另有 `/v1/grok/images/generations` |
 | 文本探活 | `/v1/grok/chat/completions`（内部映射 Build `/responses`） |
 | GrokCLI2API 接入 | 设置页「GrokCLI2API」：对接远程 Admin API，**推送**本地 Grok 号到 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go) |
+| GPT Free 批量注册 | 设置页「GPT注册」：调 any-register-engines 纯协议注册 free 号并入库 ChatGPT 号池 |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
 
 隔离原则：ChatGPT 与 Grok **不同存储、不同管理 API、不同选号**，禁止混池。
@@ -236,6 +238,13 @@ environment:
 - 模型列表：`GET /v1/grok/models`；有号时也会注入总 `GET /v1/models`
 - 设置页对接 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go)：`/api/g2a/servers*`
 - 文档：[docs/grok-pool.md](./docs/grok-pool.md)、[docs/g2a-bridge.md](./docs/g2a-bridge.md)
+
+### GPT Free 批量注册
+
+- 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填
+- 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`
+- 成功账号进入 **ChatGPT 号池**（不进 Grok）
+- 文档：[docs/gpt-register.md](./docs/gpt-register.md)
 
 ### 实验性 / 规划中
 
