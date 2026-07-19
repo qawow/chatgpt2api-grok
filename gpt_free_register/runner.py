@@ -84,15 +84,45 @@ def _ensure_register_db_url() -> None:
     os.environ["REGISTER_ENGINES_DATABASE_URL"] = f"sqlite:///{db_path}"
 
 
+def _ensure_runtime_deps(proxy: str | None) -> None:
+    """Fail fast on missing optional deps that registration will need."""
+    missing: list[str] = []
+    try:
+        import curl_cffi  # noqa: F401
+    except Exception:
+        missing.append("curl_cffi")
+    try:
+        import sqlmodel  # noqa: F401
+    except Exception:
+        missing.append("sqlmodel")
+    try:
+        import requests  # noqa: F401
+    except Exception:
+        missing.append("requests")
+
+    proxy_l = _clean(proxy).lower()
+    if proxy_l.startswith("socks"):
+        try:
+            import socks  # noqa: F401  # provided by PySocks
+        except Exception:
+            missing.append("PySocks (required for socks5/socks5h proxy + CFD1 HTTP)")
+
+    if missing:
+        raise RuntimeError(
+            "注册机运行依赖缺失: "
+            + ", ".join(missing)
+            + "。请在运行环境安装（Docker 需重建镜像：uv sync / pip install ...）"
+        )
+
+
 def _bootstrap(engines_dir: Path) -> None:
     global _BOOTED
     with _BOOT_LOCK:
         _ensure_engines_on_path(engines_dir)
         _load_env_files(engines_dir)
         _ensure_register_db_url()
-        if _BOOTED:
-            return
         # Create/seed provider + capability tables before platform construction.
+        # Safe to re-run: ensure_seeded / create_all are idempotent.
         try:
             # core.db binds engine at import time from env — import after URL is set.
             import core.db as engines_db
@@ -108,6 +138,9 @@ def _bootstrap(engines_dir: Path) -> None:
             engines_db.init_db()
         except Exception as exc:
             raise RuntimeError(f"初始化注册机数据库失败: {exc}") from exc
+
+        if _BOOTED:
+            return
 
         # Minimal bootstrap without pulling every platform: register chatgpt only.
         try:
@@ -202,6 +235,7 @@ def register_chatgpt_once(
 
     log_fn = log or print
     proxy = resolve_proxy(cfg.get("proxy") if _clean(cfg.get("proxy")) else None)
+    _ensure_runtime_deps(proxy)
     if proxy:
         log_fn(f"[proxy] {mask_proxy(proxy)}")
     else:

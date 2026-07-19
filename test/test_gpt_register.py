@@ -1,6 +1,7 @@
 """GPT free batch register settings + job helpers."""
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +116,83 @@ class ServiceRegisterOnceTest(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["email"], "a@b.c")
         self.assertEqual(out["mode"], "inprocess")
+
+    def test_inprocess_local_push_imports(self):
+        svc = GptRegisterService(config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg4.json")))
+        settings = normalize_settings(
+            {"run_mode": "inprocess", "push_enabled": True, "push_mode": "local", "dry_run": False}
+        )
+        with mock.patch(
+            "gpt_free_register.runner.register_chatgpt_once",
+            return_value={
+                "email": "b@c.d",
+                "token": "tok-2",
+                "extra": {"access_token": "tok-2"},
+                "status": "registered",
+            },
+        ):
+            with mock.patch.object(svc, "_import_local", return_value=1) as imp:
+                out = svc._register_once_inprocess(settings)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["added"], 1)
+        imp.assert_called_once()
+
+
+class RunnerBootstrapTest(unittest.TestCase):
+    def test_bootstrap_creates_provider_tables(self):
+        from gpt_free_register import runner as reg_runner
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        data_dir = Path(tmp.name)
+        db_url = f"sqlite:///{data_dir / 'register_engines.db'}"
+        with mock.patch.object(reg_runner, "_data_dir", return_value=data_dir):
+            reg_runner._BOOTED = False
+            old = os.environ.get("REGISTER_ENGINES_DATABASE_URL")
+            os.environ["REGISTER_ENGINES_DATABASE_URL"] = db_url
+            try:
+                import sys
+
+                for k in list(sys.modules):
+                    if (
+                        k == "core"
+                        or k.startswith("core.")
+                        or k.startswith("platforms")
+                        or k.startswith("providers")
+                        or k.startswith("infrastructure")
+                    ):
+                        del sys.modules[k]
+                reg_runner._bootstrap(Path(reg_runner.default_engines_dir()))
+                from sqlmodel import Session, select
+                import core.db as engines_db
+
+                with Session(engines_db.engine) as session:
+                    rows = session.exec(select(engines_db.ProviderDefinitionModel)).all()
+                self.assertGreaterEqual(len(rows), 1)
+                self.assertTrue(any(r.provider_key == "cloudflare_d1_api" for r in rows))
+                self.assertTrue((data_dir / "register_engines.db").exists())
+            finally:
+                if old is None:
+                    os.environ.pop("REGISTER_ENGINES_DATABASE_URL", None)
+                else:
+                    os.environ["REGISTER_ENGINES_DATABASE_URL"] = old
+
+    def test_socks_proxy_requires_pysocks(self):
+        from gpt_free_register.runner import _ensure_runtime_deps
+
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "socks":
+                raise ModuleNotFoundError("no socks")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            with self.assertRaises(RuntimeError) as ctx:
+                _ensure_runtime_deps("socks5h://127.0.0.1:1080")
+            self.assertIn("PySocks", str(ctx.exception))
 
 
 if __name__ == "__main__":

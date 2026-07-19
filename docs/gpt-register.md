@@ -114,8 +114,19 @@ docker compose -f docker-compose.local.yml up -d --build
 | `api/gpt_register.py` | 管理 API |
 | `web/.../gpt-register-card.tsx` | 设置页 |
 
-## 注意
+## 依赖
 
-- 只进 **ChatGPT** 号池。
-- Docker 镜像需包含 `gpt_free_register/` 目录，并注入 CFD1/代理环境变量。
-- 若仍要外部 CLI：设置 `run_mode=subprocess` 并指定外部 `engines_dir`。
+主项目需：`curl-cffi`、`sqlmodel`、`requests`、`PySocks`（已写入 `pyproject.toml` / `uv.lock`）。
+
+SOCKS 代理（`socks5h://...`）**必须**有 `PySocks`，否则 CFD1 读信会报：
+
+`Missing dependencies for SOCKS support.`
+
+```bash
+# 开发环境
+uv sync
+# 或
+python -m pip install sqlmodel requests PySocks
+```
+
+Docker 重建镜像后依赖会随 `uv sync --frozen` 装进镜像。
