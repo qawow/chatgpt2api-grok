@@ -99,11 +99,16 @@ def _ensure_platform_capabilities_seeded(session: Session) -> dict[str, Platform
 
 def get_platform_capabilities(name: str) -> dict[str, list[str]]:
     cls = get(name)
-    with Session(engine) as session:
-        by_name = _ensure_platform_capabilities_seeded(session)
-        item = by_name.get(name)
-        if item:
-            return _normalize_platform_capabilities(item.get_capabilities(), cls)
+    try:
+        with Session(engine) as session:
+            by_name = _ensure_platform_capabilities_seeded(session)
+            item = by_name.get(name)
+            if item:
+                return _normalize_platform_capabilities(item.get_capabilities(), cls)
+    except Exception:
+        # Fresh embed / missing tables: fall back to class attributes so
+        # protocol registration can still run after init_db or offline.
+        return _class_defaults(cls)
     return _class_defaults(cls)
 
 

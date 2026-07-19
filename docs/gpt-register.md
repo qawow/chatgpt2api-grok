@@ -93,6 +93,7 @@ docker compose -f docker-compose.local.yml up -d --build
 - **不要**把空的宿主机 `./gpt_free_register` 挂进容器，否则会盖掉镜像内 builtin engines。  
   本地改注册机时再临时加：`- ./gpt_free_register:/app/gpt_free_register:ro`
 - 注册机内部 sqlite 默认写 `REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db`（可写 data 卷）
+- 首次进程内注册会自动 `init_db()` 并 seed `provider_definitions`；若仍报 `no such table: provider_definitions`，检查该环境变量是否指向只读路径，或删除损坏的 db 后重启
 - 默认 `push_mode=local`：成功账号直接写本进程号池，不依赖 `127.0.0.1:8000`
 - 容器内服务监听 **:80**（host 映射常见 8000/3000 → 80）
 

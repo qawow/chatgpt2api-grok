@@ -37,6 +37,17 @@ def _ensure_engines_on_path(engines_dir: Path) -> None:
         sys.path.insert(0, root)
 
 
+def _data_dir() -> Path:
+    try:
+        from services.config import DATA_DIR
+
+        path = Path(DATA_DIR)
+    except Exception:
+        path = Path.cwd() / "data"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _load_env_files(engines_dir: Path) -> None:
     """Load .env without requiring secrets inside the git tree.
 
@@ -48,17 +59,7 @@ def _load_env_files(engines_dir: Path) -> None:
     """
     from core.proxy_env import load_dotenv
 
-    # Prefer chatgpt2api data dir when available.
-    try:
-        from services.config import DATA_DIR
-
-        data_env = Path(DATA_DIR) / "gpt_register.env"
-    except Exception:
-        data_env = Path.cwd() / "data" / "gpt_register.env"
-
-    # load data env first by temporarily unsetting nothing; load_dotenv skips set keys
-    # so we load less-specific first then more-specific? Actually load_dotenv only sets
-    # if key NOT in os.environ. So load specific first by calling it on data_env then engines.
+    data_env = _data_dir() / "gpt_register.env"
     if data_env.is_file():
         load_dotenv(data_env)
     engines_env = engines_dir / ".env"
@@ -68,13 +69,46 @@ def _load_env_files(engines_dir: Path) -> None:
     load_dotenv()
 
 
+def _ensure_register_db_url() -> None:
+    """Point engines SQLite at a writable data path when unset.
+
+    BasePlatform.__init__ reads platform_capability_overrides via SQLModel.
+    Without init_db() / tables this raises: no such table: provider_definitions
+    / platform_capability_overrides.
+    """
+    if _clean(os.environ.get("REGISTER_ENGINES_DATABASE_URL")) or _clean(
+        os.environ.get("ACCOUNT_MANAGER_DATABASE_URL")
+    ):
+        return
+    db_path = _data_dir() / "register_engines.db"
+    os.environ["REGISTER_ENGINES_DATABASE_URL"] = f"sqlite:///{db_path}"
+
+
 def _bootstrap(engines_dir: Path) -> None:
     global _BOOTED
     with _BOOT_LOCK:
         _ensure_engines_on_path(engines_dir)
         _load_env_files(engines_dir)
+        _ensure_register_db_url()
         if _BOOTED:
             return
+        # Create/seed provider + capability tables before platform construction.
+        try:
+            # core.db binds engine at import time from env — import after URL is set.
+            import core.db as engines_db
+
+            # If a previous import bound a different URL (tests/hot-reload), rebind.
+            desired = _clean(os.environ.get("REGISTER_ENGINES_DATABASE_URL"))
+            current = str(getattr(engines_db, "DATABASE_URL", "") or "")
+            if desired and desired != current:
+                from sqlmodel import create_engine as _create_engine
+
+                engines_db.DATABASE_URL = desired
+                engines_db.engine = _create_engine(desired)
+            engines_db.init_db()
+        except Exception as exc:
+            raise RuntimeError(f"初始化注册机数据库失败: {exc}") from exc
+
         # Minimal bootstrap without pulling every platform: register chatgpt only.
         try:
             import platforms.chatgpt.plugin  # noqa: F401
@@ -101,22 +135,19 @@ def _create_cfd1_mailbox(extra: dict[str, Any], proxy: str | None):
 def _create_mailbox(provider: str, extra: dict[str, Any], proxy: str | None):
     key = _clean(provider) or "cloudflare_d1_api"
     # Prefer direct registry to avoid needing seeded register_engines.db.
-    try:
-        from core.base_mailbox import MAILBOX_FACTORY_REGISTRY
+    from core.base_mailbox import MAILBOX_FACTORY_REGISTRY
 
-        if key in MAILBOX_FACTORY_REGISTRY:
-            return MAILBOX_FACTORY_REGISTRY[key](extra, proxy)
-        # driver aliases
-        aliases = {
-            "cfd1": "cloudflare_d1_api",
-            "cloudflare_d1": "cloudflare_d1_api",
-        }
-        alias = aliases.get(key)
-        if alias and alias in MAILBOX_FACTORY_REGISTRY:
-            return MAILBOX_FACTORY_REGISTRY[alias](extra, proxy)
-    except Exception:
-        pass
-    # Fallback to full create_mailbox (needs provider DB)
+    aliases = {
+        "cfd1": "cloudflare_d1_api",
+        "cloudflare_d1": "cloudflare_d1_api",
+    }
+    resolved = aliases.get(key, key)
+    factory = MAILBOX_FACTORY_REGISTRY.get(resolved) or MAILBOX_FACTORY_REGISTRY.get(key)
+    if factory is not None:
+        # Do not swallow config errors (missing CFD1 token etc.).
+        return factory(extra, proxy)
+
+    # Fallback to full create_mailbox (needs provider DB definitions)
     from core.base_mailbox import create_mailbox
 
     return create_mailbox(key, extra=extra, proxy=proxy)
