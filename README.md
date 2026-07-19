@@ -1,91 +1,177 @@
-<h1 align="center">ChatGPT2API</h1>
+<h1 align="center">ChatGPT2API-Grok</h1>
 
+<p align="center">
+  基于 <a href="https://github.com/basketikun/chatgpt2api">basketikun/chatgpt2api</a> 的二次开发分支：<br/>
+  保留原版 ChatGPT 号池 / 生图能力，并新增<strong>独立 Grok 号池</strong>与
+  <a href="https://github.com/Futureppo/grokcli2api-go">grokcli2api-go</a> 设置页接入。
+</p>
 
-<p align="center">ChatGPT2API 主要是对 ChatGPT 官网相关能力进行逆向整理与封装，提供面向 ChatGPT 图片生成、图片编辑、多图组图编辑场景的 OpenAI 兼容图片 API / 代理，并集成在线画图、号池管理、多种账号导入方式与 Docker 自托管部署能力。</p>
+<p align="center">
+  <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
+  <a href="./docs/grok-pool.md">Grok 号池</a> ·
+  <a href="./docs/g2a-bridge.md">GrokCLI2API 桥</a> ·
+  <a href="./docs/deployment.md">部署说明</a>
+</p>
+
+> [!IMPORTANT]
+> **这是私有二开仓库，不是官方镜像。**  
+> 部署时必须用当前源码 **本地构建**（`docker-compose.local.yml`）。  
+> 不要使用 `ghcr.io/basketikun/chatgpt2api:latest` 或默认 `docker compose up` 拉官方镜像，否则会丢掉 Grok / G2A 改动。
+
+## 本分支相对上游新增
+
+| 能力 | 说明 |
+| --- | --- |
+| 独立 Grok 号池 | `data/grok_accounts.json`，管理接口 `/api/grok/accounts*`，与 ChatGPT 号池完全隔离 |
+| Grok 上游 | 默认 `cli-chat-proxy.grok.com`（Build/CLI），刷新走 `auth.x.ai` |
+| 生图分流 | `model=grok-2-image` / `grok-imagine` 走 Grok 池；另有 `/v1/grok/images/generations` |
+| 文本探活 | `/v1/grok/chat/completions`（内部映射 Build `/responses`） |
+| GrokCLI2API 接入 | 设置页「GrokCLI2API」：对接远程 Admin API，**推送**本地 Grok 号到 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go) |
+| 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
+
+隔离原则：ChatGPT 与 Grok **不同存储、不同管理 API、不同选号**，禁止混池。
 
 > [!WARNING]
 > 免责声明：
 >
-> 本项目涉及对 ChatGPT 官网文本生成、图片生成与图片编辑等相关接口的逆向研究，仅供个人学习、技术研究与非商业性技术交流使用。
+> 本项目涉及对 ChatGPT / Grok 相关能力的逆向或非官方兼容封装，仅供个人学习、技术研究与非商业性技术交流使用。
 >
 > - 严禁将本项目用于任何商业用途、盈利性使用、批量操作、自动化滥用或规模化调用。
-> - 严禁将本项目用于破坏市场秩序、恶意竞争、套利倒卖、二次售卖相关服务，以及任何违反 OpenAI 服务条款或当地法律法规的行为。
+> - 严禁将本项目用于破坏市场秩序、恶意竞争、套利倒卖、二次售卖相关服务，以及任何违反 OpenAI / xAI 服务条款或当地法律法规的行为。
 > - 严禁将本项目用于生成、传播或协助生成违法、暴力、色情、未成年人相关内容，或用于诈骗、欺诈、骚扰等非法或不当用途。
 > - 使用者应自行承担全部风险，包括但不限于账号被限制、临时封禁或永久封禁以及因违规使用等所导致的法律责任。
 > - 使用本项目即视为你已充分理解并同意本免责声明全部内容；如因滥用、违规或违法使用造成任何后果，均由使用者自行承担。
-> - 本项目基于对 ChatGPT 官网相关能力的逆向研究实现，存在账号受限、临时封禁或永久封禁的风险。请勿使用你自己的重要账号、常用账号或高价值账号进行测试。
+> - 请勿使用重要账号、常用账号或高价值账号进行测试。
 
-## 快速开始
+## 快速开始（二开推荐）
 
-### Docker 运行
+### 1. 克隆本仓库
+
+私有仓需要 GitHub 登录或 Token：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
-docker compose up -d
+git clone https://github.com/qawow/chatgpt2api-grok.git
+cd chatgpt2api-grok
 ```
 
-启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
+### 2. 配置密钥
 
-- Web 面板：`http://localhost:3000`
-- API 地址：`http://localhost:3000/v1`
-- 数据目录：`./data`
+```bash
+# 编辑 config.json 中的 auth-key（务必改成强随机值）
+# 或使用环境变量覆盖：
+# export CHATGPT2API_AUTH_KEY='your_strong_secret'
+
+mkdir -p data
+```
+
+### 3. 本地构建并启动
+
+```bash
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+- Web / API：`http://localhost:8000`
+- OpenAI 兼容前缀：`http://localhost:8000/v1`
+- 数据目录：`./data`（ChatGPT 号池、Grok 号池、日志、图片等）
+- 配置挂载：`./config.json`
+
+验证二开接口：
+
+```bash
+export KEY='你的 auth-key'
+
+curl -s http://127.0.0.1:8000/api/grok/accounts \
+  -H "Authorization: Bearer $KEY"
+
+curl -s http://127.0.0.1:8000/api/g2a/servers \
+  -H "Authorization: Bearer $KEY"
+```
+
+### 4. 导入 Grok 账号（可选）
+
+支持 CLIProxyAPI / cliproxy 风格 `type=xai` JSON：
+
+```bash
+# 服务已启动时
+python scripts/import_grok_cliproxy_auth.py \
+  --dir /path/to/cliproxyapi_auth \
+  --base-url http://127.0.0.1:8000 \
+  --auth-key "$KEY"
+```
+
+或在管理 API：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/grok/accounts \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"accounts":[{ ...cliproxy json... }]}'
+```
+
+### 5. 对接 grokcli2api-go（可选）
+
+1. 远端启用 `GROK_ADMIN_KEY`（默认端口 `8088`）  
+2. Web 设置 → **GrokCLI2API** → 添加连接（base URL + Admin Key）  
+3. 探测连通 → **推送本地 Grok 号池**
+
+说明：远程 `GET /v1/admin/credentials` **不含 token**，只能「本地 → 远程」推送，不能反向拉号。详见 [docs/g2a-bridge.md](./docs/g2a-bridge.md)。
 
 ### WARP / FlareSolverr 稳定代理部署
 
-如果图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
+若 ChatGPT 上游经常被 Cloudflare 拦截：
 
 ```bash
 cp .env.example .env
+# 修改 CHATGPT2API_AUTH_KEY 等
+
+# 注意：请确认 warp compose 使用本地 build 镜像，而不是官方 ghcr 镜像
 docker compose -f docker-compose.warp.yml up -d --build
 ```
 
-该 compose 会启动：
+也可先构建本地镜像再替换 compose 中的 `image`：
 
-- `warp-proxy`：提供 WARP SOCKS5 出口。
-- `privoxy`：把 WARP SOCKS5 转成 HTTP 代理。
-- `flaresolverr`：刷新 Cloudflare clearance。
-- `init-config`：幂等写入 `proxy_runtime` 默认配置。
-- `app`：启动 ChatGPT2API 主服务。
-
-默认只让上游 OpenAI / ChatGPT 请求走稳定代理，账号邮箱、CPA 等辅助链路不会被强制接管。账号自身配置的代理优先级最高，其次是稳定代理运行时，再其次是显式代理和旧版全局代理。
-
-可在 `.env` 中调整端口和代理运行时参数，也可在后台设置页的「稳定代理运行时」面板手动保存、测试代理和测试 clearance。
+```bash
+docker build -t chatgpt2api:local .
+```
 
 ### 本地开发
 
-启动后端：
+后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
+git clone https://github.com/qawow/chatgpt2api-grok.git
+cd chatgpt2api-grok
 uv sync
 uv run main.py
 ```
 
-启动前端：
+前端：
 
 ```bash
-cd chatgpt2api/web
-bun install
-bun run dev
+cd web
+bun install   # 或 npm install
+bun run dev   # 或 npm run dev
 ```
 
-后续更新新版本：
+### 更新本分支
 
 ```bash
-docker pull ghcr.io/basketikun/chatgpt2api:latest
-docker-compose down
-docker-compose up -d
+git pull
+docker compose -f docker-compose.local.yml up -d --build
+```
 
+**不要**再执行：
+
+```bash
+docker pull ghcr.io/basketikun/chatgpt2api:latest   # 官方镜像，无本分支改动
 ```
 
 ### 存储后端配置
 
 支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
 
-- `json` - 本地 JSON 文件（默认）
-- `sqlite` - 本地 SQLite 数据库
+- `json` - 本地 JSON 文件（默认；Grok 池固定写 `data/grok_accounts.json`）
+- `sqlite` - 本地 SQLite 数据库（ChatGPT 池）
 - `postgres` - 外部 PostgreSQL（需配置 `DATABASE_URL`）
 - `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
 
@@ -106,7 +192,7 @@ environment:
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
 - `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
-  `gpt-5-mini`
+  `gpt-5-mini`；若存在 Grok 号还会注入 `grok-2-image` / `grok-imagine` / `grok-4.5` 等
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
@@ -117,6 +203,7 @@ environment:
 
 - 内置在线画图工作台，支持生成、图片编辑与多图组图编辑
 - 支持 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` 模型选择
+- 若 Grok 号池非空，模型列表也会出现 `grok-*-image*` / `grok-imagine`
 - 编辑模式支持参考图上传
 - 前端支持多图生成交互
 - 本地保存图片会话历史，支持回看、删除和清空
@@ -124,7 +211,7 @@ environment:
 - 图片生成进度追踪，超时后可继续等待
 - 图片懒加载与滚动位置记忆，优化大量图片场景性能
 
-### 号池管理功能
+### 号池管理功能（ChatGPT）
 
 - 自动刷新账号邮箱、类型、额度和恢复时间（异步进度追踪）
 - 轮询可用账号执行图片生成与图片编辑
@@ -139,15 +226,21 @@ environment:
 
 ### Grok 号池（独立）
 
-- 与 ChatGPT 号池完全隔离：`/api/grok/accounts*` + `data/grok_accounts.json`
-- 兼容 CLIProxyAPI `type=xai` 账号导入（`cli-chat-proxy.grok.com` Build 通道）
-- 生图：`model=grok-2-image|grok-imagine` 走 Grok 池；另有 `/v1/grok/images/generations`
-- 设置页可对接 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go)，推送本地 Grok 号到远程 Admin API
-- 详见 [docs/grok-pool.md](./docs/grok-pool.md)、[docs/g2a-bridge.md](./docs/g2a-bridge.md)
+- 存储：`data/grok_accounts.json`（不进 `accounts.json`）
+- 管理：`GET/POST/DELETE /api/grok/accounts`、`/refresh`、`/update`、`/import-files`
+- 上游：`cli-chat-proxy.grok.com` + cliproxy 兼容 headers
+- 生图：
+  - `POST /v1/images/generations` + `model=grok-2-image|grok-imagine`（model 分流）
+  - `POST /v1/grok/images/generations`（强制 Grok 池）
+- 文本：`POST /v1/grok/chat/completions`
+- 模型列表：`GET /v1/grok/models`；有号时也会注入总 `GET /v1/models`
+- 设置页对接 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go)：`/api/g2a/servers*`
+- 文档：[docs/grok-pool.md](./docs/grok-pool.md)、[docs/g2a-bridge.md](./docs/g2a-bridge.md)
 
 ### 实验性 / 规划中
 
 - 详细状态说明见：[功能清单](./docs/feature-status.en.md)
+- Build 通道生图以上游实际能力为准；若 `/images/generations` 不可用会返回明确错误，**不会**回落到 ChatGPT 号池
 
 ## 效果展示
 
