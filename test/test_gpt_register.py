@@ -69,6 +69,7 @@ class ServiceRegisterOnceTest(unittest.TestCase):
         settings = normalize_settings(
             {
                 "engines_dir": "/tmp",
+                "run_mode": "subprocess",
                 "push_enabled": False,
                 "timeout_secs": 30,
             }
@@ -83,6 +84,28 @@ class ServiceRegisterOnceTest(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["email"], "u@x.com")
         self.assertTrue(out["has_token"])
+
+    def test_builtin_engines_default(self):
+        s = normalize_settings({"engines_dir": "/root/any-register-engines"})
+        self.assertIn("gpt_free_register", s["engines_dir"].replace("\\", "/"))
+        self.assertEqual(s["run_mode"], "inprocess")
+
+    def test_inprocess_uses_runner(self):
+        svc = GptRegisterService(config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg3.json")))
+        settings = normalize_settings({"run_mode": "inprocess", "push_enabled": False})
+        with mock.patch(
+            "gpt_free_register.runner.register_chatgpt_once",
+            return_value={
+                "email": "a@b.c",
+                "token": "tok",
+                "extra": {"access_token": "tok"},
+                "status": "registered",
+            },
+        ):
+            out = svc._register_once_inprocess(settings)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["email"], "a@b.c")
+        self.assertEqual(out["mode"], "inprocess")
 
 
 if __name__ == "__main__":

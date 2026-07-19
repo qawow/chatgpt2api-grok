@@ -1,0 +1,15 @@
+# 注册引擎最小依赖（从上游 requirements.txt 精简）
+sqlmodel>=0.0.16
+curl_cffi>=0.6.0
+requests>=2.31.0
+playwright>=1.43.0
+pydantic>=2.0.0
+jwcrypto>=1.5.0
+cbor2>=5.4.0
+camoufox>=0.4.0
+patchright>=1.0.0
+
+# 可选：本地 Turnstile solver / 调试
+# quart>=0.19.0
+# rich>=13.0.0
+PySocks>=1.7.1

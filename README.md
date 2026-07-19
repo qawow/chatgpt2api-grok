@@ -28,7 +28,7 @@
 | 生图分流 | `model=grok-2-image` / `grok-imagine` 走 Grok 池；另有 `/v1/grok/images/generations` |
 | 文本探活 | `/v1/grok/chat/completions`（内部映射 Build `/responses`） |
 | GrokCLI2API 接入 | 设置页「GrokCLI2API」：对接远程 Admin API，**推送**本地 Grok 号到 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go) |
-| GPT Free 批量注册 | 设置页「GPT注册」：调 any-register-engines 纯协议注册 free 号并入库 ChatGPT 号池 |
+| GPT Free 批量注册 | 设置页「GPT注册」：内置 `gpt_free_register` 纯协议注册 free 号并入库 ChatGPT 号池 |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
 
 隔离原则：ChatGPT 与 Grok **不同存储、不同管理 API、不同选号**，禁止混池。
@@ -241,9 +241,11 @@ environment:
 
 ### GPT Free 批量注册
 
+- 内置模块：`gpt_free_register/`（vendored ChatGPT 协议注册机，无需外部 `/root/any-register-engines`）
 - 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填
 - 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`
 - 成功账号进入 **ChatGPT 号池**（不进 Grok）
+- 密钥放 `data/gpt_register.env` 或环境变量
 - 文档：[docs/gpt-register.md](./docs/gpt-register.md)
 
 ### 实验性 / 规划中

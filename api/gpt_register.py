@@ -17,6 +17,7 @@ from services.gpt_register_service import (
 
 class GptRegisterSettingsUpdate(BaseModel):
     engines_dir: str | None = None
+    run_mode: str | None = None
     python_bin: str | None = None
     count: int | None = Field(default=None, ge=1, le=50)
     concurrency: int | None = Field(default=None, ge=1, le=5)

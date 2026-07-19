@@ -25,9 +25,19 @@ GPT_REGISTER_JOBS_FILE = DATA_DIR / "gpt_register_jobs.json"
 
 _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}\s*$")
 
+def _builtin_engines_dir() -> str:
+    try:
+        from gpt_free_register.runner import default_engines_dir
+
+        return default_engines_dir()
+    except Exception:
+        return str(Path(__file__).resolve().parent.parent / "gpt_free_register" / "engines")
+
+
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "engines_dir": "/root/any-register-engines",
-    "python_bin": "",  # empty → <engines_dir>/.venv/bin/python or python3
+    "engines_dir": "",  # empty → builtin gpt_free_register/engines
+    "run_mode": "inprocess",  # inprocess | subprocess
+    "python_bin": "",  # only for subprocess mode
     "count": 1,
     "concurrency": 1,
     "interval_secs": 2,
@@ -76,7 +86,14 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     src = raw if isinstance(raw, dict) else {}
     out = dict(DEFAULT_SETTINGS)
     out.update({k: src[k] for k in DEFAULT_SETTINGS if k in src})
-    out["engines_dir"] = _clean(out.get("engines_dir")) or DEFAULT_SETTINGS["engines_dir"]
+    engines_dir = _clean(out.get("engines_dir"))
+    if not engines_dir or engines_dir in {"/root/any-register-engines", "any-register-engines"}:
+        engines_dir = _builtin_engines_dir()
+    out["engines_dir"] = engines_dir
+    run_mode = _clean(out.get("run_mode")).lower() or "inprocess"
+    if run_mode not in {"inprocess", "subprocess"}:
+        run_mode = "inprocess"
+    out["run_mode"] = run_mode
     out["python_bin"] = _clean(out.get("python_bin"))
     out["count"] = _clamp_int(out.get("count"), 1, 1, 50)
     out["concurrency"] = _clamp_int(out.get("concurrency"), 1, 1, 5)
@@ -405,15 +422,21 @@ class GptRegisterService:
     def _validate_engines(self, settings: dict[str, Any]) -> None:
         engines = Path(settings["engines_dir"])
         if not engines.is_dir():
-            raise RuntimeError(f"注册机目录不存在: {engines}")
-        cli = engines / "register_cli.py"
-        if not cli.is_file():
-            raise RuntimeError(f"找不到 register_cli.py: {cli}")
-        py = self._resolve_python(settings)
-        if not Path(py).exists() and py in {"python3", "python"}:
-            return
-        if not Path(py).exists():
-            raise RuntimeError(f"Python 不存在: {py}")
+            raise RuntimeError(
+                f"注册机目录不存在: {engines}。"
+                "请确认仓库内 gpt_free_register/engines 已部署，"
+                "或在设置中把 engines_dir 指到可用目录。"
+            )
+        plugin = engines / "platforms" / "chatgpt" / "plugin.py"
+        if not plugin.is_file():
+            raise RuntimeError(f"注册机不完整，缺少 ChatGPT 插件: {plugin}")
+        if str(settings.get("run_mode") or "inprocess") == "subprocess":
+            cli = engines / "register_cli.py"
+            if not cli.is_file():
+                raise RuntimeError(f"subprocess 模式需要 register_cli.py: {cli}")
+            py = self._resolve_python(settings)
+            if not Path(py).exists() and py not in {"python3", "python"}:
+                raise RuntimeError(f"Python 不存在: {py}")
 
     def _resolve_python(self, settings: dict[str, Any]) -> str:
         custom = _clean(settings.get("python_bin"))
@@ -425,6 +448,83 @@ class GptRegisterService:
         return "python3"
 
     def _register_once(self, settings: dict[str, Any]) -> dict[str, Any]:
+        run_mode = str(settings.get("run_mode") or "inprocess").strip().lower()
+        if run_mode != "subprocess":
+            return self._register_once_inprocess(settings)
+        return self._register_once_subprocess(settings)
+
+    def _register_once_inprocess(self, settings: dict[str, Any]) -> dict[str, Any]:
+        logs: list[str] = []
+
+        def _log(message: str) -> None:
+            text_msg = str(message or "").strip()
+            if text_msg:
+                logs.append(text_msg[:300])
+
+        try:
+            from gpt_free_register.runner import register_chatgpt_once
+
+            parsed = register_chatgpt_once(settings=settings, log=_log)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"内置注册机执行失败: {exc}"[:400],
+                "email": None,
+                "has_token": False,
+                "added": 0,
+                "logs": logs[-20:],
+            }
+
+        if not isinstance(parsed, dict):
+            return {
+                "ok": False,
+                "error": "内置注册机返回非 dict",
+                "email": None,
+                "has_token": False,
+                "added": 0,
+                "logs": logs[-20:],
+            }
+
+        email = _clean(parsed.get("email"))
+        token = _clean(parsed.get("token")) or _clean((parsed.get("extra") or {}).get("access_token"))
+        push = parsed.get("chatgpt2api") if isinstance(parsed.get("chatgpt2api"), dict) else None
+        added = 0
+        if push and push.get("ok"):
+            imp = push.get("import") if isinstance(push.get("import"), dict) else {}
+            added = int(imp.get("added") or 0)
+
+        if (
+            settings.get("push_enabled")
+            and not settings.get("dry_run")
+            and token
+            and not (push and push.get("ok"))
+        ):
+            try:
+                added = self._import_local(parsed, settings)
+                push = {"ok": True, "import": {"added": added, "mode": "local"}}
+            except Exception as exc:
+                push = {"ok": False, "error": str(exc)[:200]}
+
+        ok = bool(token)
+        error = None
+        if not ok:
+            error = _clean(parsed.get("error")) or _clean(parsed.get("status")) or "no access_token"
+            if isinstance(parsed.get("extra"), dict) and parsed["extra"].get("error"):
+                error = str(parsed["extra"]["error"])[:300]
+        if push and push.get("ok") is False:
+            error = (error + "; " if error else "") + str(push.get("error") or "push failed")[:200]
+        return {
+            "ok": ok,
+            "email": email or None,
+            "has_token": bool(token),
+            "added": added,
+            "push": push,
+            "error": error,
+            "logs": logs[-20:],
+            "mode": "inprocess",
+        }
+
+    def _register_once_subprocess(self, settings: dict[str, Any]) -> dict[str, Any]:
         engines = Path(settings["engines_dir"])
         py = self._resolve_python(settings)
         cmd = [
@@ -486,6 +586,7 @@ class GptRegisterService:
                 "email": None,
                 "has_token": False,
                 "added": 0,
+                "mode": "subprocess",
             }
 
         email = _clean(parsed.get("email"))
@@ -528,6 +629,7 @@ class GptRegisterService:
             "push": push,
             "error": error,
             "returncode": proc.returncode,
+            "mode": "subprocess",
         }
 
     def _import_local(self, account: dict[str, Any], settings: dict[str, Any]) -> int:

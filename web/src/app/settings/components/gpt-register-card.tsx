@@ -27,7 +27,7 @@ import {
 } from "@/lib/api";
 
 const DEFAULT_FORM: GptRegisterSettings = {
-  engines_dir: "/root/any-register-engines",
+  engines_dir: "", // empty → builtin gpt_free_register/engines
   python_bin: "",
   count: 1,
   concurrency: 1,
@@ -214,7 +214,7 @@ export function GptRegisterCard() {
             <div>
               <h2 className="text-lg font-semibold tracking-tight">GPT Free 批量注册</h2>
               <p className="text-sm text-stone-500">
-                调用 any-register-engines 纯协议注册 ChatGPT free 号，成功后自动写入本机号池。
+                内置 gpt_free_register 模块纯协议注册 ChatGPT free 号，成功后自动写入本机号池。
               </p>
             </div>
           </div>
@@ -333,7 +333,7 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
               </Field>
-              <Field label="CFD1 域名覆盖" hint="留空用 any-register-engines .env 中的 CFD1_DOMAIN">
+              <Field label="CFD1 域名覆盖" hint="留空用 data/gpt_register.env 或环境变量 CFD1_DOMAIN">
                 <Input
                   value={form.cfd1_domain}
                   onChange={(e) => setField("cfd1_domain", e.target.value)}
@@ -403,19 +403,23 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
               </Field>
-              <Field label="注册机目录">
+              <Field
+                label="注册机目录"
+                hint="留空=内置 gpt_free_register/engines（推荐）。旧路径 /root/any-register-engines 会自动迁移。"
+              >
                 <Input
                   value={form.engines_dir}
                   onChange={(e) => setField("engines_dir", e.target.value)}
+                  placeholder="(builtin) gpt_free_register/engines"
                   className="h-10 rounded-xl border-stone-200 bg-white"
                   disabled={running}
                 />
               </Field>
-              <Field label="Python 路径" hint="留空自动用 engines/.venv/bin/python">
+              <Field label="Python 路径" hint="仅 subprocess 模式需要；默认 inprocess 不走外部 Python">
                 <Input
                   value={form.python_bin}
                   onChange={(e) => setField("python_bin", e.target.value)}
-                  placeholder="/root/any-register-engines/.venv/bin/python"
+                  placeholder="(inprocess 模式可留空)"
                   className="h-10 rounded-xl border-stone-200 bg-white"
                   disabled={running}
                 />

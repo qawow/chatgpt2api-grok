@@ -1026,6 +1026,7 @@ export async function deleteG2ACredential(serverId: string, credentialId: string
 export type GptRegisterSettings = {
   engines_dir: string;
   python_bin: string;
+  run_mode?: string;
   count: number;
   concurrency: number;
   interval_secs: number;
