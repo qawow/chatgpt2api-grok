@@ -6,6 +6,14 @@ __pycache__
 *.pyc
 *.pyo
 *.pyd
+.env
+.env.*
+**/.env
+**/.env.*
+*.db
+*.sqlite
+*.sqlite3
+data
 
 web/.next
 web/node_modules

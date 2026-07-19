@@ -75,16 +75,19 @@ curl -s -X POST http://127.0.0.1:8000/api/gpt-register/start \
   -d '{"count":1,"concurrency":1}'
 ```
 
-## 依赖
+## Docker
 
-主项目需：`curl-cffi`、`sqlmodel`、`requests`、`PySocks`（已写入 `pyproject.toml`）。
+镜像构建会 `COPY gpt_free_register ./gpt_free_register`。  
+若仍看到 `/app/gpt_free_register/engines` 不存在，说明当前容器是**旧镜像**，需要重新本地构建：
 
 ```bash
-# 开发环境
-uv sync
-# 或
-python -m pip install sqlmodel requests PySocks
+docker compose -f docker-compose.local.yml up -d --build
 ```
+
+不要用官方 `ghcr.io/basketikun/chatgpt2api` 镜像。
+
+密钥挂载在 `./data` 下写 `data/gpt_register.env` 即可（容器内 `/app/data/gpt_register.env`）。
+`docker-compose.local.yml` 也会把 `./gpt_free_register` 只读挂进容器，方便本地改注册机后无需反复 COPY。
 
 ## 数据文件
 

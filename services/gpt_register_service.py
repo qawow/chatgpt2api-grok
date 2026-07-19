@@ -82,12 +82,32 @@ def _clamp_float(value: object, default: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, n))
 
 
+def _looks_like_legacy_or_missing_engines(path: str) -> bool:
+    value = _clean(path)
+    if not value:
+        return True
+    legacy = {
+        "/root/any-register-engines",
+        "any-register-engines",
+        "/app/any-register-engines",
+    }
+    if value in legacy or value.rstrip("/").endswith("/any-register-engines"):
+        return True
+    p = Path(value)
+    # Saved Docker/host path that no longer exists → fall back to builtin.
+    if not p.is_dir():
+        return True
+    if not (p / "platforms" / "chatgpt" / "plugin.py").is_file():
+        return True
+    return False
+
+
 def normalize_settings(raw: object | None) -> dict[str, Any]:
     src = raw if isinstance(raw, dict) else {}
     out = dict(DEFAULT_SETTINGS)
     out.update({k: src[k] for k in DEFAULT_SETTINGS if k in src})
     engines_dir = _clean(out.get("engines_dir"))
-    if not engines_dir or engines_dir in {"/root/any-register-engines", "any-register-engines"}:
+    if _looks_like_legacy_or_missing_engines(engines_dir):
         engines_dir = _builtin_engines_dir()
     out["engines_dir"] = engines_dir
     run_mode = _clean(out.get("run_mode")).lower() or "inprocess"

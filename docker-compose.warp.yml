@@ -101,6 +101,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
+      - ./gpt_free_register:/app/gpt_free_register:ro
     environment:
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}

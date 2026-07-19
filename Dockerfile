@@ -49,6 +49,8 @@ COPY api ./api
 COPY services ./services
 COPY utils ./utils
 COPY scripts ./scripts
+COPY gpt_free_register ./gpt_free_register
+COPY docs ./docs
 COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80

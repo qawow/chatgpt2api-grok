@@ -57,10 +57,19 @@ class ExtractJsonTest(unittest.TestCase):
 class ServiceValidateTest(unittest.TestCase):
     def test_validate_missing_dir(self):
         svc = GptRegisterService(config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg.json")))
+        # normalize falls back to builtin when path is missing; validation still
+        # rejects an explicitly broken engines_dir after normalize is bypassed.
+        broken = {
+            **normalize_settings(None),
+            "engines_dir": "/tmp/does-not-exist-gpt-reg-engines",
+        }
         with self.assertRaises(RuntimeError):
-            svc._validate_engines(
-                normalize_settings({"engines_dir": "/tmp/does-not-exist-gpt-reg-engines"})
-            )
+            svc._validate_engines(broken)
+
+    def test_missing_path_falls_back_to_builtin(self):
+        s = normalize_settings({"engines_dir": "/app/gpt_free_register/engines"})
+        self.assertTrue(Path(s["engines_dir"]).is_dir())
+        self.assertTrue((Path(s["engines_dir"]) / "platforms" / "chatgpt" / "plugin.py").is_file())
 
 
 class ServiceRegisterOnceTest(unittest.TestCase):
