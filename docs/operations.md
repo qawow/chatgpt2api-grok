@@ -154,8 +154,12 @@ curl -s "$BASE/api/gpt-register/settings" -H "Authorization: Bearer $KEY" | head
 
 ```bash
 docker logs -f chatgpt2api-local
-# 任务日志也在设置页 GPT注册 的 logs / items
-# 以及 data/gpt_register_jobs.json
+# 过滤注册机 stdout：grep gpt-register
+
+# 设置页 GPT注册：logs / items / summary
+# 任务索引：data/gpt_register_jobs.json
+# 单任务完成日志：data/gpt_register_logs/<job_id>.json
+# 系统日志：data/logs.jsonl（type=account，摘要「GPT注册任务结束」）
 ```
 
 | 症状 | 方向 |

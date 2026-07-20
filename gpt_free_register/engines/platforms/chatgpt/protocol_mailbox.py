@@ -12,18 +12,70 @@ class _MailboxEmailService:
         self._mailbox = mailbox
         self._mailbox_account = mailbox_account
         self._acct = None
+        self._baseline_ids: set[str] = set()
+        self._baseline_ready = False
 
     def create_email(self, config=None):
         self._acct = self._mailbox_account
+        # Snapshot existing mail ids for THIS address only.
+        # Empty is valid for a freshly generated address — do NOT re-snapshot later,
+        # or a fast-arriving OTP would be marked as "already seen".
+        try:
+            if hasattr(self._mailbox, "get_current_ids"):
+                self._baseline_ids = {
+                    str(x)
+                    for x in (self._mailbox.get_current_ids(self._mailbox_account) or set())
+                    if x not in (None, "")
+                }
+            else:
+                self._baseline_ids = set()
+        except Exception:
+            self._baseline_ids = set()
+        self._baseline_ready = True
         return {
             "email": self._mailbox_account.email,
             "service_id": getattr(self._mailbox_account, "account_id", ""),
             "token": getattr(self._mailbox_account, "account_id", ""),
         }
 
-    def get_verification_code(self, email=None, email_id=None, timeout=300, pattern=None, otp_sent_at=None):
+    def get_verification_code(
+        self,
+        email=None,
+        email_id=None,
+        timeout=300,
+        pattern=None,
+        otp_sent_at=None,
+    ):
         acct = self._acct or self._mailbox_account
-        return self._mailbox.wait_for_code(acct, keyword="", timeout=timeout, code_pattern=pattern)
+        if not self._baseline_ready:
+            # Defensive: if create_email was skipped, snapshot once now.
+            try:
+                if hasattr(self._mailbox, "get_current_ids"):
+                    self._baseline_ids = {
+                        str(x)
+                        for x in (self._mailbox.get_current_ids(acct) or set())
+                        if x not in (None, "")
+                    }
+            except Exception:
+                self._baseline_ids = set()
+            self._baseline_ready = True
+
+        before_ids = set(self._baseline_ids)
+        kwargs = {
+            "keyword": "",
+            "timeout": timeout,
+            "before_ids": before_ids,
+            "code_pattern": pattern,
+        }
+        try:
+            return self._mailbox.wait_for_code(
+                acct,
+                otp_sent_at=otp_sent_at,
+                min_received_at=otp_sent_at,
+                **kwargs,
+            )
+        except TypeError:
+            return self._mailbox.wait_for_code(acct, **kwargs)
 
     def update_status(self, success, error=None):
         return None

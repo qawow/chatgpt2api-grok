@@ -1,70 +1,94 @@
 """OpenAI 专用 HTTP 客户端"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
+from curl_cffi import requests as cffi_requests
+from curl_cffi.requests import Session
+
 from core.http_client import HTTPClient, HTTPClientError, RequestConfig
+from .browser_profile import (
+    apply_profile_to_session,
+    browser_profile,
+    default_request_headers,
+    random_browser_profile,
+    resolve_impersonate,
+)
 from .constants import ERROR_MESSAGES
-import logging
+
 logger = logging.getLogger(__name__)
 
+
 class OpenAIHTTPClient(HTTPClient):
-    """
-    OpenAI 专用 HTTP 客户端
-    包含 OpenAI API 特定的请求方法
-    """
+    """OpenAI 专用 HTTP 客户端：TLS impersonate + headers + Sentinel 共用同一画像。"""
 
     def __init__(
         self,
         proxy_url: Optional[str] = None,
-        config: Optional[RequestConfig] = None
+        config: Optional[RequestConfig] = None,
+        *,
+        platform: Optional[str] = None,
+        profile: Optional[Dict[str, Any]] = None,
+        randomize: bool = False,
+        profile_seed: Optional[str] = None,
     ):
-        """
-        初始化 OpenAI HTTP 客户端
+        # One account => one coherent profile. randomize=True for independent accounts.
+        if profile is not None:
+            browser = dict(profile)
+        elif randomize:
+            browser = random_browser_profile(
+                seed=profile_seed,
+                platform=platform or os.environ.get("OPENAI_BROWSER_PLATFORM"),
+            )
+        else:
+            browser = browser_profile(
+                platform=platform or os.environ.get("OPENAI_BROWSER_PLATFORM"),
+            )
 
-        Args:
-            proxy_url: 代理 URL
-            config: 请求配置
-        """
-        super().__init__(proxy_url, config)
-
-        # OpenAI 特定的默认配置
+        cfg = config or RequestConfig()
         if config is None:
-            self.config.timeout = 30
-            self.config.max_retries = 3
+            cfg.timeout = 30
+            cfg.max_retries = 3
+        # TLS impersonate must match profile chrome family.
+        cfg.impersonate = resolve_impersonate(
+            browser.get("impersonate") or getattr(cfg, "impersonate", None)
+        )
+        browser["impersonate"] = cfg.impersonate
+        browser["chrome_major"] = browser.get("chrome_major") or str(
+            "".join(ch for ch in cfg.impersonate if ch.isdigit()) or "142"
+        )
+        super().__init__(proxy_url, cfg)
 
-        # 默认请求头
-        self.default_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-        }
+        self.browser = browser
+        self.default_headers = default_request_headers(profile=self.browser, for_api=True)
+
+    def _apply_default_session_headers(self, session: Session) -> None:
+        apply_profile_to_session(session, self.browser)
+        # Keep Accept loose on session; per-request code often sets application/json.
+        session.headers.setdefault("Accept-Language", self.browser["accept_language"])
+
+    @property
+    def user_agent(self) -> str:
+        return str(self.browser.get("user_agent") or self.default_headers.get("User-Agent") or "")
 
     def check_ip_location(self) -> Tuple[bool, Optional[str]]:
-        """
-        检查 IP 地理位置
-
-        Returns:
-            Tuple[是否支持, 位置信息]
-        """
         try:
             response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
             trace_text = response.text
-
-            # 解析位置信息
-            import re
             loc_match = re.search(r"loc=([A-Z]+)", trace_text)
             loc = loc_match.group(1) if loc_match else None
-
-            # 检查是否支持
-            if loc in ["CN", "HK", "MO", "TW"]:
+            blocked = {
+                x.strip().upper()
+                for x in str(os.environ.get("OPENAI_BLOCK_REGIONS", "CN") or "CN").split(",")
+                if x.strip()
+            }
+            if loc in blocked:
                 return False, loc
             return True, loc
-
         except Exception as e:
             logger.error(f"检查 IP 地理位置失败: {e}")
             return False, None
@@ -76,36 +100,15 @@ class OpenAIHTTPClient(HTTPClient):
         data: Optional[Dict[str, Any]] = None,
         json_data: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
-        """
-        发送 OpenAI API 请求
-
-        Args:
-            endpoint: API 端点
-            method: HTTP 方法
-            data: 表单数据
-            json_data: JSON 数据
-            headers: 请求头
-            **kwargs: 其他参数
-
-        Returns:
-            响应 JSON 数据
-
-        Raises:
-            HTTPClientError: 请求失败
-        """
-        # 合并请求头
         request_headers = self.default_headers.copy()
         if headers:
             request_headers.update(headers)
-
-        # 设置 Content-Type
         if json_data is not None and "Content-Type" not in request_headers:
             request_headers["Content-Type"] = "application/json"
         elif data is not None and "Content-Type" not in request_headers:
             request_headers["Content-Type"] = "application/x-www-form-urlencoded"
-
         try:
             response = self.request(
                 method,
@@ -113,53 +116,34 @@ class OpenAIHTTPClient(HTTPClient):
                 data=data,
                 json=json_data,
                 headers=request_headers,
-                **kwargs
+                **kwargs,
             )
-
-            # 检查响应状态码
             response.raise_for_status()
-
-            # 尝试解析 JSON
             try:
                 return response.json()
             except json.JSONDecodeError:
                 return {"raw_response": response.text}
-
         except cffi_requests.RequestsError as e:
             raise HTTPClientError(f"OpenAI 请求失败: {endpoint} - {e}")
 
     def check_sentinel(self, did: str, proxies: Optional[Dict] = None) -> Optional[str]:
-        """
-        检查 Sentinel 拦截
-
-        Args:
-            did: Device ID
-            proxies: 代理配置
-
-        Returns:
-            Sentinel token 或 None
-        """
-        from .constants import OPENAI_API_ENDPOINTS
+        from .constants import OPENAI_API_ENDPOINTS, SENTINEL_FRAME_URL
 
         try:
             sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
-
             response = self.post(
                 OPENAI_API_ENDPOINTS["sentinel"],
                 headers={
                     "origin": "https://sentinel.openai.com",
-                    "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+                    "referer": SENTINEL_FRAME_URL,
                     "content-type": "text/plain;charset=UTF-8",
                 },
                 data=sen_req_body,
             )
-
             if response.status_code == 200:
                 return response.json().get("token")
-            else:
-                logger.warning(f"Sentinel 检查失败: {response.status_code}")
-                return None
-
+            logger.warning(f"Sentinel 检查失败: {response.status_code}")
+            return None
         except Exception as e:
             logger.error(f"Sentinel 检查异常: {e}")
             return None
@@ -167,33 +151,13 @@ class OpenAIHTTPClient(HTTPClient):
 
 def create_http_client(
     proxy_url: Optional[str] = None,
-    config: Optional[RequestConfig] = None
+    config: Optional[RequestConfig] = None,
 ) -> HTTPClient:
-    """
-    创建 HTTP 客户端工厂函数
-
-    Args:
-        proxy_url: 代理 URL
-        config: 请求配置
-
-    Returns:
-        HTTPClient 实例
-    """
     return HTTPClient(proxy_url, config)
 
 
 def create_openai_client(
     proxy_url: Optional[str] = None,
-    config: Optional[RequestConfig] = None
+    config: Optional[RequestConfig] = None,
 ) -> OpenAIHTTPClient:
-    """
-    创建 OpenAI HTTP 客户端工厂函数
-
-    Args:
-        proxy_url: 代理 URL
-        config: 请求配置
-
-    Returns:
-        OpenAIHTTPClient 实例
-    """
     return OpenAIHTTPClient(proxy_url, config)

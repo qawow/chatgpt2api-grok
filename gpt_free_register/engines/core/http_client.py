@@ -26,7 +26,8 @@ class RequestConfig:
     timeout: int = 30
     max_retries: int = 3
     retry_delay: float = 1.0
-    impersonate: str = "chrome136"
+    # chrome142 在 curl_cffi>=0.15 可用；旧环境可设 HTTP_IMPERSONATE 覆盖
+    impersonate: str = "chrome142"
     verify_ssl: bool = True
     follow_redirects: bool = True
 
@@ -58,6 +59,11 @@ class HTTPClient:
         """
         self.proxy_url = proxy_url
         self.config = config or RequestConfig()
+        # runtime override for TLS fingerprint (e.g. HTTP_IMPERSONATE=chrome136)
+        import os as _os
+        env_imp = str(_os.environ.get("HTTP_IMPERSONATE") or _os.environ.get("CURL_CFFI_IMPERSONATE") or "").strip()
+        if env_imp:
+            self.config.impersonate = env_imp
         self._session = session
 
     @property
@@ -70,6 +76,10 @@ class HTTPClient:
             "https": self.proxy_url,
         }
 
+    def _apply_default_session_headers(self, session: Session) -> None:
+        """Optional hook for subclasses to pin coherent browser headers."""
+        return None
+
     @property
     def session(self) -> Session:
         """获取会话对象（单例）"""
@@ -80,6 +90,10 @@ class HTTPClient:
                 verify=self.config.verify_ssl,
                 timeout=self.config.timeout
             )
+            try:
+                self._apply_default_session_headers(self._session)
+            except Exception:
+                pass
         return self._session
 
     def request(
@@ -111,6 +125,7 @@ class HTTPClient:
             kwargs["proxies"] = self.proxies
 
         last_exception = None
+        import random as _random
         for attempt in range(self.config.max_retries):
             try:
                 response = self.session.request(method, url, **kwargs)
@@ -122,9 +137,19 @@ class HTTPClient:
                         f" (attempt {attempt + 1}/{self.config.max_retries})"
                     )
 
-                    # 如果是服务器错误，重试
-                    if response.status_code >= 500 and attempt < self.config.max_retries - 1:
-                        time.sleep(self.config.retry_delay * (attempt + 1))
+                    # 服务器错误 / 限流可重试
+                    retriable = response.status_code >= 500 or response.status_code in {408, 425, 429}
+                    if retriable and attempt < self.config.max_retries - 1:
+                        delay = self.config.retry_delay * (2 ** attempt)
+                        delay = min(delay, 12.0) + _random.uniform(0.05, 0.35)
+                        # honor Retry-After when present
+                        try:
+                            ra = response.headers.get("Retry-After")
+                            if ra:
+                                delay = max(delay, min(float(ra), 20.0))
+                        except Exception:
+                            pass
+                        time.sleep(delay)
                         continue
 
                 return response
@@ -136,7 +161,9 @@ class HTTPClient:
                 )
 
                 if attempt < self.config.max_retries - 1:
-                    time.sleep(self.config.retry_delay * (attempt + 1))
+                    delay = self.config.retry_delay * (2 ** attempt)
+                    delay = min(delay, 12.0) + _random.uniform(0.05, 0.35)
+                    time.sleep(delay)
                 else:
                     break
 

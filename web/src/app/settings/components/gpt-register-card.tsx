@@ -486,30 +486,90 @@ export function GptRegisterCard() {
                   进度 {job.completed}/{job.total}（{progress}%）
                   {job.error ? <span className="ml-2 text-rose-500">{job.error}</span> : null}
                 </div>
+                {job.summary ? (
+                  <div className="rounded-lg border border-stone-200 bg-white p-3 text-xs text-stone-600">
+                    <div className="mb-1 text-[11px] font-medium tracking-[0.14em] text-stone-400 uppercase">
+                      完成摘要
+                    </div>
+                    <div className="grid gap-1 sm:grid-cols-2">
+                      <div>
+                        耗时 {job.summary.duration_secs ?? "-"}s · 成功率{" "}
+                        {job.summary.success_rate ?? "-"}%
+                      </div>
+                      <div>
+                        mode={job.summary.run_mode || "-"} · mail={job.summary.mail_provider || "-"} ·
+                        push={String(job.summary.push_mode || "-")}
+                      </div>
+                      {job.summary.success_emails && job.summary.success_emails.length > 0 ? (
+                        <div className="sm:col-span-2 truncate text-emerald-700">
+                          成功: {job.summary.success_emails.join(", ")}
+                        </div>
+                      ) : null}
+                      {job.summary.failed_items && job.summary.failed_items.length > 0 ? (
+                        <div className="sm:col-span-2 space-y-0.5 text-rose-600">
+                          {job.summary.failed_items.slice(0, 5).map((row) => (
+                            <div key={`fail-${row.index}-${row.email || ""}`} className="truncate">
+                              失败 #{row.index}: {row.email || "-"} · {row.error || "-"}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="sm:col-span-2 truncate text-stone-400">
+                        详细 JSON: data/gpt_register_logs/{job.job_id}.json
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
                 {job.items && job.items.length > 0 ? (
                   <div className="max-h-40 space-y-1 overflow-auto rounded-lg border border-stone-200 bg-white p-3 text-xs">
                     {job.items.slice().reverse().map((item) => (
-                      <div key={`${item.index}-${item.email || item.error || ""}`} className="flex gap-2">
-                        <span className="text-stone-400">#{item.index}</span>
-                        <span className={item.ok ? "text-emerald-600" : "text-rose-500"}>
-                          {item.ok ? "OK" : "FAIL"}
-                        </span>
-                        <span className="truncate text-stone-600">
-                          {item.email || item.error || "-"}
-                          {item.added ? ` · +${item.added}` : ""}
-                        </span>
+                      <div key={`${item.index}-${item.email || item.error || ""}`} className="space-y-0.5">
+                        <div className="flex gap-2">
+                          <span className="text-stone-400">#{item.index}</span>
+                          <span className={item.ok ? "text-emerald-600" : "text-rose-500"}>
+                            {item.ok ? "OK" : "FAIL"}
+                          </span>
+                          <span className="truncate text-stone-600">
+                            {item.email || item.error || "-"}
+                            {item.added ? ` · +${item.added}` : ""}
+                            {item.mode ? ` · ${item.mode}` : ""}
+                          </span>
+                        </div>
+                        {!item.ok && item.logs_tail && item.logs_tail.length > 0 ? (
+                          <div className="pl-6 font-mono text-[10px] text-stone-400">
+                            {item.logs_tail.slice(-3).map((line, i) => (
+                              <div key={i} className="truncate">
+                                {line}
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
                       </div>
                     ))}
                   </div>
                 ) : null}
                 {job.logs && job.logs.length > 0 ? (
-                  <div className="max-h-36 space-y-1 overflow-auto rounded-lg border border-stone-200 bg-white p-3 font-mono text-[11px] text-stone-500">
-                    {job.logs.slice(-30).map((log, idx) => (
-                      <div key={`${log.at}-${idx}`}>
-                        <span className="text-stone-300">{log.at ? log.at.slice(11, 19) : "--:--:--"} </span>
-                        {log.message}
-                      </div>
-                    ))}
+                  <div className="max-h-56 space-y-1 overflow-auto rounded-lg border border-stone-200 bg-white p-3 font-mono text-[11px] text-stone-500">
+                    {job.logs.slice(-80).map((log, idx) => {
+                      const level = log.level || "info";
+                      const color =
+                        level === "error"
+                          ? "text-rose-600"
+                          : level === "warn"
+                            ? "text-amber-600"
+                            : "text-stone-500";
+                      return (
+                        <div key={`${log.at}-${idx}`} className={color}>
+                          <span className="text-stone-300">
+                            {log.at ? log.at.slice(11, 19) : "--:--:--"}{" "}
+                          </span>
+                          {level !== "info" ? (
+                            <span className="mr-1 uppercase opacity-70">[{level}]</span>
+                          ) : null}
+                          {log.message}
+                        </div>
+                      );
+                    })}
                   </div>
                 ) : null}
               </div>

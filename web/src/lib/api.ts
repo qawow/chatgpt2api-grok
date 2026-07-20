@@ -1049,6 +1049,7 @@ export type GptRegisterSettings = {
 
 export type GptRegisterJobLog = {
   at?: string;
+  level?: string;
   message?: string;
 };
 
@@ -1060,6 +1061,28 @@ export type GptRegisterJobItem = {
   added?: number;
   has_token?: boolean;
   push?: unknown;
+  mode?: string;
+  logs_tail?: string[];
+};
+
+export type GptRegisterJobSummary = {
+  status?: string;
+  total?: number;
+  completed?: number;
+  success?: number;
+  failed?: number;
+  added?: number;
+  duration_secs?: number;
+  success_rate?: number;
+  success_emails?: string[];
+  failed_items?: Array<{ index?: number; email?: string | null; error?: string }>;
+  run_mode?: string;
+  mail_provider?: string;
+  executor?: string;
+  engines_dir?: string;
+  push_mode?: string;
+  push_enabled?: boolean;
+  error?: string | null;
 };
 
 export type GptRegisterJob = {
@@ -1077,6 +1100,7 @@ export type GptRegisterJob = {
   added: number;
   items?: GptRegisterJobItem[];
   logs?: GptRegisterJobLog[];
+  summary?: GptRegisterJobSummary;
   error?: string | null;
   cancel_requested?: boolean;
 };

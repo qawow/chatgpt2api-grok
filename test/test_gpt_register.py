@@ -138,6 +138,92 @@ class ServiceRegisterOnceTest(unittest.TestCase):
         imp.assert_called_once()
 
 
+
+class JobCompletionLogTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name)
+        self.cfg_path = self.data / "gpt_reg.json"
+        self.jobs_path = self.data / "jobs.json"
+        self.logs_dir = self.data / "gpt_register_logs"
+
+    def test_run_job_writes_summary_and_completion_file(self):
+        import services.gpt_register_service as mod
+
+        with mock.patch.object(mod, "DATA_DIR", self.data):
+            with mock.patch.object(mod, "GPT_REGISTER_JOBS_FILE", self.jobs_path):
+                svc = GptRegisterService(config_store=GptRegisterConfig(path=self.cfg_path))
+                settings = normalize_settings(
+                    {
+                        "count": 2,
+                        "concurrency": 1,
+                        "interval_secs": 0,
+                        "run_mode": "inprocess",
+                        "push_enabled": False,
+                    }
+                )
+                # engines validate against real builtin path from normalize
+                outcomes = [
+                    {
+                        "ok": True,
+                        "email": "ok@example.com",
+                        "has_token": True,
+                        "added": 0,
+                        "push": {"ok": True},
+                        "error": None,
+                        "logs": ["step: signup", "step: otp ok"],
+                        "mode": "inprocess",
+                    },
+                    {
+                        "ok": False,
+                        "email": "bad@example.com",
+                        "has_token": False,
+                        "added": 0,
+                        "error": "otp timeout",
+                        "logs": ["step: signup", "error: otp timeout"],
+                        "mode": "inprocess",
+                    },
+                ]
+                with mock.patch.object(svc, "_register_once", side_effect=outcomes):
+                    job = svc.start_job(settings)
+                    # wait for daemon thread
+                    import time
+
+                    for _ in range(100):
+                        cur = svc.get_job(job["job_id"])
+                        if cur and cur.get("status") in {"done", "failed", "cancelled"}:
+                            break
+                        time.sleep(0.05)
+                    cur = svc.get_job(job["job_id"])
+                self.assertIsNotNone(cur)
+                assert cur is not None
+                self.assertEqual(cur["status"], "done")
+                self.assertEqual(cur["success"], 1)
+                self.assertEqual(cur["failed"], 1)
+                self.assertIn("summary", cur)
+                self.assertEqual(cur["summary"]["success"], 1)
+                self.assertAlmostEqual(float(cur["summary"]["success_rate"]), 50.0)
+                self.assertTrue(any("任务结束" in (x.get("message") or "") for x in cur.get("logs") or []))
+                self.assertTrue(
+                    any("otp timeout" in (x.get("message") or "") for x in cur.get("logs") or [])
+                )
+                # engine step logs forwarded
+                self.assertTrue(
+                    any("step: otp ok" in (x.get("message") or "") for x in cur.get("logs") or [])
+                )
+                log_file = self.data / "gpt_register_logs" / f"{job['job_id']}.json"
+                self.assertTrue(log_file.is_file(), f"missing {log_file}")
+                import json
+
+                record = json.loads(log_file.read_text(encoding="utf-8"))
+                self.assertEqual(record["job_id"], job["job_id"])
+                self.assertEqual(record["summary"]["failed"], 1)
+                self.assertEqual(len(record["items"]), 2)
+                # secrets not present
+                self.assertEqual(record["settings"].get("chatgpt2api_auth_key"), "")
+
+
 class RunnerBootstrapTest(unittest.TestCase):
     def test_bootstrap_creates_provider_tables(self):
         from gpt_free_register import runner as reg_runner

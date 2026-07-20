@@ -273,7 +273,13 @@ def register_chatgpt_once(
         extra=extra,
     )
 
-    mailbox = _create_mailbox(mail_provider, extra, proxy)
+    # Cloudflare D1 / Email Routing APIs are independent of OpenAI egress.
+    # Forcing the register proxy here often causes read timeouts (seen on SOCKS)
+    # and is unnecessary for mail polling. Keep proxy only for OpenAI protocol.
+    mailbox_proxy = None
+    if mail_provider not in {"cloudflare_d1_api", "cloudflare_d1", "cfd1"}:
+        mailbox_proxy = proxy
+    mailbox = _create_mailbox(mail_provider, extra, mailbox_proxy)
     platform_cls = get_platform("chatgpt")
     platform = platform_cls(config=config, mailbox=mailbox)
     platform.set_logger(log_fn)

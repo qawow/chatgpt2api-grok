@@ -148,12 +148,28 @@ def _post_form(
             "https": proxy_url,
         }
 
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
+    # Keep OAuth token exchange on the same browser profile as registration.
+    try:
+        from .browser_profile import browser_profile, default_request_headers, resolve_impersonate
+        profile = browser_profile()
+        headers = default_request_headers(for_api=True)
+        headers.update({
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "Origin": "https://auth.openai.com",
+            "Referer": "https://auth.openai.com/",
+        })
+        impersonate = resolve_impersonate(profile.get("impersonate"))
+    except Exception:
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+            ),
+        }
+        impersonate = "chrome142"
 
     try:
         # 使用 curl_cffi 发送请求，支持代理和浏览器指纹
@@ -163,7 +179,7 @@ def _post_form(
             headers=headers,
             timeout=timeout,
             proxies=proxies,
-            impersonate="chrome"
+            impersonate=impersonate,
         )
 
         if response.status_code != 200:

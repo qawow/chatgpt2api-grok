@@ -1409,30 +1409,85 @@ class CloudflareD1Mailbox(BaseMailbox):
         text = str(raw or "")
         if not text:
             return ""
+
+        # OpenAI ChatGPT temporary codes are often rendered as a bare 6-digit
+        # token between Outlook conditional comments:
+        #   <![endif]-->\n  894462\n  <!--[if mso]>
+        # Prefer that high-signal pattern before any generic 6-digit scan.
         for pattern in (
+            r"<!\[endif\]-->\s*(\d{6})\s*<!--\[if mso\]>",
+            r"endif\]-->\s*(\d{6})\s*<!--\[if",
             r"<span[^>]*>\s*(\d{6})\s*</span>",
             r"<b[^>]*>\s*(\d{6})\s*</b>",
             r"<strong[^>]*>\s*(\d{6})\s*</strong>",
-            r"(?:code|验证码|otp|one[- ]time|security code)[^0-9]{0,40}(\d{6})",
+            r"(?:code|验证码|otp|one[- ]time|security code)[^0-9#]{0,40}(\d{6})",
         ):
             m = re.search(pattern, text, re.IGNORECASE)
             if m:
                 return m.group(1)
+
         body_start = text.find("\r\n\r\n")
         if body_start == -1:
             body_start = text.find("\n\n")
         search_text = text[body_start:] if body_start != -1 else text
+        # Drop noise that commonly contains 6-digit false positives.
         search_text = re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", " ", search_text)
         search_text = re.sub(r"https?://\S+", " ", search_text)
         search_text = re.sub(r"m=\+\d+\.\d+", " ", search_text)
         search_text = re.sub(r"\bt=\d+\b", " ", search_text)
-        blacklist = {"233159"}
-        pattern = code_pattern or r"(?<!\d)(\d{6})(?!\d)"
+        # CSS / brand colors (#353740) and quoted-printable color fragments.
+        search_text = re.sub(r"#[0-9A-Fa-f]{6}\b", " ", search_text)
+        search_text = re.sub(r"color:\s*#?[0-9A-Fa-f]{3,8}", " ", search_text, flags=re.I)
+        search_text = re.sub(r"rgb\([^)]*\)", " ", search_text, flags=re.I)
+        # Prefer whitespace-bounded standalone codes over mid-token digits.
+        blacklist = {
+            "233159",  # domain noise
+            "353740",  # ChatGPT brand gray #353740
+            "216706",  # sendgrid click host fragment
+            "000000",
+            "ffffff",
+        }
+        # If caller provided a custom pattern, still honor it after noise scrub.
+        pattern = code_pattern or r"(?<![\d#A-Fa-f])(\d{6})(?![\dA-Fa-f])"
         for m in re.finditer(pattern, search_text, re.IGNORECASE):
             code = next((g for g in m.groups() if g), None) or m.group(0)
-            if code and code not in blacklist:
+            if code and code not in blacklist and code.isdigit():
                 return code
         return ""
+
+    @staticmethod
+    def _mail_received_epoch(raw: str) -> float | None:
+        """Best-effort parse Date header from raw MIME for otp_sent_at filtering."""
+        import email.utils
+        import re
+        import time as _time
+
+        text = str(raw or "")
+        if not text:
+            return None
+        # Prefer true header section before body.
+        header = text.split("\r\n\r\n", 1)[0].split("\n\n", 1)[0]
+        m = re.search(r"(?im)^Date:\s*(.+)$", header)
+        if not m:
+            m = re.search(r"(?im)^Date:\s*(.+)$", text[:4000])
+        if not m:
+            return None
+        try:
+            ts = email.utils.parsedate_to_datetime(m.group(1).strip())
+            if ts is None:
+                return None
+            if ts.tzinfo is None:
+                return ts.timestamp()
+            return ts.timestamp()
+        except Exception:
+            try:
+                # fallback: email.utils.parsedate_tz
+                tt = email.utils.parsedate_tz(m.group(1).strip())
+                if not tt:
+                    return None
+                return float(email.utils.mktime_tz(tt))
+            except Exception:
+                return None
 
     def wait_for_code(
         self,
@@ -1441,13 +1496,27 @@ class CloudflareD1Mailbox(BaseMailbox):
         timeout: int = 120,
         before_ids: set = None,
         code_pattern: str = None,
+        otp_sent_at: float | None = None,
+        min_received_at: float | None = None,
+        poll_interval: float = 2.5,
     ) -> str:
         import time
 
-        seen = set(before_ids or [])
+        seen = set(str(x) for x in (before_ids or set()) if x not in (None, ""))
         start = time.time()
         email = account.email
-        print(f"[CF-D1] 等待验证码: {email} timeout={timeout}s")
+        # allow small clock skew between OpenAI send and worker Date header
+        min_ts = otp_sent_at if otp_sent_at is not None else min_received_at
+        if min_ts is not None:
+            try:
+                min_ts = float(min_ts) - 15.0
+            except Exception:
+                min_ts = None
+        print(
+            f"[CF-D1] 等待验证码: {email} timeout={timeout}s "
+            f"before_ids={len(seen)} min_ts={int(min_ts) if min_ts else '-'}"
+        )
+        last_err = ""
         while time.time() - start < timeout:
             try:
                 mails = self._list_mails(email)
@@ -1455,8 +1524,14 @@ class CloudflareD1Mailbox(BaseMailbox):
                     mid = str(mail.get("id", ""))
                     if not mid or mid in seen:
                         continue
-                    seen.add(mid)
                     raw = str(mail.get("raw", "") or "")
+                    if min_ts is not None:
+                        received = self._mail_received_epoch(raw)
+                        # If Date unparsable, still accept new id not in baseline.
+                        if received is not None and received < min_ts:
+                            seen.add(mid)
+                            continue
+                    seen.add(mid)
                     if keyword and keyword.lower() not in raw.lower():
                         continue
                     code = self._extract_code_from_raw(raw, code_pattern=code_pattern)
@@ -1464,9 +1539,16 @@ class CloudflareD1Mailbox(BaseMailbox):
                         print(f"[CF-D1] 验证码: {code}")
                         return code
             except Exception as exc:
+                last_err = str(exc)[:160]
                 logger.warning("[CF-D1] poll failed: %s", exc)
-            time.sleep(3)
-        raise TimeoutError(f"等待验证码超时 ({timeout}s) email={email}")
+            # adaptive poll: slightly faster early, then settle
+            elapsed = time.time() - start
+            sleep_s = float(poll_interval)
+            if elapsed < 20:
+                sleep_s = max(1.5, sleep_s - 0.5)
+            time.sleep(sleep_s)
+        suffix = f" last_err={last_err}" if last_err else ""
+        raise TimeoutError(f"等待验证码超时 ({timeout}s) email={email}{suffix}")
 
     def wait_for_link(
         self,

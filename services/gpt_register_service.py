@@ -317,16 +317,29 @@ class GptRegisterService:
         thread.start()
         return dict(job)
 
-    def _append_log(self, job_id: str, message: str) -> None:
+    def _append_log(self, job_id: str, message: str, *, level: str = "info") -> None:
+        msg = str(message or "").strip()
+        if not msg:
+            return
+        # also emit to process stdout for docker logs / journal
+        try:
+            print(f"[gpt-register:{job_id[:8]}] {msg}", flush=True)
+        except Exception:
+            pass
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:
                 return
             logs = list(job.get("logs") or [])
-            logs.append({"at": _now_iso(), "message": message[:500]})
-            job["logs"] = logs[-200:]
+            logs.append({"at": _now_iso(), "level": level, "message": msg[:800]})
+            job["logs"] = logs[-400:]
             job["updated_at"] = _now_iso()
             self._jobs[job_id] = job
+            # persist so UI refresh / restart still shows latest timeline
+            try:
+                self._save_jobs()
+            except Exception:
+                pass
 
     def _patch_job(self, job_id: str, **fields: Any) -> None:
         with self._lock:
@@ -341,25 +354,55 @@ class GptRegisterService:
 
     def _run_job(self, job_id: str, settings: dict[str, Any]) -> None:
         cancel = self._cancel_flags.get(job_id) or threading.Event()
-        self._patch_job(job_id, status="running", started_at=_now_iso())
-        self._append_log(job_id, f"任务开始：count={settings['count']} concurrency={settings['concurrency']}")
+        started_at = _now_iso()
+        self._patch_job(job_id, status="running", started_at=started_at)
+        self._append_log(
+            job_id,
+            "任务开始："
+            f"count={settings.get('count')} concurrency={settings.get('concurrency')} "
+            f"interval={settings.get('interval_secs')}s mode={settings.get('run_mode')} "
+            f"executor={settings.get('executor')} mail={settings.get('mail_provider')} "
+            f"push={settings.get('push_enabled')}/{settings.get('push_mode')} "
+            f"proxy={'yes' if settings.get('proxy') else 'default/env'} "
+            f"engines={settings.get('engines_dir')}",
+        )
 
         total = int(settings["count"])
         concurrency = int(settings["concurrency"])
         interval = float(settings["interval_secs"])
         success = failed = added = completed = 0
         items: list[dict[str, Any]] = []
+        t0 = time.time()
 
         try:
             self._validate_engines(settings)
+            self._append_log(job_id, f"注册机校验通过：{settings.get('engines_dir')}")
         except Exception as exc:
             self._patch_job(
                 job_id,
                 status="failed",
                 error=str(exc)[:300],
                 finished_at=_now_iso(),
+                summary={
+                    "status": "failed",
+                    "error": str(exc)[:300],
+                    "duration_secs": round(time.time() - t0, 2),
+                },
             )
-            self._append_log(job_id, f"启动失败：{exc}")
+            self._append_log(job_id, f"启动失败：{exc}", level="error")
+            self._emit_completion_log(
+                job_id,
+                status="failed",
+                success=0,
+                failed=0,
+                added=0,
+                completed=0,
+                total=total,
+                duration=time.time() - t0,
+                items=[],
+                error=str(exc),
+                settings=settings,
+            )
             return
 
         def one(index: int) -> dict[str, Any]:
@@ -379,17 +422,22 @@ class GptRegisterService:
                     "ok": False,
                     "error": str(exc)[:300],
                     "email": None,
+                    "logs": [f"exception: {exc}"],
                 }
 
         # sequential with optional limited concurrency batches
         index = 0
         while index < total:
             if cancel.is_set():
-                self._append_log(job_id, "收到取消请求，停止后续注册")
+                self._append_log(job_id, "收到取消请求，停止后续注册", level="warn")
                 break
             batch_size = min(concurrency, total - index)
             batch_indexes = list(range(index + 1, index + batch_size + 1))
             index += batch_size
+            self._append_log(
+                job_id,
+                f"开始批次 indexes={batch_indexes[0]}-{batch_indexes[-1]} size={batch_size}",
+            )
 
             if concurrency <= 1:
                 outcomes = [one(batch_indexes[0])]
@@ -401,6 +449,7 @@ class GptRegisterService:
 
             for outcome in outcomes:
                 completed += 1
+                engine_logs = outcome.get("logs") if isinstance(outcome.get("logs"), list) else []
                 item = {
                     "index": outcome.get("index"),
                     "ok": bool(outcome.get("ok")),
@@ -409,20 +458,32 @@ class GptRegisterService:
                     "added": int(outcome.get("added") or 0),
                     "has_token": bool(outcome.get("has_token")),
                     "push": outcome.get("push"),
+                    "mode": outcome.get("mode"),
+                    "logs_tail": [str(x)[:200] for x in engine_logs[-8:]],
                 }
                 items.append(item)
+
+                # forward engine step logs for troubleshooting
+                for line in engine_logs[-30:]:
+                    self._append_log(job_id, f"  · #{item.get('index')}: {line}")
+
                 if item["ok"]:
                     success += 1
                     added += int(item["added"] or 0)
+                    push = item.get("push") if isinstance(item.get("push"), dict) else {}
                     self._append_log(
                         job_id,
-                        f"[{completed}/{total}] 成功 {item.get('email') or ''} added={item['added']}",
+                        f"[{completed}/{total}] 成功 email={item.get('email') or '-'} "
+                        f"added={item['added']} has_token={item['has_token']} "
+                        f"mode={item.get('mode') or '-'} push_ok={push.get('ok')}",
                     )
                 else:
                     failed += 1
                     self._append_log(
                         job_id,
-                        f"[{completed}/{total}] 失败 {item.get('email') or ''} {item.get('error') or ''}",
+                        f"[{completed}/{total}] 失败 email={item.get('email') or '-'} "
+                        f"error={item.get('error') or 'unknown'} mode={item.get('mode') or '-'}",
+                        level="error",
                     )
                 self._patch_job(
                     job_id,
@@ -434,9 +495,39 @@ class GptRegisterService:
                 )
 
             if index < total and interval > 0 and not cancel.is_set():
+                self._append_log(job_id, f"批次间隔 sleep {interval}s")
                 time.sleep(interval)
 
         status = "cancelled" if cancel.is_set() else "done"
+        duration = time.time() - t0
+        failed_brief = [
+            {
+                "index": it.get("index"),
+                "email": it.get("email"),
+                "error": (it.get("error") or "")[:200],
+            }
+            for it in items
+            if not it.get("ok")
+        ][:20]
+        success_emails = [it.get("email") for it in items if it.get("ok") and it.get("email")][:20]
+        summary = {
+            "status": status,
+            "total": total,
+            "completed": completed,
+            "success": success,
+            "failed": failed,
+            "added": added,
+            "duration_secs": round(duration, 2),
+            "success_rate": round((success / completed) * 100, 1) if completed else 0.0,
+            "success_emails": success_emails,
+            "failed_items": failed_brief,
+            "run_mode": settings.get("run_mode"),
+            "mail_provider": settings.get("mail_provider"),
+            "executor": settings.get("executor"),
+            "engines_dir": settings.get("engines_dir"),
+            "push_mode": settings.get("push_mode"),
+            "push_enabled": settings.get("push_enabled"),
+        }
         self._patch_job(
             job_id,
             status=status,
@@ -446,11 +537,112 @@ class GptRegisterService:
             failed=failed,
             added=added,
             items=list(items),
+            summary=summary,
         )
         self._append_log(
             job_id,
-            f"任务结束 status={status} success={success} failed={failed} added={added}",
+            "任务结束 "
+            f"status={status} completed={completed}/{total} success={success} "
+            f"failed={failed} added={added} duration={duration:.1f}s "
+            f"success_rate={summary['success_rate']}%",
+            level="info" if failed == 0 and status == "done" else "warn",
         )
+        if success_emails:
+            self._append_log(job_id, "成功邮箱: " + ", ".join(str(e) for e in success_emails))
+        if failed_brief:
+            for row in failed_brief[:10]:
+                self._append_log(
+                    job_id,
+                    f"失败明细 #{row.get('index')}: {row.get('email') or '-'} | {row.get('error') or '-'}",
+                    level="error",
+                )
+        self._emit_completion_log(
+            job_id,
+            status=status,
+            success=success,
+            failed=failed,
+            added=added,
+            completed=completed,
+            total=total,
+            duration=duration,
+            items=items,
+            error=None,
+            settings=settings,
+            summary=summary,
+        )
+
+    def _emit_completion_log(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        success: int,
+        failed: int,
+        added: int,
+        completed: int,
+        total: int,
+        duration: float,
+        items: list[dict[str, Any]],
+        error: str | None,
+        settings: dict[str, Any],
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        """Write a durable completion record for ops troubleshooting."""
+        payload = summary or {
+            "status": status,
+            "success": success,
+            "failed": failed,
+            "added": added,
+            "completed": completed,
+            "total": total,
+            "duration_secs": round(duration, 2),
+            "error": (error or "")[:300] or None,
+        }
+        # file under data/ for docker volume persistence
+        try:
+            out_dir = DATA_DIR / "gpt_register_logs"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"{job_id}.json"
+            record = {
+                "job_id": job_id,
+                "finished_at": _now_iso(),
+                "summary": payload,
+                "settings": public_settings(settings),
+                "items": [
+                    {
+                        "index": it.get("index"),
+                        "ok": it.get("ok"),
+                        "email": it.get("email"),
+                        "error": it.get("error"),
+                        "added": it.get("added"),
+                        "has_token": it.get("has_token"),
+                        "mode": it.get("mode"),
+                        "logs_tail": it.get("logs_tail") or [],
+                    }
+                    for it in (items or [])
+                ],
+            }
+            path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self._append_log(job_id, f"完成日志已写入 data/gpt_register_logs/{job_id}.json")
+        except Exception as exc:
+            self._append_log(job_id, f"写入完成日志文件失败: {exc}", level="warn")
+
+        # also into main app log stream if available
+        try:
+            from services.log_service import LOG_TYPE_ACCOUNT, log_service
+
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                f"GPT注册任务结束 {status} success={success} failed={failed} added={added}",
+                {
+                    "job_id": job_id,
+                    "summary": payload,
+                    "engines_dir": settings.get("engines_dir"),
+                    "mail_provider": settings.get("mail_provider"),
+                },
+            )
+        except Exception:
+            pass
 
     def _validate_engines(self, settings: dict[str, Any]) -> None:
         engines = Path(settings["engines_dir"])
@@ -492,7 +684,7 @@ class GptRegisterService:
         def _log(message: str) -> None:
             text_msg = str(message or "").strip()
             if text_msg:
-                logs.append(text_msg[:300])
+                logs.append(text_msg[:500])
 
         try:
             from gpt_free_register.runner import register_chatgpt_once
@@ -505,7 +697,7 @@ class GptRegisterService:
                 "email": None,
                 "has_token": False,
                 "added": 0,
-                "logs": logs[-20:],
+                "logs": logs[-80:],
             }
 
         if not isinstance(parsed, dict):
@@ -515,7 +707,7 @@ class GptRegisterService:
                 "email": None,
                 "has_token": False,
                 "added": 0,
-                "logs": logs[-20:],
+                "logs": logs[-80:],
             }
 
         email = _clean(parsed.get("email"))
@@ -553,7 +745,7 @@ class GptRegisterService:
             "added": added,
             "push": push,
             "error": error,
-            "logs": logs[-20:],
+            "logs": logs[-80:],
             "mode": "inprocess",
         }
 
@@ -610,6 +802,14 @@ class GptRegisterService:
         )
         stdout = proc.stdout or ""
         stderr = proc.stderr or ""
+        logs: list[str] = []
+        for stream_name, blob in (("stdout", stdout), ("stderr", stderr)):
+            for line in str(blob).splitlines():
+                line = line.strip()
+                if line:
+                    logs.append(f"{stream_name}: {line[:400]}")
+        if proc.returncode not in (0, None):
+            logs.append(f"returncode={proc.returncode}")
         parsed = _extract_json_object(stdout)
         if not parsed:
             err = (stderr or stdout or f"exit={proc.returncode}")[-400:]
@@ -619,6 +819,7 @@ class GptRegisterService:
                 "email": None,
                 "has_token": False,
                 "added": 0,
+                "logs": logs[-80:],
                 "mode": "subprocess",
             }
 
@@ -662,6 +863,7 @@ class GptRegisterService:
             "push": push,
             "error": error,
             "returncode": proc.returncode,
+            "logs": logs[-80:],
             "mode": "subprocess",
         }
 

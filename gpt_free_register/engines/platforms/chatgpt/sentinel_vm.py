@@ -94,12 +94,20 @@ class _FakeWindow(_JSObj):
         super().__init__()
         import time as _time
 
+        # Align navigator.platform with the UA we claim (Windows vs macOS).
+        ua_l = (user_agent or "").lower()
+        if "windows" in ua_l:
+            nav_platform = "Win32"
+        elif "android" in ua_l:
+            nav_platform = "Linux armv8l"
+        else:
+            nav_platform = "MacIntel"
         self.navigator = _make_obj(
             userAgent=user_agent,
             language="en-US",
             languages=["en-US", "en"],
             hardwareConcurrency=8,
-            platform="MacIntel",
+            platform=nav_platform,
             maxTouchPoints=0,
             cookieEnabled=True,
             webdriver=False,

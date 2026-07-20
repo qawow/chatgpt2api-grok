@@ -69,8 +69,9 @@ CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
 CODEX_SCOPE = "openid email profile offline_access"
 
 # Sentinel（PoW 防护）- 版本号可能随 OpenAI 更新而变化（支持通过环境变量覆盖）
+# Align SDK hash with yukkcat/chatgpt2api (and current official frame) by default.
 SENTINEL_BASE = os.environ.get("SENTINEL_BASE_URL", "https://sentinel.openai.com")
-SENTINEL_SDK_VERSION = os.environ.get("SENTINEL_SDK_VERSION", "20260124ceb8")
+SENTINEL_SDK_VERSION = os.environ.get("SENTINEL_SDK_VERSION", "20260219f9f6")
 SENTINEL_FRAME_VERSION = os.environ.get("SENTINEL_FRAME_VERSION", "20260219f9f6")
 SENTINEL_SDK_URL = f"{SENTINEL_BASE}/sentinel/{SENTINEL_SDK_VERSION}/sdk.js"
 SENTINEL_REQ_URL = f"{SENTINEL_BASE}/backend-api/sentinel/req"

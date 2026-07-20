@@ -205,8 +205,9 @@ curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" \
 | `status` | `pending` / `running` / `done` / `failed` / `cancelled` |
 | `completed` / `total` | 进度 |
 | `success` / `failed` / `added` | 成功数 / 失败数 / 入库数 |
-| `items[]` | 每号结果（email / error / added） |
-| `logs[]` | 时间线日志 |
+| `items[]` | 每号结果（email / error / added / `logs_tail`） |
+| `logs[]` | 时间线日志（含引擎步骤；`level`: info/warn/error） |
+| `summary` | 任务结束摘要（耗时、成功率、成功邮箱、失败明细、mode 等） |
 
 #### 取消任务
 
@@ -306,9 +307,11 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | --- | --- | --- |
 | `data/gpt_register.env` | CFD1 / 代理密钥 | ✅ 机密备份 |
 | `data/gpt_register_config.json` | 表单默认值 | 可选 |
-| `data/gpt_register_jobs.json` | 最近任务（约 20 条） | 可选 |
+| `data/gpt_register_jobs.json` | 最近任务（约 20 条，含 logs/summary） | 可选 |
+| `data/gpt_register_logs/<job_id>.json` | **单任务完成日志**（settings 脱敏 + items + summary） | 排障保留 |
 | `data/register_engines.db` | provider / capability 表 | 可重建 |
 | `data/accounts.json` | ChatGPT 号池（注册成功写入） | ✅ 重要 |
+| `data/logs.jsonl` | 系统日志（含 GPT 注册任务结束摘要） | 可选 |
 
 ### 6.2 升级
 
@@ -378,7 +381,58 @@ test -f data/gpt_register.env && echo 'env ok'
 curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
 ```
 
-### 6.7 常见故障
+### 6.7 注册机稳定性优化（相对 any-auto-register 基线）
+
+本仓库 `gpt_free_register` 在 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register) 协议流基础上做了这些加固：
+
+| 点 | 说明 |
+| --- | --- |
+| passwordless 识别 | `authorize/continue` 返回 `email_otp_verification` 时区分新号 passwordless vs 已注册账号 |
+| OTP 发送 | 优先 `POST /email-otp/send`，失败再 GET；429/5xx 短重试 |
+| OTP 收信 | 透传 `otp_sent_at` + `before_ids`；CFD1 过滤旧邮件 Date，加快 poll |
+| Sentinel | PoW + turnstile VM；失败最多 3 次；Codex 路径补齐 `decrypt_turnstile` |
+| TLS 指纹 | 默认 `curl_cffi` `chrome142` + 匹配 UA/`sec-ch-ua`；可用 `HTTP_IMPERSONATE` 覆盖 |
+| HTTP 重试 | 5xx/429 指数退避 + jitter，尊重 `Retry-After` |
+| 密码 | 协议流强制大小写+数字+符号（与浏览器流 plugin 一致） |
+| create_account | 5xx/429 重试并刷新单次 sentinel |
+
+可选环境变量：
+
+```bash
+# 覆盖 TLS 指纹（默认 chrome142）
+export HTTP_IMPERSONATE=chrome136
+```
+
+### 6.8 完成日志与排障输出
+
+
+任务结束时会同时写入：
+
+1. **UI / API**：`job.logs` 时间线 + `job.summary` 摘要 + 每号 `items[].logs_tail`
+2. **Docker stdout**：`[gpt-register:<job前8位>] ...`（`docker logs -f chatgpt2api-local`）
+3. **持久文件**：`data/gpt_register_logs/<job_id>.json`（volume 可保留，含脱敏 settings）
+4. **系统日志**：`data/logs.jsonl` 一条 `type=account` 的「GPT注册任务结束 …」
+
+查看示例：
+
+```bash
+# 最近一次任务摘要
+JOB=$(ls -t data/gpt_register_logs/*.json 2>/dev/null | head -1)
+jq '.summary,.items[]? | {ok,email,error,logs_tail}' "$JOB"
+
+# 容器日志过滤
+docker logs --tail 200 chatgpt2api-local 2>&1 | grep gpt-register
+
+# API
+curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" -H "Authorization: Bearer $KEY" \
+  | jq '{status,summary,logs:(.logs[-20:]),items}'
+```
+
+`summary` 字段示例：`duration_secs` / `success_rate` / `success_emails` / `failed_items` /
+`run_mode` / `mail_provider` / `engines_dir` / `push_mode`。密钥不会写入日志文件。
+
+### 6.9 常见故障
+
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -388,7 +442,7 @@ curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
 | `Cloudflare D1 邮箱缺少配置` | 未配 CFD1 | 写 `data/gpt_register.env` |
 | 注册成功但 `added=0` | dry_run / push 关 / token 空 | 查 `push_enabled`、`dry_run`、任务 `items` |
 | HTTP 推送连不上 | 容器内用了 host 的 `:8000` | 默认用 `push_mode=local`；http 模式 Docker 内用 `:80` |
-| OTP 超时 / 风控 | 域名信誉、代理出口、OpenAI 策略 | 换域名/代理，降并发，看 `logs`/`items` |
+| OTP 超时 / 风控 | 域名信誉、代理出口、OpenAI 策略 | 换域名/代理，降并发，看 `logs`/`items`/`summary` 与 `data/gpt_register_logs/*.json` |
 
 ---
 
