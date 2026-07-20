@@ -129,8 +129,28 @@ class AccountService:
         self.storage.save_accounts(list(self._accounts.values()))
 
     @staticmethod
+    def _has_refresh_token(account: dict | None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        return bool(str(account.get("refresh_token") or "").strip())
+
+    @classmethod
+    def _is_session_only_account(cls, account: dict | None) -> bool:
+        """Access-only / NextAuth session accounts cannot refresh and are fragile."""
+        if not isinstance(account, dict):
+            return False
+        if cls._has_refresh_token(account):
+            return False
+        if account.get("session_only") is True or account.get("fragile") is True:
+            return True
+        # No refresh_token ⇒ session-only by default (register fallback, bare AT, etc.).
+        return True
+
+    @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
+            return False
+        if AccountService._is_session_only_account(account):
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
@@ -240,6 +260,11 @@ class AccountService:
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
+        # Durable tokens need refresh_token. Missing refresh ⇒ session-only / fragile:
+        # keep in pool for inspection, but exclude from image selection and auto-remove.
+        session_only = not bool(str(normalized.get("refresh_token") or "").strip())
+        normalized["session_only"] = session_only
+        normalized["fragile"] = session_only
         return normalized
 
     @staticmethod
@@ -1030,6 +1055,27 @@ class AccountService:
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
+        account = self.get_account(access_token) if access_token else None
+        # Session-only / fragile accounts (no refresh_token) die quickly when access
+        # expires; keep them for inspection instead of auto-removing from the pool.
+        if account is not None and self._is_session_only_account(account):
+            self.update_account(
+                access_token,
+                {"status": "异常", "quota": 0, "session_only": True, "fragile": True},
+                quiet=quiet,
+            )
+            if not quiet:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "会话号标记异常(保留)",
+                    {
+                        "source": event,
+                        "token": anonymize_token(access_token),
+                        "email": account.get("email"),
+                        "session_only": True,
+                    },
+                )
+            return False
         if not config.auto_remove_invalid_accounts:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
             return False
@@ -1235,6 +1281,9 @@ class AccountService:
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
             return False
+        # Never rush session-only accounts into auto-remove; they cannot refresh.
+        if self._is_session_only_account(account):
+            return True
         created_at = self._parse_time(account.get("created_at"))
         if created_at is not None and (now - created_at).total_seconds() < self._NEW_ACCOUNT_INVALID_GRACE_SECONDS:
             return True

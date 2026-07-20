@@ -870,30 +870,59 @@ class GptRegisterService:
     def _import_local(self, account: dict[str, Any], settings: dict[str, Any]) -> int:
         """Import registration result into local account_service without HTTP."""
         from services.account_service import account_service
+        from services.log_service import LOG_TYPE_ACCOUNT, log_service
+        from utils.helper import anonymize_token
 
         extra = account.get("extra") if isinstance(account.get("extra"), dict) else {}
         access = _clean(account.get("token")) or _clean(extra.get("access_token"))
         if not access:
             return 0
+        refresh = _clean(extra.get("refresh_token"))
+        id_token = _clean(extra.get("id_token"))
+        session_only = not bool(refresh)
         payload = {
             "access_token": access,
-            "refresh_token": _clean(extra.get("refresh_token")),
-            "id_token": _clean(extra.get("id_token")),
+            "refresh_token": refresh,
+            "id_token": id_token,
             "session_token": _clean(extra.get("session_token")),
             "email": _clean(account.get("email")),
             "password": _clean(account.get("password")),
             "account_id": _clean(account.get("user_id")) or _clean(extra.get("account_id")),
             "type": _clean(settings.get("plan_type")) or "free",
             "source_type": _clean(settings.get("source_type"))
-            or ("codex" if _clean(extra.get("refresh_token")) and _clean(extra.get("id_token")) else "register"),
+            or ("codex" if refresh and id_token else "register"),
             "status": "正常",
+            # NextAuth-only fallback has no refresh_token → fragile/session-only.
+            "session_only": session_only,
+            "fragile": session_only,
         }
         if payload["source_type"] == "codex":
             payload["export_type"] = "codex"
         if settings.get("bind_register_proxy") and settings.get("proxy"):
             payload["proxy"] = settings["proxy"]
         result = account_service.add_account_items([payload])
-        return int(result.get("added") or 0)
+        added = int(result.get("added") or 0)
+
+        # Populate real quota/status/type immediately; default quota=0 would hide
+        # free accounts from image selection even when upstream has remaining.
+        try:
+            account_service.fetch_remote_info(
+                access,
+                event="gpt_register_import",
+                defer_invalid_removal=True,
+            )
+        except Exception as exc:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "注册入库后刷新额度失败",
+                {
+                    "token": anonymize_token(access),
+                    "email": payload.get("email"),
+                    "session_only": session_only,
+                    "error": str(exc)[:300],
+                },
+            )
+        return added
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:

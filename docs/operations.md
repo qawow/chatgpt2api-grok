@@ -171,7 +171,8 @@ docker logs -f chatgpt2api-local
 | G2A 405 only CONNECT | 管理请求被系统代理劫持 → 已默认直连；检查 base_url 是否填成代理端口 |
 | Grok 生图 502 | Build 通道可能无 images；不会回落 ChatGPT 池 |
 | GPT 注册 `account_creation_failed` + OTP 失效 | 勿强制 auto-OTP 密码路径；见 [gpt-register.md](gpt-register.md) §6.7 |
-| GPT 注册成功但 Codex `add_phone` | 预期：回退 NextAuth session token 即可入库 |
+| GPT 注册成功但 Codex `add_phone` | 预期：回退 NextAuth session token 即可入库；号会标 `session_only`，不进生图候选、不自动删 |
+| 注册号无生图额度 / 秒死 | 入库后会自动 `fetch_remote_info`；无 refresh 号为 fragile，只标异常不剔除 |
 | OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 
 ## 7. 开发

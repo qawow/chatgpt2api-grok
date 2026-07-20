@@ -20,15 +20,37 @@ class AccountCapabilityTests(unittest.TestCase):
     def test_image_accounts_require_positive_quota(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(
-                {"status": "限流", "quota": 1}
+                {"status": "限流", "quota": 1, "refresh_token": "rt"}
             )
         )
         self.assertFalse(
             AccountService._is_image_account_available(
-                {"status": "正常", "quota": 0}
+                {"status": "正常", "quota": 0, "refresh_token": "rt"}
             )
         )
-        self.assertTrue(AccountService._is_image_account_available({"status": "正常", "quota": 1}))
+        self.assertTrue(
+            AccountService._is_image_account_available(
+                {"status": "正常", "quota": 1, "refresh_token": "rt"}
+            )
+        )
+
+    def test_session_only_accounts_are_not_image_candidates(self) -> None:
+        # No refresh_token ⇒ session-only / fragile, never image candidate.
+        self.assertTrue(
+            AccountService._is_session_only_account(
+                {"status": "正常", "quota": 5, "access_token": "at"}
+            )
+        )
+        self.assertFalse(
+            AccountService._is_image_account_available(
+                {"status": "正常", "quota": 5, "access_token": "at"}
+            )
+        )
+        self.assertFalse(
+            AccountService._is_session_only_account(
+                {"status": "正常", "quota": 5, "refresh_token": "rt"}
+            )
+        )
 
     def test_prolite_variants_are_normalized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -81,8 +103,8 @@ class AccountCapabilityTests(unittest.TestCase):
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
                 [
-                    {"access_token": "token-plus", "type": "Plus", "status": "正常", "quota": 3},
-                    {"access_token": "token-pro", "type": "Pro", "status": "正常", "quota": 3},
+                    {"access_token": "token-plus", "type": "Plus", "status": "正常", "quota": 3, "refresh_token": "rt-plus"},
+                    {"access_token": "token-pro", "type": "Pro", "status": "正常", "quota": 3, "refresh_token": "rt-pro"},
                 ]
             )
 
@@ -102,7 +124,7 @@ class AccountCapabilityTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
-                service.add_account_items([{"access_token": "invalid-token", "status": "正常"}])
+                service.add_account_items([{"access_token": "invalid-token", "status": "正常", "refresh_token": "rt-invalid"}])
 
                 with patch(
                     "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
@@ -126,7 +148,7 @@ class AccountCapabilityTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
-                service.add_account_items([{"access_token": "invalid-token", "status": "正常"}])
+                service.add_account_items([{"access_token": "invalid-token", "status": "正常", "refresh_token": "rt-invalid"}])
 
                 with patch(
                     "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
@@ -145,8 +167,54 @@ class AccountCapabilityTests(unittest.TestCase):
             else:
                 config.data["auto_remove_invalid_accounts"] = original_value
 
+    def test_session_only_invalid_token_is_kept_not_removed(self) -> None:
+        original_value = config.data.get("auto_remove_invalid_accounts")
+        config.data["auto_remove_invalid_accounts"] = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items(
+                    [
+                        {
+                            "access_token": "session-token",
+                            "status": "正常",
+                            "quota": 0,
+                            # no refresh_token → session_only
+                        }
+                    ]
+                )
+                account = service.get_account("session-token")
+                self.assertIsNotNone(account)
+                self.assertTrue(account["session_only"])
+                self.assertTrue(account["fragile"])
+
+                removed = service.remove_invalid_token("session-token", "test_event")
+                self.assertFalse(removed)
+                kept = service.get_account("session-token")
+                self.assertIsNotNone(kept)
+                self.assertEqual(kept["status"], "异常")
+                self.assertTrue(kept["session_only"])
+        finally:
+            if original_value is None:
+                config.data.pop("auto_remove_invalid_accounts", None)
+            else:
+                config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_normalize_marks_missing_refresh_as_session_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            bare = service._normalize_account({"access_token": "a1"})
+            durable = service._normalize_account(
+                {"access_token": "a2", "refresh_token": "rt-1"}
+            )
+            self.assertTrue(bare["session_only"])
+            self.assertTrue(bare["fragile"])
+            self.assertFalse(durable["session_only"])
+            self.assertFalse(durable["fragile"])
+
 
 class TokenLogTests(unittest.TestCase):
+
     def test_anonymize_token_hides_raw_value(self) -> None:
         token = "super-secret-token"
         token_ref = anonymize_token(token)

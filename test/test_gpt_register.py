@@ -283,3 +283,59 @@ class RunnerBootstrapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImportLocalTest(unittest.TestCase):
+    def test_import_local_marks_session_only_and_refreshes(self):
+        svc = GptRegisterService(config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg-import.json")))
+        settings = normalize_settings({"plan_type": "free", "bind_register_proxy": False})
+        account = {
+            "email": "s@x.com",
+            "password": "",
+            "token": "access-only",
+            "user_id": "u1",
+            "extra": {
+                "access_token": "access-only",
+                # no refresh_token / id_token → session-only register path
+            },
+        }
+        fake_svc = mock.Mock()
+        fake_svc.add_account_items.return_value = {"added": 1, "skipped": 0, "items": []}
+        fake_svc.fetch_remote_info.return_value = {
+            "access_token": "access-only",
+            "quota": 0,
+            "status": "限流",
+            "type": "free",
+        }
+        with mock.patch("services.account_service.account_service", fake_svc):
+            added = svc._import_local(account, settings)
+        self.assertEqual(added, 1)
+        payload = fake_svc.add_account_items.call_args[0][0][0]
+        self.assertTrue(payload["session_only"])
+        self.assertTrue(payload["fragile"])
+        self.assertEqual(payload["source_type"], "register")
+        fake_svc.fetch_remote_info.assert_called_once()
+        self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "access-only")
+
+    def test_import_local_codex_tokens_not_session_only(self):
+        svc = GptRegisterService(config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg-import2.json")))
+        settings = normalize_settings({"plan_type": "free", "bind_register_proxy": False})
+        account = {
+            "email": "c@x.com",
+            "token": "at-codex",
+            "extra": {
+                "access_token": "at-codex",
+                "refresh_token": "rt-codex",
+                "id_token": "id-codex",
+            },
+        }
+        fake_svc = mock.Mock()
+        fake_svc.add_account_items.return_value = {"added": 1}
+        fake_svc.fetch_remote_info.return_value = {"access_token": "at-codex", "quota": 2}
+        with mock.patch("services.account_service.account_service", fake_svc):
+            added = svc._import_local(account, settings)
+        self.assertEqual(added, 1)
+        payload = fake_svc.add_account_items.call_args[0][0][0]
+        self.assertFalse(payload["session_only"])
+        self.assertEqual(payload["source_type"], "codex")
+        fake_svc.fetch_remote_info.assert_called_once()

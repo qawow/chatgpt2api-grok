@@ -34,6 +34,9 @@ Cloudflare D1 自建邮箱（OTP） + OpenAI 协议注册
    │  成功拿到 access_token
    ▼
 account_service.add_account_items    # push_mode=local（默认）
+   │  无 refresh_token → session_only/fragile
+   ▼
+account_service.fetch_remote_info    # 入库后立刻拉真实 quota/status/type
    │
    ▼
 data/accounts.json                   # ChatGPT 号池
@@ -521,6 +524,8 @@ curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" -H "Authorization: Bearer $KEY" \
 | OTP `invalid_state` / session no longer valid | continue 二次提交或会话过期 | 保持 `OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1`；换干净代理重开流程 |
 | `IP 地理位置不支持` / OAuth reset | 出口被拦或代理不稳 | 换 TW 等可用出口；检查 `OPENAI_BLOCK_REGIONS` |
 | Codex CLI `add_phone required` | Codex 路径额外要手机 | 正常：会回退 NextAuth session token，任务仍可 `registered` |
+| 注册成功但生图额度 0 / 选不到号 | 入库默认 quota=0；free 上游 `image_gen.remaining` 常为 0；无 refresh 的 session 号不参与生图 | 现已入库后自动 `fetch_remote_info`；看号池 `quota/status/session_only`；session 号需 Codex refresh 才可生图 |
+| 注册号「秒死」被自动删 | NextAuth-only access 无 refresh，401 后 `auto_remove_invalid_accounts` 剔除 | 现已标 `session_only/fragile`：排除生图候选且**不自动删除**，只标异常保留排查 |
 
 ---
 
@@ -551,7 +556,8 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 | `gpt_free_register/engines/platforms/chatgpt/register.py` | 协议注册主流程（passwordless / Sentinel dual-header） |
 | `gpt_free_register/engines/platforms/chatgpt/browser_profile.py` | 每号浏览器画像（TLS/UA/CH 一致） |
 | `gpt_free_register/engines/platforms/chatgpt/constants.py` | Sentinel SDK 版本、OAuth 端点 |
-| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库 + 完成摘要 |
+| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库（含 session_only 标记 + 入库后 fetch_remote_info）+ 完成摘要 |
+| `services/account_service.py` | 号池：`session_only`/`fragile` 门禁、生图选号、invalid 自动移除策略 |
 | `api/gpt_register.py` | 管理 API |
 | `web/.../gpt-register-card.tsx` | 设置页 UI |
 | `test/test_gpt_register.py` | 服务层单测 |
