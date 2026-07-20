@@ -170,6 +170,9 @@ docker logs -f chatgpt2api-local
 | SOCKS 报 Missing dependencies | 镜像缺 PySocks → rebuild |
 | G2A 405 only CONNECT | 管理请求被系统代理劫持 → 已默认直连；检查 base_url 是否填成代理端口 |
 | Grok 生图 502 | Build 通道可能无 images；不会回落 ChatGPT 池 |
+| GPT 注册 `account_creation_failed` + OTP 失效 | 勿强制 auto-OTP 密码路径；见 [gpt-register.md](gpt-register.md) §6.7 |
+| GPT 注册成功但 Codex `add_phone` | 预期：回退 NextAuth session token 即可入库 |
+| OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 
 ## 7. 开发
 
@@ -177,7 +180,11 @@ docker logs -f chatgpt2api-local
 uv sync
 uv run main.py          # 后端
 cd web && bun install && bun run dev
-uv run python -m unittest test.test_gpt_register test.test_g2a_bridge test.test_grok_pool -v
+uv run python -m unittest \
+  test.test_gpt_register \
+  test.test_gpt_register_engine \
+  test.test_g2a_bridge \
+  test.test_grok_pool -v
 ```
 
 ## 8. 安全

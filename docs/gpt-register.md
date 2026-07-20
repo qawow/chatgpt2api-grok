@@ -383,25 +383,99 @@ curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
 
 ### 6.7 注册机稳定性优化（相对 any-auto-register 基线）
 
-本仓库 `gpt_free_register` 在 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register) 协议流基础上做了这些加固：
+本仓库 `gpt_free_register` 在 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register) 协议流基础上，并融合了
+[yukkcat/chatgpt2api](https://github.com/yukkcat/chatgpt2api) 当前公开注册链路的关键行为，做了这些加固：
 
 | 点 | 说明 |
 | --- | --- |
-| passwordless 识别 | `authorize/continue` 返回 `email_otp_verification` 时区分新号 passwordless vs 已注册账号 |
+| passwordless 优先 | authorize 若直接落到 `/email-verification`（auto-OTP），默认走 passwordless，**不再强行** `user/register` 设密码 |
+| 跳过二次 continue | auto-OTP 会话上再 `authorize/continue` 会开新 session 并废码；默认跳过 continue |
 | OTP 发送 | 优先 `POST /email-otp/send`，失败再 GET；429/5xx 短重试 |
 | OTP 收信 | 透传 `otp_sent_at` + `before_ids`；CFD1 过滤旧邮件 Date，加快 poll |
-| Sentinel | PoW + turnstile VM；失败最多 3 次；Codex 路径补齐 `decrypt_turnstile` |
-| TLS 指纹 | 默认 `curl_cffi` `chrome142` + 匹配 UA/`sec-ch-ua`；可用 `HTTP_IMPERSONATE` 覆盖 |
+| Sentinel dual-header | `openai-sentinel-token` + `openai-sentinel-so-token`；`oai-sc=0{c}` cookie |
+| SO collect | `oauth_create_account` / `create_account` 前默认等待 ~5s（对齐官方 SDK 采集） |
+| VM so-token | 优先 VM 求解 `t`/`so`（日志 `src=vm_t`），失败再回退 |
+| 浏览器画像 | 每号独立 profile：TLS impersonate / UA / sec-ch-ua / 硬件一致；Windows 权重默认 70% |
+| CFD1 邮箱 | CFD1 建号/收信**不走** OpenAI 代理，避免 SOCKS 超时拖垮 OTP |
+| TLS 指纹 | 默认 `curl_cffi` `chrome142` + 匹配 Client Hints |
 | HTTP 重试 | 5xx/429 指数退避 + jitter，尊重 `Retry-After` |
-| 密码 | 协议流强制大小写+数字+符号（与浏览器流 plugin 一致） |
-| create_account | 5xx/429 重试并刷新单次 sentinel |
+| create_account | 5xx/429 重试并刷新 sentinel；密码路径失败可回退 passwordless（清旧 auto-OTP 标记） |
 
-可选环境变量：
+#### 推荐协议流（当前默认）
+
+```
+chatgpt.com NextAuth signin
+  → auth.openai.com authorize (login_or_signup)
+  → 若 final_url=/email-verification：跳过 continue，passwordless
+  → 信任 auto-OTP（或显式 email-otp/send）
+  → email-otp/validate (+ sentinel flow=email_otp_validate)
+  → about_you → create_account (+ dual sentinel, SO collect 5s)
+  → chatgpt.com callback → /api/auth/session
+```
+
+日志中应能看到类似：
+
+```text
+passwordless 注册 OTP 流程: mode=passwordless_signup (auto-otp skip continue; yukkcat-aligned)
+Sentinel so-token ready: flow=authorize_continue so_len=... src=vm_t
+Sentinel SO collect wait: 5.0s flow=oauth_create_account
+create_account so-token attached: len=... src=full
+验证码校验状态: 200
+NextAuth session 获取成功
+```
+
+#### 可选环境变量
+
+写在 `data/gpt_register.env` 或进程环境均可（**勿提交密钥**）：
 
 ```bash
-# 覆盖 TLS 指纹（默认 chrome142）
-export HTTP_IMPERSONATE=chrome136
+# ---- 路径策略（推荐默认）----
+# auto-OTP 时跳过 authorize/continue（默认 1）
+OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1
+# 信任 authorize 已触发的 OTP，跳过显式 send（默认 1）
+OPENAI_TRUST_AUTO_OTP=1
+# auto-OTP 时是否强制密码路径（默认 0；yukkcat 对齐为 0）
+OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=0
+# 非 auto-OTP / 明确 passwordless_signup 时是否优先密码创建（默认 1）
+OPENAI_PREFER_PASSWORD_SIGNUP=1
+
+# ---- Sentinel / SO ----
+# create_account 前 SO 采集等待毫秒；空=默认 5000；0=关闭
+# OPENAI_SO_COLLECT_MS=5000
+# 优先 VM 解 so-token（默认 1）
+OPENAI_SO_PREFER_VM=1
+# create_account 把 so 镜像进 t 字段（默认 1）
+OPENAI_SO_MIRROR_INTO_T=1
+# create_account so 最大长度截断（默认 4096）
+# OPENAI_CREATE_ACCOUNT_SO_MAX=4096
+# Sentinel SDK/frame 版本（默认 20260219f9f6）
+# SENTINEL_SDK_VERSION=20260219f9f6
+# SENTINEL_FRAME_VERSION=20260219f9f6
+
+# ---- 浏览器画像 / TLS ----
+# 固定 TLS 指纹（默认随机 chrome142/136/131/124，偏 142）
+# HTTP_IMPERSONATE=chrome142
+# 平台：windows|mac|auto（默认 auto，Windows 权重 70）
+# OPENAI_BROWSER_PLATFORM=auto
+# OPENAI_BROWSER_WINDOWS_WEIGHT=70
+# 发送 DNT/Sec-GPC（默认 1）
+OPENAI_SEND_GPC=1
+
+# ---- OAuth / 地区 / 调试 ----
+# NextAuth screen_hint（默认 login_or_signup）
+# OPENAI_SCREEN_HINT=login_or_signup
+# 拦截地区列表（默认 CN）
+# OPENAI_BLOCK_REGIONS=CN
+# login_challenge 短超时快速失败（默认 1 / 35s）
+OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
+# OPENAI_OTP_LOGIN_CHALLENGE_PROBE_SECS=35
+# 关闭步骤间随机延迟（调试用）
+# OPENAI_REGISTER_NO_DELAY=1
 ```
+
+> 实测：auto-OTP 后若 `OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=1`（或旧逻辑强制密码），
+> 常见 `account_creation_failed` → OTP `invalid_auth_step` / `invalid_state`。
+> 保持默认 passwordless 即可。
 
 ### 6.8 完成日志与排障输出
 
@@ -443,6 +517,10 @@ curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" -H "Authorization: Bearer $KEY" \
 | 注册成功但 `added=0` | dry_run / push 关 / token 空 | 查 `push_enabled`、`dry_run`、任务 `items` |
 | HTTP 推送连不上 | 容器内用了 host 的 `:8000` | 默认用 `push_mode=local`；http 模式 Docker 内用 `:80` |
 | OTP 超时 / 风控 | 域名信誉、代理出口、OpenAI 策略 | 换域名/代理，降并发，看 `logs`/`items`/`summary` 与 `data/gpt_register_logs/*.json` |
+| `account_creation_failed` 后 OTP `invalid_auth_step` | auto-OTP 会话被强制密码路径打坏 | 保持 `OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=0`；确认日志有 `yukkcat-aligned` passwordless |
+| OTP `invalid_state` / session no longer valid | continue 二次提交或会话过期 | 保持 `OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1`；换干净代理重开流程 |
+| `IP 地理位置不支持` / OAuth reset | 出口被拦或代理不稳 | 换 TW 等可用出口；检查 `OPENAI_BLOCK_REGIONS` |
+| Codex CLI `add_phone required` | Codex 路径额外要手机 | 正常：会回退 NextAuth session token，任务仍可 `registered` |
 
 ---
 
@@ -469,16 +547,20 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 
 | 路径 | 作用 |
 | --- | --- |
-| `gpt_free_register/runner.py` | 单次注册、bootstrap、依赖预检 |
-| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库 |
+| `gpt_free_register/runner.py` | 单次注册、bootstrap、依赖预检；CFD1 邮箱不绑 OpenAI 代理 |
+| `gpt_free_register/engines/platforms/chatgpt/register.py` | 协议注册主流程（passwordless / Sentinel dual-header） |
+| `gpt_free_register/engines/platforms/chatgpt/browser_profile.py` | 每号浏览器画像（TLS/UA/CH 一致） |
+| `gpt_free_register/engines/platforms/chatgpt/constants.py` | Sentinel SDK 版本、OAuth 端点 |
+| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库 + 完成摘要 |
 | `api/gpt_register.py` | 管理 API |
 | `web/.../gpt-register-card.tsx` | 设置页 UI |
-| `test/test_gpt_register.py` | 单测 |
+| `test/test_gpt_register.py` | 服务层单测 |
+| `test/test_gpt_register_engine.py` | 引擎路径单测 |
 
 运行测试：
 
 ```bash
-uv run python -m unittest test.test_gpt_register -v
+uv run python -m unittest test.test_gpt_register test.test_gpt_register_engine -v
 ```
 
 ---
