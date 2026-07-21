@@ -900,14 +900,30 @@ class GptRegisterService:
             payload["export_type"] = "codex"
         if settings.get("bind_register_proxy") and settings.get("proxy"):
             payload["proxy"] = settings["proxy"]
+        # Default free image quota until remote fetch fills real limits_progress.
+        # Without this, quota stays 0 → "no available image quota" even for fresh accounts.
+        if payload.get("quota") in (None, "", 0):
+            payload["quota"] = int(os.environ.get("GPT_FREE_DEFAULT_IMAGE_QUOTA", "30") or 30)
         result = account_service.add_account_items([payload])
         added = int(result.get("added") or 0)
 
-        # Populate real quota/status/type immediately; default quota=0 would hide
-        # free accounts from image selection even when upstream has remaining.
+        # Populate real quota/status/type immediately; default quota above is only a bootstrap.
         try:
+            token = access
+            email = payload.get("email") or ""
+            try:
+                accounts = account_service.list_accounts() or []
+            except Exception:
+                accounts = []
+            if isinstance(accounts, list):
+                for acc in accounts:
+                    if not isinstance(acc, dict):
+                        continue
+                    if (email and str(acc.get("email") or "") == email) or str(acc.get("access_token") or "") == token:
+                        token = str(acc.get("access_token") or token)
+                        break
             account_service.fetch_remote_info(
-                access,
+                token,
                 event="gpt_register_import",
                 defer_invalid_removal=True,
             )

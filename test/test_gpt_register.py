@@ -301,6 +301,7 @@ class ImportLocalTest(unittest.TestCase):
         }
         fake_svc = mock.Mock()
         fake_svc.add_account_items.return_value = {"added": 1, "skipped": 0, "items": []}
+        fake_svc.list_accounts.return_value = []
         fake_svc.fetch_remote_info.return_value = {
             "access_token": "access-only",
             "quota": 0,
@@ -314,6 +315,7 @@ class ImportLocalTest(unittest.TestCase):
         self.assertTrue(payload["session_only"])
         self.assertTrue(payload["fragile"])
         self.assertEqual(payload["source_type"], "register")
+        self.assertEqual(int(payload.get("quota") or 0), 30)
         fake_svc.fetch_remote_info.assert_called_once()
         self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "access-only")
 
@@ -331,11 +333,16 @@ class ImportLocalTest(unittest.TestCase):
         }
         fake_svc = mock.Mock()
         fake_svc.add_account_items.return_value = {"added": 1}
-        fake_svc.fetch_remote_info.return_value = {"access_token": "at-codex", "quota": 2}
+        fake_svc.list_accounts.return_value = [
+            {"email": "c@x.com", "access_token": "at-codex-rotated"}
+        ]
+        fake_svc.fetch_remote_info.return_value = {"access_token": "at-codex-rotated", "quota": 2}
         with mock.patch("services.account_service.account_service", fake_svc):
             added = svc._import_local(account, settings)
         self.assertEqual(added, 1)
         payload = fake_svc.add_account_items.call_args[0][0][0]
         self.assertFalse(payload["session_only"])
         self.assertEqual(payload["source_type"], "codex")
+        self.assertEqual(int(payload.get("quota") or 0), 30)
         fake_svc.fetch_remote_info.assert_called_once()
+        self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "at-codex-rotated")

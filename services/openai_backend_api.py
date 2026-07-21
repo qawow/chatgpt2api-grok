@@ -201,6 +201,97 @@ class OpenAIBackendAPI:
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
+        # Free/passwordless register stores web session cookie for recovery.
+        self._attach_session_cookie()
+
+    def _attach_session_cookie(self) -> None:
+        st = str((self.account or {}).get("session_token") or "").strip()
+        if not st:
+            return
+        try:
+            self.session.cookies.set(
+                "__Secure-next-auth.session-token",
+                st,
+                domain=".chatgpt.com",
+                path="/",
+            )
+        except Exception:
+            pass
+
+    def _try_refresh_access_from_session(self) -> bool:
+        """If Bearer is revoked, mint a new accessToken from session cookie and retry once.
+
+        Always probes /backend-api/me so a stale JWT echoed by /api/auth/session
+        is never treated as a successful refresh.
+        """
+        st = str((self.account or {}).get("session_token") or "").strip()
+        if not st:
+            return False
+        try:
+            # Prefer service path (handles proxy + persistence + /me gate)
+            if self.access_token:
+                old_tok = self.access_token
+                new_tok = account_service.refresh_access_token(
+                    self.access_token, force=True, event="backend_session_refresh"
+                )
+                if new_tok:
+                    self.access_token = new_tok
+                    self.account = account_service.get_account(new_tok) or self.account
+                    self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+                    self._attach_session_cookie()
+                    try:
+                        path = "/backend-api/me"
+                        probe = self.session.get(
+                            self.base_url + path, headers=self._headers(path), timeout=20
+                        )
+                        if probe.status_code == 200:
+                            return True
+                    except Exception:
+                        pass
+                    self.access_token = old_tok
+                    self.session.headers["Authorization"] = f"Bearer {old_tok}"
+                    return False
+            # Direct session endpoint fallback — still require /me 200
+            resp = self.session.get(
+                self.base_url + "/api/auth/session",
+                headers=self._headers("/api/auth/session", {"Accept": "application/json"}),
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return False
+            data = resp.json() if resp.text else {}
+            access = str((data or {}).get("accessToken") or "").strip()
+            if not access:
+                return False
+            old = self.access_token
+            self.access_token = access
+            self.session.headers["Authorization"] = f"Bearer {access}"
+            try:
+                path = "/backend-api/me"
+                probe = self.session.get(
+                    self.base_url + path, headers=self._headers(path), timeout=20
+                )
+                if probe.status_code != 200:
+                    self.access_token = old
+                    if old:
+                        self.session.headers["Authorization"] = f"Bearer {old}"
+                    return False
+            except Exception:
+                self.access_token = old
+                if old:
+                    self.session.headers["Authorization"] = f"Bearer {old}"
+                return False
+            try:
+                if old:
+                    account_service.update_account(
+                        old, {"access_token": access, "status": "正常"}, quiet=True
+                    )
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
@@ -275,23 +366,33 @@ class OpenAIBackendAPI:
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
         response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        if response.status_code == 401 and self._try_refresh_access_from_session():
+            response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
     def _get_conversation_init(self) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
+        payload = {
+            "gizmo_id": None,
+            "requested_default_model": None,
+            "conversation_id": None,
+            "timezone_offset_min": -480,
+        }
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json"}),
-            json={
-                "gizmo_id": None,
-                "requested_default_model": None,
-                "conversation_id": None,
-                "timezone_offset_min": -480,
-            },
+            json=payload,
             timeout=20,
         )
+        if response.status_code == 401 and self._try_refresh_access_from_session():
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._headers(path, {"Content-Type": "application/json"}),
+                json=payload,
+                timeout=20,
+            )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()

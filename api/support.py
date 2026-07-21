@@ -53,7 +53,8 @@ def resolve_image_base_url(request: Request) -> str:
 def raise_image_quota_error(exc: Exception) -> None:
     message = str(exc)
     if "no available image quota" in message.lower():
-        raise HTTPException(status_code=429, detail={"error": "no available image quota"}) from exc
+        # Keep full diagnostic text (pool empty / revoked free / plan filter).
+        raise HTTPException(status_code=429, detail={"error": message}) from exc
     raise HTTPException(status_code=502, detail={"error": message}) from exc
 
 
@@ -85,6 +86,7 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
+                # list_* already exclude free session-only + revoked-cooldown accounts.
                 limited_tokens = account_service.list_limited_tokens()
                 normal_tokens = account_service.list_normal_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()
@@ -99,7 +101,13 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                         f"{len(normal_tokens)} normal accounts, "
                         f"{len(expiring_tokens)} expiring access tokens"
                     )
-                    account_service.refresh_accounts(tokens)
+                    result = account_service.refresh_accounts(tokens)
+                    skipped = int((result or {}).get("skipped") or 0)
+                    if skipped:
+                        print(f"[account-watcher] skipped {skipped} free/session_only/revoked-cooldown")
+                else:
+                    # Quiet idle tick: free session-only pools often have nothing to probe.
+                    pass
                 if keepalive_tokens:
                     print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
                     result = account_service.keepalive_refresh_tokens(keepalive_tokens)

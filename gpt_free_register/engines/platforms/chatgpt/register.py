@@ -522,86 +522,225 @@ class RegistrationEngine:
         }
         return raw if raw in allowed else "login_or_signup"
 
-    def _start_oauth(self) -> bool:
+    @staticmethod
+    def _response_body_snip(resp: Any, limit: int = 180) -> str:
+        try:
+            text = getattr(resp, "text", None) or ""
+        except Exception:
+            text = ""
+        text = str(text).replace("\n", " ").strip()
+        if not text:
+            return "<empty>"
+        return text[:limit]
+
+    def _clear_nextauth_cookies(self) -> None:
+        """Drop chatgpt.com NextAuth/session crumbs so a retry can mint a fresh state."""
+        if not getattr(self, "session", None):
+            return
+        names = (
+            "__Host-next-auth.csrf-token",
+            "__Secure-next-auth.callback-url",
+            "__Secure-next-auth.session-token",
+            "next-auth.csrf-token",
+            "next-auth.callback-url",
+            "next-auth.session-token",
+            "oai-client-auth-session",
+            "oai-sc",
+        )
+        jar = getattr(self.session, "cookies", None)
+        if jar is None:
+            return
+        for name in names:
+            try:
+                jar.set(name, "", domain="chatgpt.com", path="/")
+            except Exception:
+                pass
+            try:
+                jar.set(name, "", domain=".chatgpt.com", path="/")
+            except Exception:
+                pass
+            try:
+                jar.set(name, "", domain="auth.openai.com", path="/")
+            except Exception:
+                pass
+            try:
+                # curl_cffi CookieJar may support delete-like set with expired
+                if hasattr(jar, "delete"):
+                    jar.delete(name)
+            except Exception:
+                pass
+
+    def _parse_json_response(self, resp: Any, label: str) -> Optional[Dict[str, Any]]:
+        """Parse JSON body; log status/content-type/body snip instead of bare JSONDecodeError."""
+        status = getattr(resp, "status_code", "?")
+        headers = getattr(resp, "headers", None) or {}
+        ctype = ""
+        try:
+            ctype = str(headers.get("content-type") or headers.get("Content-Type") or "")
+        except Exception:
+            ctype = ""
+        try:
+            data = resp.json()
+        except Exception as exc:
+            self._log(
+                f"{label} 非 JSON: status={status} content-type={ctype or '-'} "
+                f"err={exc} body={self._response_body_snip(resp)}",
+                "error",
+            )
+            return None
+        if not isinstance(data, dict):
+            self._log(
+                f"{label} JSON 非对象: status={status} type={type(data).__name__} "
+                f"body={self._response_body_snip(resp)}",
+                "error",
+            )
+            return None
+        return data
+
+    def _start_oauth(self, *, attempts: int = 3) -> bool:
         """通过 chatgpt.com NextAuth 发起 OAuth 流程。
 
         Aligns with public protocol registrars / browser_register:
         signin carries prompt=login + screen_hint=login_or_signup + login_hint=email
         so authorize follow is more likely to land on email-verification and auto-send OTP.
+
+        Local robustness (not risk-control bypass):
+        - empty/HTML CSRF or signin responses get one-body diagnostics + retry
+        - each retry clears stale NextAuth cookies and re-seeds chatgpt.com session
         """
-        try:
-            from .constants import CHATGPT_APP
-            import urllib.parse
-            self._log("通过 chatgpt.com NextAuth 发起 OAuth...")
+        from .constants import CHATGPT_APP
+        import urllib.parse
 
-            # 1. 访问 chatgpt.com 获取基础 cookie
-            # WARP/IN exits are often slow; keep timeouts generous for first hop.
-            self.session.get(f"{CHATGPT_APP}/", timeout=30)
-            oai_did = self.session.cookies.get("oai-did", "")
-            self._log(f"chatgpt.com oai-did: {oai_did[:20]}...")
+        attempts = max(1, int(attempts or 1))
+        last_err = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                self._log(
+                    f"通过 chatgpt.com NextAuth 发起 OAuth..."
+                    + (f" (retry {attempt}/{attempts})" if attempt > 1 else "")
+                )
+                if attempt > 1:
+                    self._clear_nextauth_cookies()
+                    time.sleep(0.4 + random.random() * 0.8)
 
-            # 2. 获取 CSRF token
-            csrf_resp = self.session.get(f"{CHATGPT_APP}/api/auth/csrf", timeout=30)
-            csrf_data = csrf_resp.json()
-            csrf_token = csrf_data.get("csrfToken", "")
-            if not csrf_token:
-                # 从 cookie 中提取
-                csrf_cookie = self.session.cookies.get("__Host-next-auth.csrf-token", "")
-                csrf_token = csrf_cookie.split("%7C")[0] if "%7C" in csrf_cookie else csrf_cookie.split("|")[0]
-            self._log(f"CSRF token: {csrf_token[:20]}...")
+                # 1. 访问 chatgpt.com 获取基础 cookie
+                # WARP/IN exits are often slow; keep timeouts generous for first hop.
+                home = self.session.get(f"{CHATGPT_APP}/", timeout=30)
+                home_status = getattr(home, "status_code", "?")
+                if home_status not in (200, 301, 302, 303, 307, 308):
+                    self._log(
+                        f"chatgpt.com 首页异常: status={home_status} "
+                        f"body={self._response_body_snip(home)}",
+                        "warning",
+                    )
+                oai_did = self.session.cookies.get("oai-did", "") or ""
+                self._log(f"chatgpt.com oai-did: {(oai_did[:20] + '...') if oai_did else '(empty)'}")
 
-            # 3. 调用 signin/openai 获取 authorize URL
-            # Public registrars (gpt-free-register / browser_register) pass:
-            #   prompt=login & screen_hint=login_or_signup & login_hint=<email> & ext-oai-did
-            screen_hint = self._resolve_screen_hint()
-            self._oauth_screen_hint = screen_hint
-            q: Dict[str, str] = {"prompt": "login"}
-            if oai_did:
-                q["ext-oai-did"] = oai_did
-            q["screen_hint"] = screen_hint
-            if self.email:
-                q["login_hint"] = str(self.email)
-            q["auth_session_logging_id"] = str(uuid.uuid4())
-            signin_url = f"{CHATGPT_APP}/api/auth/signin/openai?{urllib.parse.urlencode(q)}"
-            self._log(f"signin mode: screen_hint={screen_hint} login_hint={'yes' if self.email else 'no'}")
+                # 2. 获取 CSRF token
+                csrf_resp = self.session.get(
+                    f"{CHATGPT_APP}/api/auth/csrf",
+                    headers={
+                        "accept": "application/json",
+                        "referer": f"{CHATGPT_APP}/",
+                    },
+                    timeout=30,
+                )
+                csrf_data = self._parse_json_response(csrf_resp, "csrf")
+                csrf_token = ""
+                if csrf_data:
+                    csrf_token = str(csrf_data.get("csrfToken") or "").strip()
+                if not csrf_token:
+                    # 从 cookie 中提取
+                    csrf_cookie = self.session.cookies.get("__Host-next-auth.csrf-token", "") or ""
+                    csrf_token = (
+                        csrf_cookie.split("%7C")[0]
+                        if "%7C" in csrf_cookie
+                        else csrf_cookie.split("|")[0]
+                    )
+                    csrf_token = str(csrf_token or "").strip()
+                if not csrf_token:
+                    last_err = "csrf_token_empty"
+                    self._log(
+                        f"CSRF token 为空 status={getattr(csrf_resp, 'status_code', '?')} "
+                        f"body={self._response_body_snip(csrf_resp)}",
+                        "error",
+                    )
+                    continue
+                self._log(f"CSRF token: {csrf_token[:20]}...")
 
-            signin_resp = self.session.post(
-                signin_url,
-                headers={
-                    "content-type": "application/x-www-form-urlencoded",
-                    "origin": CHATGPT_APP,
-                    "referer": f"{CHATGPT_APP}/",
-                    "accept": "application/json",
-                },
-                data=f"callbackUrl={CHATGPT_APP}%2F&csrfToken={csrf_token}&json=true",
-                timeout=30,
-            )
-            self._log(f"signin/openai 状态: {signin_resp.status_code}")
+                # 3. 调用 signin/openai 获取 authorize URL
+                # Public registrars (gpt-free-register / browser_register) pass:
+                #   prompt=login & screen_hint=login_or_signup & login_hint=<email> & ext-oai-did
+                screen_hint = self._resolve_screen_hint()
+                self._oauth_screen_hint = screen_hint
+                q: Dict[str, str] = {"prompt": "login"}
+                if oai_did:
+                    q["ext-oai-did"] = oai_did
+                q["screen_hint"] = screen_hint
+                if self.email:
+                    q["login_hint"] = str(self.email)
+                q["auth_session_logging_id"] = str(uuid.uuid4())
+                signin_url = f"{CHATGPT_APP}/api/auth/signin/openai?{urllib.parse.urlencode(q)}"
+                self._log(
+                    f"signin mode: screen_hint={screen_hint} login_hint={'yes' if self.email else 'no'}"
+                )
 
-            if signin_resp.status_code != 200:
-                self._log(f"signin/openai 失败: {signin_resp.text[:200]}", "error")
-                return False
+                signin_resp = self.session.post(
+                    signin_url,
+                    headers={
+                        "content-type": "application/x-www-form-urlencoded",
+                        "origin": CHATGPT_APP,
+                        "referer": f"{CHATGPT_APP}/",
+                        "accept": "application/json",
+                    },
+                    data=f"callbackUrl={CHATGPT_APP}%2F&csrfToken={csrf_token}&json=true",
+                    timeout=30,
+                )
+                self._log(f"signin/openai 状态: {signin_resp.status_code}")
 
-            signin_data = signin_resp.json()
-            auth_url = signin_data.get("url", "")
-            if not auth_url:
-                self._log("signin/openai 未返回 authorize URL", "error")
-                return False
+                if signin_resp.status_code != 200:
+                    last_err = f"signin_http_{signin_resp.status_code}"
+                    self._log(
+                        f"signin/openai 失败: {self._response_body_snip(signin_resp, 220)}",
+                        "error",
+                    )
+                    continue
 
-            self._log(f"OAuth URL: {auth_url[:80]}...")
+                signin_data = self._parse_json_response(signin_resp, "signin/openai")
+                if not signin_data:
+                    last_err = "signin_non_json"
+                    continue
 
-            # 存储为 OAuthStart (不需要 code_verifier，由 chatgpt.com 后端处理)
-            self.oauth_start = OAuthStart(
-                auth_url=auth_url,
-                state="",  # state 由 NextAuth 管理
-                code_verifier="",  # 不需要
-                redirect_uri="",  # 不需要
-            )
-            return True
+                auth_url = str(signin_data.get("url") or "").strip()
+                if not auth_url:
+                    last_err = "signin_no_url"
+                    self._log(
+                        f"signin/openai 未返回 authorize URL body={self._response_body_snip(signin_resp)}",
+                        "error",
+                    )
+                    continue
 
-        except Exception as e:
-            self._log(f"NextAuth OAuth 流程失败: {e}", "error")
-            return False
+                self._log(f"OAuth URL: {auth_url[:80]}...")
+
+                # 存储为 OAuthStart (不需要 code_verifier，由 chatgpt.com 后端处理)
+                self.oauth_start = OAuthStart(
+                    auth_url=auth_url,
+                    state="",  # state 由 NextAuth 管理
+                    code_verifier="",  # 不需要
+                    redirect_uri="",  # 不需要
+                )
+                # reset flags that belong to a previous oauth attempt
+                self._otp_auto_sent = False
+                self._otp_sent_at = None
+                return True
+
+            except Exception as e:
+                last_err = str(e)
+                self._log(f"NextAuth OAuth 流程失败: {e}", "error")
+                continue
+
+        self._log(f"NextAuth OAuth 放弃: last_err={last_err}", "error")
+        return False
 
     def _init_session(self) -> bool:
         """初始化会话"""
@@ -869,12 +1008,68 @@ class RegistrationEngine:
             pass
         self._log(f"create_account Sentinel 已获取: flow={ca_sentinel.flow}")
 
-    def _submit_signup_form(self, did: str, sen_payload: Optional[SentinelPayload]) -> SignupFormResult:
+    @staticmethod
+    def _is_invalid_state_response(status_code: Any, body: str = "") -> bool:
+        """True for authorize/continue 409 invalid_state (stale NextAuth session)."""
+        try:
+            code = int(status_code or 0)
+        except Exception:
+            code = 0
+        text = str(body or "").lower()
+        if code == 409 and "invalid_state" in text:
+            return True
+        if "invalid_state" in text and ("sign-in session is no longer valid" in text or code in {400, 401, 403, 409}):
+            return True
+        return False
+
+    def _rebuild_oauth_session(self) -> Tuple[bool, Optional[str], Optional[SentinelPayload], str]:
+        """Rebuild NextAuth → authorize → device id → sentinel after invalid_state.
+
+        Local robustness only: clear stale cookies, re-mint OAuth, re-follow authorize.
+        Does not change fingerprints, proxies, or risk-control behavior.
+        Returns (ok, did, sen_payload, error_message).
+        """
+        self._log("OAuth 会话失效，重建 NextAuth/authorize...", "warning")
+        self._clear_nextauth_cookies()
+        self.oauth_start = None
+        self._otp_auto_sent = False
+        self._otp_sent_at = None
+        self._device_id = None
+        self._signup_sentinel = None
+        self._sentinel_token = None
+        self._is_passwordless_signup = False
+        self._force_password_path = False
+        self._is_existing_account = False
+        self._email_verification_mode = ""
+        self._signup_mode = ""
+        time.sleep(0.5 + random.random() * 0.7)
+        if not self._start_oauth(attempts=3):
+            return False, None, None, "重建 OAuth 失败"
+        did = self._get_device_id()
+        if not did:
+            return False, None, None, "重建后获取 Device ID 失败"
+        sen_payload = self._check_sentinel(did)
+        if sen_payload:
+            self._log("重建后 Sentinel 检查通过")
+        else:
+            self._log("重建后 Sentinel 检查失败或未启用", "warning")
+        return True, did, sen_payload, ""
+
+    def _submit_signup_form(
+        self,
+        did: str,
+        sen_payload: Optional[SentinelPayload],
+        *,
+        allow_oauth_rebuild: bool = True,
+    ) -> SignupFormResult:
         """
         提交注册表单（通过 authorize/continue 建立 session）
 
         Returns:
             SignupFormResult: 提交结果，包含账号状态判断
+
+        Local robustness: on authorize/continue 409 invalid_state, optionally rebuild
+        OAuth once (clear cookies → _start_oauth → re-follow authorize → resubmit).
         """
         try:
             self._device_id = did
@@ -969,16 +1164,38 @@ class RegistrationEngine:
                 data=signup_body,
             )
 
-            self._log(f"提交注册表单状态: {response.status_code}")
+            status = getattr(response, "status_code", "?")
+            body_snip = self._response_body_snip(response, 220)
+            self._log(f"提交注册表单状态: {status}")
 
-            if response.status_code != 200:
-                return SignupFormResult(
-                    success=False,
-                    error_message=f"HTTP {response.status_code}: {response.text[:200]}"
-                )
+            if status != 200:
+                err_msg = f"HTTP {status}: {body_snip}"
+                if allow_oauth_rebuild and self._is_invalid_state_response(status, body_snip):
+                    self._log(
+                        f"authorize/continue invalid_state，尝试重建 OAuth 后重提: {body_snip}",
+                        "warning",
+                    )
+                    ok, new_did, new_sen, rebuild_err = self._rebuild_oauth_session()
+                    if not ok:
+                        return SignupFormResult(
+                            success=False,
+                            error_message=f"{err_msg}; rebuild_failed={rebuild_err}",
+                        )
+                    # One rebuild only — prevent infinite loop on persistent 409.
+                    return self._submit_signup_form(
+                        new_did or did,
+                        new_sen,
+                        allow_oauth_rebuild=False,
+                    )
+                return SignupFormResult(success=False, error_message=err_msg)
 
             try:
-                response_data = response.json()
+                response_data = self._parse_json_response(response, "authorize/continue")
+                if not response_data:
+                    return SignupFormResult(
+                        success=False,
+                        error_message=f"authorize/continue 非 JSON: {body_snip}",
+                    )
                 page_type = response_data.get("page", {}).get("type", "")
                 self._log(f"响应页面类型: {page_type}")
 

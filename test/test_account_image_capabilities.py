@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,9 +24,16 @@ class AccountCapabilityTests(unittest.TestCase):
                 {"status": "限流", "quota": 1, "refresh_token": "rt"}
             )
         )
+        # Zero quota without recovery material is not selectable.
         self.assertFalse(
             AccountService._is_image_account_available(
-                {"status": "正常", "quota": 0, "refresh_token": "rt"}
+                {"status": "正常", "quota": 0, "access_token": "at"}
+            )
+        )
+        # Already-used free account with quota 0 stays out (no bootstrap).
+        self.assertFalse(
+            AccountService._is_image_account_available(
+                {"status": "正常", "quota": 0, "refresh_token": "rt", "success": 1}
             )
         )
         self.assertTrue(
@@ -34,16 +42,39 @@ class AccountCapabilityTests(unittest.TestCase):
             )
         )
 
-    def test_session_only_accounts_are_not_image_candidates(self) -> None:
-        # No refresh_token ⇒ session-only / fragile, never image candidate.
+    def test_revoked_and_free_bootstrap_image_candidates(self) -> None:
+        # Known-dead tokens must not be selected even with local quota leftover.
+        self.assertFalse(
+            AccountService._is_image_account_available(
+                {
+                    "status": "正常",
+                    "quota": 25,
+                    "refresh_token": "rt",
+                    "last_refresh_error": "token invalidated (/backend-api/me)",
+                }
+            )
+        )
+        # Fresh free account with recovery material may bootstrap for remote check.
+        self.assertTrue(
+            AccountService._is_image_account_available(
+                {
+                    "status": "正常",
+                    "quota": 0,
+                    "type": "free",
+                    "session_token": "sess",
+                    "success": 0,
+                }
+            )
+        )
+        # Session-only marker still describes the account, but real quota can enter pool.
         self.assertTrue(
             AccountService._is_session_only_account(
                 {"status": "正常", "quota": 5, "access_token": "at"}
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             AccountService._is_image_account_available(
-                {"status": "正常", "quota": 5, "access_token": "at"}
+                {"status": "正常", "quota": 5, "access_token": "at", "session_only": True}
             )
         )
         self.assertFalse(
@@ -211,6 +242,150 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertTrue(bare["fragile"])
             self.assertFalse(durable["session_only"])
             self.assertFalse(durable["fragile"])
+
+    def test_free_session_only_skipped_from_periodic_watcher_lists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "free-session",
+                        "status": "正常",
+                        "type": "free",
+                        "session_token": "sess",
+                        # no refresh_token → session_only
+                    },
+                    {
+                        "access_token": "plus-oauth",
+                        "status": "正常",
+                        "type": "Plus",
+                        "refresh_token": "rt-plus",
+                        "quota": 2,
+                    },
+                ]
+            )
+            normals = service.list_normal_tokens()
+            self.assertNotIn("free-session", normals)
+            self.assertIn("plus-oauth", normals)
+
+    def test_revoked_cooldown_blocks_recover_and_refresh_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "dead-free",
+                        "status": "异常",
+                        "type": "free",
+                        "session_token": "sess",
+                        "password": "pw",
+                        "last_refresh_error": "session_refresh_stale_token_revoked",
+                        "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                        "last_token_refresh_error": "session_refresh_stale_token_revoked",
+                        "last_token_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ]
+            )
+            acc = service.get_account("dead-free")
+            self.assertTrue(AccountService._token_looks_revoked(acc))
+            self.assertTrue(AccountService._revoked_cooldown_active(acc))
+            self.assertTrue(AccountService._should_skip_periodic_refresh(acc))
+
+            # refresh_accounts should skip without calling remote
+            with patch(
+                "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+            ) as get_user_info:
+                result = service.refresh_accounts(["dead-free"])
+                get_user_info.assert_not_called()
+            self.assertEqual(result.get("skipped"), 1)
+            self.assertEqual(result.get("refreshed"), 0)
+
+            # remove_invalid_token should not force another recover round-trip
+            with patch.object(service, "refresh_access_token") as refresh_mock:
+                removed = service.remove_invalid_token("dead-free", "test_cooldown")
+                refresh_mock.assert_not_called()
+            self.assertFalse(removed)
+            kept = service.get_account("dead-free")
+            self.assertIsNotNone(kept)
+            self.assertEqual(kept["status"], "异常")
+
+    def test_revoked_free_marked_abnormal_even_when_auto_remove_off(self) -> None:
+        original_value = config.data.get("auto_remove_invalid_accounts")
+        config.data["auto_remove_invalid_accounts"] = False
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items(
+                    [
+                        {
+                            "access_token": "t1",
+                            "status": "正常",
+                            "type": "free",
+                            "quota": 25,
+                            "session_token": "sess",
+                            "last_refresh_error": "token invalidated (/backend-api/me)",
+                            "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                            "last_token_refresh_error": "session_refresh_stale_token_revoked",
+                            "last_token_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                            "invalid_count": 1,
+                        }
+                    ]
+                )
+                with patch.object(service, "refresh_access_token", return_value=None):
+                    removed = service.remove_invalid_token("t1", "test_mark")
+                self.assertFalse(removed)
+                kept = service.get_account("t1")
+                self.assertEqual(kept["status"], "异常")
+                self.assertFalse(AccountService._is_image_account_available(kept))
+        finally:
+            if original_value is None:
+                config.data.pop("auto_remove_invalid_accounts", None)
+            else:
+                config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_refresh_progress_survives_all_skipped_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "free-session",
+                        "status": "正常",
+                        "type": "free",
+                        "session_token": "sess",
+                    }
+                ]
+            )
+            progress_id = "pid-skip-all"
+            service.init_refresh_progress(progress_id, 1)
+            result = service.refresh_accounts(["free-session"], progress_id=progress_id)
+            self.assertEqual(result.get("skipped"), 1)
+            progress = service.get_refresh_progress(progress_id)
+            self.assertIsNotNone(progress)
+            self.assertTrue(progress["done"])
+            self.assertEqual(progress["result"]["skipped"], 1)
+
+    def test_image_quota_message_explains_revoked_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "dead",
+                        "status": "异常",
+                        "type": "free",
+                        "quota": 25,
+                        "session_token": "sess",
+                        "last_refresh_error": "token invalidated (/backend-api/me)",
+                        "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ]
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                service.get_available_access_token()
+            msg = str(ctx.exception)
+            self.assertIn("no available image quota", msg)
+            self.assertIn("revoked", msg)
 
 
 class TokenLogTests(unittest.TestCase):

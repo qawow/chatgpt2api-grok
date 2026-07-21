@@ -144,6 +144,42 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
 
+    def test_task_wall_clock_timeout_marks_error(self):
+        """Hung handler must fail the task instead of leaving progress=generating."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def hanging_handler(_payload):
+                time.sleep(30)
+                return {"data": [{"url": "http://example.test/late.png"}]}
+
+            service = ImageTaskService(
+                Path(tmp_dir) / "image_tasks.json",
+                generation_handler=hanging_handler,
+                edit_handler=hanging_handler,
+                retention_days_getter=lambda: 30,
+            )
+            import services.image_task_service as its
+
+            cfg = its.config
+            prev = cfg.data.get("image_task_timeout_secs")
+            cfg.data["image_task_timeout_secs"] = 1.0
+            try:
+                task = service.submit_generation(
+                    OWNER,
+                    client_task_id="timeout-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                self.assertEqual(task["id"], "timeout-task")
+                finished = wait_for_task(service, OWNER, "timeout-task", "error", timeout=4.0)
+                self.assertIn("超时", finished.get("error", ""))
+            finally:
+                if prev is None:
+                    cfg.data.pop("image_task_timeout_secs", None)
+                else:
+                    cfg.data["image_task_timeout_secs"] = prev
+
 
 if __name__ == "__main__":
     unittest.main()

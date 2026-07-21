@@ -256,6 +256,9 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        # Init BEFORE create_task so UI poll never races a missing progress_id
+        # (also covers free/session_only filtered-to-empty refresh finishing immediately).
+        account_service.init_refresh_progress(progress_id, len(access_tokens))
 
         async def _do_refresh():
             try:
@@ -284,6 +287,7 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
+        account_service.init_relogin_progress(progress_id, len(access_tokens))
 
         async def _do_relogin():
             try:

@@ -257,8 +257,43 @@ class ImageTaskService:
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
+            try:
+                task_timeout = float(config.image_task_timeout_secs)
+            except Exception:
+                task_timeout = 600.0
+            task_timeout = max(1.0, task_timeout)
+
             handler = self.edit_handler if mode == "edit" else self.generation_handler
-            result = handler(payload_with_progress)
+            # Run the handler in a nested worker so a hung SSE/proxy socket cannot
+            # leave the task stuck at progress=generating forever. The outer
+            # deadline fails the task even if the worker thread is still blocked.
+            result_box: dict[str, Any] = {}
+            error_box: dict[str, BaseException] = {}
+            done = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    result_box["result"] = handler(payload_with_progress)
+                except BaseException as exc:  # noqa: BLE001 - surface to outer task
+                    error_box["error"] = exc
+                finally:
+                    done.set()
+
+            worker = threading.Thread(
+                target=_worker,
+                name=f"image-task-worker-{key[-16:]}",
+                daemon=True,
+            )
+            worker.start()
+            if not done.wait(timeout=task_timeout):
+                raise TimeoutError(
+                    f"图片任务超时（已等待 {int(task_timeout)} 秒仍未完成；"
+                    f"常见于上游 SSE 经代理半开卡住）。可在 config 中调大 "
+                    f"image_task_timeout_secs / image_sse_idle_timeout_secs。"
+                )
+            if "error" in error_box:
+                raise error_box["error"]
+            result = result_box.get("result")
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -401,6 +436,12 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
+            progress = _clean(item.get("progress"))
+            if progress:
+                task["progress"] = progress
+            conversation_id = _clean(item.get("conversation_id"))
+            if conversation_id:
+                task["conversation_id"] = conversation_id
             tasks[_task_key(owner, task_id)] = task
         return tasks
 

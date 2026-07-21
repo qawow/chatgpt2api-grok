@@ -226,16 +226,106 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
-    for raw_line in response.iter_lines():
+class SseStreamTimeoutError(TimeoutError):
+    """Raised when an SSE stream stalls longer than the idle/wall budget."""
+
+
+def iter_sse_payloads(
+    response: requests.Response,
+    *,
+    idle_timeout_secs: float | None = None,
+    total_timeout_secs: float | None = None,
+) -> Iterator[str]:
+    """Yield SSE ``data:`` payloads with optional idle/wall timeouts.
+
+    curl_cffi's ``timeout=`` on the POST mainly covers connect/headers; once the
+    response body is open, ``iter_lines()`` can block indefinitely on a half-open
+    proxy socket (observed: stuck at progress=generating with CLOSE-WAIT SOCKS).
+
+    Implementation: background reader thread + queue so idle/wall budgets can
+    fire even when the underlying socket never returns another byte.
+    """
+    import queue
+    import threading
+
+    if idle_timeout_secs is None or total_timeout_secs is None:
+        try:
+            from services.config import config as _cfg  # lazy: avoid import cycles
+
+            if idle_timeout_secs is None:
+                idle_timeout_secs = float(_cfg.image_sse_idle_timeout_secs)
+            if total_timeout_secs is None:
+                total_timeout_secs = float(_cfg.image_sse_total_timeout_secs)
+        except Exception:
+            if idle_timeout_secs is None:
+                idle_timeout_secs = 90.0
+            if total_timeout_secs is None:
+                total_timeout_secs = 420.0
+    idle_timeout_secs = max(1.0, float(idle_timeout_secs or 90.0))
+    # Keep wall and idle independent so a short wall budget can still fire first.
+    total_timeout_secs = max(1.0, float(total_timeout_secs or 420.0))
+
+    line_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            for raw_line in response.iter_lines():
+                line_queue.put(("line", raw_line))
+            line_queue.put(("done", None))
+        except Exception as exc:  # pragma: no cover - network errors
+            line_queue.put(("error", exc))
+
+    reader = threading.Thread(target=_reader, name="sse-reader", daemon=True)
+    reader.start()
+
+    started = time.time()
+    last_activity = started
+    while True:
+        now = time.time()
+        remaining_total = total_timeout_secs - (now - started)
+        if remaining_total <= 0:
+            raise SseStreamTimeoutError(
+                f"SSE stream exceeded total timeout ({int(total_timeout_secs)}s)"
+            )
+        remaining_idle = idle_timeout_secs - (now - last_activity)
+        if remaining_idle <= 0:
+            # If wall budget is also exhausted, prefer the total-timeout message.
+            if now - started >= total_timeout_secs:
+                raise SseStreamTimeoutError(
+                    f"SSE stream exceeded total timeout ({int(total_timeout_secs)}s)"
+                )
+            raise SseStreamTimeoutError(
+                f"SSE stream idle timeout ({int(idle_timeout_secs)}s) with no data"
+            )
+        wait = max(0.05, min(remaining_total, remaining_idle))
+        try:
+            kind, payload = line_queue.get(timeout=wait)
+        except queue.Empty:
+            now = time.time()
+            # Prefer wall-clock message when the total budget is exhausted
+            # (use >= so exact equality still counts as total timeout).
+            if now - started >= total_timeout_secs:
+                raise SseStreamTimeoutError(
+                    f"SSE stream exceeded total timeout ({int(total_timeout_secs)}s)"
+                )
+            raise SseStreamTimeoutError(
+                f"SSE stream idle timeout ({int(idle_timeout_secs)}s) with no data"
+            )
+
+        if kind == "done":
+            return
+        if kind == "error":
+            raise payload  # type: ignore[misc]
+        last_activity = time.time()
+        raw_line = payload
         if not raw_line:
             continue
         line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
         if not line.startswith("data:"):
             continue
-        payload = line[5:].strip()
-        if payload:
-            yield payload
+        data = line[5:].strip()
+        if data:
+            yield data
 
 
 def save_images_from_text(text: str, prefix: str) -> list[Path]:

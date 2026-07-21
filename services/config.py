@@ -408,6 +408,30 @@ class ConfigStore:
             return 120
 
     @property
+    def image_sse_idle_timeout_secs(self) -> float:
+        """Max seconds with no SSE body data before aborting a hung image stream."""
+        try:
+            return max(5.0, float(self.data.get("image_sse_idle_timeout_secs", 90.0)))
+        except (TypeError, ValueError):
+            return 90.0
+
+    @property
+    def image_sse_total_timeout_secs(self) -> float:
+        """Hard wall-clock budget for a single image SSE stream."""
+        try:
+            return max(30.0, float(self.data.get("image_sse_total_timeout_secs", 420.0)))
+        except (TypeError, ValueError):
+            return 420.0
+
+    @property
+    def image_task_timeout_secs(self) -> float:
+        """Hard wall-clock for a whole image task thread (SSE + poll + download)."""
+        try:
+            return max(1.0, float(self.data.get("image_task_timeout_secs", 600.0)))
+        except (TypeError, ValueError):
+            return 600.0
+
+    @property
     def image_poll_interval_secs(self) -> float:
         try:
             return max(0.5, float(self.data.get("image_poll_interval_secs", 10.0)))
@@ -560,6 +584,9 @@ class ConfigStore:
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_sse_idle_timeout_secs"] = self.image_sse_idle_timeout_secs
+        data["image_sse_total_timeout_secs"] = self.image_sse_total_timeout_secs
+        data["image_task_timeout_secs"] = self.image_task_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency

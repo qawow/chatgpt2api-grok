@@ -101,6 +101,9 @@ def is_connection_timeout_error(message: str) -> bool:
         or "connection timed out" in text
         or "read timed out" in text
         or "connect timeout" in text
+        # Local hard caps on hung SSE via proxy half-open sockets.
+        or "sse stream idle timeout" in text
+        or "sse stream exceeded total timeout" in text
     )
 
 
