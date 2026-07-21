@@ -16,6 +16,8 @@ export type ImageStorageSettings = {
   public_base_url: string;
 };
 
+export type AccountPoolProvider = "chatgpt" | "grok" | "g2a";
+
 export type Account = {
   access_token: string;
   type: AccountType;
@@ -37,6 +39,22 @@ export type Account = {
   image_inflight?: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  /** Grok 号池字段 */
+  provider?: "grok" | "g2a" | string | null;
+  remaining_tokens?: number | null;
+  limit_tokens?: number | null;
+  base_url?: string | null;
+  expired?: string | null;
+  last_refresh?: string | null;
+  last_error?: string | null;
+  created_at?: string | null;
+  account_id?: string | null;
+  /** grokcli2api-go 远程脱敏状态字段（只读） */
+  g2a_server_id?: string | null;
+  g2a_server_name?: string | null;
+  g2a_credential_id?: string | null;
+  readonly?: boolean;
+  remote?: boolean;
 };
 
 export type AccountImportPayload = {
@@ -330,6 +348,173 @@ export async function login(authKey: string) {
 
 export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
+}
+
+/** 将 Grok 后端账号归一成号池 UI 共用的 Account 形状。 */
+export function normalizeGrokAccount(item: Record<string, unknown>): Account {
+  const accessToken = String(item.access_token || item.accessToken || "").trim();
+  const remaining = Number(item.remaining_tokens ?? item.quota ?? 0);
+  const statusRaw = String(item.status || "正常").trim();
+  const status = (["正常", "限流", "异常", "禁用"].includes(statusRaw)
+    ? statusRaw
+    : item.disabled
+      ? "禁用"
+      : "正常") as AccountStatus;
+  const provider =
+    item.provider != null
+      ? String(item.provider)
+      : String(item.source_type || "") === "g2a"
+        ? "g2a"
+        : "grok";
+  return {
+    access_token: accessToken,
+    type: String(item.type || (provider === "g2a" ? "g2a-remote" : "xai")),
+    source_type: provider === "g2a" ? "g2a" : "grok",
+    status,
+    quota: Number.isFinite(remaining) ? Math.max(0, remaining) : 0,
+    email: item.email != null ? String(item.email) : null,
+    user_id: item.account_id != null ? String(item.account_id) : item.sub != null ? String(item.sub) : null,
+    success: Number(item.success || 0),
+    fail: Number(item.fail || 0),
+    last_used_at: item.last_used_at != null ? String(item.last_used_at) : null,
+    proxy: item.proxy != null ? String(item.proxy) : null,
+    provider,
+    remaining_tokens: item.remaining_tokens != null ? Number(item.remaining_tokens) : null,
+    limit_tokens: item.limit_tokens != null ? Number(item.limit_tokens) : null,
+    base_url: item.base_url != null ? String(item.base_url) : null,
+    expired: item.expired != null ? String(item.expired) : null,
+    last_refresh: item.last_refresh != null ? String(item.last_refresh) : null,
+    last_error: item.last_error != null ? String(item.last_error) : null,
+    created_at: item.created_at != null ? String(item.created_at) : null,
+    account_id: item.account_id != null ? String(item.account_id) : null,
+    restore_at: item.expired != null ? String(item.expired) : null,
+    g2a_server_id: item.g2a_server_id != null ? String(item.g2a_server_id) : null,
+    g2a_server_name: item.g2a_server_name != null ? String(item.g2a_server_name) : null,
+    g2a_credential_id: item.g2a_credential_id != null ? String(item.g2a_credential_id) : null,
+    readonly: Boolean(item.readonly ?? provider === "g2a"),
+    remote: Boolean(item.remote ?? provider === "g2a"),
+  };
+}
+
+/** 拉取 grokcli2api-go 远程脱敏号池状态（不含 token）。 */
+export async function fetchG2APoolStatus(serverId?: string) {
+  const qs = serverId ? `?server_id=${encodeURIComponent(serverId)}` : "";
+  const data = await httpRequest<{
+    items?: Array<Record<string, unknown>>;
+    servers?: Array<Record<string, unknown>>;
+    errors?: Array<{ server_id?: string; error?: string }>;
+    total?: number;
+    has_image_proxy?: boolean;
+    note?: string;
+  }>(`/api/g2a/pool${qs}`);
+  return {
+    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
+    servers: data.servers || [],
+    errors: data.errors || [],
+    total: data.total ?? (data.items || []).length,
+    has_image_proxy: Boolean(data.has_image_proxy),
+    note: data.note || "",
+    provider: "g2a" as const,
+  };
+}
+
+export async function fetchGrokAccounts() {
+  const data = await httpRequest<{ items: Array<Record<string, unknown>>; provider?: string }>(
+    "/api/grok/accounts",
+  );
+  return {
+    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
+    provider: "grok" as const,
+  };
+}
+
+export async function createGrokAccounts(accounts: AccountImportPayload[]) {
+  const data = await httpRequest<{
+    items?: Array<Record<string, unknown>>;
+    added?: number;
+    skipped?: number;
+  }>("/api/grok/accounts", {
+    method: "POST",
+    body: { accounts },
+  });
+  return {
+    ...data,
+    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
+  };
+}
+
+export async function deleteGrokAccounts(tokens: string[]) {
+  const data = await httpRequest<{
+    items?: Array<Record<string, unknown>>;
+    removed?: number;
+  }>("/api/grok/accounts", {
+    method: "DELETE",
+    body: { tokens },
+  });
+  return {
+    ...data,
+    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
+  };
+}
+
+/** Grok 刷新是同步接口，直接返回 items（无 progress_id）。 */
+export async function refreshGrokAccounts(accessTokens: string[] = []) {
+  const data = await httpRequest<{
+    items?: Array<Record<string, unknown>>;
+    refreshed?: number;
+    errors?: Array<{ access_token?: string; error?: string }>;
+  }>("/api/grok/accounts/refresh", {
+    method: "POST",
+    body: { access_tokens: accessTokens },
+  });
+  return {
+    refreshed: data.refreshed ?? 0,
+    errors: data.errors ?? [],
+    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
+  };
+}
+
+export async function updateGrokAccount(
+  accessToken: string,
+  updates: {
+    status?: AccountStatus;
+    disabled?: boolean;
+    proxy?: string;
+    base_url?: string;
+  },
+) {
+  const data = await httpRequest<{
+    item?: Record<string, unknown>;
+    items?: Array<Record<string, unknown>>;
+  }>("/api/grok/accounts/update", {
+    method: "POST",
+    body: {
+      access_token: accessToken,
+      ...updates,
+    },
+  });
+  return {
+    item: data.item ? normalizeGrokAccount(data.item) : null,
+    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
+  };
+}
+
+export async function importGrokAccountFiles(
+  files: Array<{ name: string; content: string | Record<string, unknown> }>,
+) {
+  const data = await httpRequest<{
+    items?: Array<Record<string, unknown>>;
+    added?: number;
+    skipped?: number;
+    parse_errors?: Array<{ name: string; error: string }>;
+  }>("/api/grok/accounts/import-files", {
+    method: "POST",
+    body: { files },
+  });
+  return {
+    ...data,
+    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
+  };
 }
 
 export async function fetchModels() {
@@ -929,6 +1114,9 @@ export type G2AServer = {
   name: string;
   base_url: string;
   has_admin_key: boolean;
+  has_api_key?: boolean;
+  can_proxy_image?: boolean;
+  prefer_for_image?: boolean;
   enabled?: boolean;
   note?: string;
   /** Optional outbound proxy for admin calls only; empty = direct (no env proxy). */
@@ -957,8 +1145,10 @@ export async function createG2AServer(server: {
   name: string;
   base_url: string;
   admin_key: string;
+  api_key?: string;
   note?: string;
   proxy?: string;
+  prefer_for_image?: boolean;
 }) {
   return httpRequest<{ server: G2AServer; servers: G2AServer[] }>("/api/g2a/servers", {
     method: "POST",
@@ -972,9 +1162,11 @@ export async function updateG2AServer(
     name?: string;
     base_url?: string;
     admin_key?: string;
+    api_key?: string;
     note?: string;
     enabled?: boolean;
     proxy?: string;
+    prefer_for_image?: boolean;
   },
 ) {
   return httpRequest<{ server: G2AServer; servers: G2AServer[] }>(`/api/g2a/servers/${serverId}`, {

@@ -21,17 +21,21 @@ class G2AServerCreateRequest(BaseModel):
     name: str = ""
     base_url: str = ""
     admin_key: str = ""
+    api_key: str = ""
     note: str = ""
     proxy: str = ""
+    prefer_for_image: bool = True
 
 
 class G2AServerUpdateRequest(BaseModel):
     name: str | None = None
     base_url: str | None = None
     admin_key: str | None = None
+    api_key: str | None = None
     note: str | None = None
     enabled: bool | None = None
     proxy: str | None = None
+    prefer_for_image: bool | None = None
 
 
 class G2APushRequest(BaseModel):
@@ -64,8 +68,10 @@ def create_router() -> APIRouter:
                 name=body.name,
                 base_url=body.base_url,
                 admin_key=body.admin_key,
+                api_key=body.api_key,
                 note=body.note,
                 proxy=body.proxy,
+                prefer_for_image=body.prefer_for_image,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -122,6 +128,25 @@ def create_router() -> APIRouter:
             "server_id": server_id,
             "items": result.get("items") or [],
             "servers": sanitize_g2a_servers(g2a_config.list_servers()),
+        }
+
+    @router.get("/api/g2a/pool")
+    async def list_remote_pool(authorization: str | None = Header(default=None), server_id: str = ""):
+        """Desensitized remote Grok pool status for 号池管理.
+
+        Rows use synthetic access_token ``g2a:{server_id}:{credential_id}``.
+        Tokens are never available from remote admin list.
+        """
+        require_admin(authorization)
+        sid = (server_id or "").strip() or None
+        try:
+            result = await run_in_threadpool(g2a_bridge.list_remote_pool_status, sid)
+        except G2AClientError as exc:
+            raise HTTPException(status_code=_remote_http_status(exc), detail={"error": str(exc)}) from exc
+        return {
+            **result,
+            "config_servers": sanitize_g2a_servers(g2a_config.list_servers()),
+            "has_image_proxy": g2a_bridge.has_image_proxy(),
         }
 
     @router.post("/api/g2a/servers/{server_id}/push")

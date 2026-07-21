@@ -143,5 +143,75 @@ class GrokImageHandlerIsolationTest(unittest.TestCase):
             grok_svc.mark_result.assert_called()
 
 
+class GrokFreeImageExtractionTest(unittest.TestCase):
+    def test_extract_image_generation_call_result_jpeg(self):
+        from services.grok_backend_api import _extract_images_from_responses
+
+        # Minimal JPEG magic as base64 (/9j/...)
+        jpeg_b64 = (
+            "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRof"
+            "Hh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwh"
+            "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAAR"
+            "CAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAn/xAAUEAEAAAAAAAAAAAAA"
+            "AAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oA"
+            "DAMBAAIRAxEAPwCwAA//2Q=="
+        )
+        payload = {
+            "model": "grok-4.5-build-free",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan"}]},
+                {
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "result": jpeg_b64,
+                    "prompt": "a red apple",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Here is the image."}],
+                },
+            ],
+        }
+        images = _extract_images_from_responses(payload)
+        self.assertEqual(len(images), 1)
+        self.assertTrue(images[0]["b64_json"].startswith("/9j/"))
+
+    def test_generate_image_prefers_free_responses_tool(self):
+        from services import grok_backend_api as gba
+
+        account = {
+            "access_token": "at",
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
+            "proxy": "socks5h://127.0.0.1:1080",
+        }
+        jpeg_b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBD" + ("A" * 80)
+        fake_resp = {
+            "model": "grok-4.5-build-free",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "result": jpeg_b64,
+                }
+            ],
+        }
+        with mock.patch.object(gba, "create_response", return_value=fake_resp) as cr, mock.patch.object(
+            gba, "list_upstream_models", side_effect=AssertionError("should not list models first")
+        ), mock.patch.object(gba.requests, "post") as post:
+            result = gba.generate_image(account, prompt="red apple", model="grok-2-image", n=1)
+            self.assertEqual(result["_meta"]["upstream_path"], "responses+image_generation")
+            self.assertTrue(result["data"][0]["b64_json"].startswith("/9j/"))
+            cr.assert_called()
+            # paid images endpoint must not be hit when free path works
+            post.assert_not_called()
+            kwargs = cr.call_args.kwargs
+            self.assertEqual(kwargs.get("tools"), [{"type": "image_generation"}])
+            self.assertIsNone(kwargs.get("tool_choice"))
+            self.assertEqual(kwargs.get("model"), "grok-4.5")
+
+
 if __name__ == "__main__":
     unittest.main()

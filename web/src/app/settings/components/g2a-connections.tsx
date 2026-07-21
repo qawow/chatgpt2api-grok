@@ -53,6 +53,8 @@ export function G2AConnections() {
   const [formName, setFormName] = useState("");
   const [formBaseUrl, setFormBaseUrl] = useState("");
   const [formAdminKey, setFormAdminKey] = useState("");
+  const [formApiKey, setFormApiKey] = useState("");
+  const [formPreferImage, setFormPreferImage] = useState(true);
   const [formNote, setFormNote] = useState("");
   const [formProxy, setFormProxy] = useState("");
   const [showSecret, setShowSecret] = useState(false);
@@ -90,6 +92,8 @@ export function G2AConnections() {
     setFormName("");
     setFormBaseUrl("http://127.0.0.1:8088");
     setFormAdminKey("");
+    setFormApiKey("");
+    setFormPreferImage(true);
     setFormNote("");
     setFormProxy("");
     setShowSecret(false);
@@ -101,6 +105,8 @@ export function G2AConnections() {
     setFormName(server.name || "");
     setFormBaseUrl(server.base_url || "");
     setFormAdminKey("");
+    setFormApiKey("");
+    setFormPreferImage(server.prefer_for_image !== false);
     setFormNote(server.note || "");
     setFormProxy(server.proxy || "");
     setShowSecret(false);
@@ -123,6 +129,8 @@ export function G2AConnections() {
           name: formName.trim(),
           base_url: formBaseUrl.trim(),
           admin_key: formAdminKey.trim() || undefined,
+          api_key: formApiKey.trim() || undefined,
+          prefer_for_image: formPreferImage,
           note: formNote.trim(),
           proxy: formProxy.trim(),
         });
@@ -133,6 +141,8 @@ export function G2AConnections() {
           name: formName.trim(),
           base_url: formBaseUrl.trim(),
           admin_key: formAdminKey.trim(),
+          api_key: formApiKey.trim() || undefined,
+          prefer_for_image: formPreferImage,
           note: formNote.trim(),
           proxy: formProxy.trim(),
         });
@@ -243,7 +253,7 @@ export function G2AConnections() {
                   >
                     Futureppo/grokcli2api-go
                   </a>
-                  ：用 Admin Key 管理远程凭证，并将本地 Grok 号池推送到其 auths。
+                  ：远程生图代理、号池状态镜像、以及本地 → 远程凭证推送。
                 </p>
               </div>
             </div>
@@ -263,9 +273,10 @@ export function G2AConnections() {
 
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
             远程 <code className="rounded bg-white/70 px-1">GET /v1/admin/credentials</code>{" "}
-            只返回脱敏状态，不含 token，因此<strong>不能</strong>从 grokcli2api-go 反向导入本地号池。
-            支持方向：本地 Grok 号池 → 远程上传；以及查看/删除远程脱敏凭证。
-            管理请求默认<strong>直连</strong>（忽略系统 HTTP_PROXY），避免误打到只支持 CONNECT 的代理出现 405。
+            只返回脱敏状态，不含 token，因此<strong>不能</strong>从 grokcli2api-go 反向导入本地 token。
+            但已支持：① Grok 生图直连远程 <code className="rounded bg-white/70 px-1">/v1/images/generations</code>
+            （号池留在 grokcli2api-go，无需迁移）；② 号池管理「GrokCLI2API」页只读镜像远程状态；
+            ③ 本地 Grok 号池 → 远程上传。管理请求默认<strong>直连</strong>（忽略系统 HTTP_PROXY）。
             base URL 填服务根地址，例如 <code className="rounded bg-white/70 px-1">http://127.0.0.1:8088</code>
             ，不要填 <code className="rounded bg-white/70 px-1">/v1</code> 或本地代理端口。
           </div>
@@ -307,6 +318,19 @@ export function G2AConnections() {
                         <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-stone-500">
                           <Badge variant="secondary" className="rounded-md">
                             {server.has_admin_key ? "Admin Key 已配置" : "缺少 Admin Key"}
+                          </Badge>
+                          <Badge variant="secondary" className="rounded-md">
+                            {server.has_api_key ? "API Key 已配置" : "API Key 回退 Admin"}
+                          </Badge>
+                          <Badge
+                            variant={server.can_proxy_image && server.prefer_for_image !== false ? "success" : "secondary"}
+                            className="rounded-md"
+                          >
+                            {server.prefer_for_image === false
+                              ? "不优先代理生图"
+                              : server.can_proxy_image
+                                ? "可代理生图"
+                                : "不可代理生图"}
                           </Badge>
                           {server.last_ok_at ? <span>上次成功：{server.last_ok_at}</span> : null}
                           {server.last_error ? (
@@ -431,6 +455,28 @@ export function G2AConnections() {
                 </button>
               </div>
             </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">OpenAI API Key（可选）</label>
+              <Input
+                type={showSecret ? "text" : "password"}
+                value={formApiKey}
+                onChange={(event) => setFormApiKey(event.target.value)}
+                placeholder={editing ? "留空则不修改；空=回退用 Admin Key" : "可选；空=用 Admin Key 调 /v1/images"}
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs text-stone-500">
+                生图代理走远程 OpenAI 兼容接口。若远程 API Key 与 Admin Key 相同，可留空。
+              </p>
+            </div>
+            <label className="flex items-center gap-2 text-sm text-stone-700">
+              <input
+                type="checkbox"
+                className="size-4 rounded border-stone-300"
+                checked={formPreferImage}
+                onChange={(event) => setFormPreferImage(event.target.checked)}
+              />
+              优先用此连接代理 Grok 生图（号池可留在远程，不必导入本地）
+            </label>
             <div className="space-y-2">
               <label className="text-sm font-medium text-stone-700">备注（可选）</label>
               <Input

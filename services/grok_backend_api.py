@@ -261,17 +261,24 @@ def create_response(
     *,
     input_text: str,
     model: str | None = None,
-    max_output_tokens: int = 1024,
+    max_output_tokens: int | None = 1024,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
     settings = grok_settings()
     base = account_base_url(account)
     url = urljoin(base.rstrip("/") + "/", "responses")
-    body = {
+    body: dict[str, Any] = {
         "model": model or settings["probe_model"],
         "input": input_text,
-        "max_output_tokens": max_output_tokens,
     }
+    if max_output_tokens is not None:
+        body["max_output_tokens"] = max_output_tokens
+    if tools:
+        body["tools"] = tools
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
     try:
         resp = requests.post(
             url,
@@ -307,22 +314,127 @@ def generate_image(
     response_format: str = "b64_json",
     timeout: float = 180.0,
 ) -> dict[str, Any]:
-    """Try OpenAI-compatible images on Build channel; never fall back to ChatGPT.
+    """Generate images on Grok Build channel; never fall back to ChatGPT.
+
+    Free Build accounts typically have no paid /images/generations credits.
+    The working free path is:
+
+        POST {base}/responses
+        model=grok-4.5 (text / build-free)
+        tools=[{type: image_generation}]
+
+    which returns output items of type image_generation_call with JPEG/PNG
+    base64 in ``result``.
 
     Returns OpenAI-like {created, data:[{b64_json|url}], _meta:{upstream_path,...}}.
     """
     resolved_model = resolve_grok_image_model(model)
+    settings = grok_settings()
     base = account_base_url(account)
     headers = build_request_headers(account)
     proxies = _proxies(account_proxy(account))
     attempts: list[dict[str, Any]] = []
+    want_n = max(1, min(int(n or 1), 4))
+    prompt_text = str(prompt or "").strip()
+    if not prompt_text:
+        raise GrokBackendError("prompt is required", status=400)
 
-    # 1) Official-shaped images endpoint
+    # 1) Free Build path: /responses + image_generation tool (dialog-style free image)
+    free_models = _free_image_response_models(resolved_model, settings["probe_model"])
+    for free_model in free_models:
+        try:
+            # Free Build accepts tools=[{type:image_generation}] but rejects OpenAI-style
+            # tool_choice object forms (422 ModelToolChoice). Omit tool_choice.
+            data = create_response(
+                account,
+                input_text=prompt_text,
+                model=free_model,
+                max_output_tokens=None,
+                tools=[{"type": "image_generation"}],
+                timeout=timeout,
+            )
+        except GrokBackendError as exc:
+            attempts.append(
+                {
+                    "path": "responses+image_generation",
+                    "model": free_model,
+                    "error": str(exc)[:200],
+                    "status": exc.status,
+                }
+            )
+            if exc.status in {401, 403}:
+                break
+            continue
+
+        extracted = _extract_images_from_responses(data)
+        upstream_model = str(data.get("model") or free_model)
+        if not extracted:
+            attempts.append(
+                {
+                    "path": "responses+image_generation",
+                    "model": free_model,
+                    "status": 200,
+                    "error": "no_image_payload_in_response",
+                    "response_status": data.get("status"),
+                }
+            )
+            continue
+
+        data_items = list(extracted[:want_n])
+        while len(data_items) < want_n:
+            try:
+                more = create_response(
+                    account,
+                    input_text=prompt_text,
+                    model=free_model,
+                    max_output_tokens=None,
+                    tools=[{"type": "image_generation"}],
+                    timeout=timeout,
+                )
+                more_imgs = _extract_images_from_responses(more)
+                if not more_imgs:
+                    break
+                data_items.extend(more_imgs)
+            except GrokBackendError as exc:
+                attempts.append(
+                    {
+                        "path": "responses+image_generation",
+                        "model": free_model,
+                        "error": str(exc)[:200],
+                        "status": exc.status,
+                    }
+                )
+                break
+        data_items = data_items[:want_n]
+        if response_format == "url":
+            data_items = [
+                {k: v for k, v in item.items() if k != "b64_json"} if item.get("url") else item
+                for item in data_items
+            ]
+        return {
+            "created": int(time.time()),
+            "data": data_items,
+            "_meta": {
+                "upstream_path": "responses+image_generation",
+                "upstream_model": upstream_model,
+                "attempts": attempts
+                + [
+                    {
+                        "path": "responses+image_generation",
+                        "model": free_model,
+                        "status": 200,
+                        "images": len(data_items),
+                    }
+                ],
+            },
+        }
+
+    # 2) Official-shaped images endpoint (paid credits / subscription)
     images_url = urljoin(base.rstrip("/") + "/", "images/generations")
     image_body: dict[str, Any] = {
-        "prompt": prompt,
+        "prompt": prompt_text,
         "model": resolved_model,
-        "n": max(1, min(int(n or 1), 4)),
+        "n": want_n,
         "response_format": response_format or "b64_json",
     }
     if size:
@@ -360,35 +472,34 @@ def generate_image(
                 }
                 return parsed
         if resp.status_code in {401, 403}:
-            # Auth failure — no point trying aliases
-            break
+            # Auth / spending-limit — try remaining aliases once then stop this path
+            # (free path already attempted above)
+            continue
         if resp.status_code not in {404, 405, 400, 422}:
-            # Unexpected hard failure
             break
 
-    # 2) Optional responses path only if /models lists an image-like model
+    # 3) Last resort: /responses with image-like model from catalog (if any)
     image_model_from_catalog = _pick_image_model_from_catalog(account, timeout=min(timeout, 30.0))
     if image_model_from_catalog:
         try:
             data = create_response(
                 account,
-                input_text=f"Generate an image: {prompt}",
+                input_text=f"Generate an image: {prompt_text}",
                 model=image_model_from_catalog,
                 max_output_tokens=2048,
                 timeout=timeout,
             )
             extracted = _extract_images_from_responses(data)
             if extracted:
-                result = {
+                return {
                     "created": int(time.time()),
-                    "data": extracted,
+                    "data": extracted[:want_n],
                     "_meta": {
                         "upstream_path": "responses",
                         "upstream_model": image_model_from_catalog,
                         "attempts": attempts,
                     },
                 }
-                return result
             attempts.append(
                 {
                     "path": "responses",
@@ -408,7 +519,7 @@ def generate_image(
 
     raise GrokBackendError(
         "Grok Build channel has no usable image generation upstream "
-        "(tried /images/generations; optional /responses). "
+        "(tried free /responses+image_generation, then /images/generations). "
         "Account pool and refresh still work. "
         f"attempts={json.dumps(attempts, ensure_ascii=False)[:800]}",
         status=502,
@@ -455,6 +566,55 @@ def _image_model_candidates(model: str) -> list[str]:
         if alias not in ordered:
             ordered.append(alias)
     return ordered
+
+
+def _free_image_response_models(requested_image_model: str, probe_model: str) -> list[str]:
+    """Models accepted by free Build /responses for the image_generation tool.
+
+    Free cli-chat-proxy only exposes text models like grok-4.5 (resolved upstream
+    to grok-4.5-build-free). Image model ids such as grok-2-image return
+    "Model not found" on /responses.
+    """
+    ordered: list[str] = []
+    for candidate in (
+        probe_model or DEFAULT_GROK_TEXT_MODEL,
+        DEFAULT_GROK_TEXT_MODEL,
+        "grok-4.5",
+        "grok-4",
+        "grok-3",
+    ):
+        name = str(candidate or "").strip()
+        if name and name not in ordered:
+            ordered.append(name)
+    # Never put pure image model ids first — they 400 on free Build responses.
+    _ = requested_image_model
+    return ordered
+
+
+def _looks_like_image_b64(value: str) -> bool:
+    s = re.sub(r"\s+", "", value or "")
+    if len(s) < 64:
+        return False
+    if s.startswith("data:image"):
+        return True
+    # Common raw base64 image prefixes (JPEG / PNG / GIF / WEBP RIFF)
+    if s.startswith(("/9j/", "iVBOR", "R0lGOD", "UklGR")):
+        return True
+    try:
+        raw = base64.b64decode(s[:96] + "====", validate=False)
+    except Exception:
+        return False
+    return raw.startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF"))
+
+
+def _normalize_image_b64(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    m = _DATA_URL_RE.search(text)
+    if m:
+        return re.sub(r"\s+", "", m.group("data"))
+    return re.sub(r"\s+", "", text)
 
 
 def _pick_image_model_from_catalog(account: dict[str, Any], *, timeout: float) -> str | None:
@@ -517,14 +677,46 @@ def _parse_openai_images_response(resp: requests.Response, *, response_format: s
 
 
 def _extract_images_from_responses(data: dict[str, Any]) -> list[dict[str, str]]:
+    """Pull image payloads from Build /responses output.
+
+    Free image path yields items like::
+
+        {"type": "image_generation_call", "status": "completed",
+         "result": "<jpeg-or-png-base64>", "prompt": "..."}
+
+    Also accepts OpenAI-style b64_json/url fields and data:image URLs in text.
+    """
     found: list[dict[str, str]] = []
     text_blobs: list[str] = []
 
+    def push_b64(raw: str) -> None:
+        b64 = _normalize_image_b64(raw)
+        if b64 and _looks_like_image_b64(b64):
+            found.append({"b64_json": b64})
+
     def walk(node: Any) -> None:
         if isinstance(node, dict):
+            node_type = str(node.get("type") or "").strip().lower()
+
+            # Free Build: image_generation_call.result is raw image base64
+            if node_type in {"image_generation_call", "image_generation", "image_generation_result"}:
+                result = node.get("result") or node.get("image") or node.get("b64_json") or node.get("base64")
+                if isinstance(result, str) and result.strip():
+                    push_b64(result)
+                # Some gateways nest under result.b64_json / result.url
+                if isinstance(result, dict):
+                    walk(result)
+
             b64 = node.get("b64_json") or node.get("base64")
             if isinstance(b64, str) and b64.strip():
-                found.append({"b64_json": b64.strip()})
+                push_b64(b64)
+
+            # Generic "result" / "image" fields that look like image b64
+            for key in ("result", "image", "image_base64", "data"):
+                val = node.get(key)
+                if isinstance(val, str) and _looks_like_image_b64(val):
+                    push_b64(val)
+
             url = node.get("url") or node.get("image_url")
             if isinstance(url, str) and url.startswith(("http://", "https://", "data:image")):
                 if url.startswith("data:image"):
@@ -549,7 +741,7 @@ def _extract_images_from_responses(data: dict[str, Any]) -> list[dict[str, str]]
     for blob in text_blobs:
         for match in _DATA_URL_RE.finditer(blob):
             found.append({"b64_json": re.sub(r"\s+", "", match.group("data"))})
-    # de-dupe
+    # de-dupe preserving order
     uniq: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in found:

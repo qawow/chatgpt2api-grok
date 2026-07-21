@@ -170,9 +170,11 @@ def create_router() -> APIRouter:
     @router.get("/v1/grok/models")
     async def list_grok_models(authorization: str | None = Header(default=None)):
         require_identity(authorization)
+        from services.g2a_service import g2a_bridge
         from services.grok_account_service import grok_account_service
 
-        has_accounts = grok_account_service.count() > 0
+        # Expose Grok models when local pool OR remote G2A image proxy is ready.
+        has_accounts = grok_account_service.count() > 0 or g2a_bridge.has_image_proxy()
         data = []
         if has_accounts:
             for model in sorted(GROK_IMAGE_MODELS | {DEFAULT_GROK_TEXT_MODEL}):

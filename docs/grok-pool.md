@@ -36,6 +36,20 @@ chatgpt2api 内的 **并行 Grok/xAI Build 号池**。与 `/api/accounts` / `dat
 
 `base_url` 若含 `api.x.ai` 会强制改回 cli-chat-proxy（免费 Build 额度通道）。
 
+## Web 号池管理
+
+管理后台 **号池管理** 页顶部有 **ChatGPT / Grok 本地 / GrokCLI2API** 切换：
+
+- ChatGPT → `/api/accounts*`、`data/accounts.json`
+- Grok 本地 → `/api/grok/accounts*`、`data/grok_accounts.json`
+- GrokCLI2API → `/api/g2a/pool`（远程脱敏状态，**无 token**，只读）
+
+Grok 本地页支持列表、导入 cliproxy JSON、刷新（同步 OAuth refresh + 探活）、编辑状态/代理、删除。  
+GrokCLI2API 页只镜像远程凭证状态，可刷新列表、删除远程凭证；**不能**导出/编辑 token。  
+**不支持** ChatGPT 的密码重登 / OAuth 网页登录。
+
+若号池已在 grokcli2api-go：在 **设置 → GrokCLI2API** 配好连接并勾选「优先代理生图」即可，**不必**迁移到本地 `data/grok_accounts.json`。详见 [g2a-bridge.md](./g2a-bridge.md)。
+
 ## 管理 API（admin Bearer）
 
 ```bash
@@ -88,7 +102,17 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 识别为 Grok 的 model：`grok-2-image`、`grok-2-image-1212`、`grok-imagine`，以及 `grok*` 且含 `image`/`imagine` 的 id。  
 `gpt-image-2` / `codex-gpt-image-2` **仍只走 ChatGPT 池**。
 
-### 独立路径（强制 Grok 池）
+### 上游选择（G2A 优先）
+
+`grok_v1_image_generations.handle` 顺序：
+
+1. 已配置且 `prefer_for_image=true` 的 grokcli2api-go 连接 → `POST {base}/v1/images/generations`  
+2. 否则本地 `data/grok_accounts.json` 免费 Build（`/responses` + `image_generation` tool）  
+3. 永不落入 ChatGPT 号池  
+
+远程失败且本地仍有账号时会回退本地；`force_g2a` / 本地空池时直接报错。
+
+### 独立路径（强制 Grok 路径）
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/grok/images/generations \
@@ -98,15 +122,46 @@ curl -s http://127.0.0.1:8000/v1/grok/images/generations \
 
 响应形状与 OpenAI Images 一致：`{created, data:[{b64_json|url}]}`。
 
+### Web 文生图页 / 任务队列
+
+前端默认走 `POST /api/image-tasks/generations`（不是 `/v1/images/generations`）。  
+任务层 `image_task_service.route_image_generation` 会按 model 分流：
+
+- `grok-2-image` / `grok-imagine` 等 → Grok 路径（G2A 优先，本地回退）
+- 其它 → ChatGPT `IMAGE_MODELS` 白名单
+
+若看到 `unsupported image model, supported models: gpt-image-2, codex-...`，说明请求仍进了 ChatGPT 校验（旧进程或未分流）；重启服务后选 Grok 模型即可。
+
 ### 上游说明
 
-Build 通道在本地代码中**只稳定验证过** `/v1/responses` 与 `/v1/models`。  
-生图会依次尝试：
+Build 免费通道（`cli-chat-proxy.grok.com`）实际可用模型通常只有 `grok-4.5`（上游记为 `grok-4.5-build-free`）。  
+`/images/generations` 对免费号常见返回 `403 personal-team-blocked:spending-limit`（需付费额度）。
 
-1. `POST {base_url}/images/generations`
-2. 若 `/models` 出现 image 类 id，再试 `/responses`
+**免费生图（对话式）**走：
+
+```http
+POST {base_url}/responses
+{
+  "model": "grok-4.5",
+  "input": "<prompt>",
+  "tools": [{"type": "image_generation"}]
+}
+```
+
+不要传 OpenAI 风格的 `tool_choice` 对象——免费 Build 会 422 `ModelToolChoice`。
+
+成功时 `output[]` 含 `type=image_generation_call`，图片在 `result` 字段（JPEG/PNG 的 base64）。  
+本代理会把它归一成 OpenAI Images 形状 `{created, data:[{b64_json}]}`。
+
+本地 `generate_image` 尝试顺序：
+
+1. **免费** `POST /responses` + `tools=image_generation`（文本模型 `grok-4.5`）
+2. 付费 `POST /images/generations`（`grok-2-image` 等）
+3. 若 `/models` 出现 image 类 id，再试裸 `/responses`
 
 若全部失败 → **502**，错误信息标明 attempts；**不会**回落到 ChatGPT 号池。
+
+账号建议带 `proxy`（SOCKS5）；`requests` 走 SOCKS 需要环境里有 `PySocks`（`pyproject.toml` 已声明）。
 
 ## 文本（Grok 专用路径）
 

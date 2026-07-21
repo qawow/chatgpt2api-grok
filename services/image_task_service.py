@@ -11,7 +11,8 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
-from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.protocol import grok_v1_image_generations, openai_v1_image_edit, openai_v1_image_generations
+from utils.grok_models import is_grok_image_model, resolve_grok_image_model
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -61,6 +62,26 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def route_image_generation(body: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch UI/task image generations by model.
+
+    Web UI uses ``/api/image-tasks/generations`` (not ``/v1/images/generations``),
+    so Grok free image models must be routed here too — otherwise ChatGPT's
+    ``is_supported_image_model`` rejects ``grok-2-image`` with unsupported model.
+    """
+    model = str(body.get("model") or "").strip()
+    if is_grok_image_model(model):
+        payload = dict(body)
+        payload["model"] = resolve_grok_image_model(model)
+        # Grok free path is synchronous; progress callback is ChatGPT-SSE only.
+        payload.pop("progress_callback", None)
+        result = grok_v1_image_generations.handle(payload)
+        if not isinstance(result, dict):
+            raise RuntimeError("grok image generation returned unexpected streaming result")
+        return result
+    return openai_v1_image_generations.handle(body)
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -101,7 +122,7 @@ class ImageTaskService:
         self,
         path: Path,
         *,
-        generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
+        generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = route_image_generation,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
     ):
@@ -263,7 +284,14 @@ class ImageTaskService:
                 task_timeout = 600.0
             task_timeout = max(1.0, task_timeout)
 
+            if mode == "edit" and is_grok_image_model(model):
+                raise RuntimeError(
+                    "Grok 免费生图暂不支持图生图/编辑；请改用文生图模型 grok-2-image / grok-imagine"
+                )
             handler = self.edit_handler if mode == "edit" else self.generation_handler
+            # Mark progress for Grok path (no SSE steps) so UI is not stuck blank.
+            if mode != "edit" and is_grok_image_model(model):
+                progress_callback("generating")
             # Run the handler in a nested worker so a hung SSE/proxy socket cannot
             # leave the task stuck at progress=generating forever. The outer
             # deadline fails the task even if the worker thread is still blocked.
