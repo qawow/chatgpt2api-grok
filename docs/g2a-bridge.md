@@ -81,6 +81,51 @@ GET /api/g2a/pool ← 远程脱敏 credentials
 
 推送体为 cliproxy 兼容 JSON（`type=xai` + token 三件套 + headers）。
 
+## 脱敏与安全边界（重要）
+
+### API 回传前端
+
+| 接口 | 回传内容 | 是否含密钥 / token |
+|---|---|---|
+| `GET/POST/DELETE /api/g2a/servers*` | `sanitize_g2a_server` 结果 | **否**：去掉 `admin_key` / `api_key`，仅 `has_admin_key` / `has_api_key` / `can_proxy_image` |
+| `GET /api/g2a/pool` | 远程号池状态行 + 连接元信息 | **否**：`access_token` 为合成 id `g2a:{server_id}:{credential_id}`，`readonly: true` |
+| `GET /api/g2a/servers/{id}/credentials` | 远程凭证摘要 | **否**：解析时剔除 `access_token` / `refresh_token` / `id_token` |
+| `POST /api/g2a/servers/{id}/push` | 推送结果计数 / 错误摘要 | **否**（响应不回显 token） |
+
+实现入口：
+
+- `services/g2a_service.sanitize_g2a_server` / `sanitize_g2a_servers`
+- `credential_to_account_row`（合成 id，永不透传远程 token 字段）
+- `_extract_credential_list` 的 `raw` 字段已剥离 token 三件套
+
+### 密钥落盘（运行时，不进 git）
+
+| 文件 | 内容 | 提交策略 |
+|---|---|---|
+| `data/g2a_config.json` | 连接配置，含 `admin_key` / `api_key` | **禁止提交** |
+| `data/grok_accounts.json` | 本地 Grok OAuth token | **禁止提交** |
+| `data/*.env` / 代理凭据 | 注册机、代理等 | **禁止提交** |
+
+### 两种「上传」不要混
+
+| 方向 | 是否带真实 token | 说明 |
+|---|---|---|
+| **Git 推送到 GitHub** | 否 | 只推源码/文档/测试；密钥与号池文件不入库 |
+| **设置页「推送本地 Grok 号池」** | **会** | 主动把本地 OAuth 凭证发给已配置的 grokcli2api-go，远程才能轮转生图；属业务行为，需管理员 Bearer |
+| **号池管理「GrokCLI2API」列表** | 否 | 只读镜像远程脱敏状态，不能导出 / 编辑 token |
+
+### 管理鉴权
+
+- 所有 `/api/g2a/*` 均需 chatgpt2api **管理员** Bearer（`require_admin`）
+- 远程管理接口另需 `GROK_ADMIN_KEY`；OpenAI 兼容生图可用 `api_key`（空则回退 `admin_key`）
+- 密钥写入仅发生在：创建/更新连接（body 传入）或推送号池（读本地池后发往远程）
+
+### 前端展示约定
+
+- 设置页连接卡片只显示「已配置 Admin Key / API Key / 可代理生图」徽章，**不回显**密钥明文
+- 号池页 GrokCLI2API 标签为只读：可刷新、可删远程凭证，**无**导入/导出 token、无编辑 token
+- 表格里的 `access_token` 列若出现 `g2a:...` 形态，那是合成 id，不是可用 OAuth token
+
 ## 使用步骤（号池留在远程）
 
 1. 部署 grokcli2api-go，设置 `GROK_ADMIN_KEY`，确保管理接口与 `/v1/images/generations` 可访问  

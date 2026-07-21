@@ -89,13 +89,14 @@ curl -s "$BASE/v1/grok/chat/completions" \
   -d '{"model":"grok-4.5","messages":[{"role":"user","content":"Reply: OK"}]}'
 ```
 
-### 3.4 推送到 grokcli2api-go
+### 3.4 接入 grokcli2api-go
 
-1. Web：设置 → **GrokCLI2API** → 添加 `http://host:8088` + `GROK_ADMIN_KEY`  
-2. 探测连通 → 推送本地 Grok 号池  
-3. 管理请求默认**直连**（忽略系统 HTTP_PROXY），避免 CONNECT-only 405  
+1. Web：设置 → **GrokCLI2API** → 添加 `http://host:8088` + `GROK_ADMIN_KEY`（可选 API Key，勾选「优先代理生图」）  
+2. 探测连通；管理请求默认**直连**（忽略系统 HTTP_PROXY），避免 CONNECT-only 405  
+3. **号池留在远程（推荐）**：号池管理切 **GrokCLI2API** 看脱敏状态；文生图选 Grok 模型会直连远程 `/v1/images/generations`，**不必**推送/迁移本地账号  
+4. **可选**：若也要维护本地副本，再「推送本地 Grok 号池」（此操作会向远程发送真实 OAuth token）  
 
-详见 [g2a-bridge.md](./g2a-bridge.md)。
+详见 [g2a-bridge.md](./g2a-bridge.md)（含脱敏与安全边界）。
 
 ### 3.5 GPT Free 批量注册
 
@@ -194,3 +195,21 @@ uv run python -m unittest \
 - `data/*.env`、G2A admin key、号池 token 勿提交 git  
 - 管理端口勿裸奔公网；需要时反代 + HTTPS + 访问控制  
 - 本项目仅供学习研究，遵守各平台服务条款与法律  
+
+### 8.1 G2A / Grok 脱敏清单
+
+| 路径 | 是否回显密钥/token | 备注 |
+|---|---|---|
+| `/api/g2a/servers*` 响应 | 否 | `sanitize_g2a_server` 去掉 `admin_key` / `api_key` |
+| `/api/g2a/pool` | 否 | 合成 id `g2a:{server}:{cred}`，只读状态 |
+| `/api/g2a/servers/{id}/credentials` | 否 | 剔除 token 三件套 |
+| 设置页「推送本地 Grok 号池」 | 请求体会带本地 OAuth token | **主动推号**，仅管理员；响应不回显 token |
+| Git 推送到公开仓库 | 否（应） | 只提交源码/文档；`data/*` 密钥与 `backups/` 勿入库 |
+
+运行时密钥文件：
+
+- `data/g2a_config.json` — 连接 + admin/api key  
+- `data/grok_accounts.json` — 本地 Grok OAuth  
+- `data/accounts.json` — ChatGPT 号池  
+
+详见 [g2a-bridge.md §脱敏与安全边界](./g2a-bridge.md)、[grok-pool.md](./grok-pool.md)。  
