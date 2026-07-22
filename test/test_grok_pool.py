@@ -102,6 +102,50 @@ class GrokAccountServiceTest(unittest.TestCase):
         picked = {self.svc.get_next_account()["access_token"] for _ in range(4)}
         self.assertEqual(picked, {"good"})
 
+    def test_get_next_auto_refreshes_expired_token(self):
+        self.svc.add_account_items(
+            [
+                {
+                    "access_token": "old-at",
+                    "refresh_token": "rt-1",
+                    "type": "xai",
+                    "status": "正常",
+                    "expired": "2020-01-01T00:00:00Z",
+                    "token_endpoint": "https://auth.x.ai/oauth2/token",
+                }
+            ]
+        )
+        with mock.patch(
+            "services.grok_account_service.refresh_access_token",
+            return_value={
+                "access_token": "new-at",
+                "refresh_token": "rt-1",
+                "expires_in": 3600,
+                "expires_at": 4_000_000_000,
+            },
+        ) as refresh:
+            picked = self.svc.get_next_account()
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked["access_token"], "new-at")
+        refresh.assert_called_once()
+        # Pool re-keyed to new access token.
+        self.assertEqual(self.svc.count(), 1)
+        self.assertEqual(self.svc.list_accounts()[0]["access_token"], "new-at")
+
+    def test_token_needs_refresh_within_skew(self):
+        from datetime import datetime, timedelta, timezone
+
+        soon = (datetime.now(timezone.utc) + timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        account = {
+            "access_token": "at",
+            "refresh_token": "rt",
+            "expired": soon,
+        }
+        self.assertTrue(self.svc._token_needs_refresh(account, skew_seconds=300))
+        far = (datetime.now(timezone.utc) + timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        account["expired"] = far
+        self.assertFalse(self.svc._token_needs_refresh(account, skew_seconds=300))
+
     def test_delete(self):
         self.svc.add_account_items([{"access_token": "x", "type": "xai"}])
         out = self.svc.delete_accounts(["x"])

@@ -174,6 +174,23 @@ POST {base_url}/responses
 
 账号建议带 `proxy`（SOCKS5）；`requests` 走 SOCKS 需要环境里有 `PySocks`（`pyproject.toml` 已声明）。
 
+### 凭证过期与自动刷新
+
+Build access token 通常约 6 小时有效。`expired` 过期后上游会返回：
+
+```text
+HTTP 401 ... Invalid or expired credentials ... reason=no auth context
+```
+
+本侧处理：
+
+1. **选号时自动刷新**：`get_next_account` 在 token 已过期或距过期 ≤5 分钟时，用 `refresh_token` 调 `auth.x.ai/oauth2/token` 换新 access token  
+2. **401 再试一次**：本地生图若仍 401/403，会强制 `ensure_fresh_account` 后重试该号一次  
+3. **号池管理 → 刷新**：手动批量 refresh + probe（`POST /api/grok/accounts/refresh`）
+
+若 refresh_token 也失效，需重新导入 cliproxy OAuth 凭证。  
+`data/g2a_config.json` 不存在时会跳过 G2A，直接走本地池（请在设置 → GrokCLI2API 重新保存连接）。
+
 ## 文本（Grok 专用路径）
 
 ```bash

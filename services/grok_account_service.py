@@ -197,25 +197,105 @@ class GrokAccountService:
             return dict(next_item)
 
     # ── selection ───────────────────────────────────────────────
+    # Refresh a bit before natural expiry so free Build requests don't 401 mid-flight.
+    _TOKEN_SKEW_SECONDS = 300
+
     def _is_available(self, account: dict[str, Any]) -> bool:
         if bool(account.get("disabled")):
             return False
         status = _clean(account.get("status")) or "正常"
         return status not in {"禁用", "异常"}
 
+    def _parse_expired_at(self, account: dict[str, Any]) -> datetime | None:
+        raw = _clean(account.get("expired"))
+        if not raw:
+            return None
+        try:
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _token_needs_refresh(self, account: dict[str, Any], *, skew_seconds: int | None = None) -> bool:
+        """True when access token is missing expiry, already expired, or within skew window."""
+        if not _clean(account.get("refresh_token")):
+            return False
+        skew = self._TOKEN_SKEW_SECONDS if skew_seconds is None else max(0, int(skew_seconds))
+        exp = self._parse_expired_at(account)
+        if exp is None:
+            # Unknown expiry: refresh opportunistically if last_refresh is old / missing.
+            last = _clean(account.get("last_refresh"))
+            if not last:
+                return True
+            try:
+                if last.endswith("Z"):
+                    last = last[:-1] + "+00:00"
+                lr = datetime.fromisoformat(last)
+                if lr.tzinfo is None:
+                    lr = lr.replace(tzinfo=timezone.utc)
+                # Re-refresh at least every ~5h if expiry field is absent.
+                return (datetime.now(timezone.utc) - lr.astimezone(timezone.utc)).total_seconds() > 5 * 3600
+            except Exception:
+                return True
+        now = datetime.now(timezone.utc)
+        return exp.timestamp() <= now.timestamp() + skew
+
+    def ensure_fresh_account(self, account: dict[str, Any] | None, *, force: bool = False) -> dict[str, Any] | None:
+        """Refresh OAuth access token if expired / near expiry. Returns updated account snapshot."""
+        if not isinstance(account, dict):
+            return None
+        token = _clean(account.get("access_token"))
+        if not token:
+            return None
+        if not force and not self._token_needs_refresh(account):
+            return dict(account)
+
+        rt = _clean(account.get("refresh_token"))
+        if not rt:
+            return dict(account)
+
+        try:
+            token_data = refresh_access_token(
+                rt,
+                token_endpoint=_clean(account.get("token_endpoint")) or None,
+                proxy=_clean(account.get("proxy")) or None,
+            )
+        except GrokBackendError:
+            # Leave the original account; caller may still try and mark 401.
+            return dict(account)
+        except Exception:
+            return dict(account)
+
+        fields = {
+            "access_token": _clean(token_data.get("access_token")) or token,
+            "refresh_token": _clean(token_data.get("refresh_token")) or rt,
+            "id_token": _clean(token_data.get("id_token")) or account.get("id_token"),
+            "expires_in": token_data.get("expires_in"),
+        }
+        exp_at = token_data.get("expires_at")
+        if exp_at:
+            try:
+                fields["expired"] = datetime.fromtimestamp(
+                    int(exp_at), tz=timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass
+        updated = self.replace_token(token, fields)
+        return dict(updated) if updated else dict(account)
+
     def get_next_account(self, *, exclude_tokens: set[str] | None = None) -> dict[str, Any] | None:
         exclude = exclude_tokens or set()
         with self._lock:
-            tokens = [t for t, a in self._accounts.items() if t not in exclude and self._is_available(a)]
-            if not tokens:
-                return None
-            if self._index >= len(tokens):
-                self._index = 0
-            # map index into available list via full ordered keys
             ordered = list(self._accounts.keys())
             if not ordered:
                 return None
             start = self._index % len(ordered)
+            candidate: dict[str, Any] | None = None
+            candidate_token: str | None = None
             for offset in range(len(ordered)):
                 token = ordered[(start + offset) % len(ordered)]
                 if token in exclude:
@@ -226,9 +306,29 @@ class GrokAccountService:
                     next_item = dict(account)
                     next_item["last_used_at"] = _now_iso()
                     self._accounts[token] = {**account, "last_used_at": next_item["last_used_at"]}
-                    # persist last_used lazily only on mark/save paths to avoid write storms
-                    return next_item
-            return None
+                    candidate = next_item
+                    candidate_token = token
+                    break
+            if candidate is None:
+                return None
+
+        # Refresh outside the long critical section (network I/O).
+        fresh = self.ensure_fresh_account(candidate)
+        if fresh is None:
+            return candidate
+        # If token rotated, keep last_used_at.
+        if candidate_token and _clean(fresh.get("access_token")) != candidate_token:
+            with self._lock:
+                cur = self._accounts.get(_clean(fresh.get("access_token")))
+                if cur is not None:
+                    cur = dict(cur)
+                    cur["last_used_at"] = candidate.get("last_used_at") or _now_iso()
+                    self._accounts[_clean(fresh.get("access_token"))] = cur
+                    fresh = dict(cur)
+        else:
+            fresh = dict(fresh)
+            fresh["last_used_at"] = candidate.get("last_used_at") or _now_iso()
+        return fresh
 
     def mark_result(self, access_token: str, success: bool, *, error: str | None = None) -> None:
         token = _clean(access_token)

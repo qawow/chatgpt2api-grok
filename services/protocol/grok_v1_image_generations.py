@@ -115,6 +115,33 @@ def _handle_via_local_pool(body: dict[str, Any]) -> dict[str, Any]:
                     data_items.append(item)
             grok_account_service.mark_result(token, True)
         except GrokBackendError as exc:
+            # One forced refresh + retry on auth failures (token may have just expired mid-request).
+            if getattr(exc, "status", None) in {401, 403}:
+                try:
+                    refreshed = grok_account_service.ensure_fresh_account(account, force=True)
+                    new_token = str((refreshed or {}).get("access_token") or "")
+                    if refreshed and new_token and new_token != token:
+                        exclude.add(new_token)
+                    if refreshed:
+                        result = generate_image(
+                            refreshed,
+                            prompt=prompt,
+                            model=model,
+                            n=1,
+                            size=str(size) if size else None,
+                            response_format=response_format,
+                        )
+                        meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
+                        meta_attempts.append({**meta, "retried_after_refresh": True})
+                        for item in result.get("data") or []:
+                            if isinstance(item, dict):
+                                data_items.append(item)
+                        grok_account_service.mark_result(new_token or token, True)
+                        continue
+                except Exception as retry_exc:
+                    last_error = str(retry_exc)
+                    grok_account_service.mark_result(token, False, error=str(retry_exc)[:300])
+                    continue
             last_error = str(exc)
             grok_account_service.mark_result(token, False, error=str(exc)[:300])
             continue

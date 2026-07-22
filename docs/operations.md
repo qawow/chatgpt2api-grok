@@ -170,7 +170,8 @@ docker logs -f chatgpt2api-local
 | provider_definitions 缺表 | `data/register_engines.db` 权限/损坏 → 删除后重启 |
 | SOCKS 报 Missing dependencies | 镜像缺 PySocks → rebuild |
 | G2A 405 only CONNECT | 管理请求被系统代理劫持 → 已默认直连；检查 base_url 是否填成代理端口 |
-| Grok 生图 502 | Build 通道可能无 images；不会回落 ChatGPT 池 |
+| Grok 生图 502 / `no auth context` | 本地 access token 过期：号池会在选号时自动 refresh；也可号池管理点「刷新」。无 G2A 配置时只走本地池 |
+| Grok 生图 502（非 401） | Build 通道可能无 images / 额度；不会回落 ChatGPT 池 |
 | GPT 注册 `account_creation_failed` + OTP 失效 | 勿强制 auto-OTP 密码路径；见 [gpt-register.md](gpt-register.md) §6.7 |
 | GPT 注册成功但 Codex `add_phone` | 默认已跳过 Codex（`skip_codex`/`OPENAI_SKIP_CODEX=1`）；若手动关闭跳过则回退 NextAuth session；号标 `session_only`，不进生图候选、不自动删 |
 | 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；无 refresh 号为 fragile，只标异常不剔除；默认跳过 Codex 的号为 `session_only` 不进生图 |
