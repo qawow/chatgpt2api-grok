@@ -115,9 +115,14 @@ class OAuthLoginStartRequest(BaseModel):
 
 
 class OAuthLoginFinishRequest(BaseModel):
-    """提交 callback。callback 既可以是完整 URL 也可以只填 code。"""
+    """提交 callback。callback 既可以是完整 URL 也可以只填 code。
+
+    replace_access_token：可选。成功写入新 token 后删除该旧 access_token
+    （用于把 session_only 号「OAuth 补 refresh」升级成完整凭证，避免留下脆弱重复行）。
+    """
     session_id: str = ""
     callback: str = ""
+    replace_access_token: str = ""
 
 
 def _account_payload_token(item: dict[str, Any]) -> str:
@@ -385,13 +390,32 @@ def create_router() -> APIRouter:
             "refresh_token": tokens["refresh_token"],
             "id_token": tokens["id_token"],
             "source_type": "oauth_login",
+            # OAuth 完整凭证：显式清掉 session_only/fragile（normalize 也会按 refresh 重算）
+            "session_only": False,
+            "fragile": False,
         }
         add_result = await run_in_threadpool(account_service.add_account_items, [payload])
+
+        # 升级路径：用新 OAuth 行替换旧的 session_only access_token，避免号池里残留脆弱重复项
+        replaced = 0
+        old_token = str(body.replace_access_token or "").strip()
+        new_token = str(tokens["access_token"] or "").strip()
+        if old_token and new_token and old_token != new_token:
+            try:
+                del_result = await run_in_threadpool(account_service.delete_accounts, [old_token])
+                replaced = int(del_result.get("removed") or 0)
+            except Exception as exc:
+                print(
+                    f"[oauth-login] replace old token failed after oauth add: {exc}",
+                    flush=True,
+                )
+
         refresh_result = await run_in_threadpool(
             account_service.refresh_accounts, [tokens["access_token"]]
         )
         return {
             **add_result,
+            "replaced": replaced,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", add_result.get("items", [])),

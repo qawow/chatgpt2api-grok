@@ -36,6 +36,23 @@ class NormalizeSettingsTest(unittest.TestCase):
         s2 = normalize_settings({"skip_codex": False})
         self.assertFalse(s2["skip_codex"])
 
+    def test_api_model_accepts_latency_fields(self):
+        """Regression: undeclared fields were dropped by Pydantic → UI could not uncheck skip_codex."""
+        from api.gpt_register import GptRegisterSettingsUpdate
+
+        body = GptRegisterSettingsUpdate(
+            skip_codex=False,
+            register_no_delay=True,
+            so_collect_ms="1000",
+            count=2,
+        )
+        patch = body.model_dump(exclude_none=True)
+        self.assertIn("skip_codex", patch)
+        self.assertFalse(patch["skip_codex"])
+        self.assertTrue(patch["register_no_delay"])
+        self.assertEqual(patch["so_collect_ms"], "1000")
+        self.assertEqual(patch["count"], 2)
+
 
 class ConfigStoreTest(unittest.TestCase):
     def setUp(self):
@@ -51,6 +68,15 @@ class ConfigStoreTest(unittest.TestCase):
         updated = self.cfg.update({"chatgpt2api_auth_key": "", "count": 5})
         self.assertEqual(updated["chatgpt2api_auth_key"], "k1")
         self.assertEqual(updated["count"], 5)
+
+    def test_update_persists_skip_codex_false(self):
+        updated = self.cfg.update({"skip_codex": False, "register_no_delay": True})
+        self.assertFalse(updated["skip_codex"])
+        self.assertTrue(updated["register_no_delay"])
+        # reload from disk
+        reloaded = GptRegisterConfig(path=self.path).get()
+        self.assertFalse(reloaded["skip_codex"])
+        self.assertTrue(reloaded["register_no_delay"])
 
 
 class ExtractJsonTest(unittest.TestCase):

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### chatgpt2api-grok（本分支）
+
++ [修复] GPT 注册「跳过 Codex」取消不生效：`GptRegisterSettingsUpdate` 补齐 `skip_codex` / `register_no_delay` / `so_collect_ms`，避免 Pydantic 静默丢字段。
++ [新增] ChatGPT 号池 **OAuth 补 refresh**：对 `session_only` 账号可从行操作（钥匙图标）或工具栏打开浏览器 OAuth，预填邮箱并写入完整 `refresh_token`。
++ [新增] `POST /api/accounts/oauth/finish` 支持 `replace_access_token`，升级成功后删除旧 session 行，避免脆弱重复账号。
++ [文档] `docs/gpt-register.md` / `docs/operations.md` / README 补充 session_only 升级路径与保存配置说明。
+
 ## 1.7.0 - 2026-07-05
 
 + [移除] 移除注册功能、防滥用机制导致封禁GitHub账号。

@@ -495,9 +495,15 @@ OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
 | 关闭步骤随机延迟 | 关（可选 `register_no_delay` / `OPENAI_REGISTER_NO_DELAY=1`） | 调试用；默认保留轻微抖动 |
 | SO collect | 默认 5s create_account | 可用 `so_collect_ms` / `OPENAI_SO_COLLECT_MS` 覆盖；`0` 关闭 |
 
-Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关闭步骤间随机延迟」。
+Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关闭步骤间随机延迟」。  
+保存/启动时字段经 `POST /api/gpt-register/settings` 与 `start` 的 Pydantic 模型（含 `skip_codex` / `register_no_delay` / `so_collect_ms`）；未声明字段会被丢弃，旧版因此无法取消「跳过 Codex」。
 
-> 跳过 Codex 后拿到的是 **session_only** 号：可入库排查，**不参与生图候选**、不因 401 自动删除。若你明确需要 refresh_token，再取消勾选并接受更长耗时与 `add_phone` 失败概率。
+> 跳过 Codex 后拿到的是 **session_only** 号：可入库排查，**不参与生图候选**、不因 401 自动删除。若你明确需要 refresh_token，再取消勾选并**保存配置**后启动任务，接受更长耗时与 `add_phone` 失败概率。
+>
+> **已有 session_only 号怎么补 refresh？** 在 **号池管理 → ChatGPT**：
+> 1. 行操作点钥匙图标 **OAuth 补 refresh**（或勾选后点工具栏同名按钮）  
+> 2. 确认预填邮箱 → 打开授权页 → 登录**同一邮箱** → 粘贴 callback URL → 完成升级  
+> 3. 后端会写入带 `refresh_token` 的新凭证，并删除旧 session 行（`POST /api/accounts/oauth/finish` 的 `replace_access_token`）
 
 ### 6.8 完成日志与排障输出
 
@@ -577,15 +583,23 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 | `gpt_free_register/engines/platforms/chatgpt/constants.py` | Sentinel SDK 版本、OAuth 端点 |
 | `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库（session_only + 后台 fetch_remote_info + 日志节流）+ 完成摘要 |
 | `services/account_service.py` | 号池：`session_only`/`fragile` 门禁、生图选号、invalid 自动移除策略 |
-| `api/gpt_register.py` | 管理 API |
+| `services/oauth_login_service.py` | 浏览器 OAuth PKCE；换 token 三件套 |
+| `api/gpt_register.py` | 管理 API（含 `skip_codex` 等 latency 字段） |
+| `api/accounts.py` | `oauth/start` + `oauth/finish`（`replace_access_token` 升级 session 行） |
 | `web/.../gpt-register-card.tsx` | 设置页 UI |
+| `web/.../accounts/page.tsx` | 号池「OAuth 补 refresh」按钮 / session 徽章 |
+| `web/.../account-import-dialog.tsx` | OAuth 导入 + 升级模式（预填邮箱） |
 | `test/test_gpt_register.py` | 服务层单测 |
 | `test/test_gpt_register_engine.py` | 引擎路径单测 |
+| `test/test_oauth_login_api.py` | OAuth finish 模型与 replace 逻辑 |
 
 运行测试：
 
 ```bash
-uv run python -m unittest test.test_gpt_register test.test_gpt_register_engine -v
+uv run python -m unittest \
+  test.test_gpt_register \
+  test.test_gpt_register_engine \
+  test.test_oauth_login_api -v
 ```
 
 ---
@@ -602,7 +616,8 @@ uv run python -m unittest test.test_gpt_register test.test_gpt_register_engine -
 
 | 模块 | 关系 |
 | --- | --- |
-| ChatGPT 号池 `/api/accounts` | 注册成功默认写入 |
+| ChatGPT 号池 `/api/accounts` | 注册成功默认写入；session_only 可在号池页 OAuth 升级 |
+| 号池 OAuth `/api/accounts/oauth/*` | 浏览器登录补 `refresh_token`；finish 可 `replace_access_token` |
 | Grok 号池 `/api/grok/*` | **无关**，不写入 |
 | G2A `/api/g2a/*` | 只推 Grok 号，与 GPT 注册无关 |
 | CPA / Sub2API | 其它导入通道，互不替代 |

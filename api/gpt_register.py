@@ -36,6 +36,11 @@ class GptRegisterSettingsUpdate(BaseModel):
     chatgpt2api_base_url: str | None = None
     chatgpt2api_auth_key: str | None = None
     dry_run: bool | None = None
+    # latency knobs — must be declared or FastAPI/Pydantic silently drops them
+    # (frontend was sending skip_codex:false but it never reached config store)
+    skip_codex: bool | None = None
+    register_no_delay: bool | None = None
+    so_collect_ms: str | None = None
 
 
 class GptRegisterStartRequest(GptRegisterSettingsUpdate):

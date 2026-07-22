@@ -175,6 +175,7 @@ docker logs -f chatgpt2api-local
 | GPT 注册 `account_creation_failed` + OTP 失效 | 勿强制 auto-OTP 密码路径；见 [gpt-register.md](gpt-register.md) §6.7 |
 | GPT 注册成功但 Codex `add_phone` | 默认已跳过 Codex（`skip_codex`/`OPENAI_SKIP_CODEX=1`）；若手动关闭跳过则回退 NextAuth session；号标 `session_only`，不进生图候选、不自动删 |
 | 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；无 refresh 号为 fragile，只标异常不剔除；默认跳过 Codex 的号为 `session_only` 不进生图 |
+| session_only 要补 refresh | 号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「OAuth 补 refresh」；浏览器 OAuth 登录同一邮箱后粘贴 callback；见 [gpt-register.md](gpt-register.md) §6.7.1 |
 | OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 
 ## 7. 开发

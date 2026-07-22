@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useRef, useState, type ChangeEvent } from "react";
+import { useImperativeHandle, useRef, useState, type ChangeEvent, type Ref } from "react";
 import {
   ArrowLeft,
   Copy,
@@ -40,9 +40,16 @@ import { cn } from "@/lib/utils";
 
 type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth";
 
+/** 外部（号池行操作）可打开 OAuth 升级流程：预填邮箱并替换旧 session_only token */
+export type AccountImportDialogHandle = {
+  openOAuthUpgrade: (opts: { email?: string | null; replaceAccessToken?: string | null }) => void;
+};
+
 type AccountImportDialogProps = {
   disabled?: boolean;
   onImported: (items: Account[]) => void;
+  /** 允许父组件通过 ref 直接打开「OAuth 补 refresh」流程 */
+  dialogRef?: Ref<AccountImportDialogHandle>;
 };
 
 type PendingAccountJsonImport = {
@@ -180,7 +187,7 @@ function MethodCard({
   );
 }
 
-export function AccountImportDialog({ disabled, onImported }: AccountImportDialogProps) {
+export function AccountImportDialog({ disabled, onImported, dialogRef }: AccountImportDialogProps) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [method, setMethod] = useState<ImportMethod>("menu");
@@ -194,6 +201,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [oauthSession, setOauthSession] = useState<OAuthLoginStartResponse | null>(null);
   const [oauthCallbackInput, setOauthCallbackInput] = useState("");
   const [oauthStarting, setOauthStarting] = useState(false);
+  /** 升级模式：完成 OAuth 后用新 token 替换该旧 access_token（session_only 行） */
+  const [oauthReplaceToken, setOauthReplaceToken] = useState("");
+  const [oauthUpgradeMode, setOauthUpgradeMode] = useState(false);
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
   const accountJsonInputRef = useRef<HTMLInputElement | null>(null);
@@ -209,6 +219,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     setOauthSession(null);
     setOauthCallbackInput("");
     setOauthStarting(false);
+    setOauthReplaceToken("");
+    setOauthUpgradeMode(false);
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -217,6 +229,24 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       resetState();
     }
   };
+
+  useImperativeHandle(
+    dialogRef,
+    () => ({
+      openOAuthUpgrade: (opts) => {
+        const email = String(opts.email || "").trim();
+        const replace = String(opts.replaceAccessToken || "").trim();
+        setMethod("oauth");
+        setOauthEmailHint(email);
+        setOauthReplaceToken(replace);
+        setOauthUpgradeMode(true);
+        setOauthSession(null);
+        setOauthCallbackInput("");
+        setOpen(true);
+      },
+    }),
+    [],
+  );
 
   const submitTokens = async (tokens: string[], successText?: string, accountPayloads: AccountImportPayload[] = []) => {
     const normalizedTokens = tokens.map((item) => item.trim()).filter(Boolean);
@@ -288,15 +318,24 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
     setIsSubmitting(true);
     try {
-      const data = await finishOAuthLogin(oauthSession.session_id, trimmed);
+      const data = await finishOAuthLogin(oauthSession.session_id, trimmed, {
+        replaceAccessToken: oauthReplaceToken || undefined,
+      });
       onImported(data.items);
       setOpen(false);
       resetState();
 
+      const replaced = data.replaced ?? 0;
       if ((data.errors?.length ?? 0) > 0) {
         const firstError = data.errors?.[0]?.error;
         toast.error(
           `OAuth 登录完成，新增 ${data.added ?? 0} 个，已刷新 ${data.refreshed ?? 0} 个，失败 ${data.errors?.length ?? 0} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+        );
+      } else if (oauthUpgradeMode || replaced > 0) {
+        toast.success(
+          replaced > 0
+            ? `已用 OAuth 补上 refresh_token，并替换了 ${replaced} 条旧的 session_only 记录`
+            : "OAuth 完成：已写入带 refresh_token 的凭证（旧 session 行若 token 相同则已合并）",
         );
       } else {
         toast.success(
@@ -545,25 +584,51 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     if (method === "oauth") {
       return (
         <div className="space-y-4">
-          <button
-            type="button"
-            onClick={() => setMethod("menu")}
-            className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800"
-          >
-            <ArrowLeft className="size-4" />
-            返回导入方式
-          </button>
+          {!oauthUpgradeMode ? (
+            <button
+              type="button"
+              onClick={() => setMethod("menu")}
+              className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800"
+            >
+              <ArrowLeft className="size-4" />
+              返回导入方式
+            </button>
+          ) : null}
+          {oauthUpgradeMode ? (
+            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sm leading-6 text-sky-950 space-y-1">
+              <div className="font-medium">OAuth 补 refresh（升级 session_only）</div>
+              <div>
+                该号当前只有 NextAuth session、没有 refresh_token，不能自动续期 / 不参与生图。
+                用浏览器登录<strong>同一个邮箱</strong>跑完 OAuth 后，会写入完整凭证并替换旧行。
+              </div>
+              {oauthEmailHint ? (
+                <div className="text-xs text-sky-800">目标邮箱：{oauthEmailHint}</div>
+              ) : (
+                <div className="text-xs text-amber-800">未识别到邮箱，请确认登录的是正确账号。</div>
+              )}
+            </div>
+          ) : null}
           <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-sm leading-6 text-stone-600 space-y-2">
             <div className="font-medium text-stone-800">操作步骤</div>
             <ol className="list-decimal pl-5 space-y-1">
-              <li>（可选）填写你 ChatGPT 账号的邮箱，登录页会预填。</li>
+              <li>
+                {oauthUpgradeMode
+                  ? "确认邮箱正确（已从号池预填），登录页会带上 login_hint。"
+                  : "（可选）填写你 ChatGPT 账号的邮箱，登录页会预填。"}
+              </li>
               <li>点击下方"打开授权页面"，在新标签里登录自己的 ChatGPT 账号。</li>
-              <li>登录完成后浏览器会跳到 <code className="rounded bg-stone-200 px-1">platform.openai.com/auth/callback?code=...</code>。立刻从地址栏复制整段 URL（或开 F12 在 Network 里抓到 callback 那一行，右键 Copy → Copy URL）。</li>
-              <li>把 callback URL 粘到下面输入框，点"完成导入"。</li>
+              <li>
+                登录完成后浏览器会跳到{" "}
+                <code className="rounded bg-stone-200 px-1">platform.openai.com/auth/callback?code=...</code>
+                。立刻从地址栏复制整段 URL（或开 F12 在 Network 里抓到 callback 那一行，右键 Copy → Copy URL）。
+              </li>
+              <li>把 callback URL 粘到下面输入框，点"{oauthUpgradeMode ? "完成升级" : "完成导入"}"。</li>
             </ol>
           </div>
           <div className="space-y-2">
-            <label className="text-sm font-medium text-stone-700">邮箱（可选预填）</label>
+            <label className="text-sm font-medium text-stone-700">
+              {oauthUpgradeMode ? "邮箱（预填）" : "邮箱（可选预填）"}
+            </label>
             <input
               type="email"
               placeholder="you@example.com"
@@ -793,7 +858,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                     : method === "codex-auth"
                       ? "导入 Codex 认证 JSON"
                     : method === "oauth"
-                      ? "OAuth 登录已有账号"
+                      ? oauthUpgradeMode
+                        ? "OAuth 补 refresh"
+                        : "OAuth 登录已有账号"
                       : "导入账号 JSON"}
             </DialogTitle>
             <DialogDescription className="text-sm leading-6">
@@ -806,7 +873,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                     : method === "codex-auth"
                       ? "粘贴 Codex 认证 JSON，系统会按 codex 来源导入。"
                     : method === "oauth"
-                      ? "用浏览器跑一遍 OpenAI 标准 OAuth，拿回 refresh_token 后系统会自动续期。"
+                      ? oauthUpgradeMode
+                        ? "为 session_only 号补上 refresh_token：浏览器 OAuth 登录同一邮箱，完成后替换旧行。"
+                        : "用浏览器跑一遍 OpenAI 标准 OAuth，拿回 refresh_token 后系统会自动续期。"
                       : "支持读取本项目导出的单账号对象或全部账号数组，并在提交前做数量确认。"}
             </DialogDescription>
           </DialogHeader>
@@ -862,7 +931,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                 disabled={footerDisabled || !oauthSession || !oauthCallbackInput.trim()}
               >
                 {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
-                完成导入
+                {oauthUpgradeMode ? "完成升级" : "完成导入"}
               </Button>
             ) : null}
             {method === "account-json" ? (

@@ -11,6 +11,7 @@ import {
   CircleOff,
   Copy,
   Download,
+  KeyRound,
   Link2,
   LoaderCircle,
   LogIn,
@@ -68,7 +69,10 @@ import {
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
-import { AccountImportDialog } from "./components/account-import-dialog";
+import {
+  AccountImportDialog,
+  type AccountImportDialogHandle,
+} from "./components/account-import-dialog";
 import { GrokImportDialog } from "./components/grok-import-dialog";
 
 const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
@@ -173,8 +177,18 @@ function displayAccountSource(account: Account) {
   return source;
 }
 
+/** 无 refresh_token 的 session 号（跳过 Codex / NextAuth-only） */
+function isSessionOnlyAccount(account: Account) {
+  if (account.session_only === true || account.fragile === true) {
+    return true;
+  }
+  // 后端 list 会带 session_only；若旧缓存缺字段，按 source 启发式（register 常见）
+  return false;
+}
+
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
+  const importDialogRef = useRef<AccountImportDialogHandle | null>(null);
   const [provider, setProvider] = useState<AccountPoolProvider>("chatgpt");
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
@@ -344,6 +358,30 @@ function AccountsPageContent() {
   const abnormalTokens = useMemo(() => {
     return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
   }, [accounts]);
+
+  const sessionOnlySelected = useMemo(() => {
+    const selectedSet = new Set(selectedIds);
+    return accounts.filter((item) => selectedSet.has(item.access_token) && isSessionOnlyAccount(item));
+  }, [accounts, selectedIds]);
+
+  const openOAuthUpgrade = (account: Account) => {
+    importDialogRef.current?.openOAuthUpgrade({
+      email: account.email,
+      replaceAccessToken: account.access_token,
+    });
+  };
+
+  const handleOAuthUpgradeSelected = () => {
+    if (sessionOnlySelected.length === 0) {
+      toast.error("请先勾选至少 1 个 session_only（无 refresh）账号");
+      return;
+    }
+    // 逐个补：先打开第一个；完成后用户可再点下一个
+    openOAuthUpgrade(sessionOnlySelected[0]);
+    if (sessionOnlySelected.length > 1) {
+      toast.info(`将先升级 ${sessionOnlySelected[0].email || "所选账号"}；其余 ${sessionOnlySelected.length - 1} 个请完成后再点「OAuth 补 refresh」`);
+    }
+  };
 
   const paginationItems = useMemo(() => {
     const items: (number | "...")[] = [];
@@ -958,6 +996,7 @@ function AccountsPageContent() {
             />
           ) : (
             <AccountImportDialog
+              dialogRef={importDialogRef}
               disabled={isLoading || isRefreshing || isDeleting}
               onImported={(items) => {
                 setAccounts(items);
@@ -1248,6 +1287,19 @@ function AccountsPageContent() {
                     尝试恢复异常账号
                   </Button>
                 ) : null}
+                {!isGrok && !isG2A ? (
+                  <Button
+                    variant="ghost"
+                    className="h-8 rounded-lg px-3 text-sky-600 hover:bg-sky-50 hover:text-sky-700"
+                    onClick={handleOAuthUpgradeSelected}
+                    disabled={sessionOnlySelected.length === 0}
+                    title="为 session_only 号走浏览器 OAuth，补上 refresh_token"
+                  >
+                    <KeyRound className="size-4" />
+                    OAuth 补 refresh
+                    {sessionOnlySelected.length > 0 ? ` (${sessionOnlySelected.length})` : ""}
+                  </Button>
+                ) : null}
                 {!isG2A ? (
                   <Button
                     variant="ghost"
@@ -1349,13 +1401,24 @@ function AccountsPageContent() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant="outline" className="rounded-md border-stone-200 text-stone-600">
-                            {isG2A
-                              ? account.g2a_server_name || account.base_url || "g2a"
-                              : isGrok
-                                ? "xAI Build"
-                                : displayAccountSource(account)}
-                          </Badge>
+                          <div className="flex flex-wrap items-center gap-1">
+                            <Badge variant="outline" className="rounded-md border-stone-200 text-stone-600">
+                              {isG2A
+                                ? account.g2a_server_name || account.base_url || "g2a"
+                                : isGrok
+                                  ? "xAI Build"
+                                  : displayAccountSource(account)}
+                            </Badge>
+                            {!isGrok && !isG2A && isSessionOnlyAccount(account) ? (
+                              <Badge
+                                variant="outline"
+                                className="rounded-md border-sky-200 bg-sky-50 text-sky-700"
+                                title="无 refresh_token：不参与生图、不自动删除；可用「OAuth 补 refresh」升级"
+                              >
+                                session
+                              </Badge>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="px-4 py-3">
                           <Badge
@@ -1456,8 +1519,19 @@ function AccountsPageContent() {
                                 className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                                 onClick={() => openEditDialog(account)}
                                 disabled={isUpdating}
+                                title="编辑"
                               >
                                 <Pencil className="size-4" />
+                              </button>
+                            ) : null}
+                            {!isGrok && !isG2A && isSessionOnlyAccount(account) ? (
+                              <button
+                                type="button"
+                                className="rounded-lg p-2 transition hover:bg-sky-50 hover:text-sky-700"
+                                onClick={() => openOAuthUpgrade(account)}
+                                title="OAuth 补 refresh（浏览器登录同一邮箱）"
+                              >
+                                <KeyRound className="size-4" />
                               </button>
                             ) : null}
                             <button
@@ -1467,6 +1541,7 @@ function AccountsPageContent() {
                                 void handleRefreshAccounts(isG2A ? [] : [account.access_token])
                               }
                               disabled={isRefreshing || refreshingTokens.has(account.access_token)}
+                              title="刷新"
                             >
                               <RefreshCw
                                 className={cn(
@@ -1482,6 +1557,7 @@ function AccountsPageContent() {
                               className="rounded-lg p-2 transition hover:bg-rose-50 hover:text-rose-500"
                               onClick={() => void handleDeleteTokens([account.access_token])}
                               disabled={isDeleting}
+                              title="删除"
                             >
                               <Trash2 className="size-4" />
                             </button>

@@ -39,6 +39,12 @@ export type Account = {
   image_inflight?: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  /**
+   * 无 refresh_token 的 NextAuth/session 号（如跳过 Codex 的 free 注册结果）。
+   * 不参与生图候选，401 不自动删除；可用「OAuth 补 refresh」升级。
+   */
+  session_only?: boolean;
+  fragile?: boolean;
   /** Grok 号池字段 */
   provider?: "grok" | "g2a" | string | null;
   remaining_tokens?: number | null;
@@ -542,10 +548,18 @@ export async function startOAuthLogin(emailHint?: string) {
   });
 }
 
-export async function finishOAuthLogin(sessionId: string, callback: string) {
-  return httpRequest<AccountMutationResponse>("/api/accounts/oauth/finish", {
+export async function finishOAuthLogin(
+  sessionId: string,
+  callback: string,
+  options?: { replaceAccessToken?: string },
+) {
+  return httpRequest<AccountMutationResponse & { replaced?: number }>("/api/accounts/oauth/finish", {
     method: "POST",
-    body: { session_id: sessionId, callback },
+    body: {
+      session_id: sessionId,
+      callback,
+      replace_access_token: options?.replaceAccessToken ?? "",
+    },
   });
 }
 
