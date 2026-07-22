@@ -59,6 +59,7 @@ import {
   testProxy,
   updateAccount,
   updateGrokAccount,
+  upgradeAccountViaCodex,
   type Account,
   type AccountPoolProvider,
   type AccountRefreshResponse,
@@ -209,6 +210,7 @@ function AccountsPageContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isRelogining, setIsRelogining] = useState(false);
+  const [codexUpgradingTokens, setCodexUpgradingTokens] = useState<Set<string>>(new Set());
   const isGrok = provider === "grok";
   const isG2A = provider === "g2a";
   const isReadonlyPool = isG2A;
@@ -364,22 +366,55 @@ function AccountsPageContent() {
     return accounts.filter((item) => selectedSet.has(item.access_token) && isSessionOnlyAccount(item));
   }, [accounts, selectedIds]);
 
-  const openOAuthUpgrade = (account: Account) => {
-    importDialogRef.current?.openOAuthUpgrade({
-      email: account.email,
-      replaceAccessToken: account.access_token,
-    });
+  const runCodexUpgrade = async (account: Account) => {
+    const email = String(account.email || "").trim();
+    if (!email || !email.includes("@")) {
+      toast.error("该账号没有可用邮箱，无法 Codex 补 refresh");
+      return;
+    }
+    const token = account.access_token;
+    setCodexUpgradingTokens((prev) => new Set(prev).add(token));
+    const toastId = toast.loading(`Codex 补 refresh：${email}…`);
+    try {
+      const data = await upgradeAccountViaCodex({
+        email,
+        accessToken: token,
+      });
+      if (Array.isArray(data.items)) {
+        setAccounts(data.items as Account[]);
+      } else {
+        await loadAccounts();
+      }
+      const replaced = Number(data.replaced || 0);
+      toast.success(
+        replaced > 0
+          ? `已为 ${email} 补上 refresh_token，并替换旧 session 行`
+          : `已为 ${email} 补上 refresh_token`,
+        { id: toastId },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Codex 补 refresh 失败";
+      toast.error(message, { id: toastId });
+    } finally {
+      setCodexUpgradingTokens((prev) => {
+        const next = new Set(prev);
+        next.delete(token);
+        return next;
+      });
+    }
   };
 
-  const handleOAuthUpgradeSelected = () => {
+  const handleCodexUpgradeSelected = () => {
     if (sessionOnlySelected.length === 0) {
       toast.error("请先勾选至少 1 个 session_only（无 refresh）账号");
       return;
     }
-    // 逐个补：先打开第一个；完成后用户可再点下一个
-    openOAuthUpgrade(sessionOnlySelected[0]);
+    // 逐个补：先跑第一个；其余完成后再点
+    void runCodexUpgrade(sessionOnlySelected[0]);
     if (sessionOnlySelected.length > 1) {
-      toast.info(`将先升级 ${sessionOnlySelected[0].email || "所选账号"}；其余 ${sessionOnlySelected.length - 1} 个请完成后再点「OAuth 补 refresh」`);
+      toast.info(
+        `将先升级 ${sessionOnlySelected[0].email || "所选账号"}；其余 ${sessionOnlySelected.length - 1} 个请完成后再点「Codex 补 refresh」`,
+      );
     }
   };
 
@@ -1291,12 +1326,19 @@ function AccountsPageContent() {
                   <Button
                     variant="ghost"
                     className="h-8 rounded-lg px-3 text-sky-600 hover:bg-sky-50 hover:text-sky-700"
-                    onClick={handleOAuthUpgradeSelected}
-                    disabled={sessionOnlySelected.length === 0}
-                    title="为 session_only 号走浏览器 OAuth，补上 refresh_token"
+                    onClick={handleCodexUpgradeSelected}
+                    disabled={
+                      sessionOnlySelected.length === 0 ||
+                      sessionOnlySelected.some((item) => codexUpgradingTokens.has(item.access_token))
+                    }
+                    title="为 session_only 号再跑 Codex OTP，补上 refresh_token（无需浏览器）"
                   >
-                    <KeyRound className="size-4" />
-                    OAuth 补 refresh
+                    {sessionOnlySelected.some((item) => codexUpgradingTokens.has(item.access_token)) ? (
+                      <LoaderCircle className="size-4 animate-spin" />
+                    ) : (
+                      <KeyRound className="size-4" />
+                    )}
+                    Codex 补 refresh
                     {sessionOnlySelected.length > 0 ? ` (${sessionOnlySelected.length})` : ""}
                   </Button>
                 ) : null}
@@ -1413,7 +1455,7 @@ function AccountsPageContent() {
                               <Badge
                                 variant="outline"
                                 className="rounded-md border-sky-200 bg-sky-50 text-sky-700"
-                                title="无 refresh_token：不参与生图、不自动删除；可用「OAuth 补 refresh」升级"
+                                title="无 refresh_token：不参与生图、不自动删除；可用「Codex 补 refresh」升级"
                               >
                                 session
                               </Badge>
@@ -1528,10 +1570,15 @@ function AccountsPageContent() {
                               <button
                                 type="button"
                                 className="rounded-lg p-2 transition hover:bg-sky-50 hover:text-sky-700"
-                                onClick={() => openOAuthUpgrade(account)}
-                                title="OAuth 补 refresh（浏览器登录同一邮箱）"
+                                onClick={() => void runCodexUpgrade(account)}
+                                disabled={codexUpgradingTokens.has(account.access_token)}
+                                title="Codex 补 refresh（协议 OTP，无需浏览器）"
                               >
-                                <KeyRound className="size-4" />
+                                {codexUpgradingTokens.has(account.access_token) ? (
+                                  <LoaderCircle className="size-4 animate-spin" />
+                                ) : (
+                                  <KeyRound className="size-4" />
+                                )}
                               </button>
                             ) : null}
                             <button

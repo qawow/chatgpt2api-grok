@@ -41,7 +41,7 @@ export type Account = {
   proxy?: string | null;
   /**
    * 无 refresh_token 的 NextAuth/session 号（如跳过 Codex 的 free 注册结果）。
-   * 不参与生图候选，401 不自动删除；可用「OAuth 补 refresh」升级。
+   * 不参与生图候选，401 不自动删除；可用「Codex 补 refresh」升级。
    */
   session_only?: boolean;
   fragile?: boolean;
@@ -559,6 +559,29 @@ export async function finishOAuthLogin(
       session_id: sessionId,
       callback,
       replace_access_token: options?.replaceAccessToken ?? "",
+    },
+  });
+}
+
+export type CodexUpgradeResponse = AccountMutationResponse & {
+  ok?: boolean;
+  email?: string;
+  replaced?: number;
+  logs?: string[];
+};
+
+/** 协议 Codex OTP 补 refresh：对 session_only 邮箱再跑一次 Codex client_id + 邮箱 OTP。 */
+export async function upgradeAccountViaCodex(options: {
+  email?: string;
+  accessToken?: string;
+  password?: string;
+}) {
+  return httpRequest<CodexUpgradeResponse>("/api/accounts/codex-upgrade", {
+    method: "POST",
+    body: {
+      email: options.email ?? "",
+      access_token: options.accessToken ?? "",
+      password: options.password ?? "",
     },
   });
 }
@@ -1253,6 +1276,8 @@ export type GptRegisterSettings = {
   dry_run: boolean;
   /** 默认 true：跳过 Codex 二次 OTP（free 号几乎总是 add_phone 失败） */
   skip_codex?: boolean;
+  /** 默认 true：session_only 入库后后台再跑 Codex 补 refresh（软失败保留 session 行） */
+  auto_codex_upgrade?: boolean;
   /** 关闭步骤间随机抖动（OPENAI_REGISTER_NO_DELAY） */
   register_no_delay?: boolean;
   /** 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 */

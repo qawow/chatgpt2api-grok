@@ -58,6 +58,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "dry_run": False,
     # free 号 Codex 二次 OTP 几乎总是 add_phone 失败 → 默认跳过，直接 NextAuth session
     "skip_codex": True,
+    # 入库 session_only 后后台再跑 Codex 补 refresh（软失败保留 session 行）
+    "auto_codex_upgrade": True,
     # 关闭步骤间随机抖动（OPENAI_REGISTER_NO_DELAY）；默认关，避免无必要地改行为
     "register_no_delay": False,
     # 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 5000ms create_account
@@ -162,6 +164,11 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
         out["skip_codex"] = True
     else:
         out["skip_codex"] = bool(out.get("skip_codex"))
+    # default True: after session_only import, background Codex OTP upgrade
+    if "auto_codex_upgrade" not in src:
+        out["auto_codex_upgrade"] = True
+    else:
+        out["auto_codex_upgrade"] = bool(out.get("auto_codex_upgrade"))
     out["register_no_delay"] = bool(out.get("register_no_delay"))
     out["so_collect_ms"] = _clean(out.get("so_collect_ms"))
     return out
@@ -950,6 +957,7 @@ class GptRegisterService:
         # (fetch_remote_info can take 25–60s on slow/proxied paths).
         email = payload.get("email") or ""
         token_for_refresh = access
+        password = payload.get("password") or ""
 
         def _refresh_quota() -> None:
             try:
@@ -999,6 +1007,32 @@ class GptRegisterService:
                 _refresh_quota()
             except Exception:
                 pass
+
+        # session_only 入库后后台 Codex 补 refresh（默认开；add_phone 等软失败保留 session 行）
+        if session_only and email and bool(settings.get("auto_codex_upgrade", True)):
+            try:
+                from services.codex_upgrade_service import schedule_codex_upgrade
+
+                schedule_codex_upgrade(
+                    email=email,
+                    replace_access_token=access,
+                    password=password,
+                    settings=settings,
+                    name_hint=email[:16],
+                )
+            except Exception as exc:
+                try:
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "注册入库后调度 Codex 补齐失败",
+                        {
+                            "token": anonymize_token(access),
+                            "email": email,
+                            "error": str(exc)[:300],
+                        },
+                    )
+                except Exception:
+                    pass
         return added
 
 

@@ -19,7 +19,7 @@ OpenAI 兼容客户端接口（Bearer = API Key 或 Admin Key）：
 |---|---|---|
 | POST | `/v1/responses` | **生图主路径**（0.4.x）：`tools=[{"type":"image_generation"}]` + 文本模型如 `grok-4.5`；远程自有号池轮转 |
 | POST | `/v1/chat/completions` | 文本 |
-| GET | `/v1/models` | 模型列表 |
+| GET | `/v1/models` | 模型列表（远程侧） |
 | POST | `/v1/images/generations` | **不在 0.4.x**；若未来版本提供则作回退 |
 
 > 实测 `grokcli2api-go 0.4.0` 根路径返回 `{"name":"grokcli2api-go","version":"0.4.0"}`，

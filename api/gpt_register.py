@@ -39,6 +39,8 @@ class GptRegisterSettingsUpdate(BaseModel):
     # latency knobs — must be declared or FastAPI/Pydantic silently drops them
     # (frontend was sending skip_codex:false but it never reached config store)
     skip_codex: bool | None = None
+    # session_only 入库后后台 Codex 补 refresh
+    auto_codex_upgrade: bool | None = None
     register_no_delay: bool | None = None
     so_collect_ms: str | None = None
 

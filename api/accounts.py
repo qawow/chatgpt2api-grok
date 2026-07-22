@@ -118,11 +118,21 @@ class OAuthLoginFinishRequest(BaseModel):
     """提交 callback。callback 既可以是完整 URL 也可以只填 code。
 
     replace_access_token：可选。成功写入新 token 后删除该旧 access_token
-    （用于把 session_only 号「OAuth 补 refresh」升级成完整凭证，避免留下脆弱重复行）。
+    （浏览器 OAuth 备用路径：把 session_only 号升级成完整凭证；主路径见 POST /api/accounts/codex-upgrade）。
     """
     session_id: str = ""
     callback: str = ""
     replace_access_token: str = ""
+
+
+class CodexUpgradeRequest(BaseModel):
+    """协议 Codex OTP 补 refresh：对已有 session_only 邮箱再跑一次 Codex client_id + 邮箱 OTP。
+
+    成功写入 refresh/id 后删除旧 access_token 行；add_phone 等失败软返回，不删 session 行。
+    """
+    email: str = ""
+    access_token: str = ""
+    password: str = ""
 
 
 def _account_payload_token(item: dict[str, Any]) -> str:
@@ -419,6 +429,78 @@ def create_router() -> APIRouter:
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", add_result.get("items", [])),
+        }
+
+    @router.post("/api/accounts/codex-upgrade")
+    async def codex_upgrade_account(
+            body: CodexUpgradeRequest,
+            authorization: str | None = Header(default=None),
+    ):
+        """对 session_only 账号再跑 Codex CLI OTP，补齐 refresh_token（无需浏览器粘贴 callback）。"""
+        require_admin(authorization)
+        from services.codex_upgrade_service import upgrade_session_account_via_codex
+
+        email = str(body.email or "").strip().lower()
+        access_token = str(body.access_token or "").strip()
+        password = str(body.password or "").strip()
+
+        # Resolve email/password from pool if only access_token given
+        if access_token and (not email or not password):
+            try:
+                accounts = account_service.list_accounts() or []
+            except Exception:
+                accounts = []
+            for acc in accounts if isinstance(accounts, list) else []:
+                if not isinstance(acc, dict):
+                    continue
+                if str(acc.get("access_token") or "").strip() != access_token:
+                    continue
+                if not email:
+                    email = str(acc.get("email") or "").strip().lower()
+                if not password:
+                    password = str(acc.get("password") or "").strip()
+                break
+
+        if not email or "@" not in email:
+            raise HTTPException(status_code=400, detail={"error": "email is required"})
+
+        print(
+            f"[codex-upgrade] start email={email} replace={bool(access_token)}",
+            flush=True,
+        )
+        result = await run_in_threadpool(
+            upgrade_session_account_via_codex,
+            email=email,
+            replace_access_token=access_token,
+            password=password,
+            log=lambda m: print(f"[codex-upgrade] {m}", flush=True),
+        )
+        if not result.get("ok"):
+            # Soft-fail expected free gates (add_phone etc.) — 422 so UI can toast without 500
+            reason = str(result.get("reason") or "failed")
+            error = str(result.get("error") or "Codex 补齐失败")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": error,
+                    "reason": reason,
+                    "email": email,
+                    "logs": list(result.get("logs") or [])[-20:],
+                },
+            )
+        items = result.get("items")
+        if not items:
+            try:
+                items = account_service.list_accounts()
+            except Exception:
+                items = []
+        return {
+            "ok": True,
+            "email": email,
+            "added": int(result.get("added") or 0),
+            "replaced": int(result.get("replaced") or 0),
+            "items": items,
+            "logs": list(result.get("logs") or [])[-20:],
         }
 
     @router.get("/api/cpa/pools")

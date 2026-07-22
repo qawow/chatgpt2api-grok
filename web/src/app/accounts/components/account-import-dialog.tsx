@@ -48,7 +48,7 @@ export type AccountImportDialogHandle = {
 type AccountImportDialogProps = {
   disabled?: boolean;
   onImported: (items: Account[]) => void;
-  /** 允许父组件通过 ref 直接打开「OAuth 补 refresh」流程 */
+  /** 允许父组件通过 ref 直接打开浏览器 OAuth 补 refresh（备用路径） */
   dialogRef?: Ref<AccountImportDialogHandle>;
 };
 
@@ -596,10 +596,10 @@ export function AccountImportDialog({ disabled, onImported, dialogRef }: Account
           ) : null}
           {oauthUpgradeMode ? (
             <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sm leading-6 text-sky-950 space-y-1">
-              <div className="font-medium">OAuth 补 refresh（升级 session_only）</div>
+              <div className="font-medium">浏览器 OAuth 补 refresh（备用）</div>
               <div>
-                该号当前只有 NextAuth session、没有 refresh_token，不能自动续期 / 不参与生图。
-                用浏览器登录<strong>同一个邮箱</strong>跑完 OAuth 后，会写入完整凭证并替换旧行。
+                推荐优先用号池页的 <strong>Codex 补 refresh</strong>（协议 OTP，无需粘贴 callback）。
+                若 Codex 路径失败，仍可用本流程：浏览器登录<strong>同一个邮箱</strong>后粘贴 callback，写入完整凭证并替换旧 session 行。
               </div>
               {oauthEmailHint ? (
                 <div className="text-xs text-sky-800">目标邮箱：{oauthEmailHint}</div>

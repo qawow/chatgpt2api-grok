@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from services.account_service import account_service
+from services.g2a_service import g2a_bridge
 from services.grok_account_service import grok_account_service
 from services.openai_backend_api import OpenAIBackendAPI
 from utils.grok_models import DEFAULT_GROK_TEXT_MODEL, GROK_IMAGE_MODELS
@@ -58,8 +59,9 @@ def list_models() -> dict[str, Any]:
             })
             seen.add(model)
 
-    # Grok pool models (separate storage; never mixed into ChatGPT account selection)
-    if grok_account_service.count() > 0:
+    # Grok models: local pool OR remote G2A image proxy (same gate as /v1/grok/models).
+    # Remote-only setups have 0 local accounts but can still serve grok-*image* via G2A.
+    if grok_account_service.count() > 0 or g2a_bridge.has_image_proxy():
         for model in sorted(GROK_IMAGE_MODELS | {DEFAULT_GROK_TEXT_MODEL}):
             if model not in seen:
                 data.append({

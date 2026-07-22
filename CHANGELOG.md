@@ -4,10 +4,13 @@
 
 ### chatgpt2api-grok（本分支）
 
++ [调整] session_only **补 refresh 主路径**改为协议 **Codex OTP 补齐**（`POST /api/accounts/codex-upgrade` + 号池「Codex 补 refresh」），不再依赖浏览器粘贴 callback。
++ [新增] 注册入库 `session_only` 后默认后台 **自动 Codex 补 refresh**（`auto_codex_upgrade=true`）；`add_phone`/OTP 失败软保留 session 行。
++ [新增] `gpt_free_register/codex_upgrade.py` + `services/codex_upgrade_service.py`：绑定既有邮箱 + CFD1 收 OTP + 写入 refresh/id 并替换旧行。
++ [修复] 仅配置远程 G2A、本地 Grok 号池为空时，`GET /v1/models` 不注入 `grok-*`：与 `/v1/grok/models` 对齐，认 `g2a_bridge.has_image_proxy()`。
 + [修复] GPT 注册「跳过 Codex」取消不生效：`GptRegisterSettingsUpdate` 补齐 `skip_codex` / `register_no_delay` / `so_collect_ms`，避免 Pydantic 静默丢字段。
-+ [新增] ChatGPT 号池 **OAuth 补 refresh**：对 `session_only` 账号可从行操作（钥匙图标）或工具栏打开浏览器 OAuth，预填邮箱并写入完整 `refresh_token`。
-+ [新增] `POST /api/accounts/oauth/finish` 支持 `replace_access_token`，升级成功后删除旧 session 行，避免脆弱重复账号。
-+ [文档] `docs/gpt-register.md` / `docs/operations.md` / README 补充 session_only 升级路径与保存配置说明。
++ [保留] 浏览器 OAuth `oauth/start|finish` + `replace_access_token` 仍可作为备用导入/升级路径。
++ [文档] `docs/gpt-register.md` / `docs/operations.md` / README 更新 Codex 自动升级与号池入口说明。
 
 ## 1.7.0 - 2026-07-05
 

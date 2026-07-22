@@ -54,6 +54,16 @@ class ModelListTests(unittest.TestCase):
                     {"access_token": "token-web-plus", "type": "Plus", "source_type": "web"},
                 ],
             ),
+            mock.patch.object(
+                openai_v1_models.grok_account_service,
+                "count",
+                return_value=0,
+            ),
+            mock.patch.object(
+                openai_v1_models.g2a_bridge,
+                "has_image_proxy",
+                return_value=False,
+            ),
         ):
             result = openai_v1_models.list_models()
 
@@ -61,6 +71,43 @@ class ModelListTests(unittest.TestCase):
         self.assertIn("gpt-image-2", ids)
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
+        self.assertNotIn("grok-2-image", ids)
+
+    def test_list_models_injects_grok_when_g2a_proxy_ready(self):
+        """Remote-only Grok (G2A) must still expose grok image models on /v1/models."""
+        with (
+            mock.patch.object(
+                openai_v1_models.OpenAIBackendAPI,
+                "list_models",
+                return_value={"object": "list", "data": []},
+            ),
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "list_accounts",
+                return_value=[],
+            ),
+            mock.patch.object(
+                openai_v1_models.grok_account_service,
+                "count",
+                return_value=0,
+            ),
+            mock.patch.object(
+                openai_v1_models.g2a_bridge,
+                "has_image_proxy",
+                return_value=True,
+            ),
+        ):
+            result = openai_v1_models.list_models()
+
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("grok-2-image", ids)
+        self.assertIn("grok-imagine", ids)
+        self.assertIn("grok-4.5", ids)
+        self.assertTrue(all(
+            item.get("owned_by") == "grok"
+            for item in result["data"]
+            if str(item.get("id") or "").startswith("grok")
+        ))
 
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""

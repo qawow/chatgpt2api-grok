@@ -207,8 +207,8 @@ curl -s http://127.0.0.1:8000/v1/grok/chat/completions \
 
 ## 模型列表
 
-- `GET /v1/models`：有 Grok 号时注入 `grok-2-image*` / `grok-imagine` / `grok-4.5`（`owned_by: grok`）
-- `GET /v1/grok/models`：仅 Grok 侧
+- `GET /v1/models`：本地 Grok 号池非空 **或** G2A `prefer_for_image` 代理就绪时注入 `grok-2-image*` / `grok-imagine` / `grok-4.5`（`owned_by: grok`）
+- `GET /v1/grok/models`：仅 Grok 侧（同样认本地池 **或** G2A 代理）
 
 ## 配置（可选 `config.json`）
 

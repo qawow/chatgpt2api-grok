@@ -208,7 +208,7 @@ environment:
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
 - `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
-  `gpt-5-mini`；若存在 Grok 号还会注入 `grok-2-image` / `grok-imagine` / `grok-4.5` 等
+  `gpt-5-mini`；本地 Grok 号池或远程 G2A 生图代理就绪时还会注入 `grok-2-image` / `grok-imagine` / `grok-4.5` 等
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
@@ -251,7 +251,7 @@ environment:
   - G2A 优先：远程 `POST /v1/responses` + `image_generation` 工具（grokcli2api-go 0.4.x；无 Images API）
   - 本地回退：免费 Build 同路径；**永不**落入 ChatGPT 号池
 - 文本：`POST /v1/grok/chat/completions`
-- 模型列表：`GET /v1/grok/models`；有号时也会注入总 `GET /v1/models`
+- 模型列表：`GET /v1/grok/models`；本地池或 G2A 代理就绪时也会注入总 `GET /v1/models`
 - 设置页对接 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go)：`/api/g2a/servers*`
 - 文档：[docs/grok-pool.md](./docs/grok-pool.md)、[docs/g2a-bridge.md](./docs/g2a-bridge.md)
 
@@ -262,12 +262,13 @@ environment:
 - **默认跳过 Codex 二次 OTP**（`skip_codex` / `OPENAI_SKIP_CODEX=1`），入库后后台刷新额度，缩短单号耗时
   - 取消勾选后需点 **保存配置** 再启动；API 模型已声明 `skip_codex` 等字段，避免旧版静默丢弃
   - 跳过 Codex 的号为 `session_only`：不参与生图候选、401 不自动删除
-  - **已有 session 号补 refresh**：号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「OAuth 补 refresh」（浏览器 OAuth 同一邮箱，`replace_access_token` 替换旧行）
+  - **默认入库后自动 Codex 补 refresh**（`auto_codex_upgrade`）：后台对同一邮箱再跑 Codex OTP；`add_phone` 等软失败保留 session 行
+  - **已有 session 号补 refresh**：号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」（`POST /api/accounts/codex-upgrade`，无需浏览器粘贴 callback）
 - 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填
 - 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`、`/cancel`
 - 成功账号进入 **ChatGPT 号池**（不进 Grok）；默认 `push_mode=local` 进程内入库
 - 密钥放 `data/gpt_register.env` 或环境变量；SOCKS 需 `PySocks`
-- 文档：[docs/gpt-register.md](./docs/gpt-register.md)（§6.7 / §6.7.1 耗时优化与 OAuth 升级）· 运维：[docs/operations.md](./docs/operations.md)
+- 文档：[docs/gpt-register.md](./docs/gpt-register.md)（§6.7 / §6.7.1 耗时优化与 Codex 补 refresh）· 运维：[docs/operations.md](./docs/operations.md)
 
 ### 实验性 / 规划中
 

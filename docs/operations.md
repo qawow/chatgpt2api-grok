@@ -58,6 +58,11 @@ export BASE='http://127.0.0.1:8000'
 
 ```bash
 curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY"
+
+# session_only → Codex 补 refresh（主路径；需 CFD1 + 注册代理配置）
+curl -s -X POST "$BASE/api/accounts/codex-upgrade" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"email":"user@mail.example.com","access_token":"<session_access_token>"}'
 ```
 
 ### 3.3 Grok 号池
@@ -175,7 +180,7 @@ docker logs -f chatgpt2api-local
 | GPT 注册 `account_creation_failed` + OTP 失效 | 勿强制 auto-OTP 密码路径；见 [gpt-register.md](gpt-register.md) §6.7 |
 | GPT 注册成功但 Codex `add_phone` | 默认已跳过 Codex（`skip_codex`/`OPENAI_SKIP_CODEX=1`）；若手动关闭跳过则回退 NextAuth session；号标 `session_only`，不进生图候选、不自动删 |
 | 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；无 refresh 号为 fragile，只标异常不剔除；默认跳过 Codex 的号为 `session_only` 不进生图 |
-| session_only 要补 refresh | 号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「OAuth 补 refresh」；浏览器 OAuth 登录同一邮箱后粘贴 callback；见 [gpt-register.md](gpt-register.md) §6.7.1 |
+| session_only 要补 refresh | 号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」（协议 OTP，`POST /api/accounts/codex-upgrade`）；注册成功默认后台 `auto_codex_upgrade`；`add_phone` 软失败保留 session 行；见 [gpt-register.md](gpt-register.md) §6.7.1 |
 | OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 
 ## 7. 开发
@@ -187,6 +192,7 @@ cd web && bun install && bun run dev
 uv run python -m unittest \
   test.test_gpt_register \
   test.test_gpt_register_engine \
+  test.test_codex_upgrade \
   test.test_g2a_bridge \
   test.test_grok_pool -v
 ```

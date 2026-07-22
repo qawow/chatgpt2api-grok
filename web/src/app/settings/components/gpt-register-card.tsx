@@ -48,6 +48,7 @@ const DEFAULT_FORM: GptRegisterSettings = {
   has_chatgpt2api_auth_key: false,
   dry_run: false,
   skip_codex: true,
+  auto_codex_upgrade: true,
   register_no_delay: false,
   so_collect_ms: "",
 };
@@ -462,6 +463,14 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
                 跳过 Codex 二次 OTP（推荐，省 ~15–30s）
+              </label>
+              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={form.auto_codex_upgrade !== false}
+                  onCheckedChange={(checked) => setField("auto_codex_upgrade", Boolean(checked))}
+                  disabled={running}
+                />
+                注册入库后自动 Codex 补 refresh（软失败保留 session 号）
               </label>
               <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
                 <Checkbox

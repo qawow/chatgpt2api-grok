@@ -284,6 +284,31 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `engines_dir` | 内置 | 一般留空 |
 | `run_mode` | `inprocess` | `subprocess` 才需要外部 Python |
 | `python_bin` | 空 | 仅 subprocess |
+| `skip_codex` | **true** | 跳过注册流里的 Codex 二次 OTP；入库为 `session_only`（更快；见 §6.7.1） |
+| `auto_codex_upgrade` | **true** | `session_only` 入库后后台再跑 Codex 补 refresh；`add_phone` 等软失败保留 session 行 |
+| `register_no_delay` | false | 关闭步骤间随机延迟（调试） |
+| `so_collect_ms` | 空 | create_account 前 SO 采集等待毫秒；空=默认 5000；`0`=关闭 |
+
+### 号池侧相关 API（补 refresh）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/accounts/codex-upgrade` | **主路径**：对已有邮箱跑 Codex OTP，写入 refresh 并可选 `access_token` 替换旧行 |
+| POST | `/api/accounts/oauth/start` | 备用：浏览器 OAuth 起始（PKCE） |
+| POST | `/api/accounts/oauth/finish` | 备用：粘贴 callback；可带 `replace_access_token` |
+
+`POST /api/accounts/codex-upgrade` 请求体：
+
+```json
+{
+  "email": "user@mail.example.com",
+  "access_token": "旧 session access_token（可选，用于替换）",
+  "password": "可选；空则从号池按 access_token 解析"
+}
+```
+
+成功：`ok=true`，返回 `added` / `replaced` / 新账号摘要。  
+软失败（如 `add_phone`）：HTTP 422，`ok=false`，`reason` + `logs`；**不删除** session 行。
 
 ---
 
@@ -292,7 +317,7 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/gpt-register/settings` | 读配置（密钥脱敏） |
-| POST | `/api/gpt-register/settings` | 写配置 |
+| POST | `/api/gpt-register/settings` | 写配置（含 `skip_codex` / `auto_codex_upgrade` 等） |
 | POST | `/api/gpt-register/start` | 启动任务（可带覆盖） |
 | GET | `/api/gpt-register/jobs` | 任务列表 |
 | GET | `/api/gpt-register/jobs/{id}` | 任务详情 |
@@ -498,12 +523,16 @@ OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
 Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关闭步骤间随机延迟」。  
 保存/启动时字段经 `POST /api/gpt-register/settings` 与 `start` 的 Pydantic 模型（含 `skip_codex` / `register_no_delay` / `so_collect_ms`）；未声明字段会被丢弃，旧版因此无法取消「跳过 Codex」。
 
-> 跳过 Codex 后拿到的是 **session_only** 号：可入库排查，**不参与生图候选**、不因 401 自动删除。若你明确需要 refresh_token，再取消勾选并**保存配置**后启动任务，接受更长耗时与 `add_phone` 失败概率。
+> 跳过 Codex 后拿到的是 **session_only** 号：可入库排查，**不参与生图候选**、不因 401 自动删除。
+>
+> **默认会在入库后后台再跑 Codex 补 refresh**（`auto_codex_upgrade=true`）：对同一邮箱走 Codex client_id + CFD1 OTP。
+> 成功则写入 `refresh_token` 并替换旧 session 行；遇到 `add_phone` / OTP 失败则**软失败**，保留 session_only 行。
 >
 > **已有 session_only 号怎么补 refresh？** 在 **号池管理 → ChatGPT**：
-> 1. 行操作点钥匙图标 **OAuth 补 refresh**（或勾选后点工具栏同名按钮）  
-> 2. 确认预填邮箱 → 打开授权页 → 登录**同一邮箱** → 粘贴 callback URL → 完成升级  
-> 3. 后端会写入带 `refresh_token` 的新凭证，并删除旧 session 行（`POST /api/accounts/oauth/finish` 的 `replace_access_token`）
+> 1. 行操作点钥匙图标 **Codex 补 refresh**（或勾选后点工具栏同名按钮）  
+> 2. 后端对同一邮箱再跑 Codex OTP（`POST /api/accounts/codex-upgrade`），无需浏览器粘贴 callback  
+> 3. 成功写入带 `refresh_token` 的新凭证并删除旧 session 行；`add_phone` 等失败会提示原因，号仍保留  
+> 4. 备用：导入对话框里的浏览器 OAuth 粘贴 callback（`/api/accounts/oauth/*`）仍可用
 
 ### 6.8 完成日志与排障输出
 
@@ -585,13 +614,17 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 | `services/account_service.py` | 号池：`session_only`/`fragile` 门禁、生图选号、invalid 自动移除策略 |
 | `services/oauth_login_service.py` | 浏览器 OAuth PKCE；换 token 三件套 |
 | `api/gpt_register.py` | 管理 API（含 `skip_codex` 等 latency 字段） |
-| `api/accounts.py` | `oauth/start` + `oauth/finish`（`replace_access_token` 升级 session 行） |
+| `api/accounts.py` | `codex-upgrade`（主路径）+ `oauth/start|finish`（备用，`replace_access_token`） |
+| `gpt_free_register/codex_upgrade.py` | 协议 Codex OTP 补齐既有邮箱 |
+| `services/codex_upgrade_service.py` | 入库后自动调度 + 写号池 |
 | `web/.../gpt-register-card.tsx` | 设置页 UI |
-| `web/.../accounts/page.tsx` | 号池「OAuth 补 refresh」按钮 / session 徽章 |
-| `web/.../account-import-dialog.tsx` | OAuth 导入 + 升级模式（预填邮箱） |
+| `web/.../accounts/page.tsx` | 号池「Codex 补 refresh」按钮 / session 徽章 |
+| `web/.../account-import-dialog.tsx` | OAuth 导入 + 升级模式（备用；主路径为 Codex） |
+| `web/.../gpt-register-card.tsx` | `auto_codex_upgrade` 开关 |
 | `test/test_gpt_register.py` | 服务层单测 |
 | `test/test_gpt_register_engine.py` | 引擎路径单测 |
-| `test/test_oauth_login_api.py` | OAuth finish 模型与 replace 逻辑 |
+| `test/test_oauth_login_api.py` | OAuth finish 模型与 replace 逻辑（备用） |
+| `test/test_codex_upgrade.py` | Codex 补 refresh + 入库自动调度 |
 
 运行测试：
 
@@ -599,6 +632,7 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 uv run python -m unittest \
   test.test_gpt_register \
   test.test_gpt_register_engine \
+  test.test_codex_upgrade \
   test.test_oauth_login_api -v
 ```
 
@@ -616,8 +650,9 @@ uv run python -m unittest \
 
 | 模块 | 关系 |
 | --- | --- |
-| ChatGPT 号池 `/api/accounts` | 注册成功默认写入；session_only 可在号池页 OAuth 升级 |
-| 号池 OAuth `/api/accounts/oauth/*` | 浏览器登录补 `refresh_token`；finish 可 `replace_access_token` |
+| ChatGPT 号池 `/api/accounts` | 注册成功默认写入；session_only 可在号池页 Codex 补 refresh（OAuth 备用） |
+| 号池 Codex `/api/accounts/codex-upgrade` | 协议 OTP 补 `refresh_token`（主路径） |
+| 号池 OAuth `/api/accounts/oauth/*` | 浏览器登录补 `refresh_token`（备用）；finish 可 `replace_access_token` |
 | Grok 号池 `/api/grok/*` | **无关**，不写入 |
 | G2A `/api/g2a/*` | 只推 Grok 号，与 GPT 注册无关 |
 | CPA / Sub2API | 其它导入通道，互不替代 |
