@@ -30,6 +30,12 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertEqual(pub["chatgpt2api_auth_key"], "")
         self.assertTrue(pub["has_chatgpt2api_auth_key"])
 
+    def test_skip_codex_default_true(self):
+        s = normalize_settings(None)
+        self.assertTrue(s["skip_codex"])
+        s2 = normalize_settings({"skip_codex": False})
+        self.assertFalse(s2["skip_codex"])
+
 
 class ConfigStoreTest(unittest.TestCase):
     def setUp(self):
@@ -316,6 +322,12 @@ class ImportLocalTest(unittest.TestCase):
         self.assertTrue(payload["fragile"])
         self.assertEqual(payload["source_type"], "register")
         self.assertEqual(int(payload.get("quota") or 0), 30)
+        # fetch_remote_info runs in a daemon thread; wait briefly
+        import time as _time
+        for _ in range(50):
+            if fake_svc.fetch_remote_info.called:
+                break
+            _time.sleep(0.02)
         fake_svc.fetch_remote_info.assert_called_once()
         self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "access-only")
 
@@ -344,5 +356,10 @@ class ImportLocalTest(unittest.TestCase):
         self.assertFalse(payload["session_only"])
         self.assertEqual(payload["source_type"], "codex")
         self.assertEqual(int(payload.get("quota") or 0), 30)
+        import time as _time
+        for _ in range(50):
+            if fake_svc.fetch_remote_info.called:
+                break
+            _time.sleep(0.02)
         fake_svc.fetch_remote_info.assert_called_once()
         self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "at-codex-rotated")

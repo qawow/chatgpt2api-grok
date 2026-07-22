@@ -93,7 +93,7 @@ curl -s "$BASE/v1/grok/chat/completions" \
 
 1. Web：设置 → **GrokCLI2API** → 添加 `http://host:8088` + `GROK_ADMIN_KEY`（可选 API Key，勾选「优先代理生图」）  
 2. 探测连通；管理请求默认**直连**（忽略系统 HTTP_PROXY），避免 CONNECT-only 405  
-3. **号池留在远程（推荐）**：号池管理切 **GrokCLI2API** 看脱敏状态；文生图选 Grok 模型会直连远程 `/v1/images/generations`，**不必**推送/迁移本地账号  
+3. **号池留在远程（推荐）**：号池管理切 **GrokCLI2API** 看脱敏状态；文生图选 Grok 模型会直连远程 `/v1/responses`（image_generation 工具，0.4.x），**不必**推送/迁移本地账号  
 4. **可选**：若也要维护本地副本，再「推送本地 Grok 号池」（此操作会向远程发送真实 OAuth token）  
 
 详见 [g2a-bridge.md](./g2a-bridge.md)（含脱敏与安全边界）。
@@ -172,8 +172,8 @@ docker logs -f chatgpt2api-local
 | G2A 405 only CONNECT | 管理请求被系统代理劫持 → 已默认直连；检查 base_url 是否填成代理端口 |
 | Grok 生图 502 | Build 通道可能无 images；不会回落 ChatGPT 池 |
 | GPT 注册 `account_creation_failed` + OTP 失效 | 勿强制 auto-OTP 密码路径；见 [gpt-register.md](gpt-register.md) §6.7 |
-| GPT 注册成功但 Codex `add_phone` | 预期：回退 NextAuth session token 即可入库；号会标 `session_only`，不进生图候选、不自动删 |
-| 注册号无生图额度 / 秒死 | 入库后会自动 `fetch_remote_info`；无 refresh 号为 fragile，只标异常不剔除 |
+| GPT 注册成功但 Codex `add_phone` | 默认已跳过 Codex（`skip_codex`/`OPENAI_SKIP_CODEX=1`）；若手动关闭跳过则回退 NextAuth session；号标 `session_only`，不进生图候选、不自动删 |
+| 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；无 refresh 号为 fragile，只标异常不剔除；默认跳过 Codex 的号为 `session_only` 不进生图 |
 | OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 
 ## 7. 开发

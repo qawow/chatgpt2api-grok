@@ -17,9 +17,14 @@ OpenAI 兼容客户端接口（Bearer = API Key 或 Admin Key）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/v1/images/generations` | 生图（远程自有号池轮转） |
+| POST | `/v1/responses` | **生图主路径**（0.4.x）：`tools=[{"type":"image_generation"}]` + 文本模型如 `grok-4.5`；远程自有号池轮转 |
 | POST | `/v1/chat/completions` | 文本 |
 | GET | `/v1/models` | 模型列表 |
+| POST | `/v1/images/generations` | **不在 0.4.x**；若未来版本提供则作回退 |
+
+> 实测 `grokcli2api-go 0.4.0` 根路径返回 `{"name":"grokcli2api-go","version":"0.4.0"}`，
+> `POST /v1/images/generations` → `404 page not found`。chatgpt2api 已改为优先走
+> `/v1/responses` + `image_generation` 工具，与本地 free Build 路径一致。
 
 鉴权：`Authorization: Bearer <KEY>`；管理接口另支持 `X-Admin-Key`。
 
@@ -62,8 +67,11 @@ grokcli2api-go  /v1/admin/credentials  →  auths/
 chatgpt2api Grok 生图
         │  proxy（prefer_for_image）
         ▼
-grokcli2api-go  POST /v1/images/generations
-        （远程自己轮转号池；本机无需本地 token）
+grokcli2api-go  POST /v1/responses  + tools=[{type:image_generation}]
+        （0.4.x 主路径；远程自己轮转号池；本机无需本地 token）
+        │  若 404/不支持再回退
+        ▼
+grokcli2api-go  POST /v1/images/generations   （未来版本可选）
 
 号池管理「GrokCLI2API」页
         │  status only
@@ -128,7 +136,7 @@ GET /api/g2a/pool ← 远程脱敏 credentials
 
 ## 使用步骤（号池留在远程）
 
-1. 部署 grokcli2api-go，设置 `GROK_ADMIN_KEY`，确保管理接口与 `/v1/images/generations` 可访问  
+1. 部署 grokcli2api-go，设置 `GROK_ADMIN_KEY`，确保管理接口与 `/v1/responses` 可访问  
 2. chatgpt2api 设置 → **GrokCLI2API** → 添加连接  
    - 地址：服务根，如 `http://host:8088`（**不要**填 `/v1`，也不要填本地 Clash/系统代理端口）  
    - Admin Key：与远程一致  
@@ -145,12 +153,32 @@ GET /api/g2a/pool ← 远程脱敏 credentials
 `services/protocol/grok_v1_image_generations.py`：
 
 1. 若存在 `prefer_for_image` 且已配置 key 的 G2A 连接 → 远程  
-2. 否则本地 `data/grok_accounts.json` 免费 Build 路径  
+   - **主路径**：`POST /v1/responses` + `tools=[{"type":"image_generation"}]`（文本模型如 `grok-4.5`）  
+   - **回退**：若远程提供，再试 `POST /v1/images/generations`  
+2. 否则本地 `data/grok_accounts.json` 免费 Build 路径（同样 `/responses` + `image_generation`）  
 3. **永不**落入 ChatGPT 号池  
 
 Body 可选：`force_g2a` / `prefer_g2a` / `force_local` / `prefer_local` / `g2a_server_id`。
 
-## 常见错误：HTTP 405 only CONNECT supported
+> 若连接状态显示 `HTTP 404 ... /v1/images/generations`：说明仍在跑旧代理逻辑或远程是 0.4.x。
+> 升级本仓库后会优先走 `/v1/responses`；请在设置 → GrokCLI2API **重新保存连接**并探测。
+
+## 常见错误
+
+### HTTP 404 … /v1/images/generations
+
+`grokcli2api-go 0.4.x` **没有** OpenAI Images API。本侧已改为：
+
+1. 优先 `POST /v1/responses` + `tools=[{"type":"image_generation"}]`  
+2. 仅当远程真的提供时才回退 `/v1/images/generations`
+
+若设置页连接卡片仍显示该 404：
+
+1. 确认本仓库已升级并重启服务  
+2. 设置 → GrokCLI2API **重新保存连接**（`data/g2a_config.json` 丢失时列表为空）  
+3. 再点「探测连通」；生图选 `grok-2-image` 验证
+
+### HTTP 405 only CONNECT supported
 
 这不是 grokcli2api-go 返回的业务错误，而是请求被 **CONNECT-only 转发代理**（常见于本机 `HTTP_PROXY`/`HTTPS_PROXY` 指向 Clash/v2ray 的 mixed/HTTP 端口）截走了。
 
@@ -200,7 +228,7 @@ curl -s -X POST "$BASE/api/g2a/servers/$SID/push" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"access_tokens":[]}'
 
-# Grok 生图（会优先走 G2A）
+# Grok 生图（会优先走 G2A → 远程 /v1/responses + image_generation）
 curl -s -X POST "$BASE/v1/images/generations" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"prompt":"a red cube","model":"grok-2-image","n":1,"response_format":"b64_json"}'

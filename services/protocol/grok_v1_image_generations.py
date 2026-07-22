@@ -2,7 +2,8 @@
 
 Order:
 1. If any grokcli2api-go connection is configured for image proxy → remote
-   ``POST {base}/v1/images/generations`` (remote owns the real account pool).
+   ``POST {base}/v1/responses`` + ``tools=[{type:image_generation}]``
+   (0.4.x primary; falls back to ``/v1/images/generations`` if present).
 2. Else local ``data/grok_accounts.json`` free Build path.
 
 Never falls through to the ChatGPT account pool.

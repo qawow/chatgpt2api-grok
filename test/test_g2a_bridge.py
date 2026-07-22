@@ -169,7 +169,7 @@ class G2AClientTest(unittest.TestCase):
         self.assertEqual(client._session.proxies.get("http"), "http://127.0.0.1:8888")
         self.assertFalse(client._session.trust_env)
 
-    def test_generate_image_uses_api_key_and_normalizes(self):
+    def test_generate_image_uses_responses_primary(self):
         client = G2AClient(
             {
                 "id": "s1",
@@ -179,20 +179,81 @@ class G2AClientTest(unittest.TestCase):
                 "api_key": "client-key",
             }
         )
+        # Minimal valid PNG base64 (1x1) — long enough for image detector.
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
         with mock.patch.object(client._session, "request") as req:
             resp = mock.Mock()
             resp.status_code = 200
-            resp.text = '{"created":1,"data":[{"b64_json":"abc123"}]}'
-            resp.json.return_value = {"created": 1, "data": [{"b64_json": "abc123"}]}
+            payload = {
+                "id": "resp_1",
+                "status": "completed",
+                "model": "grok-4.5",
+                "output": [
+                    {
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "result": png_b64,
+                    }
+                ],
+            }
+            resp.text = '{"ok":true}'
+            resp.json.return_value = payload
             req.return_value = resp
             out = client.generate_image(prompt="a cat", model="grok-2-image", n=1)
-            self.assertEqual(out["data"][0]["b64_json"], "abc123")
+            self.assertEqual(out["data"][0]["b64_json"], png_b64)
             self.assertEqual(out["_meta"]["upstream"], "g2a")
+            self.assertEqual(out["_meta"]["upstream_path"], "responses+image_generation")
             args, kwargs = req.call_args
             self.assertEqual(args[0], "POST")
-            self.assertTrue(str(args[1]).endswith("/v1/images/generations"))
+            self.assertTrue(str(args[1]).endswith("/v1/responses"))
+            body = kwargs.get("json") or {}
+            self.assertEqual(body.get("tools"), [{"type": "image_generation"}])
+            # Free Build text model, not the public image model id.
+            self.assertNotIn("image", str(body.get("model") or "").lower())
             self.assertEqual(kwargs["headers"]["Authorization"], "Bearer client-key")
             self.assertNotIn("X-Admin-Key", kwargs["headers"])
+
+    def test_generate_image_falls_back_to_images_api(self):
+        client = G2AClient(
+            {
+                "id": "s1",
+                "name": "remote",
+                "base_url": "http://example.invalid",
+                "admin_key": "adm",
+                "api_key": "client-key",
+            }
+        )
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+
+        def side_effect(method, url, **kwargs):
+            resp = mock.Mock()
+            if str(url).endswith("/v1/responses"):
+                resp.status_code = 400
+                resp.text = "model not found"
+                resp.json.return_value = {"error": "model not found"}
+                return resp
+            if str(url).endswith("/v1/images/generations"):
+                resp.status_code = 200
+                resp.text = '{"created":1,"data":[{"b64_json":"%s"}]}' % png_b64
+                resp.json.return_value = {"created": 1, "data": [{"b64_json": png_b64}]}
+                return resp
+            resp.status_code = 404
+            resp.text = "404 page not found"
+            return resp
+
+        with mock.patch.object(client._session, "request", side_effect=side_effect) as req:
+            # Force responses path to exhaust models quickly by stubbing model list
+            with mock.patch.object(client, "_response_image_models", return_value=["grok-4.5"]):
+                out = client.generate_image(prompt="a cat", model="grok-2-image", n=1)
+            self.assertEqual(out["data"][0]["b64_json"], png_b64)
+            self.assertEqual(out["_meta"]["upstream_path"], "images/generations")
+            paths = [str(c.args[1]) for c in req.call_args_list]
+            self.assertTrue(any(p.endswith("/v1/responses") for p in paths))
+            self.assertTrue(any(p.endswith("/v1/images/generations") for p in paths))
 
 
 class G2ABridgeStatusTest(unittest.TestCase):

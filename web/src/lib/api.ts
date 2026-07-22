@@ -1237,6 +1237,12 @@ export type GptRegisterSettings = {
   chatgpt2api_auth_key?: string;
   has_chatgpt2api_auth_key?: boolean;
   dry_run: boolean;
+  /** 默认 true：跳过 Codex 二次 OTP（free 号几乎总是 add_phone 失败） */
+  skip_codex?: boolean;
+  /** 关闭步骤间随机抖动（OPENAI_REGISTER_NO_DELAY） */
+  register_no_delay?: boolean;
+  /** 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 */
+  so_collect_ms?: string;
 };
 
 export type GptRegisterJobLog = {

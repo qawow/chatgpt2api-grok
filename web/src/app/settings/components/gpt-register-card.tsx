@@ -47,6 +47,9 @@ const DEFAULT_FORM: GptRegisterSettings = {
   chatgpt2api_auth_key: "",
   has_chatgpt2api_auth_key: false,
   dry_run: false,
+  skip_codex: true,
+  register_no_delay: false,
+  so_collect_ms: "",
 };
 
 function isActiveJob(job?: GptRegisterJob | null) {
@@ -451,6 +454,22 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
                 干跑（只注册不入库）
+              </label>
+              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={form.skip_codex !== false}
+                  onCheckedChange={(checked) => setField("skip_codex", Boolean(checked))}
+                  disabled={running}
+                />
+                跳过 Codex 二次 OTP（推荐，省 ~15–30s）
+              </label>
+              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={Boolean(form.register_no_delay)}
+                  onCheckedChange={(checked) => setField("register_no_delay", Boolean(checked))}
+                  disabled={running}
+                />
+                关闭步骤间随机延迟
               </label>
               <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
                 <span className="text-stone-500">push_mode</span>

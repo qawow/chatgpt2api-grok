@@ -229,6 +229,19 @@ def register_chatgpt_once(
         if val:
             os.environ[env_key] = val
 
+    # skip_codex: free accounts almost always hit add_phone on Codex path.
+    # Default True (OPENAI_SKIP_CODEX=1) so NextAuth session_only is used without a second OTP.
+    if "skip_codex" in cfg:
+        os.environ["OPENAI_SKIP_CODEX"] = "1" if bool(cfg.get("skip_codex")) else "0"
+    elif not _clean(os.environ.get("OPENAI_SKIP_CODEX")):
+        os.environ["OPENAI_SKIP_CODEX"] = "1"
+
+    # Optional latency knobs from job settings (do not force when unset).
+    if "register_no_delay" in cfg and cfg.get("register_no_delay") is not None:
+        os.environ["OPENAI_REGISTER_NO_DELAY"] = "1" if bool(cfg.get("register_no_delay")) else "0"
+    if _clean(cfg.get("so_collect_ms")):
+        os.environ["OPENAI_SO_COLLECT_MS"] = _clean(cfg.get("so_collect_ms"))
+
     from core.base_platform import RegisterConfig
     from core.proxy_env import mask_proxy, resolve_proxy
     from core.registry import get as get_platform

@@ -8,14 +8,15 @@ Remote admin surface (requires GROK_ADMIN_KEY on the remote):
 
 OpenAI-compatible client surface (API key / admin key as Bearer):
 
-  POST   /v1/images/generations
+  POST   /v1/responses           # 0.4.x image primary: tools=[{type:image_generation}]
   POST   /v1/chat/completions
   GET    /v1/models
+  POST   /v1/images/generations  # not on 0.4.x; kept as fallback if a future remote adds it
 
 List responses are intentionally masked (no tokens / paths). Therefore:
 
   local Grok pool  ──push──►  grokcli2api-go auths
-  chatgpt2api Grok 生图 ──proxy──►  grokcli2api-go /v1/images/*  (no local tokens needed)
+  chatgpt2api Grok 生图 ──proxy──►  grokcli2api-go /v1/responses + image_generation
   remote credentials ──status only──►  号池管理展示（脱敏，不可反向导入 token）
 
 This never writes into the ChatGPT account pool.
@@ -73,6 +74,115 @@ def _normalize_base_url(value: object) -> str:
             lower = base.lower()
             break
     return base
+
+
+def _looks_like_image_b64(value: str) -> bool:
+    """Cheap check for raw/data-url image base64 (JPEG/PNG/GIF/WEBP)."""
+    import base64
+    import re as _re
+
+    s = _re.sub(r"\s+", "", value or "")
+    if len(s) < 64:
+        return False
+    if s.startswith("data:image"):
+        return True
+    if s.startswith(("/9j/", "iVBOR", "R0lGOD", "UklGR")):
+        return True
+    try:
+        raw = base64.b64decode(s[:96] + "====", validate=False)
+    except Exception:
+        return False
+    return raw.startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF"))
+
+
+def _extract_g2a_images_from_responses(data: dict[str, Any]) -> list[dict[str, str]]:
+    """Pull image payloads from grokcli2api-go /v1/responses output.
+
+    Free Build path yields items like::
+
+        {"type": "image_generation_call", "status": "completed",
+         "result": "<jpeg-or-png-base64>", "prompt": "..."}
+
+    Also accepts OpenAI-style b64_json/url fields and data:image URLs in text.
+    Kept local so g2a_service does not import the full Grok backend client.
+    """
+    import re as _re
+
+    data_url_re = _re.compile(
+        r"data:(?P<mime>image/[-+.\w]+);base64,(?P<data>[A-Za-z0-9+/=\s]+)",
+        _re.I,
+    )
+    found: list[dict[str, str]] = []
+    text_blobs: list[str] = []
+
+    def push_b64(raw: str) -> None:
+        s = _re.sub(r"\s+", "", raw or "")
+        if s.startswith("data:image"):
+            m = data_url_re.search(s)
+            if m:
+                s = _re.sub(r"\s+", "", m.group("data"))
+        if s and _looks_like_image_b64(s):
+            found.append({"b64_json": s})
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            node_type = str(node.get("type") or "").strip().lower()
+            if node_type in {
+                "image_generation_call",
+                "image_generation",
+                "image_generation_result",
+            }:
+                result = (
+                    node.get("result")
+                    or node.get("image")
+                    or node.get("b64_json")
+                    or node.get("base64")
+                )
+                if isinstance(result, str) and result.strip():
+                    push_b64(result)
+                if isinstance(result, dict):
+                    walk(result)
+            b64 = node.get("b64_json") or node.get("base64")
+            if isinstance(b64, str) and b64.strip():
+                push_b64(b64)
+            for key in ("result", "image", "image_base64", "data"):
+                val = node.get(key)
+                if isinstance(val, str) and _looks_like_image_b64(val):
+                    push_b64(val)
+            url = node.get("url") or node.get("image_url")
+            if isinstance(url, str) and url.startswith(
+                ("http://", "https://", "data:image")
+            ):
+                if url.startswith("data:image"):
+                    m = data_url_re.search(url)
+                    if m:
+                        found.append({"b64_json": _re.sub(r"\s+", "", m.group("data"))})
+                    else:
+                        found.append({"url": url})
+                else:
+                    found.append({"url": url})
+            for key in ("text", "content", "output_text"):
+                val = node.get(key)
+                if isinstance(val, str) and val:
+                    text_blobs.append(val)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    for blob in text_blobs:
+        for match in data_url_re.finditer(blob):
+            found.append({"b64_json": _re.sub(r"\s+", "", match.group("data"))})
+    uniq: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in found:
+        key = item.get("b64_json") or item.get("url") or ""
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(item)
+    return uniq
 
 
 def _normalize_server(raw: dict) -> dict:
@@ -391,9 +501,17 @@ class G2AClient:
                 f"not a local proxy port. raw={snippet[:160]}"
             )
         if status == 404 and ("not found" in lower or "<!doctype" in lower or "<html" in lower):
+            if "/v1/images/generations" in url:
+                return (
+                    f"HTTP 404 from {url}: grokcli2api-go 0.4.x has no Images API; "
+                    f"image proxy uses POST /v1/responses + tools=[image_generation] instead. "
+                    f"raw={snippet[:120]}"
+                )
             return (
                 f"HTTP 404 from {url}: path missing — use service root as base_url "
-                f"(http://host:8088), admin path is /v1/admin/credentials. raw={snippet[:160]}"
+                f"(http://host:8088), admin path is /v1/admin/credentials, "
+                f"image path is /v1/responses (not /v1/images/generations on 0.4.x). "
+                f"raw={snippet[:160]}"
             )
         return f"HTTP {status}: {snippet or '(empty body)'}"
 
@@ -505,17 +623,201 @@ class G2AClient:
         extra: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Proxy OpenAI Images shape to remote grokcli2api-go.
+        """Proxy image generation to remote grokcli2api-go.
 
-        Remote is expected to own the Grok free/paid image path and account
-        rotation. We only forward the OpenAI-compatible request.
+        grokcli2api-go 0.4.x does **not** expose ``POST /v1/images/generations``.
+        Free Grok Build images go through the OpenAI Responses surface:
+
+            POST /v1/responses
+            model=grok-4.5 (text / build-free)
+            tools=[{"type":"image_generation"}]
+
+        Account rotation stays on the remote. We only forward the request and
+        normalize the result into OpenAI Images ``{created, data:[{b64_json|url}]}``.
+
+        Fallback order:
+        1. ``/v1/responses`` + image_generation tool (primary, matches 0.4.x)
+        2. ``/v1/images/generations`` (if a future remote adds it)
         """
         if not (self.api_key or self.admin_key):
             raise G2AClientError("server api_key/admin_key is empty")
+        prompt_text = _clean(prompt)
+        if not prompt_text:
+            raise G2AClientError("prompt is required", status=400)
+        want_n = max(1, min(int(n or 1), 4))
+        prev_timeout = self.timeout
+        if timeout is not None:
+            self.timeout = float(timeout)
+        attempts: list[dict[str, Any]] = []
+        try:
+            # 1) Primary: Responses + image_generation tool (grokcli2api-go 0.4.x)
+            try:
+                out_items, used_model, path = self._generate_image_via_responses(
+                    prompt=prompt_text,
+                    model=model,
+                    n=want_n,
+                    extra=extra,
+                )
+                return self._image_result(
+                    out_items,
+                    model=used_model,
+                    path=path,
+                    response_format=response_format,
+                    attempts=attempts
+                    + [{"path": path, "model": used_model, "status": 200, "images": len(out_items)}],
+                )
+            except G2AClientError as exc:
+                attempts.append(
+                    {
+                        "path": "responses+image_generation",
+                        "error": str(exc)[:220],
+                        "status": exc.status,
+                    }
+                )
+                # Auth errors: don't bother with images/generations
+                if exc.status in {401, 403}:
+                    raise
+
+            # 2) Optional OpenAI Images endpoint (not present on 0.4.x)
+            try:
+                out_items, used_model, path = self._generate_image_via_images_api(
+                    prompt=prompt_text,
+                    model=model,
+                    n=want_n,
+                    size=size,
+                    response_format=response_format,
+                    extra=extra,
+                )
+                return self._image_result(
+                    out_items,
+                    model=used_model,
+                    path=path,
+                    response_format=response_format,
+                    attempts=attempts
+                    + [{"path": path, "model": used_model, "status": 200, "images": len(out_items)}],
+                )
+            except G2AClientError as exc:
+                attempts.append(
+                    {
+                        "path": "images/generations",
+                        "error": str(exc)[:220],
+                        "status": exc.status,
+                    }
+                )
+                raise G2AClientError(
+                    f"g2a image proxy failed on {self.base_url}: "
+                    f"{'; '.join(a.get('error') or '' for a in attempts if a.get('error'))[:500]}",
+                    status=exc.status or 502,
+                    body={"attempts": attempts},
+                ) from exc
+        finally:
+            self.timeout = prev_timeout
+
+    def _response_image_models(self, requested: str) -> list[str]:
+        """Text models accepted by free Build for the image_generation tool.
+
+        Image model ids like ``grok-2-image`` 400 on /responses ("Model not found").
+        """
+        ordered: list[str] = []
+        for candidate in (
+            "grok-4.5",
+            "grok-4",
+            "grok-3",
+            "grok",
+        ):
+            if candidate not in ordered:
+                ordered.append(candidate)
+        # Keep requested only if it already looks like a text/build model.
+        name = _clean(requested).lower()
+        if name and "image" not in name and "imagine" not in name and name not in ordered:
+            ordered.insert(0, _clean(requested))
+        return ordered
+
+    def _generate_image_via_responses(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        n: int,
+        extra: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], str, str]:
+        headers = self._headers(content_type="application/json", use_api_key=True)
+        last_exc: G2AClientError | None = None
+        for free_model in self._response_image_models(model):
+            body: dict[str, Any] = {
+                "model": free_model,
+                "input": prompt,
+                # Free Build accepts tools=[{type:image_generation}] but rejects
+                # OpenAI-style tool_choice object forms (422 ModelToolChoice).
+                "tools": [{"type": "image_generation"}],
+            }
+            if isinstance(extra, dict):
+                for key, value in extra.items():
+                    if key in body or value is None:
+                        continue
+                    body[key] = value
+            try:
+                payload = self._request(
+                    "POST",
+                    "/v1/responses",
+                    json_body=body,
+                    headers=headers,
+                )
+            except G2AClientError as exc:
+                last_exc = exc
+                if exc.status in {401, 403}:
+                    raise
+                # model not found / bad request → try next free model
+                if exc.status in {400, 404, 422}:
+                    continue
+                raise
+            if not isinstance(payload, dict):
+                last_exc = G2AClientError("remote responses body is not a JSON object")
+                continue
+            extracted = _extract_g2a_images_from_responses(payload)
+            if not extracted:
+                last_exc = G2AClientError(
+                    f"remote /v1/responses returned no image payload "
+                    f"(model={free_model}, status={payload.get('status')}, "
+                    f"keys={sorted(payload.keys())[:12]})"
+                )
+                continue
+            items = list(extracted[:n])
+            while len(items) < n:
+                try:
+                    more = self._request(
+                        "POST",
+                        "/v1/responses",
+                        json_body=body,
+                        headers=headers,
+                    )
+                except G2AClientError:
+                    break
+                if not isinstance(more, dict):
+                    break
+                more_imgs = _extract_g2a_images_from_responses(more)
+                if not more_imgs:
+                    break
+                items.extend(more_imgs)
+            return items[:n], free_model, "responses+image_generation"
+        if last_exc is not None:
+            raise last_exc
+        raise G2AClientError("remote /v1/responses image_generation produced no images")
+
+    def _generate_image_via_images_api(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        n: int,
+        size: str | None,
+        response_format: str,
+        extra: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], str, str]:
         body: dict[str, Any] = {
             "prompt": prompt,
             "model": model,
-            "n": max(1, min(int(n or 1), 4)),
+            "n": n,
             "response_format": response_format or "b64_json",
         }
         if size:
@@ -525,23 +827,16 @@ class G2AClient:
                 if key in body or value is None:
                     continue
                 body[key] = value
-        prev_timeout = self.timeout
-        if timeout is not None:
-            self.timeout = float(timeout)
-        try:
-            payload = self._request(
-                "POST",
-                "/v1/images/generations",
-                json_body=body,
-                headers=self._headers(content_type="application/json", use_api_key=True),
-            )
-        finally:
-            self.timeout = prev_timeout
+        payload = self._request(
+            "POST",
+            "/v1/images/generations",
+            json_body=body,
+            headers=self._headers(content_type="application/json", use_api_key=True),
+        )
         if not isinstance(payload, dict):
             raise G2AClientError("remote image response is not a JSON object")
         data = payload.get("data")
         if not isinstance(data, list) or not data:
-            # Some remotes wrap under result/images — normalize lightly.
             for key in ("images", "result", "output"):
                 alt = payload.get(key)
                 if isinstance(alt, list) and alt:
@@ -569,15 +864,36 @@ class G2AClient:
                 out_items.append(entry)
         if not out_items:
             raise G2AClientError("remote image response had no usable b64/url items")
+        return out_items, model, "images/generations"
+
+    def _image_result(
+        self,
+        out_items: list[dict[str, Any]],
+        *,
+        model: str,
+        path: str,
+        response_format: str,
+        attempts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if response_format == "url":
+            normalized: list[dict[str, Any]] = []
+            for item in out_items:
+                if item.get("url") and item.get("b64_json"):
+                    normalized.append({k: v for k, v in item.items() if k != "b64_json"})
+                else:
+                    normalized.append(item)
+            out_items = normalized
         return {
-            "created": int(payload.get("created") or time.time()),
+            "created": int(time.time()),
             "data": out_items,
             "_meta": {
                 "upstream": "g2a",
+                "upstream_path": path,
                 "server_id": self.server_id,
                 "server_name": self.server_name,
                 "base_url": self.base_url,
                 "model": model,
+                "attempts": attempts or [],
             },
         }
 

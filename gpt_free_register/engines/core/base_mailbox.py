@@ -1544,8 +1544,11 @@ class CloudflareD1Mailbox(BaseMailbox):
             # adaptive poll: slightly faster early, then settle
             elapsed = time.time() - start
             sleep_s = float(poll_interval)
-            if elapsed < 20:
-                sleep_s = max(1.5, sleep_s - 0.5)
+            if elapsed < 12:
+                # OTP usually arrives within a few seconds; poll hard first.
+                sleep_s = max(0.8, min(sleep_s, 1.2))
+            elif elapsed < 30:
+                sleep_s = max(1.2, sleep_s - 0.5)
             time.sleep(sleep_s)
         suffix = f" last_err={last_err}" if last_err else ""
         raise TimeoutError(f"等待验证码超时 ({timeout}s) email={email}{suffix}")

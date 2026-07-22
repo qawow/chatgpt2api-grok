@@ -56,6 +56,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "chatgpt2api_base_url": "",
     "chatgpt2api_auth_key": "",  # empty → config.auth_key
     "dry_run": False,
+    # free 号 Codex 二次 OTP 几乎总是 add_phone 失败 → 默认跳过，直接 NextAuth session
+    "skip_codex": True,
+    # 关闭步骤间随机抖动（OPENAI_REGISTER_NO_DELAY）；默认关，避免无必要地改行为
+    "register_no_delay": False,
+    # 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 5000ms create_account
+    "so_collect_ms": "",
 }
 
 
@@ -151,6 +157,13 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["chatgpt2api_base_url"] = _clean(out.get("chatgpt2api_base_url")) or _default_push_base_url()
     out["chatgpt2api_auth_key"] = _clean(out.get("chatgpt2api_auth_key"))
     out["dry_run"] = bool(out.get("dry_run"))
+    # default True: free accounts almost always fail Codex with add_phone
+    if "skip_codex" not in src:
+        out["skip_codex"] = True
+    else:
+        out["skip_codex"] = bool(out.get("skip_codex"))
+    out["register_no_delay"] = bool(out.get("register_no_delay"))
+    out["so_collect_ms"] = _clean(out.get("so_collect_ms"))
     return out
 
 
@@ -317,7 +330,14 @@ class GptRegisterService:
         thread.start()
         return dict(job)
 
-    def _append_log(self, job_id: str, message: str, *, level: str = "info") -> None:
+    def _append_log(
+        self,
+        job_id: str,
+        message: str,
+        *,
+        level: str = "info",
+        force_save: bool = False,
+    ) -> None:
         msg = str(message or "").strip()
         if not msg:
             return
@@ -335,11 +355,23 @@ class GptRegisterService:
             job["logs"] = logs[-400:]
             job["updated_at"] = _now_iso()
             self._jobs[job_id] = job
-            # persist so UI refresh / restart still shows latest timeline
-            try:
-                self._save_jobs()
-            except Exception:
-                pass
+            # Throttle disk writes: every log line used to rewrite jobs JSON.
+            # Persist on force, errors, or every N lines / ~2s.
+            should_save = force_save or level in {"error", "warn", "warning"}
+            if not should_save:
+                last_save = float(job.get("_last_log_save_at") or 0)
+                log_count = int(job.get("_log_save_counter") or 0) + 1
+                job["_log_save_counter"] = log_count
+                now = time.time()
+                if log_count >= 8 or (now - last_save) >= 2.0:
+                    should_save = True
+            if should_save:
+                job["_last_log_save_at"] = time.time()
+                job["_log_save_counter"] = 0
+                try:
+                    self._save_jobs()
+                except Exception:
+                    pass
 
     def _patch_job(self, job_id: str, **fields: Any) -> None:
         with self._lock:
@@ -787,6 +819,13 @@ class GptRegisterService:
         env["PYTHONUNBUFFERED"] = "1"
         if settings.get("cfd1_domain"):
             env["CFD1_DOMAIN"] = str(settings["cfd1_domain"])
+        # latency knobs for subprocess path (inprocess goes through runner.py)
+        env["OPENAI_SKIP_CODEX"] = "1" if settings.get("skip_codex", True) else "0"
+        if settings.get("register_no_delay"):
+            env["OPENAI_REGISTER_NO_DELAY"] = "1"
+        so_ms = _clean(settings.get("so_collect_ms"))
+        if so_ms:
+            env["OPENAI_SO_COLLECT_MS"] = so_ms
         if settings.get("push_enabled") and auth_key:
             env["CHATGPT2API_AUTH_KEY"] = auth_key
             env["CHATGPT2API_BASE_URL"] = base_url
@@ -907,37 +946,59 @@ class GptRegisterService:
         result = account_service.add_account_items([payload])
         added = int(result.get("added") or 0)
 
-        # Populate real quota/status/type immediately; default quota above is only a bootstrap.
-        try:
-            token = access
-            email = payload.get("email") or ""
+        # Populate real quota/status/type in background — do not block the register worker
+        # (fetch_remote_info can take 25–60s on slow/proxied paths).
+        email = payload.get("email") or ""
+        token_for_refresh = access
+
+        def _refresh_quota() -> None:
             try:
-                accounts = account_service.list_accounts() or []
+                token = token_for_refresh
+                try:
+                    accounts = account_service.list_accounts() or []
+                except Exception:
+                    accounts = []
+                if isinstance(accounts, list):
+                    for acc in accounts:
+                        if not isinstance(acc, dict):
+                            continue
+                        if (email and str(acc.get("email") or "") == email) or str(
+                            acc.get("access_token") or ""
+                        ) == token:
+                            token = str(acc.get("access_token") or token)
+                            break
+                account_service.fetch_remote_info(
+                    token,
+                    event="gpt_register_import",
+                    defer_invalid_removal=True,
+                )
+            except Exception as exc:
+                try:
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "注册入库后刷新额度失败",
+                        {
+                            "token": anonymize_token(access),
+                            "email": email,
+                            "session_only": session_only,
+                            "error": str(exc)[:300],
+                        },
+                    )
+                except Exception:
+                    pass
+
+        try:
+            threading.Thread(
+                target=_refresh_quota,
+                name=f"gpt-reg-quota-{(email or access)[:12]}",
+                daemon=True,
+            ).start()
+        except Exception:
+            # Fallback: never fail import if thread spawn fails
+            try:
+                _refresh_quota()
             except Exception:
-                accounts = []
-            if isinstance(accounts, list):
-                for acc in accounts:
-                    if not isinstance(acc, dict):
-                        continue
-                    if (email and str(acc.get("email") or "") == email) or str(acc.get("access_token") or "") == token:
-                        token = str(acc.get("access_token") or token)
-                        break
-            account_service.fetch_remote_info(
-                token,
-                event="gpt_register_import",
-                defer_invalid_removal=True,
-            )
-        except Exception as exc:
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
-                "注册入库后刷新额度失败",
-                {
-                    "token": anonymize_token(access),
-                    "email": payload.get("email"),
-                    "session_only": session_only,
-                    "error": str(exc)[:300],
-                },
-            )
+                pass
         return added
 
 

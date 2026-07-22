@@ -248,6 +248,8 @@ environment:
 - 生图：
   - `POST /v1/images/generations` + `model=grok-2-image|grok-imagine`（model 分流）
   - `POST /v1/grok/images/generations`（强制 Grok 池）
+  - G2A 优先：远程 `POST /v1/responses` + `image_generation` 工具（grokcli2api-go 0.4.x；无 Images API）
+  - 本地回退：免费 Build 同路径；**永不**落入 ChatGPT 号池
 - 文本：`POST /v1/grok/chat/completions`
 - 模型列表：`GET /v1/grok/models`；有号时也会注入总 `GET /v1/models`
 - 设置页对接 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go)：`/api/g2a/servers*`
@@ -257,11 +259,12 @@ environment:
 
 - 内置模块：`gpt_free_register/`（vendored ChatGPT 协议注册机 + Cloudflare D1 邮箱，无需外部 `/root/any-register-engines`）
 - 协议路径对齐 yukkcat：auto-OTP 默认 **passwordless**、Sentinel dual-header / SO collect、每号浏览器画像
+- **默认跳过 Codex 二次 OTP**（`skip_codex` / `OPENAI_SKIP_CODEX=1`），入库后后台刷新额度，缩短单号耗时
 - 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填
 - 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`、`/cancel`
 - 成功账号进入 **ChatGPT 号池**（不进 Grok）；默认 `push_mode=local` 进程内入库
 - 密钥放 `data/gpt_register.env` 或环境变量；SOCKS 需 `PySocks`
-- 文档：[docs/gpt-register.md](./docs/gpt-register.md)（§6.7 路径策略 / 环境变量 / 排障）· 运维：[docs/operations.md](./docs/operations.md)
+- 文档：[docs/gpt-register.md](./docs/gpt-register.md)（§6.7 / §6.7.1 耗时优化）· 运维：[docs/operations.md](./docs/operations.md)
 
 ### 实验性 / 规划中
 

@@ -2455,155 +2455,161 @@ class RegistrationEngine:
             self._log("NextAuth session 获取成功")
 
             # 15. Codex CLI OTP 登录获取 refresh_token + id_token
+            # Free 号几乎总是卡在 add_phone，二次 OAuth+OTP 白耗时。
+            # 默认跳过（OPENAI_SKIP_CODEX=1 / skip_codex=true），直接用 NextAuth session。
             codex_token_info = None
-            try:
-                self._log("15. Codex CLI OTP 登录...")
-                from .constants import (
-                    CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE,
-                    OPENAI_AUTH, SENTINEL_FRAME_URL,
-                )
-                import urllib.parse
-
-                codex_oauth = generate_oauth_url(
-                    redirect_uri=CODEX_REDIRECT_URI,
-                    scope=CODEX_SCOPE,
-                    client_id=CODEX_CLIENT_ID,
-                )
-
-                # 用全新 session（Hydra 需要干净 session）
-                login_client = OpenAIHTTPClient(proxy_url=self.proxy_url, profile=getattr(self, "_browser_profile", None))
-                login_session = login_client.session
-
-                # 访问 Codex OAuth URL，跟随重定向到 /log-in
-                login_session.get(codex_oauth.auth_url, timeout=15)
-                did2 = login_session.cookies.get("oai-did", "")
-                self._log(f"Codex login did: {did2[:20]}...")
-
-                # 获取 sentinel（用 login_client）
-                sen2 = None
+            skip_codex = _env_truthy("OPENAI_SKIP_CODEX", "1")
+            if skip_codex:
+                self._log("15. 跳过 Codex CLI OTP（OPENAI_SKIP_CODEX=1，直接用 NextAuth session）")
+            else:
                 try:
-                    ua2 = getattr(login_client, "user_agent", None) or login_client.default_headers.get("User-Agent", "")
-                    gen2 = _SentinelTokenGenerator(did2, ua2, profile=getattr(self, "_browser_profile", None))
-                    sp2 = gen2.generate_requirements_token()
-                    sr2 = json.dumps({"p": sp2, "id": did2, "flow": "authorize_continue"}, separators=(",", ":"))
-                    sr2_resp = login_client.post(
-                        OPENAI_API_ENDPOINTS["sentinel"],
-                        headers={"origin": "https://sentinel.openai.com", "referer": SENTINEL_FRAME_URL, "content-type": "text/plain;charset=UTF-8"},
-                        data=sr2,
+                    self._log("15. Codex CLI OTP 登录...")
+                    from .constants import (
+                        CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE,
+                        OPENAI_AUTH, SENTINEL_FRAME_URL,
                     )
-                    if sr2_resp.status_code == 200:
-                        d2 = sr2_resp.json()
-                        pm2 = d2.get("proofofwork") or {}
-                        if pm2.get("required") and pm2.get("seed"):
-                            sp2 = gen2.generate_token(str(pm2.get("seed") or ""), str(pm2.get("difficulty") or "0"))
-                        tr2 = (d2.get("turnstile") or {}).get("dx", "")
-                        tv2 = ""
-                        if tr2:
-                            try: tv2 = gen2.decrypt_turnstile(tr2, sp2)
-                            except: pass
-                        sen2 = SentinelPayload(p=sp2, t=tv2, c=str(d2.get("token") or ""), flow="authorize_continue")
-                        self._log("Codex sentinel 获取成功")
-                except Exception as e:
-                    self._log(f"Codex sentinel 失败: {e}", "warning")
+                    import urllib.parse
 
-                # authorize/continue 提交邮箱（不带 screen_hint，让 codex_cli_simplified_flow 决定）
-                signup_headers = {
-                    "referer": f"{OPENAI_AUTH}/log-in",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                }
-                if sen2 and did2:
-                    signup_headers["openai-sentinel-token"] = json.dumps({
-                        "p": sen2.p, "t": sen2.t, "c": sen2.c,
-                        "id": did2, "flow": sen2.flow,
-                    }, separators=(",", ":"))
-
-                signup_body = json.dumps({"username": {"value": self.email, "kind": "email"}, "screen_hint": "signup"})
-                signup_resp = login_session.post(
-                    OPENAI_API_ENDPOINTS["signup"], headers=signup_headers, data=signup_body
-                )
-                self._log(f"Codex authorize/continue: {signup_resp.status_code}")
-                if signup_resp.status_code != 200:
-                    raise RuntimeError(f"authorize/continue 失败: {signup_resp.text[:200]}")
-
-                page_type = signup_resp.json().get("page", {}).get("type", "")
-                self._log(f"Codex page_type: {page_type}")
-
-                # 如果返回 email_otp_send 或 email_otp_verification，走 OTP 流程
-                if page_type in ("email_otp_send", "email_otp_verification"):
-                    # 发送 OTP
-                    if page_type == "email_otp_send":
-                        login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
-                            "referer": f"{OPENAI_AUTH}/email-verification",
-                        }, timeout=15)
-                        self._log("Codex OTP 已发送")
-
-                    # 等待 OTP
-                    self._otp_sent_at = time.time()
-                    code = self._get_verification_code()
-                    if not code:
-                        raise RuntimeError("Codex OTP 获取失败")
-                    self._log(f"Codex OTP: {code}")
-
-                    # 验证 OTP
-                    otp_resp = login_session.post(
-                        OPENAI_API_ENDPOINTS["validate_otp"],
-                        headers={
-                            "referer": f"{OPENAI_AUTH}/email-verification",
-                            "accept": "application/json",
-                            "content-type": "application/json",
-                        },
-                        data=json.dumps({"code": code}),
+                    codex_oauth = generate_oauth_url(
+                        redirect_uri=CODEX_REDIRECT_URI,
+                        scope=CODEX_SCOPE,
+                        client_id=CODEX_CLIENT_ID,
                     )
-                    self._log(f"Codex OTP validate: {otp_resp.status_code}")
-                    if otp_resp.status_code != 200:
-                        raise RuntimeError(f"Codex OTP 验证失败: {otp_resp.text[:200]}")
 
-                    otp_data = otp_resp.json()
-                    otp_page = otp_data.get("page", {}).get("type", "")
-                    self._log(f"Codex OTP -> page_type={otp_page}")
+                    # 用全新 session（Hydra 需要干净 session）
+                    login_client = OpenAIHTTPClient(proxy_url=self.proxy_url, profile=getattr(self, "_browser_profile", None))
+                    login_session = login_client.session
 
-                    if otp_page == "add_phone":
-                        self._log("Codex CLI 仍需 add_phone，跳过", "warning")
-                        raise RuntimeError("add_phone required")
+                    # 访问 Codex OAuth URL，跟随重定向到 /log-in
+                    login_session.get(codex_oauth.auth_url, timeout=15)
+                    did2 = login_session.cookies.get("oai-did", "")
+                    self._log(f"Codex login did: {did2[:20]}...")
 
-                    # OTP 成功后，重新访问 OAuth URL 获取 callback
-                    self._log("Codex: 重新访问 OAuth URL...")
-                    resp = login_session.get(codex_oauth.auth_url, allow_redirects=False, timeout=15)
-                    codex_callback = None
-                    current_url = codex_oauth.auth_url
-                    for i in range(15):
-                        if resp.status_code not in (301, 302, 303, 307, 308):
-                            break
-                        location = resp.headers.get("Location", "")
-                        if not location:
-                            break
-                        next_url = urllib.parse.urljoin(current_url, location)
-                        self._log(f"Codex 重定向 {i+1}: {next_url[:80]}...")
-                        if "code=" in next_url and "state=" in next_url:
-                            codex_callback = next_url
-                            break
-                        current_url = next_url
-                        resp = login_session.get(current_url, allow_redirects=False, timeout=15)
-
-                    if codex_callback:
-                        self._log("Codex CLI callback 获取成功")
-                        token_json = submit_callback_url(
-                            callback_url=codex_callback,
-                            expected_state=codex_oauth.state,
-                            code_verifier=codex_oauth.code_verifier,
-                            redirect_uri=CODEX_REDIRECT_URI,
-                            client_id=CODEX_CLIENT_ID,
-                            proxy_url=self.proxy_url,
+                    # 获取 sentinel（用 login_client）
+                    sen2 = None
+                    try:
+                        ua2 = getattr(login_client, "user_agent", None) or login_client.default_headers.get("User-Agent", "")
+                        gen2 = _SentinelTokenGenerator(did2, ua2, profile=getattr(self, "_browser_profile", None))
+                        sp2 = gen2.generate_requirements_token()
+                        sr2 = json.dumps({"p": sp2, "id": did2, "flow": "authorize_continue"}, separators=(",", ":"))
+                        sr2_resp = login_client.post(
+                            OPENAI_API_ENDPOINTS["sentinel"],
+                            headers={"origin": "https://sentinel.openai.com", "referer": SENTINEL_FRAME_URL, "content-type": "text/plain;charset=UTF-8"},
+                            data=sr2,
                         )
-                        codex_token_info = json.loads(token_json)
-                        self._log(f"Codex token 成功: keys={list(codex_token_info.keys())}")
+                        if sr2_resp.status_code == 200:
+                            d2 = sr2_resp.json()
+                            pm2 = d2.get("proofofwork") or {}
+                            if pm2.get("required") and pm2.get("seed"):
+                                sp2 = gen2.generate_token(str(pm2.get("seed") or ""), str(pm2.get("difficulty") or "0"))
+                            tr2 = (d2.get("turnstile") or {}).get("dx", "")
+                            tv2 = ""
+                            if tr2:
+                                try: tv2 = gen2.decrypt_turnstile(tr2, sp2)
+                                except: pass
+                            sen2 = SentinelPayload(p=sp2, t=tv2, c=str(d2.get("token") or ""), flow="authorize_continue")
+                            self._log("Codex sentinel 获取成功")
+                    except Exception as e:
+                        self._log(f"Codex sentinel 失败: {e}", "warning")
+
+                    # authorize/continue 提交邮箱（不带 screen_hint，让 codex_cli_simplified_flow 决定）
+                    signup_headers = {
+                        "referer": f"{OPENAI_AUTH}/log-in",
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                    }
+                    if sen2 and did2:
+                        signup_headers["openai-sentinel-token"] = json.dumps({
+                            "p": sen2.p, "t": sen2.t, "c": sen2.c,
+                            "id": did2, "flow": sen2.flow,
+                        }, separators=(",", ":"))
+
+                    signup_body = json.dumps({"username": {"value": self.email, "kind": "email"}, "screen_hint": "signup"})
+                    signup_resp = login_session.post(
+                        OPENAI_API_ENDPOINTS["signup"], headers=signup_headers, data=signup_body
+                    )
+                    self._log(f"Codex authorize/continue: {signup_resp.status_code}")
+                    if signup_resp.status_code != 200:
+                        raise RuntimeError(f"authorize/continue 失败: {signup_resp.text[:200]}")
+
+                    page_type = signup_resp.json().get("page", {}).get("type", "")
+                    self._log(f"Codex page_type: {page_type}")
+
+                    # 如果返回 email_otp_send 或 email_otp_verification，走 OTP 流程
+                    if page_type in ("email_otp_send", "email_otp_verification"):
+                        # 发送 OTP
+                        if page_type == "email_otp_send":
+                            login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
+                                "referer": f"{OPENAI_AUTH}/email-verification",
+                            }, timeout=15)
+                            self._log("Codex OTP 已发送")
+
+                        # 等待 OTP
+                        self._otp_sent_at = time.time()
+                        code = self._get_verification_code()
+                        if not code:
+                            raise RuntimeError("Codex OTP 获取失败")
+                        self._log(f"Codex OTP: {code}")
+
+                        # 验证 OTP
+                        otp_resp = login_session.post(
+                            OPENAI_API_ENDPOINTS["validate_otp"],
+                            headers={
+                                "referer": f"{OPENAI_AUTH}/email-verification",
+                                "accept": "application/json",
+                                "content-type": "application/json",
+                            },
+                            data=json.dumps({"code": code}),
+                        )
+                        self._log(f"Codex OTP validate: {otp_resp.status_code}")
+                        if otp_resp.status_code != 200:
+                            raise RuntimeError(f"Codex OTP 验证失败: {otp_resp.text[:200]}")
+
+                        otp_data = otp_resp.json()
+                        otp_page = otp_data.get("page", {}).get("type", "")
+                        self._log(f"Codex OTP -> page_type={otp_page}")
+
+                        if otp_page == "add_phone":
+                            self._log("Codex CLI 仍需 add_phone，跳过", "warning")
+                            raise RuntimeError("add_phone required")
+
+                        # OTP 成功后，重新访问 OAuth URL 获取 callback
+                        self._log("Codex: 重新访问 OAuth URL...")
+                        resp = login_session.get(codex_oauth.auth_url, allow_redirects=False, timeout=15)
+                        codex_callback = None
+                        current_url = codex_oauth.auth_url
+                        for i in range(15):
+                            if resp.status_code not in (301, 302, 303, 307, 308):
+                                break
+                            location = resp.headers.get("Location", "")
+                            if not location:
+                                break
+                            next_url = urllib.parse.urljoin(current_url, location)
+                            self._log(f"Codex 重定向 {i+1}: {next_url[:80]}...")
+                            if "code=" in next_url and "state=" in next_url:
+                                codex_callback = next_url
+                                break
+                            current_url = next_url
+                            resp = login_session.get(current_url, allow_redirects=False, timeout=15)
+
+                        if codex_callback:
+                            self._log("Codex CLI callback 获取成功")
+                            token_json = submit_callback_url(
+                                callback_url=codex_callback,
+                                expected_state=codex_oauth.state,
+                                code_verifier=codex_oauth.code_verifier,
+                                redirect_uri=CODEX_REDIRECT_URI,
+                                client_id=CODEX_CLIENT_ID,
+                                proxy_url=self.proxy_url,
+                            )
+                            codex_token_info = json.loads(token_json)
+                            self._log(f"Codex token 成功: keys={list(codex_token_info.keys())}")
+                        else:
+                            self._log(f"Codex callback 未获取 (status={resp.status_code})", "warning")
                     else:
-                        self._log(f"Codex callback 未获取 (status={resp.status_code})", "warning")
-                else:
-                    self._log(f"Codex 非 OTP 流程 ({page_type})，跳过", "warning")
-            except Exception as e:
-                self._log(f"Codex CLI 登录失败: {e}", "warning")
+                        self._log(f"Codex 非 OTP 流程 ({page_type})，跳过", "warning")
+                except Exception as e:
+                    self._log(f"Codex CLI 登录失败: {e}", "warning")
 
             # 提取账户信息（优先 Codex token，fallback 到 NextAuth session）
             if codex_token_info and codex_token_info.get("access_token"):

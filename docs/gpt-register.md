@@ -36,7 +36,7 @@ Cloudflare D1 自建邮箱（OTP） + OpenAI 协议注册
 account_service.add_account_items    # push_mode=local（默认）
    │  无 refresh_token → session_only/fragile
    ▼
-account_service.fetch_remote_info    # 入库后立刻拉真实 quota/status/type
+account_service.fetch_remote_info    # 后台线程刷新真实 quota/status/type（不阻塞注册）
    │
    ▼
 data/accounts.json                   # ChatGPT 号池
@@ -433,6 +433,8 @@ NextAuth session 获取成功
 
 ```bash
 # ---- 路径策略（推荐默认）----
+# 跳过 Codex 二次 OTP（默认 1）。free 号几乎总是 add_phone 失败，白耗 ~15–30s
+OPENAI_SKIP_CODEX=1
 # auto-OTP 时跳过 authorize/continue（默认 1）
 OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1
 # 信任 authorize 已触发的 OTP，跳过显式 send（默认 1）
@@ -480,6 +482,23 @@ OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
 > 常见 `account_creation_failed` → OTP `invalid_auth_step` / `invalid_state`。
 > 保持默认 passwordless 即可。
 
+### 6.7.1 耗时优化（默认开启）
+
+实测单号成功约 47–63s，主要浪费在 **Codex 二次 OTP**（free 号几乎必 `add_phone` 失败）以及入库后同步 `fetch_remote_info`。
+
+| 优化项 | 默认 | 说明 |
+| --- | --- | --- |
+| 跳过 Codex 二次 OTP | **开**（`skip_codex=true` / `OPENAI_SKIP_CODEX=1`） | NextAuth session 成功后直接入库，标 `session_only`；可省约 15–30s |
+| 入库后额度刷新 | 后台线程 | 不再阻塞注册 worker；默认仍写 bootstrap quota |
+| 任务日志落盘 | 节流（约 8 行 / 2s） | 减少 `gpt_register_jobs.json` 频繁重写 |
+| CFD1 OTP 早期轮询 | 前 12s ~0.8–1.2s | 验证码通常很快到达 |
+| 关闭步骤随机延迟 | 关（可选 `register_no_delay` / `OPENAI_REGISTER_NO_DELAY=1`） | 调试用；默认保留轻微抖动 |
+| SO collect | 默认 5s create_account | 可用 `so_collect_ms` / `OPENAI_SO_COLLECT_MS` 覆盖；`0` 关闭 |
+
+Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关闭步骤间随机延迟」。
+
+> 跳过 Codex 后拿到的是 **session_only** 号：可入库排查，**不参与生图候选**、不因 401 自动删除。若你明确需要 refresh_token，再取消勾选并接受更长耗时与 `add_phone` 失败概率。
+
 ### 6.8 完成日志与排障输出
 
 
@@ -523,8 +542,8 @@ curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" -H "Authorization: Bearer $KEY" \
 | `account_creation_failed` 后 OTP `invalid_auth_step` | auto-OTP 会话被强制密码路径打坏 | 保持 `OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=0`；确认日志有 `yukkcat-aligned` passwordless |
 | OTP `invalid_state` / session no longer valid | continue 二次提交或会话过期 | 保持 `OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1`；换干净代理重开流程 |
 | `IP 地理位置不支持` / OAuth reset | 出口被拦或代理不稳 | 换 TW 等可用出口；检查 `OPENAI_BLOCK_REGIONS` |
-| Codex CLI `add_phone required` | Codex 路径额外要手机 | 正常：会回退 NextAuth session token，任务仍可 `registered` |
-| 注册成功但生图额度 0 / 选不到号 | 入库默认 quota=0；free 上游 `image_gen.remaining` 常为 0；无 refresh 的 session 号不参与生图 | 现已入库后自动 `fetch_remote_info`；看号池 `quota/status/session_only`；session 号需 Codex refresh 才可生图 |
+| Codex CLI `add_phone required` | Codex 路径额外要手机 | **默认已跳过 Codex**（`skip_codex`/`OPENAI_SKIP_CODEX=1`）。若手动关闭跳过，会回退 NextAuth session token，任务仍可 `registered` |
+| 注册成功但生图额度 0 / 选不到号 | 入库默认 bootstrap quota；free 上游 `image_gen.remaining` 常为 0；无 refresh 的 session 号不参与生图 | 入库后**后台** `fetch_remote_info`；看号池 `quota/status/session_only`；session 号需 Codex refresh 才可生图 |
 | 注册号「秒死」被自动删 | NextAuth-only access 无 refresh，401 后 `auto_remove_invalid_accounts` 剔除 | 现已标 `session_only/fragile`：排除生图候选且**不自动删除**，只标异常保留排查 |
 
 ---
@@ -556,7 +575,7 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 | `gpt_free_register/engines/platforms/chatgpt/register.py` | 协议注册主流程（passwordless / Sentinel dual-header） |
 | `gpt_free_register/engines/platforms/chatgpt/browser_profile.py` | 每号浏览器画像（TLS/UA/CH 一致） |
 | `gpt_free_register/engines/platforms/chatgpt/constants.py` | Sentinel SDK 版本、OAuth 端点 |
-| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库（含 session_only 标记 + 入库后 fetch_remote_info）+ 完成摘要 |
+| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库（session_only + 后台 fetch_remote_info + 日志节流）+ 完成摘要 |
 | `services/account_service.py` | 号池：`session_only`/`fragile` 门禁、生图选号、invalid 自动移除策略 |
 | `api/gpt_register.py` | 管理 API |
 | `web/.../gpt-register-card.tsx` | 设置页 UI |

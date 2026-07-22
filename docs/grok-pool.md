@@ -117,7 +117,7 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 
 `grok_v1_image_generations.handle` 顺序：
 
-1. 已配置且 `prefer_for_image=true` 的 grokcli2api-go 连接 → `POST {base}/v1/images/generations`  
+1. 已配置且 `prefer_for_image=true` 的 grokcli2api-go 连接 → `POST {base}/v1/responses` + `tools=[{type:image_generation}]`（0.4.x 主路径；无 Images API）  
 2. 否则本地 `data/grok_accounts.json` 免费 Build（`/responses` + `image_generation` tool）  
 3. 永不落入 ChatGPT 号池  
 

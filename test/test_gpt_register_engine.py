@@ -388,5 +388,19 @@ class BrowserProfileConsistencyTest(unittest.TestCase):
         self.assertLessEqual(eng.email_service.get_verification_code.call_count, 6)
 
 
+    def test_skip_codex_env_default(self):
+        import os
+        from unittest import mock
+        from platforms.chatgpt import register as regmod
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENAI_SKIP_CODEX", None)
+            self.assertTrue(regmod._env_truthy("OPENAI_SKIP_CODEX", "1"))
+        with mock.patch.dict(os.environ, {"OPENAI_SKIP_CODEX": "0"}):
+            self.assertFalse(regmod._env_truthy("OPENAI_SKIP_CODEX", "1"))
+        with mock.patch.dict(os.environ, {"OPENAI_SKIP_CODEX": "1"}):
+            self.assertTrue(regmod._env_truthy("OPENAI_SKIP_CODEX", "0"))
+
+
 if __name__ == "__main__":
     unittest.main()
