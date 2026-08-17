@@ -78,8 +78,10 @@ class AccountService:
         return len(self._accounts)
 
     def _save_cumulative_total(self) -> None:
+        from utils.atomic import atomic_write_json
+
         try:
-            self._get_cumulative_file().write_text(str(self._cumulative_total))
+            atomic_write_json(self._get_cumulative_file(), self._cumulative_total)
         except Exception:
             pass
 
@@ -184,6 +186,12 @@ class AccountService:
             "password_verify_failed_403",
             "无可用续期手段",
             "invalid_access_token",
+            # OAuth refresh returns this when the app session is permanently
+            # terminated (account deleted / session revoked server-side).
+            # Without this, force=True recovery keeps re-trying OAuth refresh
+            # → app_session_terminated → background password relogin → fail →
+            # remove_invalid_token → refresh_access_token(force=True) → loop.
+            "app_session_terminated",
         )
         return any(n in err for n in needles)
 
@@ -219,10 +227,33 @@ class AccountService:
         """Watcher / bulk refresh_accounts should not re-probe these every few minutes."""
         if not isinstance(account, dict):
             return True
-        if account.get("status") in {"禁用", "异常"}:
+        if account.get("status") == "禁用":
             return True
         if cls._revoked_cooldown_active(account):
             return True
+        # 异常 accounts are skipped ONLY when they have no recovery material
+        # (refresh_token / session_token / password) — those have nothing the
+        # watcher can do. Accounts WITH recovery material should be probed so
+        # the watcher can clear 异常 if the token is actually alive again.
+        if account.get("status") == "异常":
+            has_refresh = bool(str(account.get("refresh_token") or "").strip())
+            has_session = bool(str(account.get("session_token") or "").strip())
+            has_password = bool(str(account.get("password") or "").strip())
+            if not (has_refresh or has_session or has_password):
+                return True
+            # Free session-only without refresh_token AND without password:
+            # session endpoint returns the same revoked JWT, and there's no
+            # password to fall back on → skip to avoid thrashing. Confirmed
+            # revokes are already caught by _revoked_cooldown_active above.
+            # (Accounts with password are still recoverable via re-login.)
+            if (
+                not has_refresh
+                and not has_password
+                and cls._is_free_plan_account(account)
+                and cls._is_session_only_account(account)
+            ):
+                return True
+            return False
         # Free session-only: no OAuth refresh_token; periodic /me just burns proxy + logs.
         # Natural JWT expiry still handled by list_expiring_access_tokens when refresh_token exists.
         if (
@@ -426,6 +457,25 @@ class AccountService:
             token = self._token_aliases.get(token, token)
         return token
 
+    def _remove_account_locked(self, access_token: str) -> bool:
+        """Remove an account and clean up its aliases + inflight counters.
+
+        Must be called with self._lock held. Consolidates the cleanup that
+        delete_accounts / update_account / mark_image_result need so aliases
+        don't leak when accounts are popped outside delete_accounts.
+        """
+        token = self._resolve_access_token_locked(access_token)
+        existed = self._accounts.pop(token, None) is not None
+        self._image_inflight.pop(token, None)
+        # Clean up any aliases that point to or from this token so
+        # _resolve_access_token_locked doesn't return a dead token.
+        self._token_aliases = {
+            old: new
+            for old, new in self._token_aliases.items()
+            if old != token and new != token
+        }
+        return existed
+
     def resolve_access_token(self, access_token: str) -> str:
         if not access_token:
             return ""
@@ -570,6 +620,16 @@ class AccountService:
                 return old_token
 
             rotated = new_token != old_token
+            # Save BEFORE modifying memory so a disk failure doesn't leave
+            # the in-memory dict inconsistent with persisted state. If save
+            # fails, we roll back and return the old token.
+            # Strategy: apply changes, try to save; if save fails, roll back.
+            backup_old = self._accounts.get(old_token)
+            backup_new = self._accounts.get(new_token)
+            had_old = old_token in self._accounts
+            backup_aliases = dict(self._token_aliases)
+            backup_inflight = dict(self._image_inflight)
+
             if rotated:
                 self._accounts.pop(old_token, None)
                 self._token_aliases[old_token] = new_token
@@ -577,7 +637,19 @@ class AccountService:
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
             self._accounts[new_token] = account
-            self._save_accounts()
+            try:
+                self._save_accounts()
+            except Exception:
+                # Roll back to pre-rotation state
+                if had_old and backup_old is not None:
+                    self._accounts[old_token] = backup_old
+                if rotated:
+                    self._accounts.pop(new_token, None)
+                    if backup_new is not None:
+                        self._accounts[new_token] = backup_new
+                self._token_aliases = backup_aliases
+                self._image_inflight = backup_inflight
+                raise
             self._image_slot_condition.notify_all()
 
         log_service.add(
@@ -587,8 +659,14 @@ class AccountService:
         )
         return new_token
 
-    def _validate_access_token_alive(self, access_token: str, account: dict | None = None) -> bool:
-        """Return True only if Bearer works on /backend-api/me (200)."""
+    def _validate_access_token_alive(self, access_token: str, account: dict | None = None) -> bool | None:
+        """Check if Bearer works on /backend-api/me.
+
+        Returns:
+            True  — confirmed alive (HTTP 200)
+            False — confirmed dead (HTTP 401/403)
+            None  — network error, cannot determine (must NOT be treated as dead)
+        """
         access_token = str(access_token or "").strip()
         if not access_token:
             return False
@@ -608,9 +686,17 @@ class AccountService:
                 },
                 timeout=25,
             )
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                return True
+            if resp.status_code in {401, 403}:
+                return False
+            # Unexpected status (5xx, 429, etc.) — inconclusive
+            return None
         except Exception:
-            return False
+            # Network error (timeout, connection reset, TLS failure) —
+            # must NOT be treated as token invalidation, otherwise a valid
+            # freshly-refreshed token gets discarded due to transient flakes.
+            return None
         finally:
             try:
                 session.close()
@@ -658,11 +744,15 @@ class AccountService:
             if not access:
                 raise RuntimeError("session_refresh_no_accessToken")
 
-            # Reject fake refresh: same revoked JWT still returned by session endpoint
-            if not self._validate_access_token_alive(access, account):
+            # Reject fake refresh: same revoked JWT still returned by session endpoint.
+            # But a None result (network error) must NOT be treated as invalid —
+            # otherwise a valid token gets discarded on transient network flakes.
+            alive = self._validate_access_token_alive(access, account)
+            if alive is False:
                 if access == old_access:
                     raise RuntimeError("session_refresh_stale_token_revoked")
                 raise RuntimeError("session_refresh_token_still_invalid")
+            # alive is True or None — accept the token
 
             new_sess = ""
             try:
@@ -700,8 +790,16 @@ class AccountService:
             session_token = str(account.get("session_token") or "").strip()
             # Even force=recover must respect revoked cooldown for free/session-only;
             # otherwise watcher-driven remove_invalid_token re-spams session/password.
+            # Keepalive for durable OAuth accounts is the exception: it exists to
+            # rotate refresh_token before it ages out, independent of access-token
+            # revoke evidence.
             if self._revoked_cooldown_active(account):
-                return active_token
+                if not (
+                    force
+                    and event == "refresh_token_keepalive"
+                    and self._has_refresh_token(account)
+                ):
+                    return active_token
             if not force and self._recent_token_refresh_error(account):
                 return active_token
 
@@ -716,7 +814,10 @@ class AccountService:
                     error_str = str(exc or "")
                     errors.append(f"oauth:{error_str}")
                     self._record_token_refresh_error(active_token, event, error_str)
-                    if "app_session_terminated" in error_str.lower():
+                    if "app_session_terminated" in error_str.lower() and not force:
+                        # force=True already has a sync password fallback below.
+                        # Spawning a background thread here races that path and
+                        # can overwrite a successful OAuth/session refresh.
                         email = str(account.get("email") or "").strip()
                         password = str(account.get("password") or "").strip()
                         if email and password:
@@ -776,8 +877,11 @@ class AccountService:
                 return active_token
 
             new_access = str(token_data.get("access_token") or "").strip()
-            # Must be alive on /me — session endpoint can echo a revoked JWT
-            if not self._validate_access_token_alive(new_access, account):
+            # Must be alive on /me — session endpoint can echo a revoked JWT.
+            # But a None result (network error) must NOT discard the new token,
+            # otherwise a valid refresh is wasted on transient proxy flakes.
+            alive = self._validate_access_token_alive(new_access, account)
+            if alive is False:
                 err = "refreshed_token_still_invalid_on_me"
                 errors.append(err)
                 self._record_token_refresh_error(active_token, event, err)
@@ -792,6 +896,16 @@ class AccountService:
                     },
                 )
                 return active_token
+            if alive is None:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "access_token 刷新后校验跳过(网络抖动)",
+                    {
+                        "source": event,
+                        "token": anonymize_token(new_access),
+                        "same_as_old": new_access == active_token,
+                    },
+                )
 
             new_token = self._apply_refreshed_tokens(active_token, token_data, event)
             st = str(token_data.get("session_token") or "").strip()
@@ -806,23 +920,29 @@ class AccountService:
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
+        started_at = datetime.now(timezone.utc)
         try:
             result = self._login_with_password(email, password)
             if result.get("ok"):
-                # 登录成功，更新账号
+                # If another path already refreshed this account while we were
+                # logging in, do not overwrite the newer tokens.
+                current = self.get_account(access_token)
+                last_refresh = self._parse_time((current or {}).get("last_token_refresh_at"))
+                if last_refresh is not None and last_refresh > started_at:
+                    if progress_id:
+                        self.update_relogin_progress(progress_id, access_token, "跳过", "已被其他路径刷新")
+                    return
+
                 new_access_token = result.get("access_token", "")
                 new_refresh_token = result.get("refresh_token", "")
                 new_id_token = result.get("id_token", "")
-                new_expires_at = result.get("expires_at")
 
-                # 构建 token_data 供 _apply_refreshed_tokens 使用
                 token_data = {
                     "access_token": new_access_token,
                     "refresh_token": new_refresh_token,
                     "id_token": new_id_token,
                 }
 
-                # 使用 _apply_refreshed_tokens 更新账号（处理 token 别名）
                 new_token = self._apply_refreshed_tokens(access_token, token_data, f"{event}:password_relogin")
 
                 # 额外更新 source_type 和 status（静默，避免重复日志）
@@ -895,6 +1015,23 @@ class AccountService:
                             "detail": result.get("detail", {}),
                         },
                     )
+                    # OTP verification required — this is a TEMPORARY condition,
+                    # not a permanent failure. Don't mark 异常 or auto-remove;
+                    # keep the account so it can be recovered with manual OTP.
+                    if error_type in {"need_verification_code", "no_auth_code"}:
+                        log_service.add(
+                            LOG_TYPE_ACCOUNT,
+                            "密码重登需要验证码，保留账号",
+                            {
+                                "source": event,
+                                "token": anonymize_token(access_token),
+                                "email": email,
+                                "error": error_type,
+                            },
+                        )
+                        if progress_id:
+                            self.update_relogin_progress(progress_id, access_token, "跳过", "需要验证码")
+                        return
                     # 永久故障：将账号标记为异常（或自动移除）
                     self.remove_invalid_token(access_token, f"{event}:password_relogin_failed", quiet=True)
                     if progress_id:
@@ -928,11 +1065,11 @@ class AccountService:
         platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
         user_agent = self._OAUTH_USER_AGENT
         
-        # 创建 session
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
-        proxy = config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
+        # 创建 session — use proxy_runtime (account + global) so login egress
+        # matches the rest of the client. Legacy-only config.proxy left an IP
+        # mismatch that could trigger ChatGPT risk checks.
+        from services.proxy_service import proxy_settings
+        session_kwargs = proxy_settings.build_session_kwargs(impersonate="chrome110", verify=True)
         session = requests.Session(**session_kwargs)
         
         try:
@@ -1108,7 +1245,7 @@ class AccountService:
                     "code": auth_code,
                     "redirect_uri": platform_oauth_redirect_uri,
                 },
-                verify=False,
+                verify=True,
                 timeout=60,
             )
             
@@ -1521,16 +1658,20 @@ class AccountService:
                 or str(acc.get("refresh_token") or "").strip()
             ):
                 recovered = self.refresh_access_token(access_token, force=True, event=f"{event}:recover")
-                if recovered and self._validate_access_token_alive(
-                    recovered, self.get_account(recovered) or acc
-                ):
-                    self.update_account(recovered, {"status": "正常", "invalid_count": 0}, quiet=True)
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
-                        "无效 token 已恢复",
-                        {"source": event, "token": anonymize_token(recovered)},
+                if recovered:
+                    alive = self._validate_access_token_alive(
+                        recovered, self.get_account(recovered) or acc
                     )
-                    return False
+                    # True = confirmed alive; None = network error (inconclusive,
+                    # but the refresh itself succeeded so treat as recovered).
+                    if alive is not False:
+                        self.update_account(recovered, {"status": "正常", "invalid_count": 0}, quiet=True)
+                        log_service.add(
+                            LOG_TYPE_ACCOUNT,
+                            "无效 token 已恢复",
+                            {"source": event, "token": anonymize_token(recovered)},
+                        )
+                        return False
         except Exception:
             pass
 
@@ -1657,6 +1798,29 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
+    def list_abnormal_tokens(self) -> list[str]:
+        """Watcher recovery candidates: 异常 accounts with recovery material.
+
+        Excludes:
+        - 禁用 (explicitly disabled by user)
+        - revoked-cooldown (recent confirmed revoke, still cooling down)
+        - free session-only (no OAuth refresh_token; session endpoint returns
+          the same revoked JWT → skip to avoid thrashing)
+
+        Includes Plus/Pro/Team 异常 accounts with refresh_token, plus free
+        异常 accounts with email+password (re-loginable). The watcher's
+        refresh_accounts → fetch_remote_info → refresh_access_token flow will
+        attempt OAuth refresh / session / password recovery in that order.
+        """
+        with self._lock:
+            return [
+                token
+                for item in self._accounts.values()
+                if item.get("status") == "异常"
+                   and not self._should_skip_periodic_refresh(item)
+                   and (token := item.get("access_token") or "")
+            ]
+
     @staticmethod
     def _account_payload_token(item: dict) -> str:
         return str(item.get("access_token") or item.get("accessToken") or "").strip()
@@ -1750,14 +1914,7 @@ class AccountService:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
-            removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
-            for token in target_set:
-                self._image_inflight.pop(token, None)
-            self._token_aliases = {
-                old: new
-                for old, new in self._token_aliases.items()
-                if old not in target_set and new not in target_set
-            }
+            removed = sum(self._remove_account_locked(token) for token in target_set)
             if removed:
                 if self._accounts:
                     self._index %= len(self._accounts)
@@ -1780,7 +1937,7 @@ class AccountService:
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
+                self._remove_account_locked(access_token)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
@@ -1846,6 +2003,7 @@ class AccountService:
         defer_invalid_removal: bool = True,
     ) -> bool:
         now = datetime.now(timezone.utc)
+        err_text = str(error or "invalid access token")
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
@@ -1855,8 +2013,14 @@ class AccountService:
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
             next_item["last_invalid_at"] = now.isoformat()
-            next_item["last_refresh_error"] = str(error or "invalid access token")
+            next_item["last_refresh_error"] = err_text
             next_item["last_refresh_error_at"] = now.isoformat()
+            # Hard revoke signal (token invalidated / session_refresh_stale_token_revoked
+            # / authorize_failed_403 etc.): mark status 异常 immediately so the UI matches
+            # the image pool (which excludes revoked tokens), even while we defer removal
+            # for free/session-only accounts.
+            if self._token_looks_revoked(next_item):
+                next_item["status"] = "异常"
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -1895,7 +2059,7 @@ class AccountService:
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
+                self._remove_account_locked(access_token)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
@@ -1954,9 +2118,18 @@ class AccountService:
 
     # ---- 刷新进度追踪 ----
 
+    # Cap progress tracking dicts to prevent unbounded growth / OOM.
+    # clean_* methods exist but are never called by API layer, so we GC
+    # completed entries automatically when the dict exceeds this size.
+    _MAX_PROGRESS_ENTRIES = 100
+
     def init_refresh_progress(self, progress_id: str, total: int) -> None:
         """初始化刷新进度记录。"""
         with self._refresh_progress_lock:
+            # GC completed entries if the dict is getting too large.
+            if len(self._refresh_progress) >= self._MAX_PROGRESS_ENTRIES:
+                for pid in [pid for pid, p in self._refresh_progress.items() if p.get("done")]:
+                    self._refresh_progress.pop(pid, None)
             self._refresh_progress[progress_id] = {
                 "total": total,
                 "processed": 0,
@@ -2007,6 +2180,10 @@ class AccountService:
     def init_relogin_progress(self, progress_id: str, total: int) -> None:
         """初始化重新登录进度记录。"""
         with self._relogin_progress_lock:
+            # GC completed entries if the dict is getting too large.
+            if len(self._relogin_progress) >= self._MAX_PROGRESS_ENTRIES:
+                for pid in [pid for pid, p in self._relogin_progress.items() if p.get("done")]:
+                    self._relogin_progress.pop(pid, None)
             self._relogin_progress[progress_id] = {
                 "total": total,
                 "processed": 0,
@@ -2029,6 +2206,16 @@ class AccountService:
             })
             if progress["processed"] >= progress["total"]:
                 progress["done"] = True
+                # Set result so the frontend can display a summary. Previously
+                # re_login_accounts only called finish_relogin_progress when
+                # relogined==0 (no threads); with threads running, done was
+                # set here but result was never populated.
+                succeeded = sum(1 for r in progress["results"] if r.get("status") == "成功")
+                progress["result"] = {
+                    "relogined": succeeded,
+                    "total": progress["total"],
+                    "items": self.list_accounts(),
+                }
 
     def finish_relogin_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         """标记重新登录完成。"""
@@ -2132,9 +2319,12 @@ class AccountService:
         except (KeyboardInterrupt, SystemExit):
             if progress_id:
                 self.finish_refresh_progress(progress_id, error="cancelled")
-            executor.shutdown(wait=False, cancel_futures=True)
             raise
-        else:
+        finally:
+            # Ensure the pool is always shut down, even if as_completed or
+            # update_refresh_progress raises an unexpected Exception that
+            # isn't (KeyboardInterrupt, SystemExit) — previously the executor
+            # would leak its worker threads in that case.
             executor.shutdown(wait=True, cancel_futures=True)
 
         # 自动重新登录异常账号（仅当配置开启时）

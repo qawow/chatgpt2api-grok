@@ -16,7 +16,7 @@ from typing import Any
 from services.g2a_service import G2AClientError, g2a_bridge
 from services.grok_account_service import grok_account_service
 from services.grok_backend_api import GrokBackendError, b64_to_bytes, generate_image
-from utils.grok_models import resolve_grok_image_model
+from utils.grok_models import is_grok_image_model, resolve_grok_image_model
 
 
 def _persist_urls(data_items: list[dict[str, Any]], *, base_url: str | None, response_format: str) -> list[dict[str, Any]]:
@@ -90,8 +90,9 @@ def _handle_via_local_pool(body: dict[str, Any]) -> dict[str, Any]:
     meta_attempts: list[Any] = []
     exclude: set[str] = set()
     last_error: str | None = None
+    remaining = n
 
-    for _ in range(n):
+    while remaining > 0:
         account = grok_account_service.get_next_account(exclude_tokens=exclude)
         if account is None:
             if data_items:
@@ -104,16 +105,19 @@ def _handle_via_local_pool(body: dict[str, Any]) -> dict[str, Any]:
                 account,
                 prompt=prompt,
                 model=model,
-                n=1,
+                n=remaining,
                 size=str(size) if size else None,
                 response_format=response_format,
             )
             meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
             meta_attempts.append(meta)
+            added = 0
             for item in result.get("data") or []:
                 if isinstance(item, dict):
                     data_items.append(item)
+                    added += 1
             grok_account_service.mark_result(token, True)
+            remaining = max(0, remaining - max(added, 1))
         except GrokBackendError as exc:
             # One forced refresh + retry on auth failures (token may have just expired mid-request).
             if getattr(exc, "status", None) in {401, 403}:
@@ -127,20 +131,30 @@ def _handle_via_local_pool(body: dict[str, Any]) -> dict[str, Any]:
                             refreshed,
                             prompt=prompt,
                             model=model,
-                            n=1,
+                            n=remaining,
                             size=str(size) if size else None,
                             response_format=response_format,
                         )
                         meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
                         meta_attempts.append({**meta, "retried_after_refresh": True})
+                        added = 0
                         for item in result.get("data") or []:
                             if isinstance(item, dict):
                                 data_items.append(item)
+                                added += 1
                         grok_account_service.mark_result(new_token or token, True)
+                        remaining = max(0, remaining - max(added, 1))
                         continue
                 except Exception as retry_exc:
                     last_error = str(retry_exc)
-                    grok_account_service.mark_result(token, False, error=str(retry_exc)[:300])
+                    # Mark the NEW token (if rotated) as failed so it enters the
+                    # error cooldown. Previously this marked the old token which
+                    # replace_token had already removed from the pool, so the
+                    # failure was silently dropped and the new token stayed
+                    # selectable, failing again on the next request.
+                    grok_account_service.mark_result(
+                        new_token or token, False, error=str(retry_exc)[:300]
+                    )
                     continue
             last_error = str(exc)
             grok_account_service.mark_result(token, False, error=str(exc)[:300])
@@ -197,3 +211,57 @@ def handle(body: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("force_g2a set but no G2A image proxy server configured")
 
     return _handle_via_local_pool(body)
+
+
+def handle_edit(body: dict[str, Any]) -> dict[str, Any]:
+    """Proxy Grok image edits to Codex2API when a remote gateway is configured."""
+    import base64
+
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    if not g2a_bridge.has_image_proxy():
+        raise RuntimeError(
+            "Grok 本地池不支持图生图；请在设置里接入 Codex2API / OpenAI 兼容网关后再试"
+        )
+    raw_images = body.get("images") or []
+    images: list[dict[str, str]] = []
+    for item in raw_images:
+        if not isinstance(item, tuple) or not item:
+            continue
+        data = item[0]
+        mime = str(item[2] if len(item) > 2 else "image/png") or "image/png"
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            continue
+        images.append(
+            {"image_url": f"data:{mime};base64,{base64.b64encode(bytes(data)).decode('ascii')}"}
+        )
+    if not images:
+        raise ValueError("image is required")
+    model = str(body.get("model") or "gpt-image-2")
+    if is_grok_image_model(model):
+        model = "gpt-image-2"
+    result = g2a_bridge.edit_image(
+        prompt=prompt,
+        images=images,
+        model=model,
+        n=max(1, min(int(body.get("n") or 1), 4)),
+        size=str(body.get("size") or "") or None,
+        response_format=str(body.get("response_format") or "b64_json"),
+        server_id=str(body.get("g2a_server_id") or body.get("server_id") or "").strip() or None,
+    )
+    data_items = _persist_urls(
+        list(result.get("data") or []),
+        base_url=str(body.get("base_url") or "").strip() or None,
+        response_format=str(body.get("response_format") or "b64_json"),
+    )
+    if not data_items:
+        raise RuntimeError("remote image edit returned empty data")
+    out: dict[str, Any] = {
+        "created": int(result.get("created") or time.time()),
+        "data": data_items,
+    }
+    meta = result.get("_meta")
+    if isinstance(meta, dict):
+        out["_grok_meta"] = {"upstream": "g2a", **meta}
+    return out

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
@@ -343,6 +344,97 @@ class AccountCapabilityTests(unittest.TestCase):
             else:
                 config.data["auto_remove_invalid_accounts"] = original_value
 
+    def test_record_invalid_token_seen_marks_abnormal_on_revoked_error(self) -> None:
+        # Bugfix #5: a revoked token (token invalidated) must flip status to 异常
+        # immediately even while removal is deferred for free/session-only accounts.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "revoked-free",
+                        "status": "正常",
+                        "type": "free",
+                        "session_token": "sess",  # session-only, removal deferred
+                    }
+                ]
+            )
+            # Simulate the backend reporting the token is invalidated.
+            service._record_invalid_token_seen(
+                "revoked-free",
+                "test_event",
+                "token invalidated (/backend-api/me)",
+                defer_invalid_removal=True,
+            )
+            account = service.get_account("revoked-free")
+            self.assertIsNotNone(account)
+            self.assertEqual(account["status"], "异常")
+            self.assertEqual(account["invalid_count"], 1)
+            # Still selectable for nothing — image pool must exclude revoked.
+            self.assertFalse(AccountService._is_image_account_available(account))
+
+    def test_list_abnormal_tokens_includes_recoverable_plus_accounts(self) -> None:
+        # Bugfix #6: Plus/Pro 异常 accounts with refresh_token should be probed by
+        # the watcher for recovery (previously 异常 accounts were never scanned).
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "plus-abnormal",
+                        "status": "异常",
+                        "type": "Plus",
+                        "refresh_token": "rt-plus",
+                    },
+                    {
+                        "access_token": "free-abnormal-session",
+                        "status": "异常",
+                        "type": "free",
+                        "session_token": "sess",  # session-only → NOT recoverable
+                    },
+                    {
+                        "access_token": "free-abnormal-password",
+                        "status": "异常",
+                        "type": "free",
+                        "password": "pw",  # has password → recoverable
+                    },
+                    {
+                        "access_token": "disabled",
+                        "status": "禁用",
+                        "type": "Plus",
+                        "refresh_token": "rt",
+                    },
+                ]
+            )
+            abnormal = service.list_abnormal_tokens()
+            self.assertIn("plus-abnormal", abnormal)
+            self.assertIn("free-abnormal-password", abnormal)
+            # session-only free without refresh_token is NOT recoverable
+            self.assertNotIn("free-abnormal-session", abnormal)
+            # 禁用 is never a candidate
+            self.assertNotIn("disabled", abnormal)
+
+    def test_list_abnormal_tokens_excludes_revoked_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "plus-cooldown",
+                        "status": "异常",
+                        "type": "Plus",
+                        "refresh_token": "rt",
+                        "last_refresh_error": "token invalidated (/backend-api/me)",
+                        "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                        "last_token_refresh_error": "session_refresh_stale_token_revoked",
+                        "last_token_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                ]
+            )
+            abnormal = service.list_abnormal_tokens()
+            # Revoked cooldown active → skip
+            self.assertNotIn("plus-cooldown", abnormal)
+
     def test_refresh_progress_survives_all_skipped_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -386,6 +478,201 @@ class AccountCapabilityTests(unittest.TestCase):
             msg = str(ctx.exception)
             self.assertIn("no available image quota", msg)
             self.assertIn("revoked", msg)
+
+    def test_validate_access_token_alive_returns_none_on_network_error(self) -> None:
+        # Bugfix A2: network errors must return None (inconclusive), not False
+        # (which would mean "confirmed dead"). A transient proxy flake must not
+        # discard a freshly-refreshed token.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "at", "refresh_token": "rt"}])
+            account = service.get_account("at")
+            # Simulate a network error during /backend-api/me probe.
+            mock_session = mock.MagicMock()
+            mock_session.get.side_effect = ConnectionError("proxy timeout")
+            with patch("curl_cffi.requests.Session", return_value=mock_session):
+                result = service._validate_access_token_alive("at", account)
+            self.assertIsNone(result)
+
+    def test_validate_access_token_alive_returns_false_on_401(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "at", "refresh_token": "rt"}])
+            account = service.get_account("at")
+            mock_session = mock.MagicMock()
+            mock_resp = mock.MagicMock()
+            mock_resp.status_code = 401
+            mock_session.get.return_value = mock_resp
+            with patch("curl_cffi.requests.Session", return_value=mock_session):
+                result = service._validate_access_token_alive("at", account)
+            self.assertFalse(result)
+
+    def test_validate_access_token_alive_returns_true_on_200(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "at", "refresh_token": "rt"}])
+            account = service.get_account("at")
+            mock_session = mock.MagicMock()
+            mock_resp = mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_session.get.return_value = mock_resp
+            with patch("curl_cffi.requests.Session", return_value=mock_session):
+                result = service._validate_access_token_alive("at", account)
+            self.assertTrue(result)
+
+    def test_token_looks_revoked_includes_app_session_terminated(self) -> None:
+        # Bugfix S4: app_session_terminated must trigger revoked cooldown
+        # to prevent OAuth refresh storms (refresh → terminated → background
+        # relogin → fail → remove_invalid → refresh → ...).
+        self.assertTrue(
+            AccountService._token_looks_revoked(
+                {"last_token_refresh_error": "oauth_refresh_http_400: app_session_terminated"}
+            )
+        )
+
+    def test_remove_account_locked_cleans_aliases(self) -> None:
+        # Bugfix S2: _remove_account_locked must clean up _token_aliases so
+        # _resolve_access_token_locked doesn't return a dead token.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "old", "refresh_token": "rt"}])
+            # Simulate a token rotation: old → new
+            service._apply_refreshed_tokens(
+                "old",
+                {"access_token": "new", "refresh_token": "rt2"},
+                "test",
+            )
+            # old should be gone from _accounts, alias old→new should exist
+            with service._lock:
+                self.assertNotIn("old", service._accounts)
+                self.assertIn("new", service._accounts)
+            self.assertIn("old", service._token_aliases)
+            self.assertIsNotNone(service.get_account("new"))
+
+            # Now remove "new" — alias must be cleaned up
+            with service._lock:
+                service._remove_account_locked("new")
+            self.assertNotIn("old", service._token_aliases)
+            self.assertNotIn("new", service._token_aliases)
+            with service._lock:
+                self.assertNotIn("new", service._accounts)
+
+    def test_progress_dicts_gc_completed_entries(self) -> None:
+        # Bugfix S3: _refresh_progress must not grow unbounded.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            # Fill with completed entries up to the cap
+            for i in range(AccountService._MAX_PROGRESS_ENTRIES):
+                pid = f"old-{i}"
+                service.init_refresh_progress(pid, 0)
+                service.finish_refresh_progress(pid)
+            self.assertGreaterEqual(len(service._refresh_progress), AccountService._MAX_PROGRESS_ENTRIES)
+            # Adding one more should trigger GC of completed entries
+            service.init_refresh_progress("new", 1)
+            # Completed entries should have been cleaned up
+            remaining_completed = sum(1 for p in service._refresh_progress.values() if p.get("done"))
+            self.assertLess(remaining_completed, AccountService._MAX_PROGRESS_ENTRIES)
+
+    def test_config_get_masks_backup_secrets(self) -> None:
+        # Bugfix R1: GET /api/settings must not leak secret_access_key / passphrase.
+        import os
+        from services.config import ConfigStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            store = ConfigStore(config_path)
+            store.data["backup"] = {
+                "provider": "cloudflare_r2",
+                "account_id": "test-id",
+                "access_key_id": "test-key",
+                "secret_access_key": "super-secret-key",
+                "passphrase": "super-passphrase",
+                "bucket": "test-bucket",
+            }
+            store.data["image_storage"] = {
+                "provider": "webdav",
+                "url": "https://dav.example.com/",
+                "username": "user",
+                "webdav_password": "super-webdav-pw",
+            }
+            store._save()
+            public = store.get()
+            self.assertEqual(public["backup"]["secret_access_key"], "********")
+            self.assertEqual(public["backup"]["passphrase"], "********")
+            self.assertEqual(public["image_storage"]["webdav_password"], "********")
+            # Raw values still available via dedicated getters
+            self.assertEqual(store.get_backup_settings()["secret_access_key"], "super-secret-key")
+            self.assertEqual(store.get_image_storage_settings()["webdav_password"], "super-webdav-pw")
+
+    def test_config_update_preserves_secrets_on_masked_placeholder(self) -> None:
+        # Bugfix R1: when client sends "********" (the masked placeholder),
+        # the real secret must be preserved, not overwritten.
+        from services.config import ConfigStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            store = ConfigStore(config_path)
+            store.data["backup"] = {
+                "provider": "cloudflare_r2",
+                "secret_access_key": "real-secret",
+                "passphrase": "real-passphrase",
+            }
+            store._save()
+            # Client sends masked placeholder back (as returned by GET)
+            store.update({"backup": {
+                "provider": "cloudflare_r2",
+                "secret_access_key": "********",
+                "passphrase": "********",
+            }})
+            # Real secrets must be preserved
+            self.assertEqual(store.get_backup_settings()["secret_access_key"], "real-secret")
+            self.assertEqual(store.get_backup_settings()["passphrase"], "real-passphrase")
+
+    def test_proxy_runtime_settings_redact_url_credentials(self) -> None:
+        # Bugfix P7: proxy_url / flaresolverr_url with credentials must be
+        # redacted in the public settings returned to the frontend.
+        from services.config import ConfigStore
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            store = ConfigStore(config_path)
+            store.data["proxy_runtime"] = {
+                "enabled": True,
+                "proxy_url": "http://admin:secret@proxy.example.com:8080",
+                "resource_proxy_url": "http://user:pw@10.0.0.1:3128",
+                "clearance": {
+                    "flaresolverr_url": "http://fs:pass@flaresolverr.example.com:8191",
+                },
+            }
+            store._save()
+            public = store.get_public_proxy_runtime_settings()
+            self.assertNotIn("secret", public["proxy_url"])
+            self.assertNotIn("pw", public["resource_proxy_url"])
+            clearance = public.get("clearance", {})
+            self.assertNotIn("pass", clearance.get("flaresolverr_url", ""))
+
+
+    def test_backend_headers_inject_clearance_cookies(self) -> None:
+        # Bugfix: OpenAIBackendAPI._headers must call proxy_settings.build_headers
+        # so FlareSolverr / manual cf_clearance actually reach chatgpt.com.
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        with patch(
+            "services.openai_backend_api.proxy_settings.build_headers",
+            return_value={
+                "Authorization": "Bearer tok",
+                "Cookie": "cf_clearance=manual-token",
+                "X-OpenAI-Target-Path": "/backend-api/me",
+                "X-OpenAI-Target-Route": "/backend-api/me",
+            },
+        ) as build_headers:
+            backend = OpenAIBackendAPI(access_token="tok")
+            try:
+                headers = backend._headers("/backend-api/me")
+            finally:
+                backend.close()
+        build_headers.assert_called()
+        self.assertEqual(headers.get("Cookie"), "cf_clearance=manual-token")
 
 
 class TokenLogTests(unittest.TestCase):

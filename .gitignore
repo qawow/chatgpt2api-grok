@@ -35,3 +35,6 @@ logwithemailverifycode_*/
 test_batch_output/
 # Local backups (may contain secrets)
 backups/
+
+# Local audit / issue notes
+issues/

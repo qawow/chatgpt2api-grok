@@ -285,10 +285,15 @@ class ImageTaskService:
             task_timeout = max(1.0, task_timeout)
 
             if mode == "edit" and is_grok_image_model(model):
-                raise RuntimeError(
-                    "Grok 免费生图暂不支持图生图/编辑；请改用文生图模型 grok-2-image / grok-imagine"
-                )
-            handler = self.edit_handler if mode == "edit" else self.generation_handler
+                from services.g2a_service import g2a_bridge
+
+                if not g2a_bridge.has_image_proxy():
+                    raise RuntimeError(
+                        "Grok 本地池不支持图生图；请接入 Codex2API 后再用远程图生图"
+                    )
+                handler = grok_v1_image_generations.handle_edit
+            else:
+                handler = self.edit_handler if mode == "edit" else self.generation_handler
             # Mark progress for Grok path (no SSE steps) so UI is not stuck blank.
             if mode != "edit" and is_grok_image_model(model):
                 progress_callback("generating")
@@ -413,6 +418,18 @@ class ImageTaskService:
         with self._lock:
             task = self._tasks.get(key)
             if task is None:
+                return
+            # Prevent a late-arriving worker from overwriting an ERROR status
+            # (e.g. set by a timeout) with SUCCESS. Once a task is marked
+            # ERROR/timeout, only resume_poll or explicit retry can change it.
+            current_status = _clean(task.get("status"))
+            new_status = _clean(updates.get("status"))
+            if (
+                current_status == TASK_STATUS_ERROR
+                and new_status
+                and new_status != TASK_STATUS_ERROR
+                and new_status != TASK_STATUS_RUNNING
+            ):
                 return
             task.update(updates)
             task["updated_at"] = _now_iso()

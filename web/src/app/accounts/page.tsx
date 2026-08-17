@@ -982,7 +982,7 @@ function AccountsPageContent() {
               onClick={() => switchProvider("g2a")}
               disabled={isLoading || isRefreshing || isDeleting || isRelogining}
             >
-              GrokCLI2API
+              Codex2API
             </button>
           </div>
           <p className="text-xs text-stone-500">

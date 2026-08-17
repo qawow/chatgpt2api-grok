@@ -135,6 +135,8 @@ def obtain_codex_tokens_for_email(
             "logs": logs,
         }
 
+    engine = None
+    login_client = None
     try:
         _bootstrap(engines_dir)
         _apply_env_overrides(cfg)
@@ -480,3 +482,13 @@ def obtain_codex_tokens_for_email(
             "reason": "exception",
             "logs": logs[-80:] + [traceback.format_exc()[-600:]],
         }
+    finally:
+        for client in (
+            login_client,
+            getattr(engine, "http_client", None) if engine is not None else None,
+        ):
+            if client is not None and hasattr(client, "close"):
+                try:
+                    client.close()
+                except Exception:
+                    pass

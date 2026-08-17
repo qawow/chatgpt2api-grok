@@ -29,6 +29,7 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
+from utils.grok_models import is_grok_image_model, resolve_grok_image_model
 from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
 from utils.image_tokens import (
     chat_usage_from_image_usage,
@@ -286,7 +287,44 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
     yield completion_chunk(model, {}, "stop", completion_id, created)
 
 
+def _grok_image_chat(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    """Route grok-*image* chat requests to the Grok pool (never ChatGPT)."""
+    from services.protocol import grok_v1_image_generations
+
+    model, prompt, n, images = chat_image_args(body)
+    if images:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "Grok 免费生图暂不支持图生图/编辑；请改用文生图模型 grok-2-image / grok-imagine"},
+        )
+    result = grok_v1_image_generations.handle(
+        {
+            "prompt": prompt,
+            "model": resolve_grok_image_model(model),
+            "n": n,
+            "response_format": "b64_json",
+            "base_url": body.get("base_url"),
+        }
+    )
+    if body.get("stream"):
+        created = int(result.get("created") or time.time())
+        outputs = [
+            ImageOutput(kind="result", created=created, data=list(result.get("data") or []), account_email=""),
+        ]
+        return stream_image_chat_completion(outputs, model)
+    response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
+    usage = image_usage(
+        input_text_tokens=count_text_tokens(prompt, model),
+        output_tokens=count_image_output_items_tokens(result.get("data")),
+    )
+    response["usage"] = chat_usage_from_image_usage(usage)
+    return response
+
+
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    model_name = str(body.get("model") or "").strip()
+    if is_grok_image_model(model_name):
+        return _grok_image_chat(body)
     if body.get("stream"):
         if is_image_chat_request(body):
             return image_chat_events(body)

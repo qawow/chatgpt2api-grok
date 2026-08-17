@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from services.storage.base import StorageBackend
+from utils.atomic import atomic_write_json
 
 
 class JSONStorageBackend(StorageBackend):
@@ -28,11 +29,7 @@ class JSONStorageBackend(StorageBackend):
 
     @staticmethod
     def _save_json_list(file_path: Path, items: list[dict[str, Any]]) -> None:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(
-            json.dumps(items, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(file_path, items)
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从 JSON 文件加载账号数据"""
@@ -56,11 +53,7 @@ class JSONStorageBackend(StorageBackend):
 
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到 JSON 文件"""
-        self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)
-        self.auth_keys_path.write_text(
-            json.dumps({"items": auth_keys}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(self.auth_keys_path, {"items": auth_keys})
 
     def health_check(self) -> dict[str, Any]:
         """健康检查"""

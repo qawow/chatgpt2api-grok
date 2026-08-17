@@ -58,12 +58,10 @@ class GrokAccountService:
         self._accounts = accounts
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        from utils.atomic import atomic_write_json
+
         items = [dict(item) for item in self._accounts.values()]
-        self.path.write_text(
-            json.dumps(items, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(self.path, items)
 
     # ── normalize / import ──────────────────────────────────────
     @classmethod
@@ -125,6 +123,40 @@ class GrokAccountService:
     def count(self) -> int:
         with self._lock:
             return len(self._accounts)
+
+    def list_watchable_tokens(self) -> list[str]:
+        """Tokens the watcher should probe: enabled, not disabled, with refresh_token.
+
+        Includes 正常/限流/异常 so the watcher can both refresh near-expiry tokens
+        and recover tokens marked 异常 (which _is_available excludes from live
+        traffic). Watcher probes refresh_accounts → probe_responses, which will
+        re-clear 异常 if the token is actually alive again.
+        """
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            out: list[str] = []
+            for token, account in self._accounts.items():
+                if bool(account.get("disabled")):
+                    continue
+                status = _clean(account.get("status")) or "正常"
+                if status == "禁用":
+                    continue
+                # No refresh_token ⇒ nothing the watcher can do; skip.
+                if not _clean(account.get("refresh_token")):
+                    continue
+                out.append(token)
+            return out
+
+    def list_expiring_tokens(self) -> list[str]:
+        """Tokens whose access token is near natural expiry (refresh_token present)."""
+        with self._lock:
+            out: list[str] = []
+            for token, account in self._accounts.items():
+                if not _clean(account.get("refresh_token")):
+                    continue
+                if self._token_needs_refresh(account):
+                    out.append(token)
+            return out
 
     def add_account_items(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         added = 0
@@ -199,15 +231,36 @@ class GrokAccountService:
     # ── selection ───────────────────────────────────────────────
     # Refresh a bit before natural expiry so free Build requests don't 401 mid-flight.
     _TOKEN_SKEW_SECONDS = 300
+    # Cool down after recent auth/refresh failure so get_next_account stops
+    # hammering a known-dead token until the next watcher probe or manual refresh.
+    _ERROR_COOLDOWN_SECONDS = 5 * 60
 
     def _is_available(self, account: dict[str, Any]) -> bool:
         if bool(account.get("disabled")):
             return False
         status = _clean(account.get("status")) or "正常"
-        return status not in {"禁用", "异常"}
+        # 限流/异常/禁用 均不可选（限流是 429 标记，异常是 401/403 标记）
+        if status in {"禁用", "异常", "限流"}:
+            return False
+        return True
 
-    def _parse_expired_at(self, account: dict[str, Any]) -> datetime | None:
-        raw = _clean(account.get("expired"))
+    def _recent_error_cooldown_active(self, account: dict[str, Any], now: datetime | None = None) -> bool:
+        """True if the account recently failed and should be skipped by get_next_account.
+
+        Watcher (list_watchable_tokens) is NOT subject to this cooldown so it can
+        still probe/recover; but the live request path should avoid known-dead
+        tokens for a few minutes to avoid burning every request on a 401.
+        """
+        now = now or datetime.now(timezone.utc)
+        last_error_at = self._parse_expired_like(account.get("last_error_at"))
+        if last_error_at is None:
+            return False
+        return (now - last_error_at).total_seconds() < self._ERROR_COOLDOWN_SECONDS
+
+    @staticmethod
+    def _parse_expired_like(value: object) -> datetime | None:
+        """Parse the ISO timestamp stored in last_error_at / expired fields."""
+        raw = _clean(value)
         if not raw:
             return None
         try:
@@ -219,6 +272,9 @@ class GrokAccountService:
             return dt.astimezone(timezone.utc)
         except Exception:
             return None
+
+    def _parse_expired_at(self, account: dict[str, Any]) -> datetime | None:
+        return self._parse_expired_like(account.get("expired"))
 
     def _token_needs_refresh(self, account: dict[str, Any], *, skew_seconds: int | None = None) -> bool:
         """True when access token is missing expiry, already expired, or within skew window."""
@@ -264,10 +320,19 @@ class GrokAccountService:
                 token_endpoint=_clean(account.get("token_endpoint")) or None,
                 proxy=_clean(account.get("proxy")) or None,
             )
-        except GrokBackendError:
-            # Leave the original account; caller may still try and mark 401.
+        except GrokBackendError as exc:
+            # If the refresh_token itself is revoked (401/403), the account is
+            # permanently dead — mark 异常 so _is_available excludes it and the
+            # watcher can attempt recovery on the next probe cycle. Previously
+            # this silently returned the old account, causing every subsequent
+            # request to fail with 401 without any status change.
+            if getattr(exc, "status", None) in {401, 403}:
+                self.mark_result(token, False, error=f"refresh_{exc.status}")
             return dict(account)
-        except Exception:
+        except Exception as exc:
+            # Non-auth errors (network, JSON parse) — record but don't mark 异常
+            # since the failure might be transient.
+            self.mark_result(token, False, error=str(exc)[:300])
             return dict(account)
 
         fields = {
@@ -301,7 +366,7 @@ class GrokAccountService:
                 if token in exclude:
                     continue
                 account = self._accounts.get(token)
-                if account and self._is_available(account):
+                if account and self._is_available(account) and not self._recent_error_cooldown_active(account):
                     self._index = (start + offset + 1) % len(ordered)
                     next_item = dict(account)
                     next_item["last_used_at"] = _now_iso()
@@ -346,8 +411,25 @@ class GrokAccountService:
                 next_item["last_error"] = None
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
-                next_item["last_error"] = _clean(error) or next_item.get("last_error")
+                err_text = _clean(error)
+                next_item["last_error"] = err_text or next_item.get("last_error")
                 next_item["last_error_at"] = _now_iso()
+                # Auth failures (401/403) imply the token is dead → mark 异常
+                # so _is_available excludes it. Watcher can still recover later.
+                err_l = err_text.lower()
+                if (
+                    "auth_401" in err_l
+                    or "auth_403" in err_l
+                    or "401" in err_l
+                    or "403" in err_l
+                    or "unauthorized" in err_l
+                    or "forbidden" in err_l
+                    or "invalid_token" in err_l
+                ):
+                    next_item["status"] = "异常"
+                # 429 rate-limit → mark 限流 (already handled in refresh_accounts)
+                elif "429" in err_l or "rate_limit" in err_l or "rate limited" in err_l:
+                    next_item["status"] = "限流"
             self._accounts[token] = next_item
             self._save()
 
@@ -368,10 +450,26 @@ class GrokAccountService:
                 merged[key] = value
             merged["access_token"] = new_token
             merged["last_refresh"] = _now_iso()
+            # Save BEFORE modifying memory so a disk failure doesn't leave
+            # the in-memory dict inconsistent with the persisted state.
+            # Strategy: apply changes, try to save; if save fails, roll back.
+            backup_old = self._accounts.get(old)
+            backup_new = self._accounts.get(new_token)
+            had_old = old in self._accounts
             if old != new_token:
                 self._accounts.pop(old, None)
             self._accounts[new_token] = merged
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                # Roll back: restore old entry, remove new entry
+                if had_old and backup_old is not None:
+                    self._accounts[old] = backup_old
+                if old != new_token:
+                    self._accounts.pop(new_token, None)
+                    if backup_new is not None:
+                        self._accounts[new_token] = backup_new
+                raise
             return dict(merged)
 
     # ── refresh + probe ─────────────────────────────────────────
@@ -453,7 +551,19 @@ class GrokAccountService:
                         self._accounts[token] = current
                         self._save()
             except Exception as exc:
+                # Non-GrokBackendError (JSONDecodeError, OSError, etc.) — still
+                # update the account's last_error so the UI/watcher can see it.
+                # Previously this branch only appended to errors without updating
+                # the account, making it look healthy to the next selection.
                 errors.append({"access_token": token[:16] + "...", "error": str(exc)[:200]})
+                with self._lock:
+                    current = self._accounts.get(token)
+                    if current:
+                        current = dict(current)
+                        current["last_error"] = str(exc)[:300]
+                        current["last_error_at"] = _now_iso()
+                        self._accounts[token] = current
+                        self._save()
 
         return {
             "refreshed": refreshed,

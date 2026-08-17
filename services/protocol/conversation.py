@@ -724,6 +724,12 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         finally:
             if active_backend is not None:
                 active_backend.close()
+            # Also close the backend passed in by the caller so its
+            # requests.Session doesn't leak on every text/chat call.
+            try:
+                backend.close()
+            except Exception:
+                pass
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -783,9 +789,16 @@ def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id:
     if not config.image_remove_conversation_after_result or not conversation_id:
         return
 
+    # Capture the access_token now — the caller's backend may be closed by
+    # the time this background thread runs. Create a fresh backend to avoid
+    # using a session that has been closed.
+    access_token = getattr(backend, "access_token", "") or ""
+
     def _run() -> None:
+        cleanup_backend: OpenAIBackendAPI | None = None
         try:
-            backend.delete_conversation(conversation_id)
+            cleanup_backend = OpenAIBackendAPI(access_token=access_token)
+            cleanup_backend.delete_conversation(conversation_id)
             logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
         except Exception as exc:
             logger.warning({
@@ -793,6 +806,12 @@ def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id:
                 "conversation_id": conversation_id,
                 "error": str(exc),
             })
+        finally:
+            if cleanup_backend is not None:
+                try:
+                    cleanup_backend.close()
+                except Exception:
+                    pass
 
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
@@ -1510,60 +1529,53 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         "n": request.n,
         "model": request.model,
     })
-    # 每张图片一个线程，同时启动
     futures = {}
-    results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
+    emitted = False
+    last_error = ""
+    executor = ThreadPoolExecutor(max_workers=request.n)
+    try:
         for index in range(1, request.n + 1):
             future = executor.submit(_generate_single_image, request, index, request.n)
             futures[future] = index
 
-        # 按完成顺序收集结果
+        # Yield as each image finishes so the client sees progress, and so a
+        # disconnect can cancel not-yet-started workers instead of waiting
+        # for the entire batch.
         for future in as_completed(futures):
             index = futures[future]
             try:
-                results[index] = future.result()
+                outputs = future.result()
             except Exception as exc:
                 errors[index] = exc
+                last_error = str(exc)
                 logger.warning({
                     "event": "image_parallel_generation_error",
                     "index": index,
                     "error": str(exc)[:300],
                 })
-
-    # yield 结果：跳过索引顺序限制，不再让低索引失败阻塞高索引成功结果
-    emitted = False
-    last_error = ""
-    # 先 yield 所有成功的结果
-    for index in range(1, request.n + 1):
-        if index in results:
-            for output in results[index]:
+                continue
+            for output in outputs:
                 emitted = True
                 yield output
-        elif index in errors:
-            last_error = str(errors[index])
-            if not emitted:
-                logger.warning({
-                    "event": "image_parallel_failure_before_success",
-                    "failed_index": index,
-                    "error": last_error[:200],
-                })
+    except GeneratorExit:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
-    # 如果有失败但也有成功，记录警告
     if emitted:
-        for index in range(1, request.n + 1):
-            if index in errors:
-                logger.warning({
-                    "event": "image_parallel_partial_failure",
-                    "failed_index": index,
-                    "error": str(errors[index])[:200],
-                })
+        for index, exc in errors.items():
+            logger.warning({
+                "event": "image_parallel_partial_failure",
+                "failed_index": index,
+                "error": str(exc)[:200],
+            })
+        return
 
-    if not emitted:
-        if not last_error:
-            last_error = "no account in the pool could generate images — check account quota and rate-limit status"
-        raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
+    if not last_error:
+        last_error = "no account in the pool could generate images — check account quota and rate-limit status"
+    raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
 
 
 def stream_image_chunks(outputs: Iterable[ImageOutput]) -> Iterator[dict[str, Any]]:

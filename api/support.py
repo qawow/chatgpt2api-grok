@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.grok_account_service import grok_account_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -89,9 +90,10 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 # list_* already exclude free session-only + revoked-cooldown accounts.
                 limited_tokens = account_service.list_limited_tokens()
                 normal_tokens = account_service.list_normal_tokens()
+                abnormal_tokens = account_service.list_abnormal_tokens()
                 expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
+                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *abnormal_tokens, *expiring_tokens]))
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
                 if tokens:
@@ -99,6 +101,7 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                         "[account-watcher] checking "
                         f"{len(limited_tokens)} limited accounts, "
                         f"{len(normal_tokens)} normal accounts, "
+                        f"{len(abnormal_tokens)} abnormal accounts, "
                         f"{len(expiring_tokens)} expiring access tokens"
                     )
                     result = account_service.refresh_accounts(tokens)
@@ -118,6 +121,39 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
             stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_grok_account_watcher(stop_event: Event) -> Thread:
+    """Periodic probe for the Grok/xAI pool (mirrors the ChatGPT watcher).
+
+    Grok pool previously had no watcher: tokens stayed in 正常 status forever
+    even after remote 401/403, so every request burned on dead accounts until a
+    manual /refresh. This watcher re-probes 正常/限流/异常 accounts (those with
+    refresh_token) so dead tokens are marked 异常 and recovered tokens are
+    restored automatically.
+    """
+    interval_seconds = config.refresh_account_interval_minute * 60
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                tokens = grok_account_service.list_watchable_tokens()
+                if not tokens:
+                    # Empty pool or only session-only entries — quiet idle tick.
+                    pass
+                else:
+                    print(f"[grok-watcher] checking {len(tokens)} grok accounts")
+                    result = grok_account_service.refresh_accounts(tokens)
+                    errors = (result or {}).get("errors") or []
+                    if errors:
+                        print(f"[grok-watcher] errors: {errors}")
+            except Exception as exc:
+                print(f"[grok-watcher] fail {exc}")
+            stop_event.wait(interval_seconds)
+
+    thread = Thread(target=worker, name="grok-account-watcher", daemon=True)
     thread.start()
     return thread
 

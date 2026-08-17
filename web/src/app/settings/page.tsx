@@ -30,7 +30,7 @@ const settingsTabs = [
   { value: "proxy", title: "FlareSolverr" },
   { value: "cpa", title: "CPA" },
   { value: "sub2api", title: "Sub2API" },
-  { value: "g2a", title: "GrokCLI2API" },
+  { value: "g2a", title: "Codex2API" },
   { value: "gpt-register", title: "GPT注册" },
 ];
 

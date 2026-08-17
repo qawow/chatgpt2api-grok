@@ -87,8 +87,9 @@ class CPAConfig:
         return []
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(json.dumps(self._pools, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        from utils.atomic import atomic_write_json
+
+        atomic_write_json(self._store_file, self._pools)
 
     def list_pools(self) -> list[dict]:
         with self._lock:

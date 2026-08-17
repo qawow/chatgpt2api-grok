@@ -247,16 +247,26 @@ class GptRegisterService:
 
     def _save_jobs(self) -> None:
         GPT_REGISTER_JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # keep last 20 jobs
+        # Keep last 20 jobs both on disk and in memory to prevent OOM.
         items = sorted(
             self._jobs.values(),
             key=lambda j: str(j.get("created_at") or ""),
             reverse=True,
         )[:20]
-        GPT_REGISTER_JOBS_FILE.write_text(
-            json.dumps(items, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        # Trim in-memory dict: remove old completed jobs not in the top 20.
+        keep_ids = {str(j.get("job_id")) for j in items}
+        for jid in list(self._jobs.keys()):
+            if jid not in keep_ids:
+                self._jobs.pop(jid, None)
+                self._cancel_flags.pop(jid, None)
+        # Clean up cancel flags for completed jobs (Events are one-shot; no
+        # need to keep them after the job is done).
+        for jid, job in list(self._jobs.items()):
+            status = str(job.get("status") or "")
+            if status in {"done", "failed", "cancelled"}:
+                self._cancel_flags.pop(jid, None)
+        from utils.atomic import atomic_write_json
+        atomic_write_json(GPT_REGISTER_JOBS_FILE, items)
 
     def list_jobs(self) -> list[dict[str, Any]]:
         with self._lock:

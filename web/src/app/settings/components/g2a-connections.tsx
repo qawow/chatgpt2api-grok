@@ -242,18 +242,18 @@ export function G2AConnections() {
                 <ServerCog className="size-5 text-stone-600" />
               </div>
               <div>
-                <h2 className="text-lg font-semibold tracking-tight">GrokCLI2API 连接</h2>
+                <h2 className="text-lg font-semibold tracking-tight">Codex2API / 远程网关</h2>
                 <p className="text-sm text-stone-500">
                   对接{" "}
                   <a
                     className="underline decoration-stone-300 underline-offset-2 hover:text-stone-700"
-                    href="https://github.com/Futureppo/grokcli2api-go"
+                    href="https://github.com/james-6-23/codex2api"
                     target="_blank"
                     rel="noreferrer"
                   >
-                    Futureppo/grokcli2api-go
+                    james-6-23/codex2api
                   </a>
-                  ：远程生图代理、号池状态镜像、以及本地 → 远程凭证推送。
+                  （OpenAI Images / Chat / Admin）。旧 grokcli2api-go 仅作回退。
                 </p>
               </div>
             </div>
@@ -272,11 +272,13 @@ export function G2AConnections() {
           </div>
 
           <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-            远程 <code className="rounded bg-white/70 px-1">GET /v1/admin/credentials</code>{" "}
-            只返回脱敏状态，不含 token，因此<strong>不能</strong>从 grokcli2api-go 反向导入本地 token。
-            但已支持：① Grok 生图直连远程 <code className="rounded bg-white/70 px-1">/v1/images/generations</code>
-            （号池留在 grokcli2api-go，无需迁移）；② 号池管理「GrokCLI2API」页只读镜像远程状态；
-            ③ 本地 Grok 号池 → 远程上传。管理请求默认<strong>直连</strong>（忽略系统 HTTP_PROXY）。
+            远程 Codex2API 用 <code className="rounded bg-white/70 px-1">POST /v1/images/generations</code>{" "}
+            和 <code className="rounded bg-white/70 px-1">/v1/images/edits</code> 生图/改图；
+            管理接口是 <code className="rounded bg-white/70 px-1">X-Admin-Key</code> +{" "}
+            <code className="rounded bg-white/70 px-1">/api/admin/accounts</code>。
+            探测走 <code className="rounded bg-white/70 px-1">/health</code> 或{" "}
+            <code className="rounded bg-white/70 px-1">/v1/models</code>。
+            管理请求默认<strong>直连</strong>（忽略系统 HTTP_PROXY）。
             base URL 填服务根地址，例如 <code className="rounded bg-white/70 px-1">http://127.0.0.1:8088</code>
             ，不要填 <code className="rounded bg-white/70 px-1">/v1</code> 或本地代理端口。
           </div>

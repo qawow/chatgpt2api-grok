@@ -23,6 +23,12 @@ DEFAULT_HEADERS = {
     "x-grok-client-identifier": "grok-shell",
 }
 
+CODEx_HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer {token}",
+    "Accept": "application/json",
+}
+
 _DATA_URL_RE = re.compile(
     r"data:(?P<mime>image/[-+.\w]+);base64,(?P<data>[A-Za-z0-9+/=\s]+)",
     re.I,
@@ -66,13 +72,16 @@ def grok_settings() -> dict[str, Any]:
             if str(key).strip() and value is not None:
                 headers[str(key)] = str(value)
     probe_model = str(raw.get("probe_model") or DEFAULT_GROK_TEXT_MODEL).strip() or DEFAULT_GROK_TEXT_MODEL
+    backend_type = str(raw.get("backend_type") or "cli").strip()
     return {
         "base_url": normalize_base_url(base_url),
         "client_id": client_id,
         "token_endpoint": token_endpoint,
         "default_headers": headers,
         "probe_model": probe_model,
+        "backend_type": backend_type,
     }
+
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -102,14 +111,22 @@ def build_request_headers(account: dict[str, Any] | None = None) -> dict[str, st
     settings = grok_settings()
     token = ""
     account = account or {}
-    token = str(account.get("access_token") or "").strip()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "grok-cli/0.2.93",
-        **settings["default_headers"],
-    }
+    token = str(account.get("access_token") or account.get("api_key") or "").strip()
+    headers = dict(DEFAULT_HEADERS)
+    if settings["backend_type"] == "codex2api":
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+    else:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "grok-cli/0.2.93",
+            **settings["default_headers"],
+        }
     extra = account.get("headers")
     if isinstance(extra, dict):
         for key, value in extra.items():
@@ -164,7 +181,14 @@ def refresh_access_token(
             status=resp.status_code,
             body=(resp.text or "")[:500],
         )
-    token = resp.json()
+    try:
+        token = resp.json()
+    except Exception as exc:
+        raise GrokBackendError(
+            f"refresh response is not JSON: {str(exc)[:200]}: {(resp.text or '')[:300]}",
+            status=resp.status_code,
+            body=(resp.text or "")[:500],
+        ) from exc
     if not isinstance(token, dict):
         raise GrokBackendError("refresh response is not an object")
     now = int(time.time())
@@ -185,50 +209,65 @@ def probe_responses(
     timeout: float = 45.0,
 ) -> dict[str, Any]:
     settings = grok_settings()
+    backend_type = settings.get("backend_type", "cli")
     base = account_base_url(account)
-    url = urljoin(base.rstrip("/") + "/", "responses")
-    body = {
-        "model": (model or settings["probe_model"]),
-        "input": "Reply exactly: OK",
-        "max_output_tokens": 8,
-    }
+    if backend_type == "codex2api":
+        # Use OpenAI-compatible short probe (codex2api supports /v1/chat/completions)
+        url = f"{base.rstrip('/')}/chat/completions"
+        body = {
+            "model": model or settings.get("probe_model") or "grok-4.5",
+            "messages": [{"role": "user", "content": "Ping"}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+    else:
+        # Old cli-chat-proxy path
+        url = urljoin(base.rstrip("/") + "/", "responses")
+        body = {
+            "model": (model or settings["probe_model"]),
+            "input": "Reply exactly: OK",
+            "max_output_tokens": 8,
+        }
     try:
-        resp = requests.post(
-            url,
-            headers=build_request_headers(account),
-            json=body,
-            timeout=timeout,
-            proxies=_proxies(account_proxy(account)),
-        )
+        if backend_type == "codex2api":
+            resp = requests.post(
+                url,
+                headers=build_request_headers(account),
+                json=body,
+                timeout=timeout,
+                proxies=_proxies(account_proxy(account)),
+            )
+        else:
+            resp = requests.post(
+                url,
+                headers=build_request_headers(account),
+                json=body,
+                timeout=timeout,
+                proxies=_proxies(account_proxy(account)),
+            )
     except requests.RequestException as exc:
         raise GrokBackendError(f"probe network error: {exc}") from exc
 
     out: dict[str, Any] = {
         "status": resp.status_code,
         "url": url,
-        "remaining_tokens": _header_int(resp.headers, "x-ratelimit-remaining-tokens"),
-        "limit_tokens": _header_int(resp.headers, "x-ratelimit-limit-tokens"),
-        "remaining_requests": _header_int(resp.headers, "x-ratelimit-remaining-requests"),
-        "limit_requests": _header_int(resp.headers, "x-ratelimit-limit-requests"),
     }
     text = resp.text or ""
-    if resp.status_code == 429:
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                out["model"] = data.get("model")
+                out["usage"] = data.get("usage")
+        except Exception:
+            pass
+    elif resp.status_code == 429:
         out["error"] = text[:300]
         out["code"] = "rate_limited_or_quota"
-        return out
-    try:
-        data = resp.json()
-        if isinstance(data, dict):
-            out["model"] = data.get("model")
-            usage = data.get("usage")
-            if isinstance(usage, dict):
-                out["probe_total_tokens"] = usage.get("total_tokens") or usage.get("totalTokens")
-            if resp.status_code >= 400:
-                err = data.get("error")
-                out["error"] = str(err or text)[:300]
-    except Exception:
-        if resp.status_code >= 400:
-            out["error"] = text[:300]
+    elif resp.status_code in {401, 403}:
+        out["error"] = f"auth_{resp.status_code}"
+    else:
+        out["error"] = text[:300]
     return out
 
 
@@ -363,7 +402,11 @@ def generate_image(
                 }
             )
             if exc.status in {401, 403}:
-                break
+                # Auth failure: re-raise immediately so the caller can refresh
+                # the token and retry. Previously this broke out of the loop and
+                # the final raise used status=502, which made the caller's
+                # `if exc.status in {401, 403}` refresh-retry branch dead code.
+                raise exc
             continue
 
         extracted = _extract_images_from_responses(data)

@@ -1,23 +1,23 @@
-"""Integration with Futureppo/grokcli2api-go.
+"""Remote OpenAI-compatible gateway (Codex2API) for Grok image/text proxy.
 
-Remote admin surface (requires GROK_ADMIN_KEY on the remote):
+Primary target: https://github.com/james-6-23/codex2api
 
-  GET    /v1/admin/credentials
-  POST   /v1/admin/credentials   (JSON body or multipart file)
-  DELETE /v1/admin/credentials/{id}
+Client surface (Bearer API key; skip auth if remote has no keys):
 
-OpenAI-compatible client surface (API key / admin key as Bearer):
-
-  POST   /v1/responses           # 0.4.x image primary: tools=[{type:image_generation}]
+  POST   /v1/images/generations
+  POST   /v1/images/edits
   POST   /v1/chat/completions
+  POST   /v1/responses
   GET    /v1/models
-  POST   /v1/images/generations  # not on 0.4.x; kept as fallback if a future remote adds it
+  GET    /health
 
-List responses are intentionally masked (no tokens / paths). Therefore:
+Admin surface (X-Admin-Key + Bearer):
 
-  local Grok pool  ──push──►  grokcli2api-go auths
-  chatgpt2api Grok 生图 ──proxy──►  grokcli2api-go /v1/responses + image_generation
-  remote credentials ──status only──►  号池管理展示（脱敏，不可反向导入 token）
+  GET/POST/DELETE  /api/admin/accounts
+  POST             /api/admin/accounts/at
+
+Old grokcli2api-go ``/v1/admin/credentials`` + ``/v1/responses`` image tool
+is kept only as a fallback for leftover remotes.
 
 This never writes into the ChatGPT account pool.
 """
@@ -305,11 +305,9 @@ class G2AConfig:
         return []
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(
-            json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        from utils.atomic import atomic_write_json
+
+        atomic_write_json(self._store_file, self._servers)
 
     def list_servers(self) -> list[dict]:
         with self._lock:
@@ -557,39 +555,105 @@ class G2AClient:
             return {"raw": text[:500]}
 
     def ping(self) -> dict[str, Any]:
-        """List credentials as connectivity probe."""
-        if not self.admin_key:
-            raise G2AClientError("server admin_key is empty")
-        result = self.list_credentials()
-        return {
-            "ok": True,
-            "count": len(result.get("items") or []),
-            "base_url": self.base_url,
-            "can_proxy_image": bool(self.api_key or self.admin_key),
-            "raw_keys": sorted(result.keys()),
-        }
+        """Probe Codex2API /health, then /v1/models, then admin accounts."""
+        last_exc: G2AClientError | None = None
+        for path, use_api in (("/health", True), ("/v1/models", True)):
+            try:
+                payload = self._request(
+                    "GET",
+                    path,
+                    headers=self._headers(content_type=None, use_api_key=use_api),
+                )
+                count = 0
+                if isinstance(payload, dict):
+                    data = payload.get("data") or payload.get("accounts")
+                    if isinstance(data, list):
+                        count = len(data)
+                return {
+                    "ok": True,
+                    "probe": path,
+                    "count": count,
+                    "base_url": self.base_url,
+                    "can_proxy_image": bool(self.api_key or self.admin_key),
+                    "raw_keys": sorted(payload.keys()) if isinstance(payload, dict) else [],
+                }
+            except G2AClientError as exc:
+                last_exc = exc
+                if exc.status in {401, 403}:
+                    raise
+                continue
+        if self.admin_key:
+            result = self.list_credentials()
+            return {
+                "ok": True,
+                "probe": "admin_accounts",
+                "count": len(result.get("items") or []),
+                "base_url": self.base_url,
+                "can_proxy_image": True,
+                "raw_keys": sorted((result.get("raw") or {}).keys()) if isinstance(result.get("raw"), dict) else [],
+            }
+        raise last_exc or G2AClientError("remote ping failed")
 
     def list_credentials(self) -> dict[str, Any]:
         if not self.admin_key:
             raise G2AClientError("server admin_key is empty")
-        payload = self._request("GET", "/v1/admin/credentials")
-        items = _extract_credential_list(payload)
-        return {"items": items, "raw": payload if isinstance(payload, dict) else {"data": payload}}
+        last_exc: G2AClientError | None = None
+        for path in ("/api/admin/accounts", "/v1/admin/credentials"):
+            try:
+                payload = self._request("GET", path)
+                items = _extract_credential_list(payload)
+                return {
+                    "items": items,
+                    "kind": "codex2api" if path.startswith("/api/admin") else "legacy",
+                    "raw": payload if isinstance(payload, dict) else {"data": payload},
+                }
+            except G2AClientError as exc:
+                last_exc = exc
+                if exc.status in {401, 403}:
+                    raise
+                if exc.status in {404, 405}:
+                    continue
+                raise
+        raise last_exc or G2AClientError("cannot list remote accounts")
 
     def upload_credential(self, account: dict[str, Any]) -> dict[str, Any]:
-        """POST cliproxy-compatible JSON body (same as remote --data-binary @auth.json)."""
+        """Push one local account to Codex2API admin, with legacy grokcli fallback."""
         if not self.admin_key:
             raise G2AClientError("server admin_key is empty")
+        name = _clean(account.get("email") or account.get("name")) or "grok"
+        refresh = _clean(account.get("refresh_token"))
+        access = _clean(account.get("access_token"))
+        last_exc: G2AClientError | None = None
+        if refresh:
+            try:
+                return self._request(
+                    "POST",
+                    "/api/admin/accounts",
+                    json_body={"name": name, "refresh_token": refresh},
+                )
+            except G2AClientError as exc:
+                last_exc = exc
+                if exc.status not in {404, 405}:
+                    raise
+        if access:
+            try:
+                return self._request(
+                    "POST",
+                    "/api/admin/accounts/at",
+                    json_body={"name": name, "access_token": access},
+                )
+            except G2AClientError as exc:
+                last_exc = exc
+                if exc.status not in {404, 405}:
+                    raise
         body = _account_to_cliproxy_payload(account)
         if not body.get("access_token"):
-            raise G2AClientError("account missing access_token")
-        # Prefer raw JSON bytes (matches README --data-binary @auth.json).
+            raise last_exc or G2AClientError("account missing access_token")
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = self._headers(content_type="application/json")
         try:
             return self._request("POST", "/v1/admin/credentials", data=raw, headers=headers)
         except G2AClientError as first_exc:
-            # Fallback: multipart file field used by some deploy docs.
             if first_exc.status not in {400, 415, 422}:
                 raise
             try:
@@ -610,7 +674,12 @@ class G2AClient:
         cid = _clean(credential_id)
         if not cid:
             raise G2AClientError("credential id is required")
-        return self._request("DELETE", f"/v1/admin/credentials/{cid}")
+        try:
+            return self._request("DELETE", f"/api/admin/accounts/{cid}")
+        except G2AClientError as exc:
+            if exc.status in {404, 405}:
+                return self._request("DELETE", f"/v1/admin/credentials/{cid}")
+            raise
 
     def generate_image(
         self,
@@ -623,22 +692,7 @@ class G2AClient:
         extra: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Proxy image generation to remote grokcli2api-go.
-
-        grokcli2api-go 0.4.x does **not** expose ``POST /v1/images/generations``.
-        Free Grok Build images go through the OpenAI Responses surface:
-
-            POST /v1/responses
-            model=grok-4.5 (text / build-free)
-            tools=[{"type":"image_generation"}]
-
-        Account rotation stays on the remote. We only forward the request and
-        normalize the result into OpenAI Images ``{created, data:[{b64_json|url}]}``.
-
-        Fallback order:
-        1. ``/v1/responses`` + image_generation tool (primary, matches 0.4.x)
-        2. ``/v1/images/generations`` (if a future remote adds it)
-        """
+        """Proxy image generation to remote Codex2API (OpenAI Images first)."""
         if not (self.api_key or self.admin_key):
             raise G2AClientError("server api_key/admin_key is empty")
         prompt_text = _clean(prompt)
@@ -650,35 +704,6 @@ class G2AClient:
             self.timeout = float(timeout)
         attempts: list[dict[str, Any]] = []
         try:
-            # 1) Primary: Responses + image_generation tool (grokcli2api-go 0.4.x)
-            try:
-                out_items, used_model, path = self._generate_image_via_responses(
-                    prompt=prompt_text,
-                    model=model,
-                    n=want_n,
-                    extra=extra,
-                )
-                return self._image_result(
-                    out_items,
-                    model=used_model,
-                    path=path,
-                    response_format=response_format,
-                    attempts=attempts
-                    + [{"path": path, "model": used_model, "status": 200, "images": len(out_items)}],
-                )
-            except G2AClientError as exc:
-                attempts.append(
-                    {
-                        "path": "responses+image_generation",
-                        "error": str(exc)[:220],
-                        "status": exc.status,
-                    }
-                )
-                # Auth errors: don't bother with images/generations
-                if exc.status in {401, 403}:
-                    raise
-
-            # 2) Optional OpenAI Images endpoint (not present on 0.4.x)
             try:
                 out_items, used_model, path = self._generate_image_via_images_api(
                     prompt=prompt_text,
@@ -704,12 +729,111 @@ class G2AClient:
                         "status": exc.status,
                     }
                 )
+                if exc.status in {401, 403}:
+                    raise
+
+            try:
+                out_items, used_model, path = self._generate_image_via_responses(
+                    prompt=prompt_text,
+                    model=model,
+                    n=want_n,
+                    extra=extra,
+                )
+                return self._image_result(
+                    out_items,
+                    model=used_model,
+                    path=path,
+                    response_format=response_format,
+                    attempts=attempts
+                    + [{"path": path, "model": used_model, "status": 200, "images": len(out_items)}],
+                )
+            except G2AClientError as exc:
+                attempts.append(
+                    {
+                        "path": "responses+image_generation",
+                        "error": str(exc)[:220],
+                        "status": exc.status,
+                    }
+                )
                 raise G2AClientError(
                     f"g2a image proxy failed on {self.base_url}: "
                     f"{'; '.join(a.get('error') or '' for a in attempts if a.get('error'))[:500]}",
                     status=exc.status or 502,
                     body={"attempts": attempts},
                 ) from exc
+        finally:
+            self.timeout = prev_timeout
+
+    def edit_image(
+        self,
+        *,
+        prompt: str,
+        images: list[dict[str, str]],
+        model: str = "gpt-image-2",
+        n: int = 1,
+        size: str | None = None,
+        response_format: str = "b64_json",
+        extra: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Proxy image edits to remote Codex2API ``POST /v1/images/edits``."""
+        if not (self.api_key or self.admin_key):
+            raise G2AClientError("server api_key/admin_key is empty")
+        prompt_text = _clean(prompt)
+        if not prompt_text:
+            raise G2AClientError("prompt is required", status=400)
+        if not images:
+            raise G2AClientError("images is required", status=400)
+        prev_timeout = self.timeout
+        if timeout is not None:
+            self.timeout = float(timeout)
+        try:
+            body: dict[str, Any] = {
+                "prompt": prompt_text,
+                "model": model or "gpt-image-2",
+                "n": max(1, min(int(n or 1), 4)),
+                "response_format": response_format or "b64_json",
+                "images": images,
+            }
+            if size:
+                body["size"] = size
+            if isinstance(extra, dict):
+                for key, value in extra.items():
+                    if key in body or value is None:
+                        continue
+                    body[key] = value
+            payload = self._request(
+                "POST",
+                "/v1/images/edits",
+                json_body=body,
+                headers=self._headers(content_type="application/json", use_api_key=True),
+            )
+            if not isinstance(payload, dict):
+                raise G2AClientError("remote image edit response is not a JSON object")
+            data = payload.get("data")
+            if not isinstance(data, list) or not data:
+                raise G2AClientError("remote image edit response missing data[]")
+            out_items: list[dict[str, Any]] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                entry: dict[str, Any] = {}
+                b64 = item.get("b64_json") or item.get("b64") or item.get("base64")
+                url = item.get("url")
+                if isinstance(b64, str) and b64.strip():
+                    entry["b64_json"] = b64.strip()
+                if isinstance(url, str) and url.strip():
+                    entry["url"] = url.strip()
+                if entry:
+                    out_items.append(entry)
+            if not out_items:
+                raise G2AClientError("remote image edit had no usable b64/url items")
+            return self._image_result(
+                out_items,
+                model=str(payload.get("model") or model),
+                path="images/edits",
+                response_format=response_format,
+            )
         finally:
             self.timeout = prev_timeout
 
@@ -1123,6 +1247,54 @@ class G2ABridgeService:
                 continue
         detail = "; ".join(errors[:5]) or (str(last_exc) if last_exc else "unknown")
         raise G2AClientError(f"all G2A image proxy attempts failed: {detail}", status=502)
+
+    def edit_image(
+        self,
+        *,
+        prompt: str,
+        images: list[dict[str, str]],
+        model: str = "gpt-image-2",
+        n: int = 1,
+        size: str | None = None,
+        response_format: str = "b64_json",
+        server_id: str | None = None,
+        timeout: float = 180.0,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if server_id:
+            server = self.config.get_server(server_id)
+            if not server:
+                raise G2AClientError("server not found", status=404)
+            candidates = [server]
+        else:
+            candidates = self.config.list_image_proxy_servers()
+        if not candidates:
+            raise G2AClientError("no remote image proxy configured", status=404)
+        errors: list[str] = []
+        last_exc: G2AClientError | None = None
+        for server in candidates:
+            sid = _clean(server.get("id"))
+            try:
+                client = G2AClient(server, timeout=timeout)
+                result = client.edit_image(
+                    prompt=prompt,
+                    images=images,
+                    model=model,
+                    n=n,
+                    size=size,
+                    response_format=response_format,
+                    extra=extra,
+                    timeout=timeout,
+                )
+                self.config.mark_status(sid, ok=True)
+                return result
+            except G2AClientError as exc:
+                last_exc = exc
+                errors.append(f"{sid or server.get('base_url')}: {exc}")
+                self.config.mark_status(sid, ok=False, error=str(exc))
+                continue
+        detail = "; ".join(errors[:5]) or (str(last_exc) if last_exc else "unknown")
+        raise G2AClientError(f"all remote image edit attempts failed: {detail}", status=502)
 
     def has_image_proxy(self) -> bool:
         return bool(self.config.list_image_proxy_servers())

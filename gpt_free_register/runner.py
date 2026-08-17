@@ -310,6 +310,15 @@ def register_chatgpt_once(
             "extra": {"error": str(exc)[:500], "trace": traceback.format_exc()[-800:]},
             "error": str(exc)[:500],
         }
+    finally:
+        # Close curl_cffi sessions so batch register doesn't leak fds.
+        for obj in (platform, getattr(platform, "engine", None)):
+            client = getattr(obj, "http_client", None) if obj is not None else None
+            if client is not None and hasattr(client, "close"):
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     extra_out = dict(getattr(account, "extra", None) or {})
     token = _clean(getattr(account, "token", None)) or _clean(extra_out.get("access_token"))

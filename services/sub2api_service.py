@@ -87,11 +87,9 @@ class Sub2APIConfig:
         return []
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(
-            json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        from utils.atomic import atomic_write_json
+
+        atomic_write_json(self._store_file, self._servers)
 
     def list_servers(self) -> list[dict]:
         with self._lock:

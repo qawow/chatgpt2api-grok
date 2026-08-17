@@ -6,9 +6,6 @@ import random
 import re
 import time
 
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -349,6 +346,18 @@ class OpenAIBackendAPI:
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
+        # Inject Cloudflare clearance cookies / UA from proxy_runtime.
+        # Previously build_headers existed but was never called from this client,
+        # so FlareSolverr / manual cf_clearance had no effect on live traffic.
+        try:
+            merged = proxy_settings.build_headers(
+                headers=headers,
+                target_url=self.base_url + path,
+                account=self.account,
+            )
+            headers = {str(k): str(v) for k, v in merged.items()}
+        except Exception:
+            pass
         return headers
 
     @staticmethod
@@ -420,20 +429,14 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
-        try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+        # Previously used ThreadPoolExecutor to parallelize three API calls,
+        # but curl_cffi's Session (libcurl) is NOT thread-safe — concurrent use
+        # of the same session handle from multiple threads can crash or produce
+        # corrupted responses. Switched to sequential calls; the latency
+        # difference is negligible (~3 requests × ~200ms each).
+        me_payload = self._get_me()
+        init_payload = self._get_conversation_init()
+        default_account = self._get_default_account()
 
         plan_type = str(default_account.get("plan_type") or "free")
 
@@ -799,8 +802,13 @@ class OpenAIBackendAPI:
     @staticmethod
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
-        status_code = getattr(raw, "status", None)
+        if hasattr(raw, "text"):
+            text = str(raw.text or "")
+        else:
+            text = raw.read().decode("utf-8", "replace")
+        status_code = getattr(raw, "status_code", None)
+        if status_code is None:
+            status_code = getattr(raw, "status", None)
         parse_errors: list[str] = []
         events: list[Dict[str, Any]] = []
         if "application/json" in content_type:
@@ -881,12 +889,6 @@ class OpenAIBackendAPI:
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
-        request = urllib.request.Request(
-            self.base_url + path,
-            json.dumps(payload).encode(),
-            self._codex_responses_headers(),
-            method="POST",
-        )
         account = account_service.get_account(self.access_token) or {}
         token_payload = account_service._decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
@@ -895,7 +897,7 @@ class OpenAIBackendAPI:
         logger.info({
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
-            "transport": "urllib.request",
+            "transport": "curl_cffi.session",
             "timeout_secs": 1200,
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
@@ -929,19 +931,31 @@ class OpenAIBackendAPI:
             },
         })
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
-                yield from self._iter_codex_response_events(raw)
-        except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
-            body: Any = body_text
-            try:
-                body = json.loads(body_text)
-            except Exception:
-                pass
-            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
-            retry_after_header = error.headers.get("Retry-After") if error.headers else None
-            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
-            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+            # Use the same curl_cffi session as the rest of the client so
+            # proxy_runtime / account proxy / clearance / skip_ssl_verify apply.
+            # urllib.request previously bypassed all of that.
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._codex_responses_headers(),
+                json=payload,
+                timeout=1200,
+            )
+            if response.status_code >= 400:
+                body_text = response.text or ""
+                body: Any = body_text
+                try:
+                    body = response.json()
+                except Exception:
+                    pass
+                self._log_codex_response_failure(path, response.status_code, response.headers, payload, body)
+                retry_after_header = response.headers.get("Retry-After") if response.headers else None
+                retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
+                raise UpstreamHTTPError(path, response.status_code, body, retry_after=retry_after)
+            yield from self._iter_codex_response_events(response)
+        except UpstreamHTTPError:
+            raise
+        except Exception as error:
+            raise RuntimeError(f"codex responses network error: {error}") from error
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
@@ -2624,11 +2638,16 @@ class OpenAIBackendAPI:
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
+        seen_urls: set[str] = set()
         for url in urls:
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
             response = self.session.get(url, timeout=120)
             ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            # Do not de-dupe by image bytes: identical pixels from different
+            # URLs are still distinct results the client asked for (n>1).
+            images.append(response.content)
         return images
 
     def stream_conversation(

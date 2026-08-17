@@ -28,6 +28,7 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
+from utils.grok_models import is_grok_image_model, resolve_grok_image_model
 from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
 from utils.image_tokens import (
     count_image_content_tokens,
@@ -427,6 +428,29 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
     model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    if is_grok_image_model(model):
+        image_info = extract_response_image(body.get("input"))
+        if image_info:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Grok 免费生图暂不支持图生图/编辑；请改用文生图模型 grok-2-image / grok-imagine"},
+            )
+        from services.protocol import grok_v1_image_generations
+
+        result = grok_v1_image_generations.handle(
+            {
+                "prompt": prompt,
+                "model": resolve_grok_image_model(model),
+                "n": 1,
+                "response_format": "b64_json",
+            }
+        )
+        created = int(result.get("created") or time.time())
+        outputs = [
+            ImageOutput(kind="result", created=created, data=list(result.get("data") or []), account_email=""),
+        ]
+        yield from stream_image_response(outputs, prompt, model, 0, None, "auto")
+        return
     image_info = extract_response_image(body.get("input"))
     if image_info:
         image_data, mime_type = image_info

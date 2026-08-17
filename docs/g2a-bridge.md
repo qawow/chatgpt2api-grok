@@ -1,7 +1,8 @@
-# grokcli2api-go 接入（设置页）
+# 远程网关接入（Codex2API）
 
-在 chatgpt2api **设置 → GrokCLI2API** 中对接
-[Futureppo/grokcli2api-go](https://github.com/Futureppo/grokcli2api-go)。
+在 chatgpt2api **设置 → Codex2API** 中对接
+[james-6-23/codex2api](https://github.com/james-6-23/codex2api)
+（OpenAI Images / Chat / Admin）。旧 grokcli2api-go 仅作回退。
 
 ## 远程接口（对方）
 

@@ -28,7 +28,7 @@
 | Grok 上游 | 默认 `cli-chat-proxy.grok.com`（Build/CLI），刷新走 `auth.x.ai` |
 | 生图分流 | `model=grok-2-image` / `grok-imagine` 走 Grok 池；另有 `/v1/grok/images/generations` |
 | 文本探活 | `/v1/grok/chat/completions`（内部映射 Build `/responses`） |
-| GrokCLI2API 接入 | 设置页「GrokCLI2API」：对接远程 Admin API，**推送**本地 Grok 号到 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go) |
+| 远程网关 | 设置页「Codex2API」：对接 [james-6-23/codex2api](https://github.com/james-6-23/codex2api) 的 `/v1/images/*` 与 `/api/admin/accounts` |
 | GPT Free 批量注册 | 设置页「GPT注册」：内置 `gpt_free_register` 纯协议注册 free 号并入库 ChatGPT 号池；入库后自动刷新额度；无 refresh 的 session 号标 fragile |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
 

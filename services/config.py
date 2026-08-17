@@ -367,7 +367,9 @@ class ConfigStore:
         return _read_json_object(self.path, name="config.json")
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        from utils.atomic import atomic_write_json
+
+        atomic_write_json(self.path, self.data)
 
     @property
     def auth_key(self) -> str:
@@ -599,8 +601,8 @@ class ConfigStore:
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
-        data["backup"] = self.get_backup_settings()
-        data["image_storage"] = self.get_image_storage_settings()
+        data["backup"] = self._sanitize_backup_settings(self.get_backup_settings())
+        data["image_storage"] = self._sanitize_image_storage_settings(self.get_image_storage_settings())
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
@@ -614,7 +616,14 @@ class ConfigStore:
         return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
 
     def get_public_proxy_runtime_settings(self) -> dict[str, object]:
+        from services.proxy_service import _redact_url_credentials
+
         runtime = copy.deepcopy(self.get_proxy_runtime_settings())
+        # Redact credentials in proxy URLs (http://user:pass@host → http://[REDACTED]@host)
+        for url_field in ("proxy_url", "resource_proxy_url"):
+            val = str(runtime.get(url_field) or "").strip()
+            if val:
+                runtime[url_field] = _redact_url_credentials(val)
         clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
         if isinstance(clearance, dict):
             cf_cookies = str(clearance.get("cf_cookies") or "").strip()
@@ -623,6 +632,10 @@ class ConfigStore:
             clearance["cf_clearance"] = ""
             clearance["has_cf_cookies"] = bool(cf_cookies)
             clearance["has_cf_clearance"] = bool(cf_clearance)
+            # Redact FlareSolverr URL credentials too
+            fs_url = str(clearance.get("flaresolverr_url") or "").strip()
+            if fs_url:
+                clearance["flaresolverr_url"] = _redact_url_credentials(fs_url)
         return runtime
 
     def get_third_party_apps_settings(self) -> dict[str, object]:
@@ -632,8 +645,22 @@ class ConfigStore:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
         if "backup" in next_data:
+            incoming_backup = next_data.get("backup")
+            if isinstance(incoming_backup, dict):
+                current_backup = self.get_backup_settings()
+                # Preserve existing secrets when the client sent "********"
+                # (the masked placeholder returned by GET /api/settings).
+                if incoming_backup.get("secret_access_key") == "********":
+                    incoming_backup["secret_access_key"] = current_backup.get("secret_access_key")
+                if incoming_backup.get("passphrase") == "********":
+                    incoming_backup["passphrase"] = current_backup.get("passphrase")
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:
+            incoming_storage = next_data.get("image_storage")
+            if isinstance(incoming_storage, dict):
+                current_storage = self.get_image_storage_settings()
+                if incoming_storage.get("webdav_password") == "********":
+                    incoming_storage["webdav_password"] = current_storage.get("webdav_password")
             next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
             _validate_image_storage_settings(next_data["image_storage"])
         if "chat_completion_cache" in next_data:
@@ -659,8 +686,26 @@ class ConfigStore:
     def get_backup_settings(self) -> dict[str, object]:
         return _normalize_backup_settings(self.data.get("backup"))
 
+    @staticmethod
+    def _sanitize_backup_settings(settings: dict[str, object]) -> dict[str, object]:
+        """Mask sensitive backup fields for API responses."""
+        out = dict(settings) if isinstance(settings, dict) else {}
+        if out.get("secret_access_key"):
+            out["secret_access_key"] = "********"
+        if out.get("passphrase"):
+            out["passphrase"] = "********"
+        return out
+
     def get_image_storage_settings(self) -> dict[str, object]:
         return _normalize_image_storage_settings(self.data.get("image_storage"))
+
+    @staticmethod
+    def _sanitize_image_storage_settings(settings: dict[str, object]) -> dict[str, object]:
+        """Mask sensitive image storage fields for API responses."""
+        out = dict(settings) if isinstance(settings, dict) else {}
+        if out.get("webdav_password"):
+            out["webdav_password"] = "********"
+        return out
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
@@ -678,8 +723,10 @@ def load_backup_state() -> dict[str, object]:
 
 
 def save_backup_state(state: dict[str, object]) -> dict[str, object]:
+    from utils.atomic import atomic_write_json
+
     normalized = _normalize_backup_state(state)
-    BACKUP_STATE_FILE.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(BACKUP_STATE_FILE, normalized)
     return normalized
 
 

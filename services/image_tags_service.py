@@ -24,8 +24,10 @@ def load_tags() -> dict[str, list[str]]:
 
 
 def save_tags(data: dict[str, list[str]]) -> None:
+    from utils.atomic import atomic_write_json
+
     _ensure_file()
-    TAGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(TAGS_FILE, data)
 
 
 def get_tags(image_rel: str) -> list[str]:

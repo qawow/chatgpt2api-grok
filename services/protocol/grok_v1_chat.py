@@ -60,6 +60,31 @@ def handle(body: dict[str, Any]) -> dict[str, Any]:
             grok_account_service.mark_result(token, True)
             return responses_to_chat_completion(data, model=model)
         except GrokBackendError as exc:
+            # On 401/403, attempt one forced refresh + retry before giving up
+            # on this account (the token may have just expired mid-request).
+            if getattr(exc, "status", None) in {401, 403}:
+                try:
+                    refreshed = grok_account_service.ensure_fresh_account(account, force=True)
+                    new_token = str((refreshed or {}).get("access_token") or "")
+                    if refreshed and new_token and new_token != token:
+                        exclude.add(new_token)
+                    if refreshed:
+                        data = create_response(
+                            refreshed,
+                            input_text=input_text,
+                            model=model,
+                            max_output_tokens=max_output_tokens,
+                        )
+                        grok_account_service.mark_result(new_token or token, True)
+                        return responses_to_chat_completion(data, model=model)
+                except Exception as retry_exc:
+                    last_error = str(retry_exc)
+                    # Mark the NEW token (if rotated) so it enters cooldown.
+                    new_token_val = str((refreshed or {}).get("access_token") or "")
+                    grok_account_service.mark_result(
+                        new_token_val or token, False, error=str(retry_exc)[:300]
+                    )
+                    continue
             last_error = str(exc)
             grok_account_service.mark_result(token, False, error=str(exc)[:300])
             continue

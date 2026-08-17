@@ -565,12 +565,21 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
             "error": "invalid proxy url",
             **result_base,
         }
-    session = Session(impersonate="edge101", verify=True, proxy=candidate)
+    # Use the same session kwargs as production so the test actually
+    # reflects live egress (impersonate / skip_ssl_verify / proxy).
+    kwargs = proxy_settings.build_session_kwargs(impersonate="chrome110", verify=True, proxy=candidate)
+    session = Session(**kwargs)
     started = time.perf_counter()
     try:
         response = session.get(
             "https://chatgpt.com/api/auth/csrf",
-            headers={"user-agent": "Mozilla/5.0 (chatgpt2api proxy test)"},
+            headers={
+                "user-agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/143.0.0.0 Safari/537.36"
+                )
+            },
             timeout=timeout,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)

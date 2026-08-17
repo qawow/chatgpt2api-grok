@@ -202,6 +202,21 @@ def create_router() -> APIRouter:
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
         await filter_or_log(call, prompt)
+        if is_grok_image_model(model):
+            from services.g2a_service import g2a_bridge
+
+            if not g2a_bridge.has_image_proxy():
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Grok 本地池不支持图生图；请接入 Codex2API 后再用远程 /v1/images/edits",
+                    },
+                )
+            payload["images"] = await read_image_sources(image_sources)
+            if mask_sources:
+                payload["mask"] = await read_image_sources(mask_sources)
+            payload["base_url"] = resolve_image_base_url(request)
+            return await call.run(grok_v1_image_generations.handle_edit, payload)
         payload["images"] = await read_image_sources(image_sources)
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)

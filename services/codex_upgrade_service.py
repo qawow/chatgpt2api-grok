@@ -68,7 +68,11 @@ def apply_codex_tokens_to_pool(
     if proxy:
         payload["proxy"] = proxy
 
-    add_result = account_service.add_account_items([payload])
+    # Delete the OLD token FIRST, then add the new one. Previously this was
+    # add-then-delete, which created a window where both old (session_only)
+    # and new tokens were in the pool simultaneously — both could be selected
+    # by get_available_access_token, causing wasted requests on the dead old
+    # token and double-occupancy of image inflight slots.
     replaced = 0
     old_token = _clean(replace_access_token)
     if old_token and old_token != access:
@@ -77,6 +81,8 @@ def apply_codex_tokens_to_pool(
             replaced = int(del_result.get("removed") or 0)
         except Exception as exc:
             print(f"[codex-upgrade] replace old token failed: {exc}", flush=True)
+
+    add_result = account_service.add_account_items([payload])
 
     try:
         account_service.fetch_remote_info(
