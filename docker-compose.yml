@@ -1,13 +1,15 @@
 services:
   app:
-    # 官方上游镜像不含本仓库 Grok / GPT 注册机改动。
-    # 二开部署请改用 docker-compose.local.yml 本地构建：
-    #   docker compose -f docker-compose.local.yml up -d --build
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    # 二开镜像（GitHub Actions 构建并推送）。
+    # - push 到 publish-root/main 分支 → 推 :sha 标签（滚动部署可固定 sha）
+    # - 打 v* tag → 推 :latest + 版本号
+    # 部署：docker compose up -d（自动拉取镜像，无需本地构建）
+    # 本地开发/改源码构建：docker compose -f docker-compose.local.yml up -d --build
+    image: ghcr.io/qawow/chatgpt2api:latest
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "8000:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json

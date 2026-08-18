@@ -16,9 +16,10 @@
 </p>
 
 > [!IMPORTANT]
-> **这是二开仓库，不是官方镜像。**  
-> 部署时必须用当前源码 **本地构建**（`docker-compose.local.yml`）。  
-> 不要使用 `ghcr.io/basketikun/chatgpt2api:latest` 或默认 `docker compose up` 拉官方镜像，否则会丢掉 Grok / G2A / GPT 注册改动。
+> **这是二开仓库，不是官方镜像。**
+> 部署时直接拉本仓库 GitHub Actions 构建的镜像：`ghcr.io/qawow/chatgpt2api:latest`。
+> 不要使用 `ghcr.io/basketikun/chatgpt2api:latest`（上游官方镜像，丢掉 Grok / G2A / GPT 注册改动）。
+> 本地改源码构建用 `docker-compose.local.yml`。
 
 ## 本分支相对上游新增
 
@@ -67,11 +68,15 @@ cd chatgpt2api-grok
 mkdir -p data
 ```
 
-### 3. 本地构建并启动
+### 3. 拉取镜像并启动
+
+部署机无需编译，直接拉取 GitHub Actions 构建的镜像：
 
 ```bash
-docker compose -f docker-compose.local.yml up -d --build
+docker compose up -d
 ```
+
+镜像由 GitHub Actions 在每次 push 到 `publish-root`/`main` 分支时构建并推送 `:sha` 标签，打 `v*` tag 时推送 `:latest` + 版本号。首次部署或升级时 `docker compose pull && docker compose up -d` 即可。
 
 - Web / API：`http://localhost:8000`
 - OpenAI 兼容前缀：`http://localhost:8000/v1`
@@ -171,15 +176,26 @@ bun run dev   # 或 npm run dev
 
 ### 更新本分支
 
+部署机无需 git pull 也无需本地构建，直接拉新镜像：
+
 ```bash
-git pull
-docker compose -f docker-compose.local.yml up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-**不要**再执行：
+`docker-compose.yml` 默认拉 `ghcr.io/qawow/chatgpt2api:latest`（GitHub Actions 在打 `v*` tag 时推送）。
+
+**不要**拉官方上游镜像：
 
 ```bash
 docker pull ghcr.io/basketikun/chatgpt2api:latest   # 官方镜像，无本分支改动
+```
+
+本地改源码构建仍可用：
+
+```bash
+git pull
+docker compose -f docker-compose.local.yml up -d --build
 ```
 
 ### 存储后端配置
