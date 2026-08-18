@@ -76,22 +76,37 @@ class OpenAIHTTPClient(HTTPClient):
         return str(self.browser.get("user_agent") or self.default_headers.get("User-Agent") or "")
 
     def check_ip_location(self) -> Tuple[bool, Optional[str]]:
-        try:
-            response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
-            trace_text = response.text
-            loc_match = re.search(r"loc=([A-Z]+)", trace_text)
-            loc = loc_match.group(1) if loc_match else None
-            blocked = {
-                x.strip().upper()
-                for x in str(os.environ.get("OPENAI_BLOCK_REGIONS", "CN") or "CN").split(",")
-                if x.strip()
-            }
-            if loc in blocked:
-                return False, loc
-            return True, loc
-        except Exception as e:
-            logger.error(f"检查 IP 地理位置失败: {e}")
-            return False, None
+        """Return (ok, location).
+
+        ok=False only when the egress IP is in a blocked region. If the trace
+        probe itself fails (proxy hiccup / network jitter), we return ok=True
+        with location=None so a transient cloudflare.com timeout does not abort
+        the whole registration — the real OpenAI requests use the same proxy
+        and will surface their own errors if it is truly down.
+        """
+        blocked = {
+            x.strip().upper()
+            for x in str(os.environ.get("OPENAI_BLOCK_REGIONS", "CN") or "CN").split(",")
+            if x.strip()
+        }
+        last_err = ""
+        for attempt in range(1, 4):
+            try:
+                response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
+                trace_text = response.text or ""
+                loc_match = re.search(r"loc=([A-Z]+)", trace_text)
+                loc = loc_match.group(1) if loc_match else None
+                if loc and loc in blocked:
+                    return False, loc
+                return True, loc
+            except Exception as e:
+                last_err = str(e)
+                if attempt < 3:
+                    import time as _time
+
+                    _time.sleep(0.8 * attempt)
+        logger.warning(f"检查 IP 地理位置失败（放行继续）: {last_err}")
+        return True, None
 
     def send_openai_request(
         self,
