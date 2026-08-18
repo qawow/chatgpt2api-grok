@@ -1413,6 +1413,8 @@ class RegistrationEngine:
                     if "already" in error_msg.lower() or "exists" in error_msg.lower() or error_code == "user_exists":
                         self._log(f"邮箱 {self.email} 可能已在 OpenAI 注册过", "error")
                         self._mark_email_as_registered()
+                        # Surface to caller so step 8 routes to login OTP instead of aborting.
+                        self._is_existing_account = True
                         return False, None
                 except Exception:
                     pass
@@ -2324,9 +2326,22 @@ class RegistrationEngine:
                 if not password_ok:
                     # If OpenAI already parked the session on passwordless OTP, password
                     # create returns account_creation_failed. Fall back to OTP send.
-                    if getattr(self, "_force_password_path", False) or getattr(self, "_email_verification_mode", "") in {
-                        "passwordless_signup", "login_challenge", "login", "login_otp",
-                    }:
+                    #
+                    # OpenAI now rejects user/register (password create) for almost all
+                    # fresh free addresses with account_creation_failed even when the
+                    # authorize/continue page was create_account_password and no
+                    # verification_mode was signalled. Aborting here made every register
+                    # fail. Route to the OTP path instead:
+                    #   - user_exists (already registered) → login OTP (existing account)
+                    #   - otherwise → passwordless signup OTP
+                    if getattr(self, "_is_existing_account", False):
+                        self._log(
+                            "密码注册失败且邮箱已注册，回退到登录 OTP 路径",
+                            "warning",
+                        )
+                        self._is_passwordless_signup = False
+                        self._force_password_path = False
+                    else:
                         self._log(
                             "密码注册失败，回退 passwordless OTP 发送路径",
                             "warning",
@@ -2334,13 +2349,10 @@ class RegistrationEngine:
                         self._is_passwordless_signup = True
                         self._force_password_path = False
                         self._is_existing_account = False
-                        # Password attempts often invalidate the auto-OTP session; do not
-                        # trust the original auto-sent code after a failed create.
-                        self._otp_auto_sent = False
-                        self._otp_sent_at = None
-                    else:
-                        result.error_message = "注册密码失败"
-                        return result
+                    # Password attempts often invalidate the auto-OTP session; do not
+                    # trust the original auto-sent code after a failed create.
+                    self._otp_auto_sent = False
+                    self._otp_sent_at = None
             _random_delay(0.3, 0.9)
 
             # 9. 发送验证码
