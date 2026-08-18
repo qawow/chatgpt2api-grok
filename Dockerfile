@@ -44,7 +44,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
-COPY config.json ./
+# config.json 不打包进镜像：含密钥且被 gitignore，运行时由 compose 挂载
+# （docker-compose.yml: ./config.json:/app/config.json）。缺失时 config.py 回退默认值。
 COPY VERSION ./
 COPY api ./api
 COPY services ./services
