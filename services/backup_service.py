@@ -141,6 +141,11 @@ class CloudflareR2Client:
         self.bucket = _clean(settings.get("bucket"))
         self.prefix = _clean(settings.get("prefix")) or "backups"
         self.session = requests.Session(impersonate="chrome", verify=True)
+        try:
+            self.session.trust_env = False
+            self.session.proxies = {"http": "", "https": ""}
+        except Exception:
+            pass
 
     def validate(self) -> None:
         missing = []

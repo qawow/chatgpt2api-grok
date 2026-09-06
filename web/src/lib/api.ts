@@ -3,6 +3,11 @@ import { httpRequest, request } from "@/lib/request";
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = string;
+
+export function isGrokImageModel(model?: string | null) {
+  const id = String(model || "").trim().toLowerCase();
+  return id.includes("grok") && (id.includes("image") || id.includes("imagine"));
+}
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
 
@@ -186,6 +191,7 @@ export type SettingsConfig = {
   refresh_account_interval_minute?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
+  image_poll_interval_secs?: number | string;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
   image_settle_enabled?: boolean;
@@ -288,11 +294,6 @@ export type SystemLog = {
   summary?: string;
   detail?: Record<string, unknown>;
   [key: string]: unknown;
-};
-
-export type ImageResponse = {
-  created: number;
-  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
 };
 
 export type ImageTask = {
@@ -597,49 +598,6 @@ export async function updateAccount(
   });
 }
 
-export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  return httpRequest<ImageResponse>(
-    "/v1/images/generations",
-    {
-      method: "POST",
-      body: {
-        prompt,
-        ...(model ? { model } : {}),
-        ...(size ? { size } : {}),
-        quality,
-        n: 1,
-        response_format: "b64_json",
-      },
-    },
-  );
-}
-
-export async function editImage(files: File | File[], prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  const formData = new FormData();
-  const uploadFiles = Array.isArray(files) ? files : [files];
-
-  uploadFiles.forEach((file) => {
-    formData.append("image", file);
-  });
-  formData.append("prompt", prompt);
-  if (model) {
-    formData.append("model", model);
-  }
-  if (size) {
-    formData.append("size", size);
-  }
-  formData.append("quality", quality);
-  formData.append("n", "1");
-
-  return httpRequest<ImageResponse>(
-    "/v1/images/edits",
-    {
-      method: "POST",
-      body: formData,
-    },
-  );
-}
-
 export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
   return httpRequest<ImageTask>("/api/image-tasks/generations", {
     method: "POST",
@@ -882,11 +840,6 @@ export async function deleteUserKey(keyId: string) {
 
 // ── Upstream proxy ────────────────────────────────────────────────
 
-export type ProxySettings = {
-  enabled: boolean;
-  url: string;
-};
-
 export type ProxyTestResult = {
   ok: boolean;
   status: number;
@@ -905,17 +858,6 @@ export type ClearanceTestResult = {
   error: string | null;
   runtime: ProxyRuntimeStatus;
 };
-
-export async function fetchProxy() {
-  return httpRequest<{ proxy: ProxySettings }>("/api/proxy");
-}
-
-export async function updateProxy(updates: { enabled?: boolean; url?: string }) {
-  return httpRequest<{ proxy: ProxySettings }>("/api/proxy", {
-    method: "POST",
-    body: updates,
-  });
-}
 
 export async function testProxy(url?: string) {
   return httpRequest<{ result: ProxyTestResult }>("/api/proxy/test", {

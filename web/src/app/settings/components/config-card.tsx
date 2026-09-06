@@ -25,8 +25,11 @@ export function ConfigCard() {
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
+  const setImagePollIntervalSecs = useSettingsStore((state) => state.setImagePollIntervalSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setImageParallelGeneration = useSettingsStore((state) => state.setImageParallelGeneration);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
+  const setImageCheckBeforeHitEnabled = useSettingsStore((state) => state.setImageCheckBeforeHitEnabled);
   const setImageRemoveConversationAfterResult = useSettingsStore((state) => state.setImageRemoveConversationAfterResult);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
   const setImageTimeoutRetrySecs = useSettingsStore((state) => state.setImageTimeoutRetrySecs);
@@ -167,6 +170,16 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
           </div>
           <div className="space-y-2">
+            <label className="text-sm text-stone-700">图片轮询间隔</label>
+            <Input
+              value={String(config?.image_poll_interval_secs || "5")}
+              onChange={(event) => setImagePollIntervalSecs(event.target.value)}
+              placeholder="5"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">单位秒，任务进度轮询间隔，默认 5。</p>
+          </div>
+          <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>
             <Input
               value={String(config?.image_account_concurrency || "")}
@@ -175,6 +188,16 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <Checkbox
+                checked={Boolean(config?.image_parallel_generation !== false)}
+                onCheckedChange={(checked) => setImageParallelGeneration(Boolean(checked))}
+              />
+              <span className="text-sm text-stone-700">多图并行生成</span>
+            </div>
+            <p className="text-xs text-stone-500">一次请求多张图时用独立线程和账号同时生成。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
@@ -195,6 +218,16 @@ export function ConfigCard() {
               <span className="text-sm text-stone-700">图片二次确认机制</span>
             </div>
             <p className="text-xs text-stone-500">打开后能稍微提升获取图片的成功率。</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <Checkbox
+                checked={Boolean(config?.image_check_before_hit_enabled !== false)}
+                onCheckedChange={(checked) => setImageCheckBeforeHitEnabled(Boolean(checked))}
+              />
+              <span className="text-sm text-stone-700">先确认文件再取图</span>
+            </div>
+            <p className="text-xs text-stone-500">轮询确认 file_ids 存在后再下载，而不是只信 SSE 事件。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
@@ -269,10 +302,10 @@ export function ConfigCard() {
             <Textarea
               value={String(config?.global_system_prompt || "")}
               onChange={(event) => setGlobalSystemPrompt(event.target.value)}
-              placeholder="例如：先判断用户提示词是否合规；遇到违法、色情、暴力、仇恨等请求时拒绝回答。"
+              placeholder="例如：画面干净、不要文字水印。"
               className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
             />
-            <p className="text-xs text-stone-500">每次请求都会作为 system 消息注入，可用于审核用户提示词、避免违规内容、统一约束模型行为或固定角色设定。</p>
+            <p className="text-xs text-stone-500">会拼到生图提示词前面，用来统一风格或附加约束。敏感词/审核仍单独生效。</p>
           </div>
           <div className="space-y-2 md:col-span-2">
             <label className="text-sm text-stone-700">敏感词</label>

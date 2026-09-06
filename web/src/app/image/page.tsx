@@ -23,6 +23,7 @@ import {
   fetchAccounts,
   fetchModels,
   fetchImageTasks,
+  isGrokImageModel,
   resumeImagePoll,
   type Account,
   type ImageModel,
@@ -1064,6 +1065,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     if (files.length === 0) {
       return;
     }
+    if (isGrokImageModel(imageModel)) {
+      toast.error("Grok 本地池不支持图生图");
+      return;
+    }
 
     try {
       const previews = await Promise.all(
@@ -1083,7 +1088,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       const message = error instanceof Error ? error.message : "读取参考图失败";
       toast.error(message);
     }
-  }, []);
+  }, [imageModel]);
 
   const handleReferenceImageChange = useCallback(
     async (files: File[]) => {
@@ -1095,6 +1100,24 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     },
     [appendReferenceImages],
   );
+
+  const handleImageModelChange = useCallback((model: ImageModel) => {
+    setImageModel(model);
+    if (!isGrokImageModel(model)) {
+      return;
+    }
+    setReferenceImages((prev) => {
+      if (prev.length === 0) {
+        return prev;
+      }
+      toast.message("Grok 不支持图生图，已移除参考图");
+      return [];
+    });
+    setReferenceImageFiles([]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, []);
 
   const handleRemoveReferenceImage = useCallback((index: number) => {
     setReferenceImageFiles((prev) => {
@@ -1109,6 +1132,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleContinueEdit = useCallback(
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
+      if (isGrokImageModel(imageModel)) {
+        toast.error("当前模型是 Grok，不支持图生图，请先切回 gpt-image-2");
+        return;
+      }
       try {
         const nextReference =
           "dataUrl" in image
@@ -1133,7 +1160,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         toast.error(message);
       }
     },
-    [],
+    [imageModel],
   );
 
   const handleReuseTurnConfig = useCallback(async (conversationId: string, turnId: string) => {
@@ -1153,9 +1180,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setImageHeight(parsedSize.height);
     setImageQuality(turn.quality);
     setImageModel(turn.model);
-    setReferenceImages(turn.referenceImages);
+    const nextRefs = isGrokImageModel(turn.model) ? [] : turn.referenceImages;
+    setReferenceImages(nextRefs);
     setReferenceImageFiles(
-      turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
+      nextRefs.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
     );
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -1555,6 +1583,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
+    if (isGrokImageModel(imageModel) && referenceImageFiles.length > 0) {
+      toast.error("Grok 本地池不支持图生图，请先移除参考图或换模型");
+      return;
+    }
+
     const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
 
     const targetConversation = selectedConversationId
@@ -1699,6 +1732,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
                 selectedConversation={selectedConversation}
                 onOpenLightbox={openLightbox}
                 onContinueEdit={handleContinueEdit}
+                canEditImages={!isGrokImageModel(imageModel)}
                 onDeletePrompt={openDeletePromptConfirm}
                 onDeleteResults={openDeleteResultsConfirm}
                 onReuseTurnConfig={handleReuseTurnConfig}
@@ -1745,7 +1779,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             onImageWidthChange={setImageWidth}
             onImageHeightChange={setImageHeight}
             onImageQualityChange={setImageQuality}
-            onImageModelChange={setImageModel}
+            onImageModelChange={handleImageModelChange}
             onSubmit={handleSubmit}
             onPickReferenceImage={() => fileInputRef.current?.click()}
             onReferenceImageChange={handleReferenceImageChange}

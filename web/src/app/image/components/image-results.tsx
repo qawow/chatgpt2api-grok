@@ -18,6 +18,7 @@ type ImageResultsProps = {
   selectedConversation: ImageConversation | null;
   onOpenLightbox: (images: ImageLightboxItem[], index: number) => void;
   onContinueEdit: (conversationId: string, image: StoredImage | StoredReferenceImage) => void;
+  canEditImages?: boolean;
   onDeletePrompt: (conversationId: string, turnId: string) => void;
   onDeleteResults: (conversationId: string, turnId: string) => void;
   onReuseTurnConfig: (conversationId: string, turnId: string) => void | Promise<void>;
@@ -88,6 +89,7 @@ export function ImageResults({
   selectedConversation,
   onOpenLightbox,
   onContinueEdit,
+  canEditImages = true,
   onDeletePrompt,
   onDeleteResults,
   onReuseTurnConfig,
@@ -227,6 +229,8 @@ export function ImageResults({
                               size="sm"
                               className="rounded-full border-stone-200 bg-white text-stone-700 hover:bg-stone-50"
                               onClick={() => onContinueEdit(selectedConversation.id, image)}
+                              disabled={!canEditImages}
+                              title={!canEditImages ? "当前模型不支持图生图" : undefined}
                             >
                               <Sparkles className="size-4" />
                               加入编辑
@@ -284,6 +288,8 @@ export function ImageResults({
                                   size="sm"
                                   className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
                                   onClick={() => onContinueEdit(selectedConversation.id, image)}
+                                  disabled={!canEditImages}
+                                  title={!canEditImages ? "当前模型不支持图生图" : undefined}
                                   aria-label="加入编辑"
                                 >
                                   <Sparkles className="size-3 sm:size-4" />

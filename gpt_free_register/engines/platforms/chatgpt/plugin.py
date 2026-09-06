@@ -50,7 +50,7 @@ class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
     version = "1.0.0"
-    supported_executors = ["protocol", "headless", "headed"]
+    supported_executors = ["protocol"]
     supported_identity_modes = ["mailbox", "oauth_browser"]
     supported_oauth_providers = ["google", "microsoft"]
     protocol_captcha_order = ("2captcha", "capsolver", "auto")

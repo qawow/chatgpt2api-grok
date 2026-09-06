@@ -149,6 +149,9 @@ export function GptRegisterCard() {
         concurrency: Number(form.concurrency) || 1,
         interval_secs: Number(form.interval_secs) || 0,
         timeout_secs: Number(form.timeout_secs) || 600,
+        executor: "protocol",
+        mail_provider: "cloudflare_d1_api",
+        captcha: "",
       };
       if (!String(payload.chatgpt2api_auth_key || "").trim()) {
         delete payload.chatgpt2api_auth_key;
@@ -177,6 +180,9 @@ export function GptRegisterCard() {
         concurrency: Number(form.concurrency) || 1,
         interval_secs: Number(form.interval_secs) || 0,
         timeout_secs: Number(form.timeout_secs) || 600,
+        executor: "protocol",
+        mail_provider: "cloudflare_d1_api",
+        captcha: "",
       };
       if (!String(payload.chatgpt2api_auth_key || "").trim()) {
         delete payload.chatgpt2api_auth_key;
@@ -219,7 +225,7 @@ export function GptRegisterCard() {
             <div>
               <h2 className="text-lg font-semibold tracking-tight">GPT Free 批量注册</h2>
               <p className="text-sm text-stone-500">
-                内置 gpt_free_register 模块纯协议注册 ChatGPT free 号，成功后自动写入本机号池。
+                内置 gpt_free_register 纯协议 + Cloudflare D1 邮箱注册 ChatGPT free 号，成功后写入本机号池。
               </p>
             </div>
           </div>
@@ -317,41 +323,14 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
               </Field>
-              <Field label="执行器" hint="protocol = 纯协议（推荐）">
-                <select
-                  value={form.executor}
-                  onChange={(e) => setField("executor", e.target.value)}
-                  disabled={running}
-                  className="h-10 w-full rounded-xl border border-stone-200 bg-white px-3 text-sm"
-                >
-                  <option value="protocol">protocol</option>
-                  <option value="headless">headless</option>
-                  <option value="headed">headed</option>
-                </select>
-              </Field>
-              <Field label="邮箱 Provider">
-                <Input
-                  value={form.mail_provider}
-                  onChange={(e) => setField("mail_provider", e.target.value)}
-                  placeholder="cloudflare_d1_api"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={running}
-                />
+              <Field label="注册路径" hint="浏览器 / Playwright 执行器已移除，固定纯协议。">
+                <Input value="protocol + Cloudflare D1" readOnly className="h-10 rounded-xl border-stone-200 bg-stone-50 text-stone-600" />
               </Field>
               <Field label="CFD1 域名覆盖" hint="留空用 data/gpt_register.env 或环境变量 CFD1_DOMAIN">
                 <Input
                   value={form.cfd1_domain}
                   onChange={(e) => setField("cfd1_domain", e.target.value)}
                   placeholder="mail.example.com"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={running}
-                />
-              </Field>
-              <Field label="验证码 Provider" hint="留空则用注册机默认/自动">
-                <Input
-                  value={form.captcha}
-                  onChange={(e) => setField("captcha", e.target.value)}
-                  placeholder="yescaptcha_api / auto / 留空"
                   className="h-10 rounded-xl border-stone-200 bg-white"
                   disabled={running}
                 />

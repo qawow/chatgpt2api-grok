@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from threading import Event
+from threading import Event, Thread
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +26,15 @@ def create_app() -> FastAPI:
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         backup_service.start()
         config.cleanup_old_images()
+        def _warmup_tiktoken() -> None:
+            try:
+                from utils.tiktoken_encoding import warmup
+
+                warmup()
+            except Exception:
+                return
+
+        Thread(target=_warmup_tiktoken, daemon=True).start()
         try:
             yield
         finally:

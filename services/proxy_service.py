@@ -151,7 +151,9 @@ class FlareSolverrClearanceProvider:
     @staticmethod
     def _urllib_post(endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
         req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
-        with urllib_request.urlopen(req, timeout=timeout) as response:
+        # FlareSolverr is usually a docker DNS name; env SOCKS would black-hole it.
+        opener = urllib_request.build_opener(urllib_request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as response:
             return response.read()
 
 
@@ -226,8 +228,9 @@ class ProxySettingsStore:
         **session_kwargs,
     ) -> dict[str, object]:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
-        if profile.proxy_url:
-            session_kwargs["proxy"] = profile.proxy_url
+        # Always set proxy so curl_cffi does not fall back to HTTP(S)_PROXY/ALL_PROXY
+        # (a dead SOCKS in the environment would 502 every ChatGPT call).
+        session_kwargs["proxy"] = profile.proxy_url or ""
         if profile.runtime_enabled and profile.skip_ssl_verify:
             session_kwargs["verify"] = False
         return session_kwargs

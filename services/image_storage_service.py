@@ -102,6 +102,11 @@ class WebDAVClient:
         self.password = _clean(settings.get("webdav_password"))
         self.root_path = _clean(settings.get("webdav_root_path")).strip("/")
         self.session = requests.Session()
+        try:
+            self.session.trust_env = False
+            self.session.proxies = {"http": "", "https": ""}
+        except Exception:
+            pass
 
     def _auth_kwargs(self) -> dict[str, object]:
         return {"auth": (self.username, self.password)} if self.username or self.password else {}

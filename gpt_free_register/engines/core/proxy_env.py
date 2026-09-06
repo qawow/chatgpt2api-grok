@@ -15,6 +15,20 @@ from pathlib import Path
 from typing import Optional
 
 
+# Do not leak these into the FastAPI process from gpt_register.env / engines/.env.
+# tiktoken, Grok stdlib requests, urllib, and D1 would otherwise inherit a dead SOCKS.
+_PROCESS_WIDE_PROXY_KEYS = frozenset({
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+})
+
+
 def load_dotenv(path: str | Path | None = None) -> Path | None:
     """轻量加载 .env 到 os.environ（不覆盖已有环境变量）。"""
     candidates: list[Path] = []
@@ -38,6 +52,8 @@ def load_dotenv(path: str | Path | None = None) -> Path | None:
                 key, value = line.split("=", 1)
                 key = key.strip()
                 value = value.strip().strip("'").strip('"')
+                if key in _PROCESS_WIDE_PROXY_KEYS:
+                    continue
                 if key and key not in os.environ:
                     os.environ[key] = value
             return env_path

@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import type { ImageModel } from "@/lib/api";
+import { isGrokImageModel, type ImageModel } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type ImageComposerProps = {
@@ -128,6 +128,7 @@ export function ImageComposer({
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
   const isCodexModel = imageModel.toLowerCase().includes("codex");
+  const grokEditsDisabled = isGrokImageModel(imageModel);
 
   useEffect(() => {
     if (!isSizeMenuOpen) {
@@ -156,13 +157,17 @@ export function ImageComposer({
     if (imageFiles.length === 0) {
       return;
     }
+    if (grokEditsDisabled) {
+      event.preventDefault();
+      return;
+    }
 
     event.preventDefault();
     void onReferenceImageChange(imageFiles);
   };
 
   const handleComposerDragEnter = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasDraggedImages(event.dataTransfer)) {
+    if (grokEditsDisabled || !hasDraggedImages(event.dataTransfer)) {
       return;
     }
 
@@ -173,7 +178,7 @@ export function ImageComposer({
   };
 
   const handleComposerDragOver = (event: DragEvent<HTMLDivElement>) => {
-    if (!hasDraggedImages(event.dataTransfer)) {
+    if (grokEditsDisabled || !hasDraggedImages(event.dataTransfer)) {
       return;
     }
 
@@ -198,7 +203,7 @@ export function ImageComposer({
     }
 
     setIsDraggingImage(false);
-    if (imageFiles.length === 0) {
+    if (grokEditsDisabled || imageFiles.length === 0) {
       return;
     }
 
@@ -213,6 +218,7 @@ export function ImageComposer({
           type="file"
           accept="image/*"
           multiple
+          disabled={grokEditsDisabled}
           className="hidden"
           onChange={(event) => {
             void onReferenceImageChange(Array.from(event.target.files || []));
@@ -283,9 +289,11 @@ export function ImageComposer({
               onChange={(event) => onPromptChange(event.target.value)}
               onPaste={handleTextareaPaste}
               placeholder={
-                referenceImages.length > 0
-                  ? "描述你希望如何修改参考图"
-                  : "输入你想要生成的画面，也可直接粘贴图片"
+                grokEditsDisabled
+                  ? "输入你想要生成的画面（Grok 不支持参考图改图）"
+                  : referenceImages.length > 0
+                    ? "描述你希望如何修改参考图"
+                    : "输入你想要生成的画面，也可直接粘贴图片"
               }
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
@@ -312,6 +320,8 @@ export function ImageComposer({
                     variant="outline"
                     className="h-9 shrink-0 rounded-full border-stone-200 bg-white px-3 text-xs font-medium text-stone-700 shadow-none sm:h-10 sm:px-4 sm:text-sm"
                     onClick={onPickReferenceImage}
+                    disabled={grokEditsDisabled}
+                    title={grokEditsDisabled ? "Grok 本地池不支持图生图" : undefined}
                     aria-label={referenceImages.length > 0 ? "添加参考图" : "上传"}
                   >
                     <ImagePlus className="size-3.5 sm:size-4" />

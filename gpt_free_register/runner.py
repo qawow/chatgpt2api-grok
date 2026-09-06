@@ -256,11 +256,9 @@ def register_chatgpt_once(
     else:
         log_fn("[proxy] (none)")
 
-    mail_provider = _clean(cfg.get("mail_provider")) or "cloudflare_d1_api"
-    captcha = _clean(cfg.get("captcha")) or "auto"
-    executor = _clean(cfg.get("executor")) or "protocol"
-    if executor not in {"protocol", "headless", "headed"}:
-        executor = "protocol"
+    mail_provider = "cloudflare_d1_api"
+    captcha = "auto"
+    executor = "protocol"
 
     extra: dict[str, Any] = {
         "mail_provider": mail_provider,

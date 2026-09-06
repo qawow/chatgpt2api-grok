@@ -5,7 +5,7 @@ import json
 import os
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 
 class ChatGPT2APIError(RuntimeError):
@@ -65,7 +65,8 @@ class ChatGPT2APIClient:
 
         req = Request(url, data=data, headers=headers, method=method.upper())
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            opener = build_opener(ProxyHandler({}))
+            with opener.open(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 if not raw.strip():
                     return {}

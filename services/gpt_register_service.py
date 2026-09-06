@@ -238,11 +238,11 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["interval_secs"] = _clamp_float(out.get("interval_secs"), 3, 0, 600)
     out["timeout_secs"] = _clamp_int(out.get("timeout_secs"), 600, 60, 3600)
     executor = _clean(out.get("executor")).lower() or "protocol"
-    if executor not in {"protocol", "headless", "headed"}:
+    if executor != "protocol":
         executor = "protocol"
     out["executor"] = executor
-    out["mail_provider"] = _clean(out.get("mail_provider")) or "cloudflare_d1_api"
-    out["captcha"] = _clean(out.get("captcha"))
+    out["mail_provider"] = "cloudflare_d1_api"
+    out["captcha"] = ""
     out["proxy"] = _clean(out.get("proxy"))
     out["bind_register_proxy"] = bool(out.get("bind_register_proxy"))
     out["plan_type"] = _clean(out.get("plan_type")) or "free"

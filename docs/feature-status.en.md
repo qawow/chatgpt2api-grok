@@ -10,7 +10,7 @@
 | 面向图片工作流的 `POST /v1/responses` | ✅  | 仅 `image_generation` 工具；纯文本返回 400。 |
 | `GET /v1/models` 接口 | ✅  | 仅生图：`gpt-image-2`、`codex-gpt-image-2`（及 plus/team/pro 前缀）、本地 Grok 池非空时 `grok-2-image` / `grok-imagine-image`。`grok-4.5` 是对话模型，不列出。 |
 | 同时生成多张图片 | ✅  | 已支持，后端与前端都可进行多图生成。 |
-| 图片并行生成 | ✅  | 多张图片使用独立线程和账号同时生成，可通过 `image_parallel_generation` 配置关闭。 |
+| 图片并行生成 | ✅  | 多张图片使用独立线程和账号同时生成，设置页可关闭 `image_parallel_generation`。 |
 | 图片生成进度追踪 | ✅  | 任务显示当前步骤（上传/预热/获取token/生成中等），支持耗时统计。 |
 | 图片超时续轮询 | ✅  | 超时任务可继续等待，前端显示"继续等待"按钮，后端 resume-poll API。 |
 | 图片二次确认与先check再hit | ✅  | 可通过 `image_settle_enabled` 和 `image_check_before_hit_enabled` 配置，关闭后跳过等待直接返回。 |
@@ -35,7 +35,7 @@
 | 文本补全缓存与重复请求合并 | ❌  | 文本链路已关闭。 |
 | Anthropic 协议支持 | ❌  | 已移除实现，`/v1/messages` 返回 400。 |
 | PPT / PSD 可编辑文件 | ❌  | 已移除。 |
-| 图片尺寸参数 | ❌  | 待实现。 |
+| 图片尺寸参数 | ⚠️ | 网页会把 `WxH` 写入提示词；Codex 工具会带 `size`。不是严格按像素出图。 |
 | 服务端图片 URL 缓存 | ✅  | 已实现。 |
 | `rt_token` 刷新 | ❌  | 待实现。 |
 | 代理配置功能 | ✅  | 已支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理，并应用到出站请求。 |

@@ -29,6 +29,16 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertEqual(s["executor"], "protocol")
         self.assertTrue(s["push_enabled"])
 
+    def test_removed_register_paths_are_clamped(self):
+        s = normalize_settings({
+            "executor": "headless",
+            "mail_provider": "outlook_token",
+            "captcha": "yescaptcha_api",
+        })
+        self.assertEqual(s["executor"], "protocol")
+        self.assertEqual(s["mail_provider"], "cloudflare_d1_api")
+        self.assertEqual(s["captcha"], "")
+
     def test_public_hides_auth_key(self):
         raw = normalize_settings({"chatgpt2api_auth_key": "secret-key"})
         pub = public_settings(raw)

@@ -23,7 +23,8 @@ ARG TARGETARCH
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
-    REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
+    REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db \
+    TIKTOKEN_CACHE_DIR=/app/.tiktoken_cache
 
 WORKDIR /app
 
@@ -42,6 +43,8 @@ RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
+RUN uv run python -c "import tiktoken; tiktoken.get_encoding('o200k_base'); tiktoken.get_encoding('cl100k_base')" \
+    || echo "tiktoken encoding prefetch skipped"
 
 COPY main.py ./
 # config.json 不打包进镜像：含密钥且被 gitignore，运行时由 compose 挂载

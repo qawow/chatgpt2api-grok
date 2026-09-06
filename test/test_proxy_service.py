@@ -54,6 +54,11 @@ class ProxyServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["impersonate"], "chrome")
         self.assertEqual(kwargs["proxy"], "http://legacy.example:8080")
 
+    def test_build_session_kwargs_sets_empty_proxy_when_direct(self) -> None:
+        store = ProxySettingsStore(FakeConfig())
+        kwargs = store.build_session_kwargs(impersonate="chrome")
+        self.assertEqual(kwargs["proxy"], "")
+
     def test_runtime_proxy_is_limited_to_upstream_scope_by_default(self) -> None:
         runtime = make_runtime(enabled=True, egress_mode="single_proxy", proxy_url="http://runtime.example:8080")
         store = ProxySettingsStore(FakeConfig(legacy_proxy="http://legacy.example:8080", runtime=runtime))

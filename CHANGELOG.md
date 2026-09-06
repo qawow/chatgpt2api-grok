@@ -5,6 +5,9 @@
 ### chatgpt2api-grok（本分支）
 
 + [清理] 去掉 CPA/sub2api 前端残骸、备份项、引擎 `upload_cpa`、本地 `MERGE_REPORT.md`；接口文档与调试 Skill 改为生图。
++ [修复] 注册设置只保留 protocol + Cloudflare D1；Grok 模型禁用图生图；补齐并行生图/轮询间隔/先确认再取图开关。
++ [修复] tiktoken 拉 `o200k_base` 不再走进程 SOCKS 代理；下载失败时回退估算，避免生图 usage 统计把整次请求打挂。
++ [修复] Grok / D1 / WebDAV / R2 / FlareSolverr / 号池 HTTP 推送不再继承环境 SOCKS；curl_cffi 无代理时显式清空 `proxy`。
 + [移除] PPT/PSD 可编辑文件任务、搜索接口、Anthropic messages 实现、文本补全缓存；调试页仅保留 Skills。
 + [移除] 注册引擎非 ChatGPT / 非 Cloudflare D1 的邮箱、验证码、SMS、Playwright 执行器。
 + [移除] `openai_backend_api` 内 PPT/PSD/搜索实现；浏览器注册 `browser_register.py`（protocol 路径保留）。

@@ -168,7 +168,9 @@ class CloudflareD1Mailbox(BaseMailbox):
         import requests
 
         payload = {"sql": sql, "params": list(params or [])}
-        r = requests.post(
+        session = requests.Session()
+        session.trust_env = False
+        r = session.post(
             self._query_url(),
             headers=self._headers(),
             json=payload,

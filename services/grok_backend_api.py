@@ -28,6 +28,7 @@ def _http() -> requests.Session:
     sess = getattr(_tls, "session", None)
     if sess is None:
         sess = requests.Session()
+        sess.trust_env = False
         adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
         sess.mount("https://", adapter)
         sess.mount("http://", adapter)
