@@ -1386,11 +1386,18 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
-        return [
-            token
-            for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-            if int(self._image_inflight.get(token, 0)) < max_concurrency
-        ]
+        tokens: list[str] = []
+        for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+            inflight = int(self._image_inflight.get(token, 0))
+            if inflight >= max_concurrency:
+                continue
+            quota = int((self._accounts.get(token) or {}).get("quota") or 0)
+            # Do not launch more in-flight gens than remaining local quota
+            # (skip-probe would otherwise oversubscribe quota=1 with concurrency=3).
+            if quota > 0 and inflight >= quota:
+                continue
+            tokens.append(token)
+        return tokens
 
     def _image_quota_empty_message(
             self,
@@ -1440,8 +1447,7 @@ class AccountService:
                     break
                 tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
+                    access_token = self._pick_image_candidate_token(tokens)
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
@@ -1452,6 +1458,18 @@ class AccountService:
                 tried=len(excluded_tokens or set()),
             )
         )
+
+    def _pick_image_candidate_token(self, tokens: list[str]) -> str:
+        """Prefer least in-flight, then highest remaining quota. Caller holds the slot lock."""
+        if len(tokens) == 1:
+            return tokens[0]
+
+        def sort_key(token: str) -> tuple[int, int, str]:
+            inflight = int(self._image_inflight.get(token, 0))
+            quota = int((self._accounts.get(token) or {}).get("quota") or 0)
+            return (inflight, -quota, token)
+
+        return min(tokens, key=sort_key)
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
@@ -1465,6 +1483,37 @@ class AccountService:
                 self._image_inflight[access_token] = current_inflight - 1
             self._image_slot_condition.notify_all()
 
+    _IMAGE_PROBE_JWT_MIN_REMAINING = 5 * 60
+
+    def _can_skip_image_remote_probe(
+        self,
+        account: dict | None,
+        *,
+        plan_type: str | None = None,
+        source_type: str | None = None,
+        plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> bool:
+        """Skip /me+init+accounts when local cache is enough to start an image job."""
+        if not isinstance(account, dict):
+            return False
+        if int(account.get("quota") or 0) <= 0:
+            return False
+        if str(account.get("status") or "") != "正常":
+            return False
+        if str(account.get("last_refresh_error") or "").strip():
+            return False
+        if self._token_looks_revoked(account):
+            return False
+        remaining = self._token_expires_in(str(account.get("access_token") or ""))
+        if remaining is None or remaining < self._IMAGE_PROBE_JWT_MIN_REMAINING:
+            return False
+        return (
+            self._is_image_account_available(account)
+            and self._account_matches_plan_type(account, plan_type)
+            and self._account_matches_any_plan_type(account, plan_types)
+            and self._account_matches_source_type(account, source_type)
+        )
+
     def get_available_access_token(
             self,
             plan_type: str | None = None,
@@ -1473,7 +1522,8 @@ class AccountService:
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
-        基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
+        基于本地缓存做初筛；JWT 仍有效且本地额度>0 时跳过 fetch_remote_info
+        （那会新建 curl_cffi session 再打 /me + init + accounts，生图前多 0.5–2s）。
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
@@ -1487,6 +1537,10 @@ class AccountService:
             )
             attempted_tokens.add(access_token)
             local_account = self.get_account(access_token) or {}
+            if self._can_skip_image_remote_probe(
+                local_account, plan_type=plan_type, source_type=source_type, plan_types=plan_types
+            ):
+                return access_token
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
             except Exception as exc:

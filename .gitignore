@@ -38,3 +38,8 @@ backups/
 
 # Local audit / issue notes
 issues/
+
+# Research clones / j-space ledger
+.tmp-research/
+.ref/
+.jspace/

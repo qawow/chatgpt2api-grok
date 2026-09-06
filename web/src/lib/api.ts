@@ -16,7 +16,7 @@ export type ImageStorageSettings = {
   public_base_url: string;
 };
 
-export type AccountPoolProvider = "chatgpt" | "grok" | "g2a";
+export type AccountPoolProvider = "chatgpt" | "grok";
 
 export type Account = {
   access_token: string;
@@ -46,7 +46,7 @@ export type Account = {
   session_only?: boolean;
   fragile?: boolean;
   /** Grok 号池字段 */
-  provider?: "grok" | "g2a" | string | null;
+  provider?: "grok" | string | null;
   remaining_tokens?: number | null;
   limit_tokens?: number | null;
   base_url?: string | null;
@@ -55,10 +55,6 @@ export type Account = {
   last_error?: string | null;
   created_at?: string | null;
   account_id?: string | null;
-  /** grokcli2api-go 远程脱敏状态字段（只读） */
-  g2a_server_id?: string | null;
-  g2a_server_name?: string | null;
-  g2a_credential_id?: string | null;
   readonly?: boolean;
   remote?: boolean;
 };
@@ -366,16 +362,11 @@ export function normalizeGrokAccount(item: Record<string, unknown>): Account {
     : item.disabled
       ? "禁用"
       : "正常") as AccountStatus;
-  const provider =
-    item.provider != null
-      ? String(item.provider)
-      : String(item.source_type || "") === "g2a"
-        ? "g2a"
-        : "grok";
+  const provider = item.provider != null ? String(item.provider) : "grok";
   return {
     access_token: accessToken,
-    type: String(item.type || (provider === "g2a" ? "g2a-remote" : "xai")),
-    source_type: provider === "g2a" ? "g2a" : "grok",
+    type: String(item.type || "xai"),
+    source_type: "grok",
     status,
     quota: Number.isFinite(remaining) ? Math.max(0, remaining) : 0,
     email: item.email != null ? String(item.email) : null,
@@ -394,33 +385,8 @@ export function normalizeGrokAccount(item: Record<string, unknown>): Account {
     created_at: item.created_at != null ? String(item.created_at) : null,
     account_id: item.account_id != null ? String(item.account_id) : null,
     restore_at: item.expired != null ? String(item.expired) : null,
-    g2a_server_id: item.g2a_server_id != null ? String(item.g2a_server_id) : null,
-    g2a_server_name: item.g2a_server_name != null ? String(item.g2a_server_name) : null,
-    g2a_credential_id: item.g2a_credential_id != null ? String(item.g2a_credential_id) : null,
-    readonly: Boolean(item.readonly ?? provider === "g2a"),
-    remote: Boolean(item.remote ?? provider === "g2a"),
-  };
-}
-
-/** 拉取 grokcli2api-go 远程脱敏号池状态（不含 token）。 */
-export async function fetchG2APoolStatus(serverId?: string) {
-  const qs = serverId ? `?server_id=${encodeURIComponent(serverId)}` : "";
-  const data = await httpRequest<{
-    items?: Array<Record<string, unknown>>;
-    servers?: Array<Record<string, unknown>>;
-    errors?: Array<{ server_id?: string; error?: string }>;
-    total?: number;
-    has_image_proxy?: boolean;
-    note?: string;
-  }>(`/api/g2a/pool${qs}`);
-  return {
-    items: (data.items || []).map((item) => normalizeGrokAccount(item)),
-    servers: data.servers || [],
-    errors: data.errors || [],
-    total: data.total ?? (data.items || []).length,
-    has_image_proxy: Boolean(data.has_image_proxy),
-    note: data.note || "",
-    provider: "g2a" as const,
+    readonly: Boolean(item.readonly),
+    remote: Boolean(item.remote),
   };
 }
 
@@ -1141,112 +1107,6 @@ export async function testProxyClearance(targetUrl?: string) {
   return httpRequest<{ result: ClearanceTestResult }>("/api/proxy/clearance/test", {
     method: "POST",
     body: { target_url: targetUrl ?? "https://chatgpt.com" },
-  });
-}
-
-// ── GrokCLI2API-Go (Futureppo) ──────────────────────────────────
-
-export type G2AServer = {
-  id: string;
-  name: string;
-  base_url: string;
-  has_admin_key: boolean;
-  has_api_key?: boolean;
-  can_proxy_image?: boolean;
-  prefer_for_image?: boolean;
-  enabled?: boolean;
-  note?: string;
-  /** Optional outbound proxy for admin calls only; empty = direct (no env proxy). */
-  proxy?: string;
-  last_error?: string | null;
-  last_ok_at?: string | null;
-  created_at?: string;
-  updated_at?: string;
-};
-
-export type G2ARemoteCredential = {
-  id: string;
-  email?: string | null;
-  disabled?: boolean;
-  status?: string | null;
-  type?: string | null;
-  scopes?: string[] | null;
-  model_discovery?: unknown;
-};
-
-export async function fetchG2AServers() {
-  return httpRequest<{ servers: G2AServer[] }>("/api/g2a/servers");
-}
-
-export async function createG2AServer(server: {
-  name: string;
-  base_url: string;
-  admin_key: string;
-  api_key?: string;
-  note?: string;
-  proxy?: string;
-  prefer_for_image?: boolean;
-}) {
-  return httpRequest<{ server: G2AServer; servers: G2AServer[] }>("/api/g2a/servers", {
-    method: "POST",
-    body: server,
-  });
-}
-
-export async function updateG2AServer(
-  serverId: string,
-  updates: {
-    name?: string;
-    base_url?: string;
-    admin_key?: string;
-    api_key?: string;
-    note?: string;
-    enabled?: boolean;
-    proxy?: string;
-    prefer_for_image?: boolean;
-  },
-) {
-  return httpRequest<{ server: G2AServer; servers: G2AServer[] }>(`/api/g2a/servers/${serverId}`, {
-    method: "POST",
-    body: updates,
-  });
-}
-
-export async function deleteG2AServer(serverId: string) {
-  return httpRequest<{ servers: G2AServer[] }>(`/api/g2a/servers/${serverId}`, {
-    method: "DELETE",
-  });
-}
-
-export async function pingG2AServer(serverId: string) {
-  return httpRequest<{ ok: boolean; count?: number; servers: G2AServer[] }>(
-    `/api/g2a/servers/${serverId}/ping`,
-    { method: "POST", body: {} },
-  );
-}
-
-export async function fetchG2ACredentials(serverId: string) {
-  return httpRequest<{ server_id: string; items: G2ARemoteCredential[]; servers: G2AServer[] }>(
-    `/api/g2a/servers/${serverId}/credentials`,
-  );
-}
-
-export async function pushLocalGrokToG2A(serverId: string, accessTokens: string[] = []) {
-  return httpRequest<{
-    total: number;
-    pushed: number;
-    failed: number;
-    errors: Array<{ email?: string; error?: string }>;
-    servers: G2AServer[];
-  }>(`/api/g2a/servers/${serverId}/push`, {
-    method: "POST",
-    body: { access_tokens: accessTokens },
-  });
-}
-
-export async function deleteG2ACredential(serverId: string, credentialId: string) {
-  return httpRequest<{ ok: boolean }>(`/api/g2a/servers/${serverId}/credentials/${credentialId}`, {
-    method: "DELETE",
   });
 }
 

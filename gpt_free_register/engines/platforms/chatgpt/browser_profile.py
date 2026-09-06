@@ -433,7 +433,7 @@ def default_request_headers(
             "application/signed-exchange;v=b3;q=0.7"
         ),
         "Accept-Language": p.get("accept_language") or "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
         "Connection": "keep-alive",
         **_profile_client_hint_headers(p),
         "Sec-Fetch-Dest": "empty" if for_api else "document",
@@ -446,6 +446,29 @@ def default_request_headers(
     }:
         headers.setdefault("DNT", "1")
         headers.setdefault("Sec-GPC", "1")
+    return headers
+
+
+def navigation_request_headers(
+    *,
+    profile: dict[str, Any] | None = None,
+    referer: str = "",
+    fetch_site: str = "none",
+) -> dict[str, str]:
+    """Document-navigation headers for chatgpt.com / authorize hops.
+
+    gpt-auto-register: bare Accept/UA on these GETs correlated with 409 invalid_state
+    and Cloudflare 403; Client Hints + Sec-Fetch navigate cut both.
+    """
+    headers = default_request_headers(profile=profile, for_api=False)
+    headers["Sec-Fetch-Dest"] = "document"
+    headers["Sec-Fetch-Mode"] = "navigate"
+    headers["Sec-Fetch-Site"] = fetch_site or "none"
+    headers["Upgrade-Insecure-Requests"] = "1"
+    if fetch_site in {"none", "cross-site"}:
+        headers["Sec-Fetch-User"] = "?1"
+    if referer:
+        headers["Referer"] = referer
     return headers
 
 

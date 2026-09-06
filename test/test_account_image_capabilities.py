@@ -150,6 +150,99 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
+    def test_acquire_prefers_least_inflight_then_highest_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "busy", "type": "Plus", "status": "正常", "quota": 9, "refresh_token": "rt-a"},
+                    {"access_token": "idle", "type": "Plus", "status": "正常", "quota": 4, "refresh_token": "rt-b"},
+                ]
+            )
+            service._image_inflight["busy"] = 2
+            picked = service._acquire_next_candidate_token()
+            service.release_image_slot(picked)
+            self.assertEqual(picked, "idle")
+
+            service._image_inflight.clear()
+            service._accounts["busy"]["quota"] = 2
+            service._accounts["idle"]["quota"] = 8
+            picked = service._acquire_next_candidate_token()
+            service.release_image_slot(picked)
+            self.assertEqual(picked, "idle")
+
+    def test_acquire_does_not_oversubscribe_remaining_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "low", "type": "free", "status": "正常", "quota": 1, "refresh_token": "rt-a"},
+                    {"access_token": "high", "type": "free", "status": "正常", "quota": 5, "refresh_token": "rt-b"},
+                ]
+            )
+            service._image_inflight["low"] = 1
+            picked = service._acquire_next_candidate_token()
+            service.release_image_slot(picked)
+            self.assertEqual(picked, "high")
+
+    def test_get_available_access_token_skips_remote_probe_when_jwt_fresh(self) -> None:
+        import base64
+        import json
+        import time as time_mod
+
+        payload = {"exp": int(time_mod.time()) + 3600, "iat": int(time_mod.time())}
+        jwt = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=") + ".s"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": jwt,
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 5,
+                        "refresh_token": "rt-plus",
+                    }
+                ]
+            )
+            probed = {"n": 0}
+
+            def boom(_access_token, event="fetch_remote_info"):
+                probed["n"] += 1
+                raise AssertionError("remote probe should be skipped")
+
+            service.fetch_remote_info = boom  # type: ignore[method-assign]
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, jwt)
+            self.assertEqual(probed["n"], 0)
+
+    def test_get_available_access_token_probes_when_jwt_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "opaque-token",
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 5,
+                        "refresh_token": "rt-plus",
+                    }
+                ]
+            )
+            probed = {"n": 0}
+
+            def fake(access_token, event="fetch_remote_info"):
+                probed["n"] += 1
+                return service.get_account(access_token)
+
+            service.fetch_remote_info = fake  # type: ignore[method-assign]
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, "opaque-token")
+            self.assertEqual(probed["n"], 1)
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True

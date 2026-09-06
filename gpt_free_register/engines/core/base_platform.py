@@ -319,12 +319,8 @@ class BasePlatform(ABC):
         t = self.config.executor_type
         if t == "protocol":
             return ProtocolExecutor(proxy=self.config.proxy)
-        elif t == "headless":
-            from .executors.playwright import PlaywrightExecutor
-            return PlaywrightExecutor(proxy=self.config.proxy, headless=True)
-        elif t == "headed":
-            from .executors.playwright import PlaywrightExecutor
-            return PlaywrightExecutor(proxy=self.config.proxy, headless=False)
+        if t in {"headless", "headed"}:
+            raise RuntimeError("浏览器执行器已移除，请使用 executor=protocol")
         raise ValueError(f"未知执行器类型: {t}")
 
     def _make_captcha(self, **kwargs):

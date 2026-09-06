@@ -1293,6 +1293,7 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     account_email = ""
+    sticky_token = ""
 
     while True:
         try:
@@ -1300,11 +1301,14 @@ def _generate_single_image(
                 request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
-            token = account_service.get_available_access_token(
-                plan_type=plan_type,
-                source_type="codex" if codex_model else None,
-                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-            )
+            if sticky_token:
+                token = sticky_token
+            else:
+                token = account_service.get_available_access_token(
+                    plan_type=plan_type,
+                    source_type="codex" if codex_model else None,
+                    plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                )
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
@@ -1447,7 +1451,6 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1456,32 +1459,30 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
-            if not emitted_for_token and is_token_invalid_error(last_error):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                if refreshed_token and refreshed_token != token:
-                    token = refreshed_token
-                    continue
-                account_service.remove_invalid_token(token, "image_stream")
-                continue
-            # TLS/SSL 连接错误：自动重试
+            # Transient SOCKS/TLS: keep the inflight slot and retry the same
+            # account. mark_image_result(False) would release the slot, bump
+            # fail, and the next loop would re-pick (often a different token).
             if not emitted_for_token and is_tls_connection_error(last_error):
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
+                    wait_secs = min(0.4 * tls_retry_count, 1.5)
                     logger.warning({
                         "event": "image_stream_tls_retry",
                         "request_token": token,
                         "account_email": account_email,
                         "retry_count": tls_retry_count,
                         "index": index,
+                        "wait_secs": wait_secs,
+                        "sticky": True,
                         "error": last_error[:200],
                     })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    time.sleep(wait_secs)
+                    sticky_token = token
                     continue
-            # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
                 conn_timeout_retry_count += 1
                 if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
-                    wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
+                    wait_secs = min(1.0 * conn_timeout_retry_count, 3.0)
                     logger.warning({
                         "event": "image_stream_conn_timeout_retry",
                         "request_token": token,
@@ -1489,10 +1490,21 @@ def _generate_single_image(
                         "retry_count": conn_timeout_retry_count,
                         "index": index,
                         "wait_secs": wait_secs,
+                        "sticky": True,
                         "error": last_error[:200],
                     })
                     time.sleep(wait_secs)
+                    sticky_token = token
                     continue
+            sticky_token = ""
+            account_service.mark_image_result(token, False)
+            if not emitted_for_token and is_token_invalid_error(last_error):
+                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
+                if refreshed_token and refreshed_token != token:
+                    token = refreshed_token
+                    continue
+                account_service.remove_invalid_token(token, "image_stream")
+                continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
             if backend is not None:

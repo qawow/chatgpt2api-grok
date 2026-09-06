@@ -6,27 +6,13 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
     count_message_image_tokens,
-    count_message_text_tokens,
     count_text_tokens,
     encode_images,
-    normalize_messages,
     stream_image_outputs_with_pool,
-    stream_text_deltas,
-    text_backend,
-)
-from services.protocol.web_search_tool import (
-    WEB_SEARCH_TOOL_TYPES,
-    has_unsupported_tools,
-    has_web_search_tool,
-    normalized_sources,
-    run_web_search,
-    search_query_from_messages,
-    text_with_url_citations,
 )
 from utils.grok_models import is_grok_image_model, resolve_grok_image_model
 from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
@@ -69,6 +55,11 @@ def thinking_effort_from_body(body: dict[str, Any]) -> str:
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
+    from utils.helper import is_supported_image_model
+
+    model = str(body.get("model") or "").strip()
+    if is_supported_image_model(model) or is_grok_image_model(model):
+        return False
     return not has_response_image_generation_tool(body)
 
 
@@ -411,18 +402,15 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return completed
 
 
+TEXT_MODELS_DISABLED = (
+    "this backend only serves image models "
+    "(gpt-image-2 / codex-gpt-image-2 / grok-2-image); text models are disabled"
+)
+
+
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if is_text_response_request(body):
-        model, messages = text_response_parts(body)
-        if has_web_search_tool(body) and not has_unsupported_response_tools(body):
-            yield from stream_web_search_response(body, messages)
-            return
-        key = cache_key(body, messages, stream=bool(body.get("stream")))
-        yield from chat_completion_cache.get_or_compute_stream(
-            key,
-            lambda: stream_text_response(text_backend(), body, messages),
-        )
-        return
+        raise HTTPException(status_code=400, detail={"error": TEXT_MODELS_DISABLED})
 
     prompt = extract_response_prompt(body.get("input"))
     if not prompt:
@@ -433,7 +421,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         if image_info:
             raise HTTPException(
                 status_code=400,
-                detail={"error": "Grok 免费生图暂不支持图生图/编辑；请改用文生图模型 grok-2-image / grok-imagine"},
+                detail={"error": "Grok 免费生图暂不支持图生图/编辑；请改用 grok-imagine-image / grok-2-image"},
             )
         from services.protocol import grok_v1_image_generations
 

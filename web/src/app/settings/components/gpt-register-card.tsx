@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   cancelGptRegisterJob,
   fetchGptRegisterJob,
@@ -31,7 +32,7 @@ const DEFAULT_FORM: GptRegisterSettings = {
   python_bin: "",
   count: 1,
   concurrency: 1,
-  interval_secs: 2,
+  interval_secs: 3,
   timeout_secs: 600,
   executor: "protocol",
   mail_provider: "cloudflare_d1_api",
@@ -355,12 +356,15 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
               </Field>
-              <Field label="出站代理" hint="留空读 REGISTER_PROXY_DEFAULT；WARP 例 socks5h://127.0.0.1:40000">
-                <Input
+              <Field
+                label="出站代理"
+                hint="留空读 REGISTER_PROXY_DEFAULT。多条按行或逗号分隔，并发时 round-robin 分给各号"
+              >
+                <Textarea
                   value={form.proxy}
                   onChange={(e) => setField("proxy", e.target.value)}
-                  placeholder="socks5h://127.0.0.1:40000"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
+                  placeholder={"socks5h://127.0.0.1:40000\nsocks5h://user:pass@host:1080"}
+                  className="min-h-24 rounded-xl border-stone-200 bg-white"
                   disabled={running}
                 />
               </Field>

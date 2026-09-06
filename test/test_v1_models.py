@@ -14,13 +14,11 @@ BASE_URL = "http://localhost:8000"
 
 
 class ModelListTests(unittest.TestCase):
+    def setUp(self) -> None:
+        openai_v1_models.reset_models_cache()
+
     def test_list_models_only_returns_image_models_backed_by_account_types(self):
         with (
-            mock.patch.object(
-                openai_v1_models.OpenAIBackendAPI,
-                "list_models",
-                return_value={"object": "list", "data": []},
-            ),
             mock.patch.object(
                 openai_v1_models.account_service,
                 "list_accounts",
@@ -30,6 +28,7 @@ class ModelListTests(unittest.TestCase):
                     {"access_token": "token-codex-team", "type": "Team", "source_type": "codex"},
                 ],
             ),
+            mock.patch.object(openai_v1_models.grok_account_service, "count", return_value=0),
         ):
             result = openai_v1_models.list_models()
 
@@ -39,14 +38,13 @@ class ModelListTests(unittest.TestCase):
         self.assertIn("team-codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
         self.assertNotIn("pro-codex-gpt-image-2", ids)
+        self.assertNotIn("gpt-5", ids)
+        self.assertNotIn("gpt-5-3", ids)
+        self.assertNotIn("auto", ids)
+        self.assertNotIn("grok-4.5", ids)
 
     def test_list_models_does_not_return_codex_models_for_web_plus_accounts(self):
         with (
-            mock.patch.object(
-                openai_v1_models.OpenAIBackendAPI,
-                "list_models",
-                return_value={"object": "list", "data": []},
-            ),
             mock.patch.object(
                 openai_v1_models.account_service,
                 "list_accounts",
@@ -59,11 +57,6 @@ class ModelListTests(unittest.TestCase):
                 "count",
                 return_value=0,
             ),
-            mock.patch.object(
-                openai_v1_models.g2a_bridge,
-                "has_image_proxy",
-                return_value=False,
-            ),
         ):
             result = openai_v1_models.list_models()
 
@@ -72,42 +65,31 @@ class ModelListTests(unittest.TestCase):
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
         self.assertNotIn("grok-2-image", ids)
+        self.assertNotIn("gpt-5-mini", ids)
 
-    def test_list_models_injects_grok_when_g2a_proxy_ready(self):
-        """Remote-only Grok (G2A) must still expose grok image models on /v1/models."""
+    def test_list_models_injects_grok_image_not_text(self):
         with (
-            mock.patch.object(
-                openai_v1_models.OpenAIBackendAPI,
-                "list_models",
-                return_value={"object": "list", "data": []},
-            ),
-            mock.patch.object(
-                openai_v1_models.account_service,
-                "list_accounts",
-                return_value=[],
-            ),
-            mock.patch.object(
-                openai_v1_models.grok_account_service,
-                "count",
-                return_value=0,
-            ),
-            mock.patch.object(
-                openai_v1_models.g2a_bridge,
-                "has_image_proxy",
-                return_value=True,
-            ),
+            mock.patch.object(openai_v1_models.account_service, "list_accounts", return_value=[]),
+            mock.patch.object(openai_v1_models.grok_account_service, "count", return_value=2),
         ):
             result = openai_v1_models.list_models()
-
         ids = {item["id"] for item in result["data"]}
         self.assertIn("grok-2-image", ids)
         self.assertIn("grok-imagine", ids)
-        self.assertIn("grok-4.5", ids)
-        self.assertTrue(all(
-            item.get("owned_by") == "grok"
-            for item in result["data"]
-            if str(item.get("id") or "").startswith("grok")
-        ))
+        self.assertIn("grok-imagine-image", ids)
+        self.assertNotIn("grok-4.5", ids)
+
+    def test_list_models_does_not_hit_upstream(self):
+        with (
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "list_accounts",
+                return_value=[{"access_token": "t", "type": "free"}],
+            ),
+            mock.patch.object(openai_v1_models.grok_account_service, "count", return_value=0),
+        ):
+            result = openai_v1_models.list_models()
+        self.assertEqual({item["id"] for item in result["data"]}, {"gpt-image-2"})
 
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""

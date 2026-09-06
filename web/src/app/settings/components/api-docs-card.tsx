@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronDown, FileArchive, FileText, KeyRound, ListChecks, type LucideIcon } from "lucide-react";
+import { ChevronDown, FileArchive, KeyRound, ListChecks, type LucideIcon } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
 import webConfig from "@/constants/common-env";
@@ -40,7 +40,7 @@ const docs: ApiDoc[] = [
     path: "/v1/chat/completions",
     icon: FileText,
     input: [
-      ["model", "string", "模型名，例如 gpt-5-mini，也可用于图片兼容场景。"],
+      ["model", "string", "仅生图：gpt-image-2 / grok-imagine-image / grok-2-image。grok-4.5 是对话模型，已关闭。"],
       ["messages", "array", "OpenAI 兼容消息数组。"],
       ["stream", "boolean", "可选，是否流式返回。"],
       ["n", "number", "可选，图片兼容场景会解析为生成数量。"],
@@ -53,7 +53,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/chat/completions \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":"你好"}]}'`,
+  -d '{"model":"gpt-image-2","messages":[{"role":"user","content":"一只橘猫"}]}'`,
   },
   {
     title: "Responses",
@@ -74,7 +74,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/responses \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-5-mini","input":"生成一张未来城市图片"}'`,
+  -d '{"model":"gpt-image-2","input":"生成一张未来城市图片","tools":[{"type":"image_generation"}]}'`,
   },
   {
     title: "搜索",
@@ -141,81 +141,9 @@ const docs: ApiDoc[] = [
   -F "prompt=改成赛博朋克夜景" \\
   -F "image=@./input.png"`,
   },
-  {
-    title: "创建 PPT 任务",
-    method: "POST",
-    path: "/v1/ppt/generations",
-    icon: FileText,
-    input: [
-      ["prompt", "string", "PPT 需求描述，可为空但建议填写完整主题、页数、风格和内容结构。"],
-      ["base64_images", "string[]", "可选，图片 data URL/base64，用作 PPT 参考素材。"],
-      ["client_task_id", "string", "可选，客户端幂等任务 ID；重复提交同 ID 会返回已有任务。"],
-    ],
-    output: [
-      ["id / taskId", "string", "任务 ID，用于轮询状态。"],
-      ["status", "queued | running | success | error", "任务状态。"],
-      ["kind", "ppt", "任务类型。"],
-      ["created_at / updated_at", "string", "任务创建和更新时间。"],
-    ],
-    example: (baseUrl: string, key: string) => `curl ${baseUrl}/ppt/generations \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${key}" \\
-  -d '{"prompt":"制作一份 8 页以内的季度业务汇报 PPT","base64_images":[]}'`,
-  },
-  {
-    title: "创建 PSD 任务",
-    method: "POST",
-    path: "/v1/psd/generations",
-    icon: FileArchive,
-    input: [
-      ["prompt", "string", "PSD 拆分与合成要求，例如保留图层、位置、背景和素材 zip。"],
-      ["base64_images", "string[]", "必填，至少一张图片 data URL/base64，作为 PSD 拆分源图。"],
-      ["client_task_id", "string", "可选，客户端幂等任务 ID。"],
-    ],
-    output: [
-      ["id / taskId", "string", "任务 ID，用于轮询状态。"],
-      ["status", "queued | running | success | error", "任务状态。"],
-      ["kind", "psd", "任务类型。"],
-      ["error", "string", "失败时返回错误信息。"],
-    ],
-    example: (baseUrl: string, key: string) => `curl ${baseUrl}/psd/generations \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${key}" \\
-  -d '{"prompt":"按原图位置拆分海报元素并合成可编辑 PSD","base64_images":["data:image/png;base64,..."]}'`,
-  },
-  {
-    title: "任务状态查询",
-    method: "GET",
-    path: "/v1/editable-file-tasks?ids={taskId1,taskId2}",
-    icon: ListChecks,
-    input: [
-      ["ids", "string", "可选，逗号分隔任务 ID；不传则返回当前用户全部可编辑文件任务。"],
-    ],
-    output: [
-      ["items", "array", "任务列表。成功任务的 result 内包含 primary_url 和 zip_url。"],
-      ["missing_ids", "string[]", "查询指定 ids 时，返回未找到的任务 ID。"],
-      ["result.primary_url", "string", "主文件下载地址。"],
-      ["result.zip_url", "string", "素材 zip 下载地址。"],
-    ],
-    example: (baseUrl: string, key: string) => `curl "${baseUrl}/editable-file-tasks?ids=<task_id>" \\
-  -H "Authorization: Bearer ${key}"`,
-  },
-  {
-    title: "结果文件下载",
-    method: "GET",
-    path: "/files/{file_path}",
-    icon: FileArchive,
-    input: [
-      ["file_path", "string", "由任务 result.primary_url 或 result.zip_url 返回，通常不需要手动拼接。"],
-    ],
-    output: [
-      ["binary", "file", "返回 pptx/psd/zip 文件流。"],
-    ],
-    example: (baseUrl: string, _key: string) => `curl ${baseUrl.replace(/\/v1$/, "")}/files/<file_path> -o result.zip`,
-  },
 ];
 
-const usableModels = ["gpt-image-2", "codex-gpt-image-2", "auto", "gpt-5", "gpt-5-1", "gpt-5-2", "gpt-5-3", "gpt-5-3-mini", "gpt-5-mini"];
+const usableModels = ["gpt-image-2", "codex-gpt-image-2", "grok-2-image", "grok-imagine-image", "grok-imagine"];
 
 function ParamTable({ rows }: { rows: ParamRow[] }) {
   return (

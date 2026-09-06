@@ -2,30 +2,26 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
-from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
 from services.protocol import (
-    anthropic_v1_messages,
-    grok_v1_chat,
     grok_v1_image_generations,
     openai_v1_chat_complete,
     openai_v1_image_edit,
     openai_v1_image_generations,
     openai_v1_models,
     openai_v1_response,
-    openai_search,
 )
 from utils.grok_models import (
     DEFAULT_GROK_IMAGE_MODEL,
-    DEFAULT_GROK_TEXT_MODEL,
     GROK_IMAGE_MODELS,
+    GROK_TEXT_MODELS_DISABLED,
     is_grok_image_model,
+    is_grok_text_model,
     resolve_grok_image_model,
 )
 
@@ -60,24 +56,6 @@ class ResponseCreateRequest(BaseModel):
     stream: bool | None = None
 
 
-class AnthropicMessageRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    model: str | None = None
-    messages: list[dict[str, object]] | None = None
-    system: object | None = None
-    stream: bool | None = None
-
-
-class SearchRequest(BaseModel):
-    prompt: str = Field(..., min_length=1)
-
-
-class EditableFileTaskRequest(BaseModel):
-    prompt: str = ""
-    base64_images: list[str] = Field(default_factory=list)
-    client_task_id: str | None = None
-
-
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
         await run_in_threadpool(check_request, text)
@@ -106,8 +84,10 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         payload["base_url"] = resolve_image_base_url(request)
-        # Model-name split: grok-*image* / grok-imagine → Grok pool only.
-        # Never fall through to ChatGPT account_service.
+        # grok-4.5 is chat, not image — never fall through to ChatGPT.
+        if is_grok_text_model(body.model):
+            raise HTTPException(status_code=400, detail={"error": GROK_TEXT_MODELS_DISABLED})
+        # grok-*image* / grok-imagine → Grok pool only.
         if is_grok_image_model(body.model):
             payload["model"] = resolve_grok_image_model(body.model)
             call = LoggedCall(
@@ -149,35 +129,24 @@ def create_router() -> APIRouter:
             body: ChatCompletionRequest,
             authorization: str | None = Header(default=None),
     ):
-        """OpenAI chat shape → Grok Build /responses. Does not use ChatGPT pool."""
-        identity = require_identity(authorization)
-        payload = body.model_dump(mode="python")
-        if not payload.get("model"):
-            payload["model"] = DEFAULT_GROK_TEXT_MODEL
-        model = str(payload.get("model") or DEFAULT_GROK_TEXT_MODEL)
-        request_preview = request_text(payload.get("prompt"), payload.get("messages"))
-        call = LoggedCall(
-            identity,
-            "/v1/grok/chat/completions",
-            model,
-            "Grok文本",
-            request_text=request_preview,
-            request_shape=request_shape(payload.get("messages")),
+        """Grok text chat is disabled; image models go through /v1/images or image chat."""
+        require_identity(authorization)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": GROK_TEXT_MODELS_DISABLED,
+            },
         )
-        await filter_or_log(call, request_preview)
-        return await call.run(grok_v1_chat.handle, payload)
 
     @router.get("/v1/grok/models")
     async def list_grok_models(authorization: str | None = Header(default=None)):
         require_identity(authorization)
-        from services.g2a_service import g2a_bridge
         from services.grok_account_service import grok_account_service
 
-        # Expose Grok models when local pool OR remote G2A image proxy is ready.
-        has_accounts = grok_account_service.count() > 0 or g2a_bridge.has_image_proxy()
+        has_accounts = grok_account_service.count() > 0
         data = []
         if has_accounts:
-            for model in sorted(GROK_IMAGE_MODELS | {DEFAULT_GROK_TEXT_MODEL}):
+            for model in sorted(GROK_IMAGE_MODELS):
                 data.append(
                     {
                         "id": model,
@@ -203,20 +172,10 @@ def create_router() -> APIRouter:
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
         await filter_or_log(call, prompt)
         if is_grok_image_model(model):
-            from services.g2a_service import g2a_bridge
-
-            if not g2a_bridge.has_image_proxy():
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": "Grok 本地池不支持图生图；请接入 Codex2API 后再用远程 /v1/images/edits",
-                    },
-                )
-            payload["images"] = await read_image_sources(image_sources)
-            if mask_sources:
-                payload["mask"] = await read_image_sources(mask_sources)
-            payload["base_url"] = resolve_image_base_url(request)
-            return await call.run(grok_v1_image_generations.handle_edit, payload)
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Grok 本地池不支持图生图"},
+            )
         payload["images"] = await read_image_sources(image_sources)
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
@@ -258,65 +217,8 @@ def create_router() -> APIRouter:
         return await call.run(openai_v1_response.handle, payload)
 
     @router.post("/v1/messages")
-    async def create_message(
-            body: AnthropicMessageRequest,
-            authorization: str | None = Header(default=None),
-            x_api_key: str | None = Header(default=None, alias="x-api-key"),
-            anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
-    ):
-        identity = require_identity(authorization or (f"Bearer {x_api_key}" if x_api_key else None))
-        payload = body.model_dump(mode="python")
-        model = str(payload.get("model") or "auto")
-        request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
-        call = LoggedCall(identity, "/v1/messages", model, "Messages", request_text=request_preview)
-        await filter_or_log(call, request_preview)
-        return await call.run(anthropic_v1_messages.handle, payload, sse="anthropic")
-
-    @router.post("/v1/search")
-    async def search(body: SearchRequest, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
-        call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
-        await filter_or_log(call, body.prompt)
-        return await call.run(openai_search.handle, body.model_dump(mode="python"))
-
-    @router.get("/v1/editable-file-tasks")
-    async def list_editable_file_tasks(ids: str = "", authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
-        task_ids = [item.strip() for item in ids.split(",") if item.strip()]
-        return await run_in_threadpool(editable_file_task_service.list_tasks, identity, task_ids)
-
-    @router.get("/files/{file_path:path}")
-    async def download_editable_file(file_path: str):
-        try:
-            path = await run_in_threadpool(editable_file_task_service.public_file_path, file_path)
-        except Exception as exc:
-            raise HTTPException(status_code=404, detail={"error": "file not found"}) from exc
-        return FileResponse(path, filename=path.name)
-
-    @router.post("/v1/ppt/generations")
-    async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
-        await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
-            editable_file_task_service.submit_ppt,
-            identity,
-            client_task_id=body.client_task_id or "",
-            prompt=body.prompt,
-            base64_images=body.base64_images,
-            base_url=resolve_image_base_url(request),
-        )
-
-    @router.post("/v1/psd/generations")
-    async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
-        await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
-            editable_file_task_service.submit_psd,
-            identity,
-            client_task_id=body.client_task_id or "",
-            prompt=body.prompt,
-            base64_images=body.base64_images,
-            base_url=resolve_image_base_url(request),
-        )
+    async def create_message(authorization: str | None = Header(default=None)):
+        require_identity(authorization)
+        raise HTTPException(status_code=400, detail={"error": "text models are disabled"})
 
     return router

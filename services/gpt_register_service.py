@@ -40,7 +40,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "python_bin": "",  # only for subprocess mode
     "count": 1,
     "concurrency": 1,
-    "interval_secs": 2,
+    "interval_secs": 3,
     "timeout_secs": 600,
     "executor": "protocol",
     "mail_provider": "cloudflare_d1_api",
@@ -60,9 +60,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "skip_codex": True,
     # 入库 session_only 后后台再跑 Codex 补 refresh（软失败保留 session 行）
     "auto_codex_upgrade": True,
-    # 关闭步骤间随机抖动（OPENAI_REGISTER_NO_DELAY）；默认关，避免无必要地改行为
+    # 步骤间随机抖动（OPENAI_REGISTER_NO_DELAY）；默认保留，批量更稳
     "register_no_delay": False,
-    # 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 5000ms create_account
+    # 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 0ms（现网 create_account 不需要 5s collect）
     "so_collect_ms": "",
 }
 
@@ -73,6 +73,103 @@ def _now_iso() -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _is_network_register_error(error: object) -> bool:
+    """Heuristic: proxy/TLS/timeout failures vs OpenAI business errors."""
+    text = str(error or "").lower()
+    if not text:
+        return False
+    markers = (
+        "curl: (35)",
+        "curl: (7)",
+        "curl: (28)",
+        "curl: (56)",
+        "curl: (55)",
+        "tls connect",
+        "tls handshake",
+        "openssl_internal",
+        "sslerror",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "network is unreachable",
+        "name or service not known",
+        "could not resolve",
+        "socks",
+        "proxy error",
+        "proxyerror",
+        "开始 oauth 流程失败",
+        "初始化会话失败",
+        "检查 ip",
+        "oai_did_missing",
+        "invalid_state",
+        "403 forbidden",
+        "cloudflare",
+        "just a moment",
+        "csrf token",
+        "curl: (6)",
+        "curl: (52)",
+        "curl: (56)",
+    )
+    return any(marker in text for marker in markers)
+
+
+def parse_proxy_pool(text: object) -> list[str]:
+    """Split a proxy field into a round-robin pool.
+
+    Accepts newlines, commas, or whitespace-separated URLs. Lines starting
+    with ``#`` are comments. Empty input → empty pool (caller uses env default).
+    """
+    raw = str(text or "").replace(",", "\n")
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        item = line.strip()
+        if not item or item.startswith("#"):
+            continue
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def pick_proxy(pool: list[str], index: int) -> str:
+    if not pool:
+        return ""
+    if index <= 0:
+        index = 1
+    return pool[(index - 1) % len(pool)]
+
+
+def _mask_proxy_url(proxy: object) -> str:
+    text = str(proxy or "").strip()
+    if not text:
+        return ""
+    if "@" not in text:
+        return text
+    scheme, rest = text.split("://", 1) if "://" in text else ("", text)
+    creds, host = rest.rsplit("@", 1)
+    if ":" in creds:
+        user, _password = creds.split(":", 1)
+        hidden = f"{user}:***"
+    else:
+        hidden = "***"
+    return f"{scheme}://{hidden}@{host}" if scheme else f"{hidden}@{host}"
+
+
+def _circuit_break_threshold(settings: dict[str, Any] | None = None) -> int:
+    raw = ""
+    if settings:
+        raw = str(settings.get("circuit_break") or "").strip()
+    if not raw:
+        raw = str(os.environ.get("GPT_REGISTER_CIRCUIT_BREAK") or "3").strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 3
+    return max(0, min(20, n))
 
 
 def _default_push_base_url() -> str:
@@ -138,7 +235,7 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["python_bin"] = _clean(out.get("python_bin"))
     out["count"] = _clamp_int(out.get("count"), 1, 1, 50)
     out["concurrency"] = _clamp_int(out.get("concurrency"), 1, 1, 5)
-    out["interval_secs"] = _clamp_float(out.get("interval_secs"), 2, 0, 600)
+    out["interval_secs"] = _clamp_float(out.get("interval_secs"), 3, 0, 600)
     out["timeout_secs"] = _clamp_int(out.get("timeout_secs"), 600, 60, 3600)
     executor = _clean(out.get("executor")).lower() or "protocol"
     if executor not in {"protocol", "headless", "headed"}:
@@ -419,6 +516,15 @@ class GptRegisterService:
         total = int(settings["count"])
         concurrency = int(settings["concurrency"])
         interval = float(settings["interval_secs"])
+        proxy_pool = parse_proxy_pool(settings.get("proxy"))
+        if proxy_pool and concurrency > len(proxy_pool):
+            self._append_log(
+                job_id,
+                f"并发 {concurrency} 大于代理池 {len(proxy_pool)}，钳到 {len(proxy_pool)} "
+                "（避免多号同出口）",
+                level="warn",
+            )
+            concurrency = len(proxy_pool)
         success = failed = added = completed = 0
         items: list[dict[str, Any]] = []
         t0 = time.time()
@@ -462,8 +568,22 @@ class GptRegisterService:
                     "cancelled": True,
                     "error": "cancelled",
                 }
+            per_settings = dict(settings)
+            if proxy_pool:
+                per_settings["proxy"] = pick_proxy(proxy_pool, index)
+            if concurrency > 1:
+                # gpt-auto-register: stagger workers so N accounts don't hit
+                # the same egress in the same second.
+                time.sleep(0.8 * ((max(index, 1) - 1) % concurrency))
             try:
-                result = self._register_once(settings)
+                result = self._register_once(per_settings)
+                if proxy_pool:
+                    result.setdefault("logs", [])
+                    if isinstance(result.get("logs"), list):
+                        result["logs"] = [
+                            f"proxy={_mask_proxy_url(per_settings.get('proxy'))} "
+                            f"pool={len(proxy_pool)}"
+                        ] + list(result["logs"])
                 return {"index": index, **result}
             except Exception as exc:
                 return {
@@ -476,6 +596,9 @@ class GptRegisterService:
 
         # sequential with optional limited concurrency batches
         index = 0
+        consecutive_network = 0
+        circuit_threshold = _circuit_break_threshold(settings)
+        circuit_tripped = False
         while index < total:
             if cancel.is_set():
                 self._append_log(job_id, "收到取消请求，停止后续注册", level="warn")
@@ -519,6 +642,7 @@ class GptRegisterService:
                 if item["ok"]:
                     success += 1
                     added += int(item["added"] or 0)
+                    consecutive_network = 0
                     push = item.get("push") if isinstance(item.get("push"), dict) else {}
                     self._append_log(
                         job_id,
@@ -528,6 +652,10 @@ class GptRegisterService:
                     )
                 else:
                     failed += 1
+                    if _is_network_register_error(item.get("error")):
+                        consecutive_network += 1
+                    else:
+                        consecutive_network = 0
                     self._append_log(
                         job_id,
                         f"[{completed}/{total}] 失败 email={item.get('email') or '-'} "
@@ -542,6 +670,21 @@ class GptRegisterService:
                     added=added,
                     items=list(items),
                 )
+
+            if (
+                circuit_threshold
+                and consecutive_network >= circuit_threshold
+                and index < total
+                and not cancel.is_set()
+            ):
+                circuit_tripped = True
+                self._append_log(
+                    job_id,
+                    f"连续 {consecutive_network} 次网络错误，熔断停止后续注册 "
+                    f"(GPT_REGISTER_CIRCUIT_BREAK={circuit_threshold})",
+                    level="error",
+                )
+                break
 
             if index < total and interval > 0 and not cancel.is_set():
                 self._append_log(job_id, f"批次间隔 sleep {interval}s")
@@ -576,6 +719,8 @@ class GptRegisterService:
             "engines_dir": settings.get("engines_dir"),
             "push_mode": settings.get("push_mode"),
             "push_enabled": settings.get("push_enabled"),
+            "circuit_break": circuit_tripped,
+            "circuit_break_threshold": circuit_threshold,
         }
         self._patch_job(
             job_id,
@@ -956,6 +1101,18 @@ class GptRegisterService:
             payload["export_type"] = "codex"
         if settings.get("bind_register_proxy") and settings.get("proxy"):
             payload["proxy"] = settings["proxy"]
+        # Match register TLS profile so first image gen does not curl(35) on chrome110.
+        payload["impersonate"] = "chrome142"
+        payload["fp"] = {
+            "impersonate": "chrome142",
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/142.0.7540.34 Safari/537.36"
+            ),
+            "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        }
         # Default free image quota until remote fetch fills real limits_progress.
         # Without this, quota stays 0 → "no available image quota" even for fresh accounts.
         if payload.get("quota") in (None, "", 0):

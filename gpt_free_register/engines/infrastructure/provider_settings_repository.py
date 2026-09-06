@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 
 from sqlmodel import Session, select
 
-from core.db import ProviderSettingModel, engine
+from core import db as core_db
+from core.db import ProviderSettingModel
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
 
@@ -17,7 +18,7 @@ class ProviderSettingsRepository:
         self.definitions = definitions or ProviderDefinitionsRepository()
 
     def list_by_type(self, provider_type: str) -> list[ProviderSettingModel]:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             return session.exec(
                 select(ProviderSettingModel)
                 .where(ProviderSettingModel.provider_type == provider_type)
@@ -25,11 +26,11 @@ class ProviderSettingsRepository:
             ).all()
 
     def get(self, setting_id: int) -> ProviderSettingModel | None:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             return session.get(ProviderSettingModel, setting_id)
 
     def get_by_key(self, provider_type: str, provider_key: str) -> ProviderSettingModel | None:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             return session.exec(
                 select(ProviderSettingModel)
                 .where(ProviderSettingModel.provider_type == provider_type)
@@ -55,7 +56,7 @@ class ProviderSettingsRepository:
         return payload
 
     def list_enabled(self, provider_type: str) -> list[ProviderSettingModel]:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             items = session.exec(
                 select(ProviderSettingModel)
                 .where(ProviderSettingModel.provider_type == provider_type)
@@ -87,7 +88,7 @@ class ProviderSettingsRepository:
         return None
 
     def delete(self, setting_id: int) -> bool:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             item = session.get(ProviderSettingModel, setting_id)
             if not item:
                 return False
@@ -128,7 +129,7 @@ class ProviderSettingsRepository:
         if not definition:
             raise ValueError(f"未知 provider: {provider_type}/{provider_key}")
 
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             if setting_id:
                 item = session.get(ProviderSettingModel, setting_id)
                 if not item:

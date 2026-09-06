@@ -266,8 +266,8 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `count` | 1 | 注册数量 1–50 |
-| `concurrency` | 1 | 并发 1–5；邮箱/代理不稳时建议 1 |
-| `interval_secs` | 2 | 每批间隔秒 |
+| `concurrency` | 1 | 并发 1–5；稳优先默认 1；多出口时可提到 2–3（钳到代理池大小） |
+| `interval_secs` | 3 | 每号间隔秒 |
 | `timeout_secs` | 600 | 单号超时（subprocess 严格生效） |
 | `executor` | `protocol` | `protocol` / `headless` / `headed`；推荐 protocol |
 | `mail_provider` | `cloudflare_d1_api` | 邮箱 provider |
@@ -286,8 +286,8 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `python_bin` | 空 | 仅 subprocess |
 | `skip_codex` | **true** | 跳过注册流里的 Codex 二次 OTP；入库为 `session_only`（更快；见 §6.7.1） |
 | `auto_codex_upgrade` | **true** | `session_only` 入库后后台再跑 Codex 补 refresh；`add_phone` 等软失败保留 session 行 |
-| `register_no_delay` | false | 关闭步骤间随机延迟（调试） |
-| `so_collect_ms` | 空 | create_account 前 SO 采集等待毫秒；空=默认 5000；`0`=关闭 |
+| `register_no_delay` | false | 关闭步骤间随机延迟；默认保留抖动，批量更稳 |
+| `so_collect_ms` | 空 | create_account 前 SO 采集等待毫秒；空=默认 0；需要旧行为时设 `5000` |
 
 ### 号池侧相关 API（补 refresh）
 
@@ -428,15 +428,28 @@ curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
 | TLS 指纹 | 默认 `curl_cffi` `chrome142` + 匹配 Client Hints |
 | HTTP 重试 | 5xx/429 指数退避 + jitter，尊重 `Retry-After` |
 | create_account | 5xx/429 重试并刷新 sentinel；密码路径失败可回退 passwordless（清旧 auto-OTP 标记） |
+| oai-did warmup | 先 GET chatgpt.com 种植 `oai-did`（导航头 + 最多 4 次），失败**不创建邮箱**，避免 409 白烧 CFD1 |
+| auth XHR 头 | authorize/continue、OTP send/validate 补 `Origin`（与 Referer 同 host）、`oai-device-id`、Datadog RUM |
+| OTP 401 补发 | `wrong_email_otp` / 401 不重试同一码，resend 后再等新邮件校验一次 |
+| 代理池 | 设置页代理可多行/逗号；并发按号 round-robin，且不写进程级 `REGISTER_PROXY` |
+| 熔断分类 | 连续网络错误含 `invalid_state` / Cloudflare 403 / `oai_did_missing` / curl 6 |
+| GET 传输重试 | 同 session 重试 curl 52/56/28（空回复/中断）；POST 不重试以免双提交 create_account |
+| OTP callback | validate 返回 `/api/auth/callback?code=`（已有号登录）则跳过 create_account |
+| continue_url | 兼容 `continueUrl`/`redirect_url`；无 `code=` 时跟随 redirect / workspace/select |
+| 死号 | validate 返回 `account_deactivated`/`deleted`/`banned` 立即失败，不补发 OTP |
+| OTP Subject | 主题里唯一 6 位数字优先（仍过滤 `493682`）；关键词含日/韩 |
+| 代理池并发 | 并发数钳到代理条数，避免多 worker 同出口 |
 
 #### 推荐协议流（当前默认）
 
 ```
-chatgpt.com NextAuth signin
+chatgpt.com warmup（种植 oai-did；失败则不建邮箱）
+  → CFD1 建号
+  → chatgpt.com NextAuth signin
   → auth.openai.com authorize (login_or_signup)
   → 若 final_url=/email-verification：跳过 continue，passwordless
-  → 信任 auto-OTP（或显式 email-otp/send）
-  → email-otp/validate (+ sentinel flow=email_otp_validate)
+  → 信任 auto-OTP；显式发码时 auto-OTP 只 resend（避免新 challenge 废码）
+  → email-otp/validate (+ sentinel)；401 则 resend 等新码再验一次
   → about_you → create_account (+ dual sentinel, SO collect 5s)
   → chatgpt.com callback → /api/auth/session
 ```
@@ -466,11 +479,11 @@ OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1
 OPENAI_TRUST_AUTO_OTP=1
 # auto-OTP 时是否强制密码路径（默认 0；yukkcat 对齐为 0）
 OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=0
-# 非 auto-OTP / 明确 passwordless_signup 时是否优先密码创建（默认 1）
-OPENAI_PREFER_PASSWORD_SIGNUP=1
+# 非 auto-OTP / continue 返回 passwordless_signup 时是否优先密码创建（默认 0；现网 user/register 400）
+# OPENAI_PREFER_PASSWORD_SIGNUP=1
 
 # ---- Sentinel / SO ----
-# create_account 前 SO 采集等待毫秒；空=默认 5000；0=关闭
+# create_account 前 SO 采集等待毫秒；空=默认 0（2026-09-06 现网成功路径不需要 5s）
 # OPENAI_SO_COLLECT_MS=5000
 # 优先 VM 解 so-token（默认 1）
 OPENAI_SO_PREFER_VM=1
@@ -501,6 +514,13 @@ OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
 # OPENAI_OTP_LOGIN_CHALLENGE_PROBE_SECS=35
 # 关闭步骤间随机延迟（调试用）
 # OPENAI_REGISTER_NO_DELAY=1
+
+# ---- 出口 / 熔断（对齐 gpt-auto-register 实战经验）----
+# socks5:// 会自动改成 socks5h://（DNS 走代理）
+# TLS curl(35) 握手失败会在同一 session 上重试，避免重建后 409 invalid_state
+# 批量任务连续 N 次网络错误后停止后续号（默认 3；0=关闭）
+# GPT_REGISTER_CIRCUIT_BREAK=3
+# 设置页「出站代理」可填多条（换行或逗号），并发时 round-robin
 ```
 
 > 实测：auto-OTP 后若 `OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=1`（或旧逻辑强制密码），
@@ -518,7 +538,9 @@ OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
 | 任务日志落盘 | 节流（约 8 行 / 2s） | 减少 `gpt_register_jobs.json` 频繁重写 |
 | CFD1 OTP 早期轮询 | 前 12s ~0.8–1.2s | 验证码通常很快到达 |
 | 关闭步骤随机延迟 | 关（可选 `register_no_delay` / `OPENAI_REGISTER_NO_DELAY=1`） | 调试用；默认保留轻微抖动 |
-| SO collect | 默认 5s create_account | 可用 `so_collect_ms` / `OPENAI_SO_COLLECT_MS` 覆盖；`0` 关闭 |
+| SO collect | **关**（默认 0ms） | 现网 create_account VM 不需要 5s 等待；`so_collect_ms=5000` 可恢复旧行为 |
+| 跳过 continue Sentinel | **开**（auto-OTP） | authorize 已落到 `/email-verification` 时不再解 authorize_continue PoW |
+| 默认不走密码创建 | **开** | `user/register` 现网 400 `account_creation_failed`；WARP/IN 可设 `OPENAI_PREFER_PASSWORD_SIGNUP=1` |
 
 Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关闭步骤间随机延迟」。  
 保存/启动时字段经 `POST /api/gpt-register/settings` 与 `start` 的 Pydantic 模型（含 `skip_codex` / `register_no_delay` / `so_collect_ms`）；未声明字段会被丢弃，旧版因此无法取消「跳过 Codex」。
@@ -574,6 +596,9 @@ curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" -H "Authorization: Bearer $KEY" \
 | 注册成功但 `added=0` | dry_run / push 关 / token 空 | 查 `push_enabled`、`dry_run`、任务 `items` |
 | HTTP 推送连不上 | 容器内用了 host 的 `:8000` | 默认用 `push_mode=local`；http 模式 Docker 内用 `:80` |
 | OTP 超时 / 风控 | 域名信誉、代理出口、OpenAI 策略 | 换域名/代理，降并发，看 `logs`/`items`/`summary` 与 `data/gpt_register_logs/*.json` |
+| OTP 一直是 `493682` 且 validate 401 | tm1.openai.com 影子发码 | 引擎会丢弃该码继续等；换出口/邮箱域 |
+| `curl: (35)` / TLS handshake | 代理链路瞬断 | 同 session 自动重试；连续失败会熔断（`GPT_REGISTER_CIRCUIT_BREAK`） |
+| 连续失败后任务提前结束 | 网络熔断 | 换代理后再跑；`GPT_REGISTER_CIRCUIT_BREAK=0` 关闭 |
 | `account_creation_failed` 后 OTP `invalid_auth_step` | auto-OTP 会话被强制密码路径打坏 | 保持 `OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=0`；确认日志有 `yukkcat-aligned` passwordless |
 | OTP `invalid_state` / session no longer valid | continue 二次提交或会话过期 | 保持 `OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1`；换干净代理重开流程 |
 | `IP 地理位置不支持` / OAuth reset | 出口被拦或代理不稳 | 换 TW 等可用出口；检查 `OPENAI_BLOCK_REGIONS` |
@@ -654,5 +679,4 @@ uv run python -m unittest \
 | 号池 Codex `/api/accounts/codex-upgrade` | 协议 OTP 补 `refresh_token`（主路径） |
 | 号池 OAuth `/api/accounts/oauth/*` | 浏览器登录补 `refresh_token`（备用）；finish 可 `replace_access_token` |
 | Grok 号池 `/api/grok/*` | **无关**，不写入 |
-| G2A `/api/g2a/*` | 只推 Grok 号，与 GPT 注册无关 |
 | CPA / Sub2API | 其它导入通道，互不替代 |

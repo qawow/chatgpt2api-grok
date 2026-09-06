@@ -10,8 +10,13 @@ from unittest import mock
 from services.gpt_register_service import (
     GptRegisterConfig,
     GptRegisterService,
+    _circuit_break_threshold,
     _extract_json_object,
+    _is_network_register_error,
+    _mask_proxy_url,
     normalize_settings,
+    parse_proxy_pool,
+    pick_proxy,
     public_settings,
 )
 
@@ -35,6 +40,12 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertTrue(s["skip_codex"])
         s2 = normalize_settings({"skip_codex": False})
         self.assertFalse(s2["skip_codex"])
+
+    def test_stable_register_defaults(self):
+        s = normalize_settings(None)
+        self.assertEqual(s["concurrency"], 1)
+        self.assertEqual(s["interval_secs"], 3)
+        self.assertFalse(s["register_no_delay"])
 
     def test_api_model_accepts_latency_fields(self):
         """Regression: undeclared fields were dropped by Pydantic → UI could not uncheck skip_codex."""
@@ -269,17 +280,9 @@ class RunnerBootstrapTest(unittest.TestCase):
             old = os.environ.get("REGISTER_ENGINES_DATABASE_URL")
             os.environ["REGISTER_ENGINES_DATABASE_URL"] = db_url
             try:
-                import sys
-
-                for k in list(sys.modules):
-                    if (
-                        k == "core"
-                        or k.startswith("core.")
-                        or k.startswith("platforms")
-                        or k.startswith("providers")
-                        or k.startswith("infrastructure")
-                    ):
-                        del sys.modules[k]
+                # Rebind the already-imported engine instead of deleting
+                # core.db from sys.modules (SQLModel MetaData cannot re-register
+                # the same tables in one process).
                 reg_runner._bootstrap(Path(reg_runner.default_engines_dir()))
                 from sqlmodel import Session, select
                 import core.db as engines_db
@@ -389,3 +392,41 @@ class ImportLocalTest(unittest.TestCase):
             _time.sleep(0.02)
         fake_svc.fetch_remote_info.assert_called_once()
         self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "at-codex-rotated")
+
+
+class CircuitBreakerTest(unittest.TestCase):
+    def test_network_error_classifier(self):
+        self.assertTrue(_is_network_register_error("curl: (35) TLS connect error"))
+        self.assertTrue(_is_network_register_error("开始 OAuth 流程失败"))
+        self.assertTrue(_is_network_register_error("authorize 409 invalid_state"))
+        self.assertTrue(_is_network_register_error("oai_did_missing"))
+        self.assertTrue(_is_network_register_error("curl: (52) Empty reply from server"))
+        self.assertFalse(_is_network_register_error("注册密码失败"))
+        self.assertFalse(_is_network_register_error("验证验证码失败"))
+        self.assertFalse(_is_network_register_error("wrong_email_otp_code"))
+
+    def test_threshold_env(self):
+        with mock.patch.dict(os.environ, {"GPT_REGISTER_CIRCUIT_BREAK": "5"}):
+            self.assertEqual(_circuit_break_threshold({}), 5)
+        self.assertEqual(_circuit_break_threshold({"circuit_break": "0"}), 0)
+
+
+class ProxyPoolTest(unittest.TestCase):
+    def test_parse_and_round_robin(self):
+        pool = parse_proxy_pool(
+            "socks5h://a:1\n# skip\nsocks5h://b:2, socks5h://a:1\n"
+        )
+        self.assertEqual(pool, ["socks5h://a:1", "socks5h://b:2"])
+        self.assertEqual(pick_proxy(pool, 1), "socks5h://a:1")
+        self.assertEqual(pick_proxy(pool, 2), "socks5h://b:2")
+        self.assertEqual(pick_proxy(pool, 3), "socks5h://a:1")
+        self.assertEqual(pick_proxy([], 1), "")
+        self.assertEqual(
+            _mask_proxy_url("socks5h://user:secret@host:1080"),
+            "socks5h://user:***@host:1080",
+        )
+
+    def test_concurrency_should_not_exceed_pool(self):
+        pool = parse_proxy_pool("socks5h://a:1\nsocks5h://b:2")
+        self.assertEqual(len(pool), 2)
+        self.assertEqual(min(5, len(pool)), 2)

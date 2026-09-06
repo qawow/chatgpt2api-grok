@@ -30,6 +30,7 @@ class SentinelGeneratorTest(unittest.TestCase):
         gen = _SentinelTokenGenerator("did-1", "Mozilla/5.0 Chrome/142.0.0.0")
         token = gen.generate_requirements_token()
         self.assertTrue(token.startswith("gAAAAAC"))
+        self.assertEqual(gen.sid, "did-1")
 
     def test_decrypt_turnstile_delegates(self):
         gen = _SentinelTokenGenerator("did-1", "ua")
@@ -400,6 +401,404 @@ class BrowserProfileConsistencyTest(unittest.TestCase):
             self.assertFalse(regmod._env_truthy("OPENAI_SKIP_CODEX", "1"))
         with mock.patch.dict(os.environ, {"OPENAI_SKIP_CODEX": "1"}):
             self.assertTrue(regmod._env_truthy("OPENAI_SKIP_CODEX", "0"))
+
+
+class ProxyNormalizeTest(unittest.TestCase):
+    def test_socks5_becomes_socks5h(self):
+        from core.proxy_env import normalize_proxy_url, proxy_dict
+
+        self.assertEqual(
+            normalize_proxy_url("socks5://user:pass@127.0.0.1:1080"),
+            "socks5h://user:pass@127.0.0.1:1080",
+        )
+        self.assertEqual(
+            normalize_proxy_url("socks5h://127.0.0.1:1080"),
+            "socks5h://127.0.0.1:1080",
+        )
+        self.assertEqual(normalize_proxy_url("http://127.0.0.1:8080"), "http://127.0.0.1:8080")
+        self.assertIsNone(normalize_proxy_url(""))
+        self.assertEqual(
+            proxy_dict("socks5://127.0.0.1:1")["https"],
+            "socks5h://127.0.0.1:1",
+        )
+
+
+class TlsRetrySessionTest(unittest.TestCase):
+    def test_retries_tls_handshake_then_succeeds(self):
+        from core.http_client import TlsRetrySession, is_tls_handshake_error
+
+        class Inner:
+            def __init__(self):
+                self.calls = 0
+                self.cookies = {"oai-did": "keep-me"}
+
+            def get(self, url, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("curl: (35) TLS connect error OPENSSL_internal")
+                return SimpleNamespace(status_code=200, url=url)
+
+        inner = Inner()
+        wrapped = TlsRetrySession(inner, retries=2, backoff=0)
+        resp = wrapped.get("https://chatgpt.com/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(inner.calls, 2)
+        self.assertEqual(wrapped.cookies["oai-did"], "keep-me")
+        self.assertTrue(is_tls_handshake_error(RuntimeError("curl: (35) TLS connect error")))
+        self.assertFalse(is_tls_handshake_error(RuntimeError("HTTP 409 invalid_state")))
+
+    def test_get_retries_empty_reply_but_post_does_not(self):
+        from core.http_client import TlsRetrySession, is_get_transport_error
+
+        class Inner:
+            def __init__(self):
+                self.gets = 0
+                self.posts = 0
+
+            def get(self, url, **kwargs):
+                self.gets += 1
+                if self.gets == 1:
+                    raise RuntimeError("curl: (52) Empty reply from server")
+                return SimpleNamespace(status_code=200, url=url)
+
+            def post(self, url, **kwargs):
+                self.posts += 1
+                raise RuntimeError("curl: (52) Empty reply from server")
+
+        inner = Inner()
+        wrapped = TlsRetrySession(inner, retries=2, backoff=0)
+        self.assertEqual(wrapped.get("https://chatgpt.com/").status_code, 200)
+        self.assertEqual(inner.gets, 2)
+        with self.assertRaises(RuntimeError):
+            wrapped.post("https://auth.openai.com/api/accounts/create_account")
+        self.assertEqual(inner.posts, 1)
+        self.assertTrue(is_get_transport_error(RuntimeError("curl: (56) Failure")))
+
+
+class SessionTokenExtractTest(unittest.TestCase):
+    def test_cookie_then_json_fallback(self):
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+
+        class Cookie:
+            def __init__(self, name, value, domain="chatgpt.com"):
+                self.name = name
+                self.value = value
+                self.domain = domain
+
+        class Jar:
+            def __init__(self, cookies):
+                self._cookies = cookies
+
+            def get(self, name, default=""):
+                for c in self._cookies:
+                    if c.name == name:
+                        return c.value
+                return default
+
+            def __iter__(self):
+                return iter(self._cookies)
+
+        eng.session = SimpleNamespace(
+            cookies=Jar([Cookie("__Secure-next-auth.session-token", "from-cookie")])
+        )
+        self.assertEqual(eng._extract_session_token(), "from-cookie")
+
+        eng.session = SimpleNamespace(cookies=Jar([]))
+        self.assertEqual(
+            eng._extract_session_token({"sessionToken": "from-json"}),
+            "from-json",
+        )
+
+
+class ShadowOtpFilterTest(unittest.TestCase):
+    def test_extract_skips_tm1_shadow_code(self):
+        raw = (
+            "From: otp@tm1.openai.com\r\n"
+            "Date: Wed, 01 Jan 2030 00:00:00 +0000\r\n"
+            "\r\n"
+            "<span>493682</span>\nYour code is 654321\n"
+        )
+        code = CloudflareD1Mailbox._extract_code_from_raw(raw)
+        self.assertEqual(code, "654321")
+
+    def test_extract_prefers_unique_subject_code(self):
+        raw = (
+            "From: otp@openai.com\r\n"
+            "Subject: Your OpenAI code is 525210\r\n"
+            "Date: Wed, 01 Jan 2030 00:00:00 +0000\r\n"
+            "\r\n"
+            "<span>353740</span>\ntracking 216706\n"
+        )
+        self.assertEqual(CloudflareD1Mailbox._extract_code_from_raw(raw), "525210")
+
+    def test_extract_skips_brand_color_in_span(self):
+        raw = (
+            "From: otp@openai.com\r\n"
+            "Date: Wed, 01 Jan 2030 00:00:00 +0000\r\n"
+            "\r\n"
+            "<span>353740</span>\nYour OpenAI code is 654321\n"
+        )
+        self.assertEqual(CloudflareD1Mailbox._extract_code_from_raw(raw), "654321")
+
+
+class OtpKickoffOrderTest(unittest.TestCase):
+    def test_new_signup_tries_passwordless_first(self):
+        from platforms.chatgpt.constants import OPENAI_API_ENDPOINTS
+
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+        eng.session = mock.Mock()
+        dump = mock.Mock(status_code=200)
+        dump.json.return_value = {}
+        eng.session.get.return_value = dump
+        seen = []
+
+        def fake_otp(method, url, referer, label):
+            seen.append((method, url, label))
+            return label == "email-otp/resend"
+
+        eng._otp_http = fake_otp  # type: ignore
+        eng._is_existing_account = False
+        self.assertTrue(eng._send_verification_code())
+        self.assertEqual(seen[0][1], OPENAI_API_ENDPOINTS["send_passwordless_otp"])
+        self.assertEqual(seen[1][2], "email-otp/resend")
+
+    def test_auto_otp_passwordless_resends_first(self):
+        from platforms.chatgpt.constants import OPENAI_API_ENDPOINTS
+
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+        eng.session = mock.Mock()
+        dump = mock.Mock(status_code=200)
+        dump.json.return_value = {}
+        eng.session.get.return_value = dump
+        seen = []
+
+        def fake_otp(method, url, referer, label):
+            seen.append((method, url, label))
+            return True
+
+        eng._otp_http = fake_otp  # type: ignore
+        eng._is_existing_account = False
+        eng._otp_auto_sent = True
+        eng._is_passwordless_signup = True
+        self.assertTrue(eng._send_verification_code())
+        self.assertEqual(seen[0][1], OPENAI_API_ENDPOINTS["resend_otp"])
+
+    def test_warmup_requires_oai_did(self):
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+
+        class Jar:
+            def get(self, name, default=""):
+                return default
+
+            def __iter__(self):
+                return iter(())
+
+        resp = SimpleNamespace(status_code=200, text="ok", headers={})
+        eng.session = SimpleNamespace(
+            cookies=Jar(),
+            get=mock.Mock(return_value=resp),
+        )
+        with mock.patch("platforms.chatgpt.register.time.sleep", return_value=None):
+            self.assertFalse(eng._warmup_chatgpt_home())
+        self.assertGreaterEqual(eng.session.get.call_count, 4)
+
+    def test_continue_url_aliases_and_otp_callback(self):
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+        self.assertEqual(
+            eng._continue_url_from_payload({"continueUrl": "/api/auth/callback/openai?code=abc"}),
+            "/api/auth/callback/openai?code=abc",
+        )
+        eng._otp_continue_url = "https://chatgpt.com/api/auth/callback/openai?code=xyz"
+        eng._create_account_continue_url = ""
+        self.assertIn("code=xyz", eng._resolve_session_callback_url())
+        eng._follow_otp_continue_url()  # must not GET a code= URL
+
+    def test_retry_otp_after_401(self):
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+        eng._otp_validate_retryable = True
+        eng._send_verification_code = mock.Mock(return_value=True)  # type: ignore
+        eng._get_verification_code = mock.Mock(return_value="654321")  # type: ignore
+        eng._validate_verification_code = mock.Mock(return_value=True)  # type: ignore
+        self.assertTrue(eng._retry_otp_after_bad_validate())
+        eng._send_verification_code.assert_called_once_with(prefer_resend=True)
+        eng._otp_validate_retryable = False
+        self.assertFalse(eng._retry_otp_after_bad_validate())
+
+    def test_existing_account_resends_first(self):
+        from platforms.chatgpt.constants import OPENAI_API_ENDPOINTS
+
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+        eng.session = mock.Mock()
+        dump = mock.Mock(status_code=200)
+        dump.json.return_value = {}
+        eng.session.get.return_value = dump
+        seen = []
+
+        def fake_otp(method, url, referer, label):
+            seen.append((method, url, label))
+            return True
+
+        eng._otp_http = fake_otp  # type: ignore
+        eng._is_existing_account = True
+        self.assertTrue(eng._send_verification_code())
+        self.assertEqual(seen[0][1], OPENAI_API_ENDPOINTS["resend_otp"])
+
+
+class LiveAutoOtpProtocolTest(unittest.TestCase):
+    """Locks the 2026-09-06 JP SOCKS capture: authorize → /email-verification → skip continue/send."""
+
+    def _eng(self) -> RegistrationEngine:
+        return RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x"))
+        )
+
+    def test_skip_helpers_match_live_capture(self):
+        eng = self._eng()
+        self.assertFalse(eng._should_skip_authorize_continue())
+        self.assertFalse(eng._should_skip_explicit_otp_send())
+        eng._otp_auto_sent = True
+        self.assertTrue(eng._should_skip_authorize_continue())
+        self.assertFalse(eng._should_skip_explicit_otp_send())
+        eng._is_passwordless_signup = True
+        self.assertTrue(eng._should_skip_explicit_otp_send())
+        eng._force_password_path = True
+        self.assertFalse(eng._should_skip_explicit_otp_send())
+        eng._force_password_path = False
+        with mock.patch.dict(os.environ, {"OPENAI_TRUST_AUTO_OTP": "0"}):
+            self.assertFalse(eng._should_skip_explicit_otp_send())
+        with mock.patch.dict(os.environ, {"OPENAI_SKIP_CONTINUE_ON_AUTO_OTP": "0"}):
+            self.assertFalse(eng._should_skip_authorize_continue())
+
+    def test_auto_otp_skips_authorize_continue_post(self):
+        eng = self._eng()
+        eng.session = mock.Mock()
+        eng._otp_auto_sent = True
+        eng.email = "a@b.c"
+        result = eng._submit_signup_form("did-1", None)
+        self.assertTrue(result.success)
+        self.assertEqual(result.page_type, "email_otp_verification")
+        eng.session.post.assert_not_called()
+        self.assertTrue(eng._is_passwordless_signup)
+        self.assertFalse(eng._force_password_path)
+        self.assertFalse(eng._is_existing_account)
+
+    def test_authorize_email_verification_marks_auto_otp(self):
+        eng = self._eng()
+        eng.oauth_start = SimpleNamespace(
+            auth_url="https://auth.openai.com/api/accounts/authorize?client_id=x"
+        )
+        jar = mock.Mock()
+        jar.get.return_value = "did-live"
+        jar.__iter__ = mock.Mock(return_value=iter(()))
+        eng.session = mock.Mock()
+        eng.session.cookies = jar
+        eng.session.get.return_value = SimpleNamespace(
+            status_code=200,
+            url="https://auth.openai.com/email-verification",
+            text="<html>email-verification</html>",
+        )
+        did = eng._get_device_id()
+        self.assertEqual(did, "did-live")
+        self.assertTrue(eng._otp_auto_sent)
+
+    def test_create_account_callback_wins_over_about_you(self):
+        eng = self._eng()
+        eng._otp_continue_url = "https://auth.openai.com/about-you"
+        eng._create_account_continue_url = (
+            "https://chatgpt.com/api/auth/callback/openai?code=ac_from_create"
+        )
+        resolved = eng._resolve_session_callback_url()
+        self.assertIn("code=ac_from_create", resolved)
+        self.assertNotIn("about-you", resolved)
+
+    def test_auto_otp_waits_longer_before_resend(self):
+        eng = self._eng()
+        self.assertEqual(eng._otp_wait_policy(), (25, 50, 3))
+        eng._otp_auto_sent = True
+        eng._is_passwordless_signup = True
+        self.assertEqual(eng._otp_wait_policy(), (25, 75, 2))
+
+    def test_sentinel_prefers_vm_so_not_40k_server_blob(self):
+        from platforms.chatgpt.register import SentinelPayload, _build_sentinel_header_bundle
+
+        payload = SentinelPayload(
+            p="p-token",
+            c="c-token",
+            flow="authorize_continue",
+            t="vm-turnstile-1860",
+            so="vm-turnstile-1860",
+        )
+        _token_h, so_h, sen_obj = _build_sentinel_header_bundle(
+            payload, "did-1", include_so_header=True
+        )
+        self.assertEqual(so_h, "vm-turnstile-1860")
+        self.assertLess(len(so_h), 4096)
+        self.assertEqual(sen_obj["flow"], "authorize_continue")
+        self.assertEqual(sen_obj["id"], "did-1")
+
+    def test_run_skips_send_when_auto_otp_passwordless(self):
+        eng = self._eng()
+        eng.email = "a@b.c"
+        eng.email_info = {"email": "a@b.c"}
+        eng._otp_auto_sent = True
+        eng._is_passwordless_signup = True
+        eng._force_password_path = False
+        eng._check_ip_location = mock.Mock(return_value=(True, "JP"))  # type: ignore
+        eng._init_session = mock.Mock(return_value=True)  # type: ignore
+        eng._warmup_chatgpt_home = mock.Mock(return_value=True)  # type: ignore
+        eng._create_email = mock.Mock(return_value=True)  # type: ignore
+        eng._start_oauth = mock.Mock(return_value=True)  # type: ignore
+        eng._get_device_id = mock.Mock(return_value="did-1")  # type: ignore
+        eng._check_sentinel = mock.Mock(return_value=None)  # type: ignore
+        eng._submit_signup_form = mock.Mock(  # type: ignore
+            return_value=SimpleNamespace(success=True, error_message="", page_type="email_otp_verification")
+        )
+        eng._send_verification_code = mock.Mock(return_value=True)  # type: ignore
+        eng._get_verification_code = mock.Mock(return_value=None)  # type: ignore
+        with mock.patch.dict(os.environ, {"OPENAI_REGISTER_NO_DELAY": "1", "OPENAI_TRUST_AUTO_OTP": "1"}):
+            result = eng.run()
+        self.assertFalse(result.success)
+        eng._send_verification_code.assert_not_called()
+        eng._check_sentinel.assert_not_called()
+        self.assertIn("获取验证码失败", result.error_message or "")
+
+    def test_so_collect_default_is_zero(self):
+        from platforms.chatgpt.register import _so_collect_seconds
+
+        old = os.environ.pop("OPENAI_SO_COLLECT_MS", None)
+        try:
+            self.assertEqual(_so_collect_seconds("oauth_create_account"), 0.0)
+            self.assertEqual(_so_collect_seconds("authorize_continue"), 0.0)
+        finally:
+            if old is not None:
+                os.environ["OPENAI_SO_COLLECT_MS"] = old
+        with mock.patch.dict(os.environ, {"OPENAI_SO_COLLECT_MS": "5000"}):
+            self.assertEqual(_so_collect_seconds("oauth_create_account"), 5.0)
+
+    def test_prefer_password_signup_default_off(self):
+        eng = self._eng()
+        old = os.environ.pop("OPENAI_PREFER_PASSWORD_SIGNUP", None)
+        try:
+            self.assertFalse(eng._prefer_password_signup())
+        finally:
+            if old is not None:
+                os.environ["OPENAI_PREFER_PASSWORD_SIGNUP"] = old
+        with mock.patch.dict(os.environ, {"OPENAI_PREFER_PASSWORD_SIGNUP": "1"}):
+            self.assertTrue(eng._prefer_password_signup())
 
 
 if __name__ == "__main__":

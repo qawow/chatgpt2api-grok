@@ -19,10 +19,12 @@ class GrokModelHelpersTest(unittest.TestCase):
     def test_image_models(self):
         self.assertTrue(is_grok_image_model("grok-2-image"))
         self.assertTrue(is_grok_image_model("grok-imagine"))
+        self.assertTrue(is_grok_image_model("grok-imagine-image"))
         self.assertTrue(is_grok_image_model("GROK-2-Image-1212"))
         self.assertFalse(is_grok_image_model("gpt-image-2"))
         self.assertFalse(is_grok_image_model("codex-gpt-image-2"))
         self.assertFalse(is_grok_image_model("grok-4.5"))
+        self.assertFalse(is_grok_image_model("grok-4"))
 
     def test_text_models(self):
         self.assertTrue(is_grok_text_model("grok-4.5"))
@@ -31,7 +33,17 @@ class GrokModelHelpersTest(unittest.TestCase):
 
     def test_resolve_default(self):
         self.assertEqual(resolve_grok_image_model(None), "grok-2-image")
-        self.assertEqual(resolve_grok_image_model("grok-imagine"), "grok-imagine")
+        self.assertEqual(resolve_grok_image_model("grok-imagine"), "grok-imagine-image")
+        self.assertEqual(resolve_grok_image_model("grok-imagine-image"), "grok-imagine-image")
+        self.assertEqual(resolve_grok_image_model("grok-4.5"), "grok-2-image")
+
+    def test_free_image_models_skip_grok3_grok4(self):
+        from services.grok_backend_api import _free_image_response_models
+
+        models = _free_image_response_models("grok-2-image", "grok-4.5")
+        self.assertEqual(models, ["grok-4.5"])
+        self.assertNotIn("grok-3", models)
+        self.assertNotIn("grok-4", models)
 
 
 class GrokAccountServiceTest(unittest.TestCase):
@@ -474,6 +486,34 @@ class GrokFreeImageExtractionTest(unittest.TestCase):
             # paid path must not be tried when free path already got auth error
             post.assert_not_called()
 
+    def test_http_session_is_reused_on_same_thread(self):
+        from services.grok_backend_api import _http
+
+        first = _http()
+        second = _http()
+        self.assertIs(first, second)
+
+    def test_generate_image_reraises_429_instead_of_trying_more_models(self):
+        from services import grok_backend_api as gba
+        from services.grok_backend_api import GrokBackendError
+
+        account = {
+            "access_token": "at",
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
+        }
+        with mock.patch.object(
+            gba,
+            "create_response",
+            side_effect=GrokBackendError("responses failed: HTTP 429", status=429),
+        ), mock.patch.object(gba, "list_upstream_models") as catalog, mock.patch.object(
+            gba, "_http"
+        ) as http:
+            with self.assertRaises(GrokBackendError) as ctx:
+                gba.generate_image(account, prompt="test", model="grok-2-image", n=1)
+            self.assertEqual(ctx.exception.status, 429)
+            catalog.assert_not_called()
+            http.assert_not_called()
+
 
 class GrokImageRoutingTest(unittest.TestCase):
     def test_chat_completions_routes_grok_image_to_grok_pool(self):
@@ -495,6 +535,26 @@ class GrokImageRoutingTest(unittest.TestCase):
         grok_handle.assert_called_once()
         chatgpt_pool.assert_not_called()
         self.assertIn("choices", result)
+
+    def test_image_handle_rejects_grok_45_chat_model(self):
+        from services.protocol import grok_v1_image_generations
+
+        with self.assertRaises(ValueError) as ctx:
+            grok_v1_image_generations.handle(
+                {"prompt": "a cat", "model": "grok-4.5"}
+            )
+        self.assertIn("chat model", str(ctx.exception))
+
+    def test_chat_completions_rejects_text_models(self):
+        from fastapi import HTTPException
+        from services.protocol import openai_v1_chat_complete
+
+        with self.assertRaises(HTTPException) as ctx:
+            openai_v1_chat_complete.handle(
+                {"model": "gpt-5-mini", "messages": [{"role": "user", "content": "hello"}]}
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("image models", str(ctx.exception.detail))
 
     def test_chat_completions_rejects_grok_image_edit(self):
         from fastapi import HTTPException

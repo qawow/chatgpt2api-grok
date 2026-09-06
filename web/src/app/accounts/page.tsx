@@ -45,10 +45,8 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
-  deleteG2ACredential,
   deleteGrokAccounts,
   fetchAccounts,
-  fetchG2APoolStatus,
   fetchGrokAccounts,
   fetchModels,
   fetchRefreshProgress,
@@ -212,14 +210,6 @@ function AccountsPageContent() {
   const [isRelogining, setIsRelogining] = useState(false);
   const [codexUpgradingTokens, setCodexUpgradingTokens] = useState<Set<string>>(new Set());
   const isGrok = provider === "grok";
-  const isG2A = provider === "g2a";
-  const isReadonlyPool = isG2A;
-  const [g2aMeta, setG2aMeta] = useState<{
-    note: string;
-    hasImageProxy: boolean;
-    errors: Array<{ server_id?: string; error?: string }>;
-    servers: Array<Record<string, unknown>>;
-  }>({ note: "", hasImageProxy: false, errors: [], servers: [] });
   const [progress, setProgress] = useState<{
     visible: boolean;
     current: number;
@@ -241,28 +231,13 @@ function AccountsPageContent() {
       setIsLoading(true);
     }
     try {
-      if (nextProvider === "g2a") {
-        const data = await fetchG2APoolStatus();
-        setAccounts(data.items);
-        setG2aMeta({
-          note: data.note || "",
-          hasImageProxy: data.has_image_proxy,
-          errors: data.errors || [],
-          servers: data.servers || [],
-        });
-        setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
-        if ((data.errors || []).length > 0 && !silent) {
-          toast.error(`部分 G2A 连接拉取失败：${data.errors[0]?.error || "unknown"}`);
-        }
-      } else if (nextProvider === "grok") {
+      if (nextProvider === "grok") {
         const data = await fetchGrokAccounts();
         setAccounts(data.items);
-        setG2aMeta({ note: "", hasImageProxy: false, errors: [], servers: [] });
         setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       } else {
         const data = await fetchAccounts();
         setAccounts(data.items);
-        setG2aMeta({ note: "", hasImageProxy: false, errors: [], servers: [] });
         setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       }
     } catch (error) {
@@ -440,34 +415,6 @@ function AccountsPageContent() {
 
     setIsDeleting(true);
     try {
-      if (isG2A) {
-        let removed = 0;
-        const errors: string[] = [];
-        for (const token of tokens) {
-          const account = accounts.find((item) => item.access_token === token);
-          const serverId = account?.g2a_server_id || "";
-          const credentialId = account?.g2a_credential_id || "";
-          if (!serverId || !credentialId) {
-            errors.push("缺少远程凭证 id");
-            continue;
-          }
-          try {
-            await deleteG2ACredential(serverId, credentialId);
-            removed += 1;
-          } catch (error) {
-            errors.push(error instanceof Error ? error.message : "删除失败");
-          }
-        }
-        await loadAccounts(true, "g2a");
-        setSelectedIds([]);
-        if (removed > 0) {
-          toast.success(`已删除 ${removed} 条远程凭证`);
-        }
-        if (errors.length > 0) {
-          toast.error(`失败 ${errors.length} 条：${errors[0]}`);
-        }
-        return;
-      }
       const data = isGrok ? await deleteGrokAccounts(tokens) : await deleteAccounts(tokens);
       setAccounts(data.items || []);
       setSelectedIds((prev) => prev.filter((id) => (data.items || []).some((item) => item.access_token === id)));
@@ -524,16 +471,6 @@ function AccountsPageContent() {
   };
 
   const handleRefreshAccounts = async (accessTokens: string[]) => {
-    if (isG2A) {
-      setIsRefreshing(true);
-      try {
-        await loadAccounts(false, "g2a");
-        toast.success("已重新拉取 grokcli2api-go 远程号池状态");
-      } finally {
-        setIsRefreshing(false);
-      }
-      return;
-    }
     if (isGrok) {
       await handleRefreshGrokAccounts(accessTokens);
       return;
@@ -736,12 +673,8 @@ function AccountsPageContent() {
   };
 
   const handleReLogin = async (accessTokens: string[]) => {
-    if (isGrok || isG2A) {
-      toast.error(
-        isG2A
-          ? "G2A 远程号池只读状态镜像，不支持 ChatGPT 密码重登"
-          : "Grok 号池不支持 ChatGPT 密码重登，请用「刷新」走 xAI OAuth refresh",
-      );
+    if (isGrok) {
+      toast.error("Grok 号池不支持 ChatGPT 密码重登，请用「刷新」走 xAI OAuth refresh");
       return;
     }
 
@@ -870,8 +803,8 @@ function AccountsPageContent() {
   };
 
   const openEditDialog = (account: Account) => {
-    if (account.readonly || isG2A) {
-      toast.error("远程 G2A 号池为只读状态，不能在本机编辑");
+    if (account.readonly) {
+      toast.error("该账号为只读，不能编辑");
       return;
     }
     setEditingAccount(account);
@@ -902,8 +835,8 @@ function AccountsPageContent() {
     if (!editingAccount) {
       return;
     }
-    if (isG2A || editingAccount.readonly) {
-      toast.error("远程 G2A 号池为只读状态，不能在本机编辑");
+    if (editingAccount.readonly) {
+      toast.error("该账号为只读，不能编辑");
       return;
     }
 
@@ -971,30 +904,14 @@ function AccountsPageContent() {
               onClick={() => switchProvider("grok")}
               disabled={isLoading || isRefreshing || isDeleting || isRelogining}
             >
-              Grok 本地
-            </button>
-            <button
-              type="button"
-              className={cn(
-                "rounded-lg px-3 py-1.5 text-sm font-medium transition",
-                isG2A ? "bg-stone-950 text-white shadow-sm" : "text-stone-600 hover:bg-stone-100",
-              )}
-              onClick={() => switchProvider("g2a")}
-              disabled={isLoading || isRefreshing || isDeleting || isRelogining}
-            >
-              Codex2API
+              Grok
             </button>
           </div>
           <p className="text-xs text-stone-500">
-            {isG2A
-              ? `当前：grokcli2api-go 远程号池状态（只读脱敏，无 token）${g2aMeta.hasImageProxy ? " · 生图可直连远程" : " · 需在设置中配置连接后才能代理生图"}`
-              : isGrok
-                ? "当前：Grok / xAI 本地号池（data/grok_accounts.json），与 ChatGPT 完全隔离"
-                : "当前：ChatGPT 号池（data/accounts.json）"}
+            {isGrok
+              ? "当前：Grok / xAI 本地号池（data/grok_accounts.json），与 ChatGPT 完全隔离"
+              : "当前：ChatGPT 号池（data/accounts.json）"}
           </p>
-          {isG2A && g2aMeta.note ? (
-            <p className="text-xs text-amber-700">{g2aMeta.note}</p>
-          ) : null}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -1011,16 +928,12 @@ function AccountsPageContent() {
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || (!isG2A && accounts.length === 0)}
+            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
           >
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
-            {isG2A
-              ? "重新拉取远程状态"
-              : isGrok
-                ? "一键刷新 Grok 账号"
-                : "一键刷新所有账号信息和额度"}
+            {isGrok ? "一键刷新 Grok 账号" : "一键刷新所有账号信息和额度"}
           </Button>
-          {isG2A ? null : isGrok ? (
+          {isGrok ? (
             <GrokImportDialog
               disabled={isLoading || isRefreshing || isDeleting}
               onImported={(items) => {
@@ -1040,17 +953,15 @@ function AccountsPageContent() {
               }}
             />
           )}
-          {!isReadonlyPool ? (
-            <Button
-              variant="outline"
-              className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-              onClick={() => downloadTokens(accounts)}
-              disabled={accounts.length === 0}
-            >
-              <Download className="size-4" />
-              导出全部 Token
-            </Button>
-          ) : null}
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
+            onClick={() => downloadTokens(accounts)}
+            disabled={accounts.length === 0}
+          >
+            <Download className="size-4" />
+            导出全部 Token
+          </Button>
         </div>
       </section>
 
@@ -1289,28 +1200,16 @@ function AccountsPageContent() {
           <CardContent className="space-y-0 p-0">
             <div className="flex flex-col gap-3 border-b border-stone-100 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
               <div className="flex flex-wrap items-center gap-2 text-sm text-stone-500">
-                {isG2A ? (
-                  <Button
-                    variant="ghost"
-                    className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
-                    onClick={() => void handleRefreshAccounts([])}
-                    disabled={isRefreshing}
-                  >
-                    {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-                    重新拉取远程状态
-                  </Button>
-                ) : (
-                  <Button
-                    variant="ghost"
-                    className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
-                    onClick={() => void handleRefreshAccounts(selectedTokens)}
-                    disabled={selectedTokens.length === 0 || isRefreshing}
-                  >
-                    {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-                    刷新选中账号信息和额度
-                  </Button>
-                )}
-                {!isGrok && !isG2A ? (
+                <Button
+                  variant="ghost"
+                  className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
+                  onClick={() => void handleRefreshAccounts(selectedTokens)}
+                  disabled={selectedTokens.length === 0 || isRefreshing}
+                >
+                  {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                  刷新选中账号信息和额度
+                </Button>
+                {!isGrok ? (
                   <Button
                     variant="ghost"
                     className="h-8 rounded-lg px-3 text-amber-600 hover:bg-amber-50 hover:text-amber-700"
@@ -1322,7 +1221,7 @@ function AccountsPageContent() {
                     尝试恢复异常账号
                   </Button>
                 ) : null}
-                {!isGrok && !isG2A ? (
+                {!isGrok ? (
                   <Button
                     variant="ghost"
                     className="h-8 rounded-lg px-3 text-sky-600 hover:bg-sky-50 hover:text-sky-700"
@@ -1342,17 +1241,15 @@ function AccountsPageContent() {
                     {sessionOnlySelected.length > 0 ? ` (${sessionOnlySelected.length})` : ""}
                   </Button>
                 ) : null}
-                {!isG2A ? (
-                  <Button
-                    variant="ghost"
-                    className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
-                    onClick={() => void handleDeleteTokens(abnormalTokens)}
-                    disabled={abnormalTokens.length === 0 || isDeleting}
-                  >
-                    {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
-                    移除异常账号
-                  </Button>
-                ) : null}
+                <Button
+                  variant="ghost"
+                  className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                  onClick={() => void handleDeleteTokens(abnormalTokens)}
+                  disabled={abnormalTokens.length === 0 || isDeleting}
+                >
+                  {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                  移除异常账号
+                </Button>
                 <Button
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
@@ -1360,7 +1257,7 @@ function AccountsPageContent() {
                   disabled={selectedTokens.length === 0 || isDeleting}
                 >
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
-                  {isG2A ? "删除远程所选" : "删除所选"}
+                  删除所选
                 </Button>
                 {selectedIds.length > 0 ? (
                   <span className="rounded-lg bg-stone-100 px-2.5 py-1 text-xs font-medium text-stone-600">
@@ -1380,15 +1277,15 @@ function AccountsPageContent() {
                         onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))}
                       />
                     </th>
-                    <th className="w-56 px-4 py-3">{isG2A ? "远程 id" : "token"}</th>
+                    <th className="w-56 px-4 py-3">token</th>
                     <th className="w-28 px-4 py-3">类型</th>
-                    <th className="w-24 px-4 py-3">{isG2A ? "服务器" : isGrok ? "通道" : "来源"}</th>
+                    <th className="w-24 px-4 py-3">{isGrok ? "通道" : "来源"}</th>
                     <th className="w-24 px-4 py-3">状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
-                    <th className="w-32 px-4 py-3">{isG2A ? "连接" : "创建时间"}</th>
-                    <th className="w-24 px-4 py-3">{isG2A ? "额度" : isGrok ? "剩余 tokens" : "额度"}</th>
-                    <th className="w-40 px-4 py-3">{isG2A ? "备注" : isGrok ? "token 过期" : "恢复时间"}</th>
-                    {!isGrok && !isG2A ? <th className="w-18 px-4 py-3">在途</th> : null}
+                    <th className="w-32 px-4 py-3">创建时间</th>
+                    <th className="w-24 px-4 py-3">{isGrok ? "剩余 tokens" : "额度"}</th>
+                    <th className="w-40 px-4 py-3">{isGrok ? "token 过期" : "恢复时间"}</th>
+                    {!isGrok ? <th className="w-18 px-4 py-3">在途</th> : null}
                     <th className="w-18 px-4 py-3">成功</th>
                     <th className="w-18 px-4 py-3">失败</th>
                     <th className="w-24 px-4 py-3">操作</th>
@@ -1419,22 +1316,18 @@ function AccountsPageContent() {
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
                             <span className="font-medium tracking-tight text-stone-700">
-                              {isG2A
-                                ? account.g2a_credential_id || maskToken(account.access_token)
-                                : maskToken(account.access_token)}
+                              {maskToken(account.access_token)}
                             </span>
-                            {!isG2A ? (
-                              <button
-                                type="button"
-                                className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
-                                onClick={() => {
-                                  void navigator.clipboard.writeText(account.access_token);
-                                  toast.success("token 已复制");
-                                }}
-                              >
-                                <Copy className="size-4" />
-                              </button>
-                            ) : null}
+                            <button
+                              type="button"
+                              className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                              onClick={() => {
+                                void navigator.clipboard.writeText(account.access_token);
+                                toast.success("token 已复制");
+                              }}
+                            >
+                              <Copy className="size-4" />
+                            </button>
                           </div>
                         </td>
                         <td className="px-4 py-3">
@@ -1445,13 +1338,9 @@ function AccountsPageContent() {
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap items-center gap-1">
                             <Badge variant="outline" className="rounded-md border-stone-200 text-stone-600">
-                              {isG2A
-                                ? account.g2a_server_name || account.base_url || "g2a"
-                                : isGrok
-                                  ? "xAI Build"
-                                  : displayAccountSource(account)}
+                              {isGrok ? "xAI Build" : displayAccountSource(account)}
                             </Badge>
-                            {!isGrok && !isG2A && isSessionOnlyAccount(account) ? (
+                            {!isGrok && isSessionOnlyAccount(account) ? (
                               <Badge
                                 variant="outline"
                                 className="rounded-md border-sky-200 bg-sky-50 text-sky-700"
@@ -1474,7 +1363,7 @@ function AccountsPageContent() {
                         <td className="px-4 py-3">
                           <div className="space-y-0.5 text-xs leading-5 text-stone-500">
                             <div>{account.email ?? "—"}</div>
-                            {(isGrok || isG2A) && account.last_error ? (
+                            {isGrok && account.last_error ? (
                               <div className="max-w-[220px] truncate text-rose-500" title={account.last_error}>
                                 {account.last_error}
                               </div>
@@ -1482,53 +1371,44 @@ function AccountsPageContent() {
                           </div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {isG2A
-                            ? account.base_url || account.g2a_server_id || "—"
-                            : (() => {
-                                const raw = (account as any).created_at;
-                                if (!raw) return "—";
-                                try {
-                                  const d = new Date(raw + "Z");
-                                  if (isNaN(d.getTime())) return String(raw).slice(0, 10);
-                                  return d.toLocaleDateString("zh-CN", {
-                                    month: "2-digit",
-                                    day: "2-digit",
-                                    hour: "2-digit",
-                                    minute: "2-digit",
-                                  });
-                                } catch {
-                                  return String(raw).slice(0, 10);
-                                }
-                              })()}
+                          {(() => {
+                            const raw = (account as any).created_at;
+                            if (!raw) return "—";
+                            try {
+                              const d = new Date(raw + "Z");
+                              if (isNaN(d.getTime())) return String(raw).slice(0, 10);
+                              return d.toLocaleDateString("zh-CN", {
+                                month: "2-digit",
+                                day: "2-digit",
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              });
+                            } catch {
+                              return String(raw).slice(0, 10);
+                            }
+                          })()}
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant="info" className="rounded-md">
-                            {isG2A ? "远程" : formatQuota(account)}
+                            {formatQuota(account)}
                           </Badge>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {isG2A ? (
-                            <div className="space-y-0.5">
-                              <div className="font-medium text-stone-700">只读状态</div>
-                              <div>不含 token</div>
-                            </div>
-                          ) : (
-                            (() => {
-                              const restore = formatRestoreAt(
-                                isGrok ? account.expired || account.restore_at : account.restore_at,
-                              );
-                              return (
-                                <div className="space-y-0.5">
-                                  {restore.relative ? (
-                                    <div className="font-medium text-stone-700">{restore.relative}</div>
-                                  ) : null}
-                                  <div>{restore.absolute}</div>
-                                </div>
-                              );
-                            })()
-                          )}
+                          {(() => {
+                            const restore = formatRestoreAt(
+                              isGrok ? account.expired || account.restore_at : account.restore_at,
+                            );
+                            return (
+                              <div className="space-y-0.5">
+                                {restore.relative ? (
+                                  <div className="font-medium text-stone-700">{restore.relative}</div>
+                                ) : null}
+                                <div>{restore.absolute}</div>
+                              </div>
+                            );
+                          })()}
                         </td>
-                        {!isGrok && !isG2A ? (
+                        {!isGrok ? (
                           <td className="px-4 py-3">
                             {(() => {
                               const inflight = account.image_inflight ?? 0;
@@ -1555,18 +1435,16 @@ function AccountsPageContent() {
                         <td className="px-4 py-3 text-stone-500">{account.fail}</td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1 text-stone-400">
-                            {!isG2A ? (
-                              <button
-                                type="button"
-                                className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
-                                onClick={() => openEditDialog(account)}
-                                disabled={isUpdating}
-                                title="编辑"
-                              >
-                                <Pencil className="size-4" />
-                              </button>
-                            ) : null}
-                            {!isGrok && !isG2A && isSessionOnlyAccount(account) ? (
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              onClick={() => openEditDialog(account)}
+                              disabled={isUpdating}
+                              title="编辑"
+                            >
+                              <Pencil className="size-4" />
+                            </button>
+                            {!isGrok && isSessionOnlyAccount(account) ? (
                               <button
                                 type="button"
                                 className="rounded-lg p-2 transition hover:bg-sky-50 hover:text-sky-700"
@@ -1585,7 +1463,7 @@ function AccountsPageContent() {
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() =>
-                                void handleRefreshAccounts(isG2A ? [] : [account.access_token])
+                                void handleRefreshAccounts([account.access_token])
                               }
                               disabled={isRefreshing || refreshingTokens.has(account.access_token)}
                               title="刷新"

@@ -285,13 +285,7 @@ class ImageTaskService:
             task_timeout = max(1.0, task_timeout)
 
             if mode == "edit" and is_grok_image_model(model):
-                from services.g2a_service import g2a_bridge
-
-                if not g2a_bridge.has_image_proxy():
-                    raise RuntimeError(
-                        "Grok 本地池不支持图生图；请接入 Codex2API 后再用远程图生图"
-                    )
-                handler = grok_v1_image_generations.handle_edit
+                raise RuntimeError("Grok 本地池不支持图生图")
             else:
                 handler = self.edit_handler if mode == "edit" else self.generation_handler
             # Mark progress for Grok path (no SSE steps) so UI is not stuck blank.

@@ -59,28 +59,6 @@ def raise_image_quota_error(exc: Exception) -> None:
     raise HTTPException(status_code=502, detail={"error": message}) from exc
 
 
-def sanitize_cpa_pool(pool: dict | None) -> dict | None:
-    if not isinstance(pool, dict):
-        return None
-    return {key: value for key, value in pool.items() if key != "secret_key"}
-
-
-def sanitize_cpa_pools(pools: list[dict]) -> list[dict]:
-    return [sanitized for pool in pools if (sanitized := sanitize_cpa_pool(pool)) is not None]
-
-
-def sanitize_sub2api_server(server: dict | None) -> dict | None:
-    if not isinstance(server, dict):
-        return None
-    sanitized = {key: value for key, value in server.items() if key not in {"password", "api_key"}}
-    sanitized["has_api_key"] = bool(str(server.get("api_key") or "").strip())
-    return sanitized
-
-
-def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
-    return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
-
-
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
 

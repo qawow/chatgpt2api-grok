@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 
 from sqlmodel import Session, select
 
-from core.db import ProviderDefinitionModel, ProviderSettingModel, engine
+from core import db as core_db
+from core.db import ProviderDefinitionModel, ProviderSettingModel
 
 logger = logging.getLogger(__name__)
 
@@ -416,7 +417,7 @@ class ProviderDefinitionsRepository:
         新增的插入，已存在的更新字段定义（label、description、fields 等），
         确保代码升级后内置 provider 的元数据能同步到数据库。
         """
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             existing: dict[str, ProviderDefinitionModel] = {}
             for row in session.exec(select(ProviderDefinitionModel)).all():
                 key = f"{row.provider_type}::{row.provider_key}"
@@ -459,14 +460,14 @@ class ProviderDefinitionsRepository:
     # ── 查询（全部从 DB） ────────────────────────────────────────────
 
     def list_by_type(self, provider_type: str, *, enabled_only: bool = False) -> list[ProviderDefinitionModel]:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             query = select(ProviderDefinitionModel).where(ProviderDefinitionModel.provider_type == provider_type)
             if enabled_only:
                 query = query.where(ProviderDefinitionModel.enabled == True)  # noqa: E712
             return session.exec(query.order_by(ProviderDefinitionModel.id)).all()
 
     def get_by_key(self, provider_type: str, provider_key: str) -> ProviderDefinitionModel | None:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             return session.exec(
                 select(ProviderDefinitionModel)
                 .where(ProviderDefinitionModel.provider_type == provider_type)
@@ -475,7 +476,7 @@ class ProviderDefinitionsRepository:
 
     def list_driver_templates(self, provider_type: str) -> list[dict]:
         """从 DB 读取：按 driver_type 去重，返回可用驱动模板列表。"""
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             definitions = session.exec(
                 select(ProviderDefinitionModel)
                 .where(ProviderDefinitionModel.provider_type == provider_type)
@@ -499,7 +500,7 @@ class ProviderDefinitionsRepository:
 
     def _get_driver_defaults(self, provider_type: str, driver_type: str) -> dict | None:
         """从 DB 中查找同 driver_type 的已有 definition 作为模板。"""
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             ref = session.exec(
                 select(ProviderDefinitionModel)
                 .where(ProviderDefinitionModel.provider_type == provider_type)
@@ -531,7 +532,7 @@ class ProviderDefinitionsRepository:
     ) -> ProviderDefinitionModel:
         defaults = self._get_driver_defaults(provider_type, driver_type)
 
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             if definition_id:
                 item = session.get(ProviderDefinitionModel, definition_id)
                 if not item:
@@ -568,7 +569,7 @@ class ProviderDefinitionsRepository:
             return item
 
     def delete(self, definition_id: int) -> bool:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             item = session.get(ProviderDefinitionModel, definition_id)
             if not item:
                 return False

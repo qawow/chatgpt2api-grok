@@ -36,6 +36,7 @@ from .constants import (
     SENTINEL_SDK_URL,
     OAUTH_REDIRECT_URI,
     OAUTH_CLIENT_ID,
+    SHADOW_OTP_CODES,
 )
 # from ..config.settings import get_settings  # removed: external dep
 
@@ -141,10 +142,10 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _so_collect_seconds(flow: str) -> float:
-    """yukkcat aligns create_account Turnstile SO with official SDK 5000ms collect.
+    """Optional pause before Turnstile VM on create_account.
 
-    OPENAI_SO_COLLECT_MS overrides (milliseconds). 0 disables.
-    Default: 5000 for oauth_create_account / create_account, 0 otherwise.
+    Live JP capture (2026-09-06) succeeded with 0ms collect; the 5s yukkcat
+    wait is now opt-in via OPENAI_SO_COLLECT_MS.
     """
     raw = str(os.environ.get("OPENAI_SO_COLLECT_MS") or "").strip()
     if raw:
@@ -152,8 +153,6 @@ def _so_collect_seconds(flow: str) -> float:
             return max(0.0, float(raw) / 1000.0)
         except Exception:
             pass
-    if flow in {"oauth_create_account", "create_account"}:
-        return 5.0
     return 0.0
 
 
@@ -254,7 +253,7 @@ class _SentinelTokenGenerator:
         self.device_id = device_id or str(uuid.uuid4())
         self.user_agent = user_agent
         self.profile = profile or {}
-        self.sid = str(uuid.uuid4())
+        self.sid = str(self.device_id)
 
     @staticmethod
     def _fnv1a32(text: str) -> str:
@@ -327,7 +326,8 @@ class _SentinelTokenGenerator:
             digest = self._fnv1a32((seed or "") + encoded)
             if digest[: len(diff)] <= diff:
                 return "gAAAAAB" + encoded + "~S"
-        return "gAAAAAB" + self._b64(None)
+        # Official sdk.js unsolved prefix (gpt-free-register); do not emit a fake gAAAAAB.
+        return "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + self._b64(["e"])
 
     def decrypt_turnstile(self, dx_b64: str, p_token: str) -> str:
         """Compatibility wrapper used by Codex login paths.
@@ -414,6 +414,8 @@ class RegistrationEngine:
         self._otp_login_challenge: bool = False
         # authorize follow / login_or_signup may auto-trigger OTP before explicit send.
         self._otp_auto_sent: bool = False
+        # 401/wrong_email_otp_code can be recovered by resend + a fresh code.
+        self._otp_validate_retryable: bool = False
         self._oauth_screen_hint: str = ""
         self._device_id: Optional[str] = None
         self._sentinel_token: Optional[str] = None
@@ -422,6 +424,29 @@ class RegistrationEngine:
         self._create_account_continue_url: Optional[str] = None
         self._otp_continue_url: Optional[str] = None
         self._otp_page_type: Optional[str] = None
+
+    def _should_skip_authorize_continue(self) -> bool:
+        """Authorize already landed on /email-verification (live capture 2026-09-06)."""
+        return bool(getattr(self, "_otp_auto_sent", False)) and _env_truthy(
+            "OPENAI_SKIP_CONTINUE_ON_AUTO_OTP", "1"
+        )
+
+    def _should_skip_explicit_otp_send(self) -> bool:
+        """A second send/passwordless OTP mints a new challenge and 401s the in-flight code."""
+        return (
+            bool(getattr(self, "_otp_auto_sent", False))
+            and bool(getattr(self, "_is_passwordless_signup", False))
+            and not bool(getattr(self, "_force_password_path", False))
+            and _env_truthy("OPENAI_TRUST_AUTO_OTP", "1")
+        )
+
+    @staticmethod
+    def _prefer_password_signup() -> bool:
+        """Password create is dead on current free signup (account_creation_failed).
+
+        Default off; WARP/IN can still force it with OPENAI_PREFER_PASSWORD_SIGNUP=1.
+        """
+        return _env_truthy("OPENAI_PREFER_PASSWORD_SIGNUP", "0")
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -623,18 +648,34 @@ class RegistrationEngine:
                     self._clear_nextauth_cookies()
                     time.sleep(0.4 + random.random() * 0.8)
 
-                # 1. 访问 chatgpt.com 获取基础 cookie
-                # WARP/IN exits are often slow; keep timeouts generous for first hop.
-                home = self.session.get(f"{CHATGPT_APP}/", timeout=30)
-                home_status = getattr(home, "status_code", "?")
-                if home_status not in (200, 301, 302, 303, 307, 308):
-                    self._log(
-                        f"chatgpt.com 首页异常: status={home_status} "
-                        f"body={self._response_body_snip(home)}",
-                        "warning",
-                    )
-                oai_did = self.session.cookies.get("oai-did", "") or ""
+                # 1. 访问 chatgpt.com 获取基础 cookie（warmup 已种 oai-did 时跳过重试）
+                oai_did = self._cookie_value("oai-did")
+                if not oai_did:
+                    nav = self._navigation_headers(fetch_site="none")
+                    home = self.session.get(f"{CHATGPT_APP}/", headers=nav, timeout=30)
+                    home_status = getattr(home, "status_code", "?")
+                    if home_status in {403, 429, 500, 502, 503, 520, 521, 522, 523, 524}:
+                        last_err = f"home_http_{home_status}"
+                        self._log(
+                            f"chatgpt.com 首页 {home_status}，退避后重试 "
+                            f"body={self._response_body_snip(home)}",
+                            "warning",
+                        )
+                        time.sleep(0.8 * attempt + random.random() * 0.4)
+                        continue
+                    if home_status not in (200, 301, 302, 303, 307, 308):
+                        self._log(
+                            f"chatgpt.com 首页异常: status={home_status} "
+                            f"body={self._response_body_snip(home)}",
+                            "warning",
+                        )
+                    oai_did = self._cookie_value("oai-did")
                 self._log(f"chatgpt.com oai-did: {(oai_did[:20] + '...') if oai_did else '(empty)'}")
+                if not oai_did:
+                    last_err = "oai_did_missing"
+                    self._log("OAuth 开始时仍无 oai-did，本轮放弃", "warning")
+                    time.sleep(0.4 + random.random() * 0.6)
+                    continue
 
                 # 2. 获取 CSRF token
                 csrf_resp = self.session.get(
@@ -645,6 +686,15 @@ class RegistrationEngine:
                     },
                     timeout=30,
                 )
+                csrf_status = getattr(csrf_resp, "status_code", "?")
+                if csrf_status in {403, 429, 500, 502, 503, 520, 521, 522, 523, 524}:
+                    last_err = f"csrf_http_{csrf_status}"
+                    self._log(
+                        f"CSRF {csrf_status}，退避后重试 body={self._response_body_snip(csrf_resp)}",
+                        "warning",
+                    )
+                    time.sleep(0.8 * attempt + random.random() * 0.4)
+                    continue
                 csrf_data = self._parse_json_response(csrf_resp, "csrf")
                 csrf_token = ""
                 if csrf_data:
@@ -680,6 +730,7 @@ class RegistrationEngine:
                 if self.email:
                     q["login_hint"] = str(self.email)
                 q["auth_session_logging_id"] = str(uuid.uuid4())
+                q["ext-passkey-client-capabilities"] = "1111"
                 signin_url = f"{CHATGPT_APP}/api/auth/signin/openai?{urllib.parse.urlencode(q)}"
                 self._log(
                     f"signin mode: screen_hint={screen_hint} login_hint={'yes' if self.email else 'no'}"
@@ -760,18 +811,110 @@ class RegistrationEngine:
             self._log(f"初始化会话失败: {e}", "error")
             return False
 
+    def _navigation_headers(self, *, referer: str = "", fetch_site: str = "none") -> Dict[str, str]:
+        from .browser_profile import navigation_request_headers
+
+        return navigation_request_headers(
+            profile=getattr(self, "_browser_profile", None),
+            referer=referer,
+            fetch_site=fetch_site,
+        )
+
+    def _auth_api_headers(self, referer: str, *, include_datadog: bool = True) -> Dict[str, str]:
+        """XHR headers for auth.openai.com state-machine calls.
+
+        Origin must match the referer host; oai-device-id + Datadog RUM are
+        attached on every hop (gpt-auto-register: missing these → OTP silent-drop).
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(referer or "https://auth.openai.com/")
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "https://auth.openai.com"
+        headers: Dict[str, str] = {
+            "referer": referer or "https://auth.openai.com/",
+            "accept": "application/json",
+            "content-type": "application/json",
+            "origin": origin,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+        }
+        if self._device_id:
+            headers["oai-device-id"] = self._device_id
+        if include_datadog:
+            headers.update(_generate_datadog_trace_headers())
+        return headers
+
+    def _warmup_chatgpt_home(self) -> bool:
+        """Plant oai-did before spending a mailbox. Fail here → 409 later."""
+        from .constants import CHATGPT_APP
+
+        if not getattr(self, "session", None):
+            return False
+        oai_did = self._cookie_value("oai-did")
+        if oai_did:
+            self._log(f"warmup 已有 oai-did: {oai_did[:20]}...")
+            return True
+        nav = self._navigation_headers(fetch_site="none")
+        for warm in range(1, 5):
+            try:
+                home = self.session.get(f"{CHATGPT_APP}/", headers=nav, timeout=30)
+            except Exception as exc:
+                self._log(f"warmup chatgpt.com 异常 ({warm}/4): {exc}", "warning")
+                time.sleep(0.6 * warm)
+                continue
+            home_status = getattr(home, "status_code", "?")
+            oai_did = self._cookie_value("oai-did")
+            if oai_did:
+                self._log(f"warmup oai-did ok status={home_status}: {oai_did[:20]}...")
+                return True
+            self._log(
+                f"warmup 未种到 oai-did ({warm}/4) status={home_status} "
+                f"body={self._response_body_snip(home)}",
+                "warning",
+            )
+            time.sleep(0.6 * warm)
+        self._log("warmup 4 次均未种到 oai-did", "error")
+        return False
+
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID，并探测 authorize 跟随是否已落到 email-verification。"""
         try:
             if not self.oauth_start:
                 return None
 
-            response = self.session.get(
-                self.oauth_start.auth_url,
-                timeout=30,
-                allow_redirects=True,
-            )
-            did = self.session.cookies.get("oai-did")
+            from core.http_client import is_get_transport_error
+
+            response = None
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, 4):
+                try:
+                    response = self.session.get(
+                        self.oauth_start.auth_url,
+                        headers=self._navigation_headers(
+                            referer="https://chatgpt.com/",
+                            fetch_site="cross-site",
+                        ),
+                        timeout=30,
+                        allow_redirects=True,
+                    )
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if not is_get_transport_error(exc) or attempt >= 3:
+                        raise
+                    wait = 2.0 ** (attempt - 1)
+                    self._log(
+                        f"authorize 跟随临时网络错误 ({attempt}/3): {exc}，{wait:.1f}s 后重试",
+                        "warning",
+                    )
+                    time.sleep(wait)
+            if response is None:
+                if last_exc:
+                    raise last_exc
+                return None
+            did = self._cookie_value("oai-did") or self.session.cookies.get("oai-did")
             self._log(f"Device ID: {did}")
             # login_or_signup path may auto-land on email-verification and trigger OTP.
             try:
@@ -849,7 +992,6 @@ class RegistrationEngine:
                     dx_b64 = str(turnstile.get("dx") or "")
                     turnstile_required = bool(turnstile.get("required") and dx_b64)
                     if dx_b64:
-                        # yukkcat: sleep 5000ms before SO collect on create_account
                         collect_s = _so_collect_seconds(flow)
                         if collect_s > 0 and not _env_truthy("OPENAI_REGISTER_NO_DELAY", "0"):
                             self._log(
@@ -1048,11 +1190,15 @@ class RegistrationEngine:
         did = self._get_device_id()
         if not did:
             return False, None, None, "重建后获取 Device ID 失败"
-        sen_payload = self._check_sentinel(did)
-        if sen_payload:
-            self._log("重建后 Sentinel 检查通过")
+        sen_payload = None
+        if self._should_skip_authorize_continue():
+            self._log("重建后跳过 authorize_continue Sentinel（auto-OTP）")
         else:
-            self._log("重建后 Sentinel 检查失败或未启用", "warning")
+            sen_payload = self._check_sentinel(did)
+            if sen_payload:
+                self._log("重建后 Sentinel 检查通过")
+            else:
+                self._log("重建后 Sentinel 检查失败或未启用", "warning")
         return True, did, sen_payload, ""
 
     def _submit_signup_form(
@@ -1084,9 +1230,7 @@ class RegistrationEngine:
             # invents a password here. Forcing password create on an auto-OTP session
             # yields account_creation_failed, then invalid_auth_step on OTP validate.
             # Only force password when OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=1.
-            if getattr(self, "_otp_auto_sent", False) and str(
-                os.environ.get("OPENAI_SKIP_CONTINUE_ON_AUTO_OTP", "1")
-            ).strip().lower() in {"1", "true", "yes", "on"}:
+            if self._should_skip_authorize_continue():
                 self._log(
                     "authorize 已到 email-verification，跳过 authorize/continue，"
                     "直接使用 auto-OTP 会话"
@@ -1137,11 +1281,7 @@ class RegistrationEngine:
             )
             self._log(f"authorize/continue body screen_hint={body_hint} (oauth={screen_hint})")
 
-            headers = {
-                "referer": "https://auth.openai.com/create-account",
-                "accept": "application/json",
-                "content-type": "application/json",
-            }
+            headers = self._auth_api_headers("https://auth.openai.com/create-account")
 
             if sen_payload:
                 token_h, so_h, _ = _build_sentinel_header_bundle(
@@ -1223,11 +1363,9 @@ class RegistrationEngine:
                 # login OTP (often silent / no delivery for brand-new catch-all addresses);
                 # do NOT treat that as passwordless signup solely because signup_mode=email_signup.
                 if verification_mode == "passwordless_signup":
-                    # Observed on WARP/IN: passwordless_signup → email-otp/send flips to
-                    # login_challenge and never delivers. Prefer password create path first.
-                    prefer_password = str(
-                        os.environ.get("OPENAI_PREFER_PASSWORD_SIGNUP", "1")
-                    ).strip().lower() in {"1", "true", "yes", "on"}
+                    # Live JP capture: passwordless OTP works; user/register 400s.
+                    # WARP/IN can still set OPENAI_PREFER_PASSWORD_SIGNUP=1.
+                    prefer_password = self._prefer_password_signup()
                     is_passwordless_signup = not prefer_password
                 elif verification_mode in {"login_challenge", "login", "login_otp"}:
                     is_passwordless_signup = False
@@ -1252,8 +1390,7 @@ class RegistrationEngine:
                     )
                     or (
                         verification_mode == "passwordless_signup"
-                        and str(os.environ.get("OPENAI_PREFER_PASSWORD_SIGNUP", "1")).strip().lower()
-                        in {"1", "true", "yes", "on"}
+                        and self._prefer_password_signup()
                     )
                 )
                 self._is_passwordless_signup = is_passwordless_signup and not force_password_path
@@ -1446,18 +1583,190 @@ class RegistrationEngine:
         except Exception as e:
             logger.warning(f"标记邮箱状态失败: {e}")
 
-    def _send_verification_code(self) -> bool:
-        """发送验证码。
+    def _cookie_value(self, name: str) -> str:
+        """Read a cookie by name without requiring a specific domain."""
+        jar = getattr(getattr(self, "session", None), "cookies", None)
+        if jar is None or not name:
+            return ""
+        try:
+            value = jar.get(name) or ""
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        try:
+            for cookie in jar:
+                cookie_name = getattr(cookie, "name", None)
+                if cookie_name is None:
+                    cookie_name = str(cookie)
+                if cookie_name != name:
+                    continue
+                value = getattr(cookie, "value", "") or ""
+                if value:
+                    return str(value)
+        except Exception:
+            pass
+        try:
+            mapping = jar.get_dict() if hasattr(jar, "get_dict") else {}
+            value = (mapping or {}).get(name) or ""
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        return ""
 
-        passwordless_signup 场景下，authorize/continue 后页面虽是 email_otp_verification，
-        但邮件常需显式 POST /api/accounts/email-otp/send 才会投递（已用 zc.233159.xyz 探针验证）。
+    @staticmethod
+    def _continue_url_from_payload(data: Any) -> str:
+        """gptfree-register / klsf: continue_url aliases on OTP and create_account."""
+        if not isinstance(data, dict):
+            return ""
+        for key in (
+            "continue_url",
+            "continueUrl",
+            "redirect_url",
+            "redirectUrl",
+            "url",
+        ):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _absolute_auth_url(self, url: str) -> str:
+        text = str(url or "").strip()
+        if not text:
+            return ""
+        if text.startswith("/"):
+            return "https://auth.openai.com" + text
+        return text
+
+    def _follow_otp_continue_url(self) -> None:
+        """Advance the auth state machine after email-otp/validate (open_continue_url)."""
+        url = self._absolute_auth_url(str(getattr(self, "_otp_continue_url", "") or ""))
+        if not url:
+            return
+        if "code=" in url:
+            return
+        try:
+            self.session.get(
+                url,
+                headers=self._navigation_headers(
+                    referer="https://auth.openai.com/email-verification",
+                    fetch_site="same-origin",
+                ),
+                timeout=15,
+            )
+            self._log(f"跟随 OTP continue_url: {url[:100]}")
+        except Exception as exc:
+            self._log(f"跟随 OTP continue_url 失败: {exc}", "warning")
+
+    def _resolve_session_callback_url(self) -> str:
+        """Find the NextAuth callback with code= after create_account / existing login.
+
+        gptfree-register: OTP validate itself may return /api/auth/callback.
+        klsf/codex-register + gpt-auto-register: continue_url may be /workspace
+        and needs select + redirect follow instead of a hard fail.
         """
-        headers = {
-            "origin": "https://auth.openai.com",
-            "referer": "https://auth.openai.com/email-verification",
-            "accept": "application/json",
-            "content-type": "application/json",
-        }
+        for raw in (
+            getattr(self, "_create_account_continue_url", None),
+            getattr(self, "_otp_continue_url", None),
+        ):
+            url = self._absolute_auth_url(str(raw or ""))
+            if url and "code=" in url:
+                return url
+
+        start = self._absolute_auth_url(str(getattr(self, "_create_account_continue_url", "") or ""))
+        if not start:
+            start = self._absolute_auth_url(str(getattr(self, "_otp_continue_url", "") or ""))
+        if not start:
+            return ""
+
+        followed = self._follow_redirects(start)
+        if followed and "code=" in followed:
+            return followed
+
+        if "workspace" in start.lower() or (followed and "workspace" in str(followed).lower()):
+            workspace_id = self._get_workspace_id()
+            if workspace_id:
+                selected = self._select_workspace(workspace_id) or ""
+                selected = self._absolute_auth_url(selected)
+                if selected and "code=" in selected:
+                    return selected
+                if selected:
+                    nested = self._follow_redirects(selected)
+                    if nested and "code=" in nested:
+                        return nested
+        return followed or start
+
+    def _extract_session_token(self, session_json: Optional[Dict[str, Any]] = None) -> str:
+        """session_token: cookie → JSON sessionToken/session_token → domain-free cookie."""
+        cookie = (
+            self._cookie_value("__Secure-next-auth.session-token")
+            or self._cookie_value("next-auth.session-token")
+        )
+        data = session_json if isinstance(session_json, dict) else {}
+        json_token = str(
+            data.get("sessionToken")
+            or data.get("session_token")
+            or ""
+        ).strip()
+        return cookie or json_token
+
+    def _note_otp_mode_from_payload(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        page_payload = ((data.get("page") or {}).get("payload") or {})
+        sess = data.get("oai-client-auth-session") or {}
+        mode = str(
+            page_payload.get("email_verification_mode")
+            or sess.get("email_verification_mode")
+            or ""
+        ).strip().lower()
+        if not mode:
+            return
+        self._email_verification_mode = mode
+        self._log(f"otp verification_mode={mode}")
+        if mode in {"login_challenge", "login", "login_otp"}:
+            self._otp_login_challenge = True
+        elif mode in {"passwordless_signup", "signup", "email_signup"}:
+            self._otp_login_challenge = False
+
+    def _otp_http(self, method: str, url: str, referer: str, label: str) -> bool:
+        headers = self._auth_api_headers(referer)
+        if method == "POST":
+            response = self.session.post(url, headers=headers, data="{}", timeout=15)
+        else:
+            get_headers = dict(headers)
+            get_headers.pop("content-type", None)
+            response = self.session.get(
+                url,
+                headers=get_headers,
+                timeout=15,
+            )
+        status = getattr(response, "status_code", "?")
+        self._log(f"{label}: {status}")
+        if status != 200:
+            body = self._response_body_snip(response, 180)
+            if body and body != "<empty>":
+                self._log(f"{label} body: {body}", "warning")
+            return False
+        self._otp_sent_at = time.time()
+        try:
+            self._note_otp_mode_from_payload(response.json())
+        except Exception:
+            pass
+        if not self._cookie_value("oai-client-auth-session"):
+            self._log(f"警告: {label} 后缺少 oai-client-auth-session", "warning")
+        return True
+
+    def _send_verification_code(self, *, prefer_resend: bool = False) -> bool:
+        """Kick off OTP delivery.
+
+        New signup (no auto-OTP): passwordless/send-otp → email-otp/resend → email-otp/send.
+        Existing / auto-OTP / passwordless_signup / mid-wait: resend first.
+        A second email-otp/send starts a new challenge and invalidates the
+        code already in flight.
+        """
         # Light session touch only. Full HTML navigation of email-verification
         # after passwordless authorize/continue has been observed to flip the
         # server state to login_challenge and later invalid_state on validate.
@@ -1473,86 +1782,47 @@ class RegistrationEngine:
             self._log(f"预热 auth session dump: {dump_resp.status_code}")
             try:
                 dump = dump_resp.json() if dump_resp.status_code == 200 else {}
-                mode = str(
-                    ((dump.get("page") or {}).get("payload") or {}).get("email_verification_mode")
-                    or (dump.get("oai-client-auth-session") or {}).get("email_verification_mode")
-                    or dump.get("email_verification_mode")
-                    or ""
-                ).strip().lower()
-                if mode:
-                    self._log(f"send 前 session verification_mode={mode}")
+                self._note_otp_mode_from_payload(dump)
             except Exception:
                 pass
         except Exception as e:
             self._log(f"预热 auth session dump 失败: {e}", "warning")
+
+        # gpt-auto-register: authorize/continue (and auto-OTP / passwordless_signup)
+        # already created a challenge. A second passwordless/send-otp or email-otp/send
+        # mints a new state and invalidates the code already in flight → 401.
+        # Only treat auto-sent OTP / existing / mid-wait as resend-first.
+        # passwordless_signup alone is still a new CFD1 signup and may need
+        # passwordless/send-otp (gpt-auto-register's "existing" fold is for Outlook pools).
+        existing = (
+            bool(getattr(self, "_is_existing_account", False))
+            or prefer_resend
+            or bool(getattr(self, "_otp_auto_sent", False))
+        )
+        verify_ref = "https://auth.openai.com/email-verification"
+        create_ref = "https://auth.openai.com/create-account/password"
+        steps: list[tuple[str, str, str, str]] = []
+        if existing:
+            steps.append(("POST", OPENAI_API_ENDPOINTS["resend_otp"], verify_ref, "email-otp/resend"))
+            steps.append(("POST", OPENAI_API_ENDPOINTS["send_otp"], verify_ref, "email-otp/send"))
+            steps.append(("GET", OPENAI_API_ENDPOINTS["send_otp"], verify_ref, "email-otp/send GET"))
+        else:
+            steps.append(
+                ("POST", OPENAI_API_ENDPOINTS["send_passwordless_otp"], create_ref, "passwordless/send-otp")
+            )
+            steps.append(("POST", OPENAI_API_ENDPOINTS["resend_otp"], verify_ref, "email-otp/resend"))
+            steps.append(("POST", OPENAI_API_ENDPOINTS["send_otp"], verify_ref, "email-otp/send"))
+            steps.append(("GET", OPENAI_API_ENDPOINTS["send_otp"], verify_ref, "email-otp/send GET"))
+
         last_err = ""
-        for attempt in range(1, 4):
+        for method, url, referer, label in steps:
             try:
-                # stamp send time at the successful attempt; on retries refresh it
-                self._otp_sent_at = time.time()
-                # Prefer POST (works for passwordless). Fall back to GET for older flows.
-                response = self.session.post(
-                    OPENAI_API_ENDPOINTS["send_otp"],
-                    headers=headers,
-                    data="{}",
-                )
-                self._log(f"验证码发送状态(POST): {response.status_code} attempt={attempt}")
-                if response.status_code == 200:
-                    body = (response.text or "")[:180].replace("\n", " ")
-                    if body:
-                        self._log(f"验证码发送响应: {body}")
-                    try:
-                        data = response.json()
-                        page_payload = ((data.get("page") or {}).get("payload") or {})
-                        sess = data.get("oai-client-auth-session") or {}
-                        mode = str(
-                            page_payload.get("email_verification_mode")
-                            or sess.get("email_verification_mode")
-                            or ""
-                        ).strip().lower()
-                        if mode:
-                            self._email_verification_mode = mode
-                            self._log(f"send_otp verification_mode={mode}")
-                            if mode in {"login_challenge", "login", "login_otp"}:
-                                self._otp_login_challenge = True
-                            elif mode in {"passwordless_signup", "signup", "email_signup"}:
-                                # real signup OTP — clear sticky challenge flag
-                                self._otp_login_challenge = False
-                    except Exception:
-                        pass
-                    # ensure page cookies still present
-                    if not self.session.cookies.get("oai-client-auth-session"):
-                        self._log("警告: send_otp 后缺少 oai-client-auth-session", "warning")
+                if self._otp_http(method, url, referer, label):
                     return True
-
-                # 429 / 5xx retry
-                if response.status_code in {408, 425, 429} or response.status_code >= 500:
-                    last_err = f"POST {response.status_code}"
-                    time.sleep(0.8 * attempt + random.random() * 0.3)
-                    continue
-
-                response = self.session.get(
-                    OPENAI_API_ENDPOINTS["send_otp"],
-                    headers={
-                        "referer": "https://auth.openai.com/email-verification",
-                        "accept": "application/json",
-                    },
-                )
-                self._log(f"验证码发送状态(GET fallback): {response.status_code} attempt={attempt}")
-                if response.status_code == 200:
-                    self._otp_sent_at = time.time()
-                    return True
-                last_err = f"GET {response.status_code} body={response.text[:180]}"
-                self._log(f"发送验证码响应: {response.text[:300]}", "warning")
-                if response.status_code in {408, 425, 429} or response.status_code >= 500:
-                    time.sleep(0.8 * attempt + random.random() * 0.3)
-                    continue
-                # non-retriable client error
-                break
-            except Exception as e:
-                last_err = str(e)
-                self._log(f"发送验证码失败 attempt={attempt}: {e}", "error")
-                time.sleep(0.6 * attempt)
+                last_err = label
+            except Exception as exc:
+                last_err = f"{label}: {exc}"
+                self._log(f"{label} 异常: {exc}", "warning")
         self._log(f"发送验证码最终失败: {last_err}", "error")
         return False
 
@@ -1584,6 +1854,15 @@ class RegistrationEngine:
         except Exception:
             return 35.0
 
+    def _otp_wait_policy(self) -> tuple[int, int, int]:
+        """Return (slice_secs, resend_every, max_resends) for the OTP wait loop."""
+        auto_otp = bool(getattr(self, "_otp_auto_sent", False)) and bool(
+            getattr(self, "_is_passwordless_signup", False)
+        )
+        if auto_otp:
+            return 25, 75, 2
+        return 25, 50, 3
+
     def _get_verification_code(self) -> Optional[str]:
         """获取验证码（分段轮询 + 会话保活 + 中途重发，降低 invalid_state / 投递丢信）。
 
@@ -1595,9 +1874,7 @@ class RegistrationEngine:
             self._log(f"正在等待邮箱 {self.email} 的验证码...")
             email_id = self.email_info.get("service_id") if self.email_info else None
             total_timeout = 300
-            slice_secs = 20
-            resend_every = 45
-            max_resends = 4
+            slice_secs, resend_every, max_resends = self._otp_wait_policy()
             # login_challenge rarely delivers to catch-all; use short budget.
             login_challenge = bool(getattr(self, "_otp_login_challenge", False))
             if login_challenge and self._login_challenge_fast_fail_enabled():
@@ -1632,17 +1909,24 @@ class RegistrationEngine:
                     if "超时" not in last_err and "timeout" not in last_err.lower():
                         self._log(f"收信切片异常: {e}", "warning")
                 if code:
-                    self._log(f"成功获取验证码: {code}")
-                    # refresh page right before validate
-                    self._keep_auth_session_alive()
-                    return code
+                    code = str(code).strip()
+                    if code in SHADOW_OTP_CODES:
+                        self._log(
+                            f"忽略影子 OTP {code}（tm1.openai.com 坏发码域），继续等待真实验证码",
+                            "warning",
+                        )
+                    else:
+                        self._log(f"成功获取验证码: {code}")
+                        # refresh page right before validate
+                        self._keep_auth_session_alive()
+                        return code
                 self._keep_auth_session_alive()
                 # OpenAI sometimes returns send_otp 200 without actually delivering.
                 # Resend mid-wait while keeping the same auth session.
                 if resends < max_resends and time.time() >= next_resend_at and time.time() < deadline - 8:
                     resends += 1
                     self._log(f"验证码未到，重发 OTP attempt={resends}/{max_resends}")
-                    if self._send_verification_code():
+                    if self._send_verification_code(prefer_resend=True):
                         # If resend flipped into/kept login_challenge, keep short budget.
                         if getattr(self, "_otp_login_challenge", False) and self._login_challenge_fast_fail_enabled():
                             # do not extend beyond original short deadline
@@ -1664,6 +1948,20 @@ class RegistrationEngine:
             self._log(f"获取验证码失败: {e}", "error")
             return None
 
+    def _retry_otp_after_bad_validate(self) -> bool:
+        """Resend + wait for a new code once after a 401/wrong_email_otp validate."""
+        if not getattr(self, "_otp_validate_retryable", False):
+            return False
+        self._log("OTP 首次验证失败，补发并重试一次", "warning")
+        # Force an explicit resend; do not trust the original auto-sent challenge.
+        self._otp_auto_sent = False
+        if not self._send_verification_code(prefer_resend=True):
+            return False
+        code = self._get_verification_code()
+        if not code:
+            return False
+        return self._validate_verification_code(code)
+
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码（网络抖动时短重试一次）。
 
@@ -1674,6 +1972,7 @@ class RegistrationEngine:
         code = str(code or "").strip()
         if not code:
             return False
+        self._otp_validate_retryable = False
         headers = {
             "referer": "https://auth.openai.com/email-verification",
             "accept": "application/json",
@@ -1731,8 +2030,9 @@ class RegistrationEngine:
                 if response.status_code == 200:
                     try:
                         resp_data = response.json()
-                        self._otp_continue_url = resp_data.get("continue_url", "")
-                        self._otp_page_type = resp_data.get("page", {}).get("type", "")
+                        self._otp_continue_url = self._continue_url_from_payload(resp_data)
+                        page = resp_data.get("page") if isinstance(resp_data.get("page"), dict) else {}
+                        self._otp_page_type = str((page or {}).get("type") or "")
                         self._log(f"验证码校验 -> page_type={self._otp_page_type}")
                     except Exception:
                         self._otp_continue_url = ""
@@ -1741,9 +2041,36 @@ class RegistrationEngine:
 
                 body = response.text[:300]
                 self._log(f"验证码校验响应: {body}", "warning")
+                body_l = body.lower()
+                error_code = ""
+                try:
+                    payload = response.json()
+                    err = payload.get("error") if isinstance(payload, dict) else None
+                    if isinstance(err, dict):
+                        error_code = str(err.get("code") or "").strip().lower()
+                    elif isinstance(err, str):
+                        error_code = err.strip().lower()
+                except Exception:
+                    error_code = ""
+                # gpt-free-register: deactivated/deleted/banned is a dead mailbox, not a stale OTP.
+                if error_code in {"account_deactivated", "account_deleted", "account_banned"}:
+                    self._otp_validate_retryable = False
+                    self._log(f"账号已废 ({error_code})，停止 OTP 补发", "error")
+                    return False
                 # invalid_state = session lost; retrying same code rarely helps
-                if "invalid_state" in body or response.status_code == 409:
+                if "invalid_state" in body_l or response.status_code == 409:
+                    self._otp_validate_retryable = False
                     self._log("会话 invalid_state，停止重试同一验证码", "error")
+                    return False
+                # gpt-auto-register: 401/wrong_email_otp often means stale challenge;
+                # recover by resend + a fresh mailbox code (not the same digits).
+                if (
+                    response.status_code in {400, 401}
+                    or "wrong_email_otp" in body_l
+                    or "login_failed" in body_l
+                    or "invalid_otp" in body_l
+                ):
+                    self._otp_validate_retryable = True
                     return False
                 # wrong code / expired usually 400 — do not spin forever
                 if response.status_code in {408, 425, 429} or response.status_code >= 500:
@@ -1836,7 +2163,7 @@ class RegistrationEngine:
             # 提取 continue_url（ChatGPT Web 流程直接返回 OAuth callback URL）
             try:
                 resp_data = response.json()
-                self._create_account_continue_url = resp_data.get("continue_url", "")
+                self._create_account_continue_url = self._continue_url_from_payload(resp_data)
                 if self._create_account_continue_url:
                     self._log(f"create_account continue_url: {self._create_account_continue_url[:100]}...")
             except Exception:
@@ -2180,8 +2507,12 @@ class RegistrationEngine:
 
                 response = self.session.get(
                     current_url,
+                    headers=self._navigation_headers(
+                        referer="https://auth.openai.com/",
+                        fetch_site="same-origin" if "auth.openai.com" in current_url else "cross-site",
+                    ),
                     allow_redirects=False,
-                    timeout=15
+                    timeout=15,
                 )
 
                 location = response.headers.get("Location") or ""
@@ -2264,8 +2595,21 @@ class RegistrationEngine:
             self._log(f"IP 位置: {location}")
             _random_delay(0.2, 0.6)
 
-            # 2. 创建邮箱
-            self._log("2. 创建邮箱...")
+            # 2. 初始化会话（先于邮箱：warmup 失败不浪费 CFD1 地址）
+            self._log("2. 初始化会话...")
+            if not self._init_session():
+                result.error_message = "初始化会话失败"
+                return result
+            _random_delay(0.2, 0.6)
+
+            self._log("3. warmup chatgpt.com（种植 oai-did）...")
+            if not self._warmup_chatgpt_home():
+                result.error_message = "初始化会话失败: oai_did_missing"
+                return result
+            _random_delay(0.2, 0.6)
+
+            # 4. 创建邮箱
+            self._log("4. 创建邮箱...")
             if not self._create_email():
                 result.error_message = "创建邮箱失败"
                 return result
@@ -2273,36 +2617,33 @@ class RegistrationEngine:
             result.email = self.email
             _random_delay(0.2, 0.7)
 
-            # 3. 初始化会话
-            self._log("3. 初始化会话...")
-            if not self._init_session():
-                result.error_message = "初始化会话失败"
-                return result
-            _random_delay(0.3, 0.9)
-
-            # 4. 开始 OAuth 流程
-            self._log("4. 开始 OAuth 授权流程...")
+            # 5. 开始 OAuth 流程
+            self._log("5. 开始 OAuth 授权流程...")
             if not self._start_oauth():
                 result.error_message = "开始 OAuth 流程失败"
                 return result
             _random_delay(0.3, 0.9)
 
-            # 5. 获取 Device ID
-            self._log("5. 获取 Device ID...")
+            # 6. 获取 Device ID
+            self._log("6. 获取 Device ID...")
             did = self._get_device_id()
             if not did:
                 result.error_message = "获取 Device ID 失败"
                 return result
             _random_delay(0.25, 0.8)
 
-            # 6. 检查 Sentinel 拦截
-            self._log("6. 检查 Sentinel 拦截...")
-            sen_payload = self._check_sentinel(did)
-            if sen_payload:
-                self._log("Sentinel 检查通过")
+            # 6. Sentinel for authorize/continue — unused once auto-OTP has landed.
+            sen_payload = None
+            if self._should_skip_authorize_continue():
+                self._log("6. 跳过 authorize_continue Sentinel（auto-OTP 已落地 /email-verification）")
             else:
-                self._log("Sentinel 检查失败或未启用", "warning")
-            _random_delay(0.3, 1.0)
+                self._log("6. 检查 Sentinel 拦截...")
+                sen_payload = self._check_sentinel(did)
+                if sen_payload:
+                    self._log("Sentinel 检查通过")
+                else:
+                    self._log("Sentinel 检查失败或未启用", "warning")
+                _random_delay(0.3, 1.0)
 
             # 7. 提交注册表单 + 解析响应判断账号状态
             self._log("7. 提交注册表单...")
@@ -2359,13 +2700,7 @@ class RegistrationEngine:
             # login_or_signup may already auto-trigger OTP on authorize follow.
             # passwordless / partial new accounts still need explicit email-otp/send.
             # Only trust auto-OTP when we never left the passwordless path.
-            skip_explicit_send = (
-                bool(getattr(self, "_otp_auto_sent", False))
-                and bool(getattr(self, "_is_passwordless_signup", False))
-                and not bool(getattr(self, "_force_password_path", False))
-                and str(os.environ.get("OPENAI_TRUST_AUTO_OTP", "1")).strip().lower()
-                in {"1", "true", "yes", "on"}
-            )
+            skip_explicit_send = self._should_skip_explicit_otp_send()
             if skip_explicit_send:
                 self._log("9. [login_or_signup] authorize 已疑似触发 OTP，跳过显式 send（OPENAI_TRUST_AUTO_OTP=1）")
             else:
@@ -2406,12 +2741,17 @@ class RegistrationEngine:
             # 11. 验证验证码
             self._log("11. 验证验证码...")
             if not self._validate_verification_code(code):
-                result.error_message = "验证验证码失败"
-                return result
+                if not self._retry_otp_after_bad_validate():
+                    result.error_message = "验证验证码失败"
+                    return result
+            self._follow_otp_continue_url()
             _random_delay(0.3, 0.8)
 
             # 12. 根据 OTP 响应决定下一步
-            if self._otp_page_type == "about_you" and not self._is_existing_account:
+            otp_callback = self._absolute_auth_url(str(getattr(self, "_otp_continue_url", "") or ""))
+            if "code=" in otp_callback:
+                self._log("12. OTP continue_url 已是 session callback，跳过 create_account")
+            elif self._otp_page_type == "about_you" and not self._is_existing_account:
                 # 正常注册流程: about_you → create_account
                 self._log("12. 创建用户账户...")
                 if not self._create_user_account():
@@ -2426,7 +2766,7 @@ class RegistrationEngine:
                     return result
 
             # 13. 跟随 callback URL 到 chatgpt.com 获取 session
-            callback_url = self._create_account_continue_url
+            callback_url = self._resolve_session_callback_url()
             if not callback_url or "code=" not in str(callback_url):
                 result.error_message = "create_account 未返回有效的 callback URL"
                 return result
@@ -2435,9 +2775,9 @@ class RegistrationEngine:
             cb_resp = self.session.get(callback_url, timeout=20)
             self._log(f"callback 状态: {cb_resp.status_code}")
 
-            # 提取 session cookie
-            session_token = self.session.cookies.get("__Secure-next-auth.session-token")
-            account_cookie = self.session.cookies.get("_account", "")
+            # 提取 session cookie（domain-free；NextAuth 有时不写默认 domain）
+            session_token = self._extract_session_token()
+            account_cookie = self._cookie_value("_account")
             if session_token:
                 self._log(f"获取到 session-token: {session_token[:30]}...")
             if account_cookie:
@@ -2454,11 +2794,21 @@ class RegistrationEngine:
             self._log(f"session API 状态: {session_resp.status_code}")
             self._log(f"session API 响应: {session_resp.text[:500]}")
 
-            session_data = session_resp.json()
-            access_token = session_data.get("accessToken", "")
-            user_data = session_data.get("user", {})
+            session_data: Dict[str, Any] = {}
+            try:
+                parsed = session_resp.json()
+                if isinstance(parsed, dict):
+                    session_data = parsed
+            except Exception as exc:
+                self._log(f"session API 非 JSON: {exc}", "warning")
+            access_token = str(
+                session_data.get("accessToken") or session_data.get("access_token") or ""
+            ).strip()
+            user_data = session_data.get("user", {}) if isinstance(session_data.get("user"), dict) else {}
+            session_token = self._extract_session_token(session_data) or session_token
             self._log(f"session keys: {list(session_data.keys())}")
             self._log(f"accessToken 长度: {len(access_token)}")
+            self._log(f"session_token={'有' if session_token else '无'}")
 
             if not access_token:
                 result.error_message = "chatgpt.com session 未返回 accessToken"

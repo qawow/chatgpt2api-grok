@@ -38,28 +38,15 @@ chatgpt2api 内的 **并行 Grok/xAI Build 号池**。与 `/api/accounts` / `dat
 
 ## Web 号池管理
 
-管理后台 **号池管理** 页顶部有 **ChatGPT / Grok 本地 / GrokCLI2API** 切换：
+管理后台 **号池管理** 页顶部有 **ChatGPT / Grok** 切换：
 
 - ChatGPT → `/api/accounts*`、`data/accounts.json`
-- Grok 本地 → `/api/grok/accounts*`、`data/grok_accounts.json`
-- GrokCLI2API → `/api/g2a/pool`（远程脱敏状态，**无 token**，只读）
+- Grok → `/api/grok/accounts*`、`data/grok_accounts.json`
 
-Grok 本地页支持列表、导入 cliproxy JSON、刷新（同步 OAuth refresh + 探活）、编辑状态/代理、删除。  
-GrokCLI2API 页只镜像远程凭证状态，可刷新列表、删除远程凭证；**不能**导出/编辑 token。  
+Grok 页支持列表、导入 cliproxy JSON、刷新（同步 OAuth refresh + 探活）、编辑状态/代理、删除。  
 **不支持** ChatGPT 的密码重登 / OAuth 网页登录。
 
-若号池已在 grokcli2api-go：在 **设置 → GrokCLI2API** 配好连接并勾选「优先代理生图」即可，**不必**迁移到本地 `data/grok_accounts.json`。详见 [g2a-bridge.md](./g2a-bridge.md)。
-
-### 脱敏速览
-
-| 视图 | 是否含真实 token | 说明 |
-|---|---|---|
-| ChatGPT 号池 | 管理 API 含 token（仅管理员） | 本地调度需要 |
-| Grok 本地 | 管理 API 含 token（仅管理员） | 本地 Build 生图需要 |
-| GrokCLI2API | **否** | 合成 id `g2a:{server}:{cred}`，`readonly`；密钥与 OAuth 均不回显 |
-| 设置 → GrokCLI2API 连接列表 | **否** | 只显示 `has_admin_key` / `has_api_key` / `can_proxy_image` |
-
-`data/grok_accounts.json` / `data/g2a_config.json` 为运行时密钥文件，**禁止提交 git**。完整安全边界见 [g2a-bridge.md §脱敏与安全边界](./g2a-bridge.md)。
+`data/grok_accounts.json` 为运行时密钥文件，**禁止提交 git**。
 
 ## 管理 API（admin Bearer）
 
@@ -113,15 +100,7 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 识别为 Grok 的 model：`grok-2-image`、`grok-2-image-1212`、`grok-imagine`，以及 `grok*` 且含 `image`/`imagine` 的 id。  
 `gpt-image-2` / `codex-gpt-image-2` **仍只走 ChatGPT 池**。
 
-### 上游选择（G2A 优先）
-
-`grok_v1_image_generations.handle` 顺序：
-
-1. 已配置且 `prefer_for_image=true` 的 grokcli2api-go 连接 → `POST {base}/v1/responses` + `tools=[{type:image_generation}]`（0.4.x 主路径；无 Images API）  
-2. 否则本地 `data/grok_accounts.json` 免费 Build（`/responses` + `image_generation` tool）  
-3. 永不落入 ChatGPT 号池  
-
-远程失败且本地仍有账号时会回退本地；`force_g2a` / 本地空池时直接报错。
+生图只走本地 `data/grok_accounts.json` 免费 Build（`/responses` + `image_generation` tool），**永不**落入 ChatGPT 号池。
 
 ### 独立路径（强制 Grok 路径）
 
@@ -138,17 +117,26 @@ curl -s http://127.0.0.1:8000/v1/grok/images/generations \
 前端默认走 `POST /api/image-tasks/generations`（不是 `/v1/images/generations`）。  
 任务层 `image_task_service.route_image_generation` 会按 model 分流：
 
-- `grok-2-image` / `grok-imagine` 等 → Grok 路径（G2A 优先，本地回退）
+- `grok-2-image` / `grok-imagine` 等 → Grok 本地池
 - 其它 → ChatGPT `IMAGE_MODELS` 白名单
 
 若看到 `unsupported image model, supported models: gpt-image-2, codex-...`，说明请求仍进了 ChatGPT 校验（旧进程或未分流）；重启服务后选 Grok 模型即可。
 
 ### 上游说明
 
-Build 免费通道（`cli-chat-proxy.grok.com`）实际可用模型通常只有 `grok-4.5`（上游记为 `grok-4.5-build-free`）。  
-`/images/generations` 对免费号常见返回 `403 personal-team-blocked:spending-limit`（需付费额度）。
+型号不要混：
 
-**免费生图（对话式）**走：
+| id | 类型 | 本代理 |
+|---|---|---|
+| `grok-4.5` | **对话**（[Grok 4.5](https://x.ai/news/grok-4-5)） | **不**出现在 `/v1/models`；仅内部探活 / 免费 Build agent |
+| `grok-imagine-image` | **生图**（xAI SDK `client.image.sample`） | 对外生图 id |
+| `grok-2-image` / `grok-2-image-1212` | 旧版 Flux 生图 | 对外生图 id；免费 Build 的 `/responses` 上会 Model not found |
+| `grok-imagine` | 别名 | 路由到生图 |
+
+Build 免费通道（`cli-chat-proxy.grok.com`）对话 agent 通常是 `grok-4.5`（上游 `grok-4.5-build-free`）。  
+`POST /images/generations` 对免费号常见 `403 personal-team-blocked:spending-limit`。
+
+**免费生图**不是「用 grok-4.5 当生图模型」，而是让对话 agent 调工具：
 
 ```http
 POST {base_url}/responses
@@ -166,8 +154,8 @@ POST {base_url}/responses
 
 本地 `generate_image` 尝试顺序：
 
-1. **免费** `POST /responses` + `tools=image_generation`（文本模型 `grok-4.5`）
-2. 付费 `POST /images/generations`（`grok-2-image` 等）
+1. **免费** `POST /responses` + `tools=image_generation`（对话 agent `grok-4.5`，不是生图 catalog id）
+2. 付费 `POST /images/generations`（`grok-imagine-image` / `grok-2-image`）
 3. 若 `/models` 出现 image 类 id，再试裸 `/responses`
 
 若全部失败 → **502**，错误信息标明 attempts；**不会**回落到 ChatGPT 号池。
@@ -188,27 +176,16 @@ HTTP 401 ... Invalid or expired credentials ... reason=no auth context
 2. **401 再试一次**：本地生图若仍 401/403，会强制 `ensure_fresh_account` 后重试该号一次  
 3. **号池管理 → 刷新**：手动批量 refresh + probe（`POST /api/grok/accounts/refresh`）
 
-若 refresh_token 也失效，需重新导入 cliproxy OAuth 凭证。  
-`data/g2a_config.json` 不存在时会跳过 G2A，直接走本地池（请在设置 → GrokCLI2API 重新保存连接）。
+若 refresh_token 也失效，需重新导入 cliproxy OAuth 凭证。
 
-## 文本（Grok 专用路径）
+## 文本
 
-```bash
-curl -s http://127.0.0.1:8000/v1/grok/chat/completions \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{
-    "model": "grok-4.5",
-    "messages": [{"role":"user","content":"Reply exactly: OK"}]
-  }'
-```
-
-内部翻译为 Build `POST /responses`（`input` / `max_output_tokens`）。  
-`/v1/chat/completions` **默认仍只走 ChatGPT**（本阶段不按 model 抢 Grok 文本，避免串路由）。
+Grok 文本模型已关闭：`POST /v1/grok/chat/completions` 返回 400。号池探活仍可内部使用 `probe_model`（默认 grok-4.5），不对外暴露。
 
 ## 模型列表
 
-- `GET /v1/models`：本地 Grok 号池非空 **或** G2A `prefer_for_image` 代理就绪时注入 `grok-2-image*` / `grok-imagine` / `grok-4.5`（`owned_by: grok`）
-- `GET /v1/grok/models`：仅 Grok 侧（同样认本地池 **或** G2A 代理）
+- `GET /v1/models`：本地 Grok 号池非空时注入 `grok-2-image*` / `grok-imagine-image` / `grok-imagine`（`owned_by: grok`），**不含对话模型 grok-4.5**
+- `GET /v1/grok/models`：同上，仅生图 id
 
 ## 配置（可选 `config.json`）
 
@@ -222,12 +199,6 @@ curl -s http://127.0.0.1:8000/v1/grok/chat/completions \
 ```
 
 环境变量：`GROK_BASE_URL`、`GROK_CLIENT_ID`。
-
-## 与 grokcli2api-go 同步
-
-设置页 **GrokCLI2API** 可将本地 Grok 号池推送到
-[Futureppo/grokcli2api-go](https://github.com/Futureppo/grokcli2api-go) 的
-`/v1/admin/credentials`。详见 [g2a-bridge.md](./g2a-bridge.md)。
 
 运维 / 调用总册：[operations.md](./operations.md)。  
 GPT free 注册（写入 ChatGPT 池，与 Grok 无关）：[gpt-register.md](./gpt-register.md)。
@@ -243,4 +214,3 @@ GPT free 注册（写入 ChatGPT 池，与 Grok 无关）：[gpt-register.md](./
 | `services/protocol/grok_v1_chat.py` | 文本 |
 | `utils/grok_models.py` | 模型判定 |
 | `scripts/import_grok_cliproxy_auth.py` | 目录导入 |
-| `services/g2a_service.py` / `api/g2a.py` | grokcli2api-go 桥 |

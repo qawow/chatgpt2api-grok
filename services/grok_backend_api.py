@@ -9,10 +9,31 @@ from typing import Any
 from urllib.parse import urljoin
 
 import os
+import threading
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from utils.grok_models import DEFAULT_GROK_TEXT_MODEL, resolve_grok_image_model
+
+_tls = threading.local()
+
+
+def _http() -> requests.Session:
+    """Per-thread Session so keep-alive survives probe → image → extra n.
+
+    requests.Session is not thread-safe; thread-local avoids sharing the pool
+    across FastAPI worker threads / image ThreadPoolExecutor.
+    """
+    sess = getattr(_tls, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _tls.session = sess
+    return sess
+
 
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
@@ -166,7 +187,7 @@ def refresh_access_token(
         "refresh_token": rt,
     }
     try:
-        resp = requests.post(
+        resp = _http().post(
             endpoint,
             data=data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -230,7 +251,7 @@ def probe_responses(
         }
     try:
         if backend_type == "codex2api":
-            resp = requests.post(
+            resp = _http().post(
                 url,
                 headers=build_request_headers(account),
                 json=body,
@@ -238,7 +259,7 @@ def probe_responses(
                 proxies=_proxies(account_proxy(account)),
             )
         else:
-            resp = requests.post(
+            resp = _http().post(
                 url,
                 headers=build_request_headers(account),
                 json=body,
@@ -275,7 +296,7 @@ def list_upstream_models(account: dict[str, Any], *, timeout: float = 30.0) -> d
     base = account_base_url(account)
     url = urljoin(base.rstrip("/") + "/", "models")
     try:
-        resp = requests.get(
+        resp = _http().get(
             url,
             headers=build_request_headers(account),
             timeout=timeout,
@@ -319,7 +340,7 @@ def create_response(
     if tool_choice is not None:
         body["tool_choice"] = tool_choice
     try:
-        resp = requests.post(
+        resp = _http().post(
             url,
             headers=build_request_headers(account),
             json=body,
@@ -356,11 +377,14 @@ def generate_image(
     """Generate images on Grok Build channel; never fall back to ChatGPT.
 
     Free Build accounts typically have no paid /images/generations credits.
-    The working free path is:
+    grok-4.5 is a *chat* model (not an image catalog id). The working free
+    path asks that chat agent to call the image_generation tool:
 
         POST {base}/responses
-        model=grok-4.5 (text / build-free)
+        model=grok-4.5          # chat agent, internally grok-4.5-build-free
         tools=[{type: image_generation}]
+
+    Paid path uses real image ids: grok-imagine-image / grok-2-image.
 
     which returns output items of type image_generation_call with JPEG/PNG
     base64 in ``result``.
@@ -401,11 +425,9 @@ def generate_image(
                     "status": exc.status,
                 }
             )
-            if exc.status in {401, 403}:
-                # Auth failure: re-raise immediately so the caller can refresh
-                # the token and retry. Previously this broke out of the loop and
-                # the final raise used status=502, which made the caller's
-                # `if exc.status in {401, 403}` refresh-retry branch dead code.
+            if exc.status in {401, 403, 429}:
+                # Auth / quota: re-raise so the pool can refresh or rotate.
+                # Trying grok-4 / grok-3 / paid images after 429 only burns timeout.
                 raise exc
             continue
 
@@ -487,7 +509,7 @@ def generate_image(
         body = dict(image_body)
         body["model"] = candidate_model
         try:
-            resp = requests.post(
+            resp = _http().post(
                 images_url,
                 headers=headers,
                 json=body,
@@ -514,14 +536,25 @@ def generate_image(
                     "attempts": attempts,
                 }
                 return parsed
-        if resp.status_code in {401, 403}:
-            # Auth / spending-limit — try remaining aliases once then stop this path
-            # (free path already attempted above)
-            continue
+        if resp.status_code in {401, 403, 429}:
+            # spending-limit / auth / quota — extra aliases and /models catalog
+            # will not unlock images and add 30–180s each.
+            break
         if resp.status_code not in {404, 405, 400, 422}:
             break
 
     # 3) Last resort: /responses with image-like model from catalog (if any)
+    last_paid = attempts[-1] if attempts else {}
+    last_paid_status = last_paid.get("status") if last_paid.get("path") == "images/generations" else None
+    if last_paid_status in {401, 403, 429}:
+        raise GrokBackendError(
+            "Grok Build channel has no usable image generation upstream "
+            "(tried free /responses+image_generation, then /images/generations). "
+            "Account pool and refresh still work. "
+            f"attempts={json.dumps(attempts, ensure_ascii=False)[:800]}",
+            status=last_paid_status,
+            body={"attempts": attempts},
+        )
     image_model_from_catalog = _pick_image_model_from_catalog(account, timeout=min(timeout, 30.0))
     if image_model_from_catalog:
         try:
@@ -605,7 +638,7 @@ def _header_int(headers: Any, name: str) -> int | None:
 
 def _image_model_candidates(model: str) -> list[str]:
     ordered = [model]
-    for alias in ("grok-2-image", "grok-2-image-1212", "grok-imagine"):
+    for alias in ("grok-imagine-image", "grok-2-image", "grok-2-image-1212", "grok-imagine"):
         if alias not in ordered:
             ordered.append(alias)
     return ordered
@@ -614,17 +647,15 @@ def _image_model_candidates(model: str) -> list[str]:
 def _free_image_response_models(requested_image_model: str, probe_model: str) -> list[str]:
     """Models accepted by free Build /responses for the image_generation tool.
 
-    Free cli-chat-proxy only exposes text models like grok-4.5 (resolved upstream
-    to grok-4.5-build-free). Image model ids such as grok-2-image return
-    "Model not found" on /responses.
+    Free cli-chat-proxy only hosts the grok-4.5 *chat* agent (upstream
+    grok-4.5-build-free). Passing image catalog ids (grok-2-image,
+    grok-imagine-image) to /responses returns "Model not found".
     """
     ordered: list[str] = []
     for candidate in (
         probe_model or DEFAULT_GROK_TEXT_MODEL,
         DEFAULT_GROK_TEXT_MODEL,
         "grok-4.5",
-        "grok-4",
-        "grok-3",
     ):
         name = str(candidate or "").strip()
         if name and name not in ordered:

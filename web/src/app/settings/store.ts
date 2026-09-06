@@ -370,7 +370,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isStartingImport: false,
 
   initialize: async () => {
-    await Promise.allSettled([get().loadConfig(), get().loadPools()]);
+    await get().loadConfig();
     const backup = get().config?.backup;
     const isConfigured = Boolean(
       String(backup?.account_id || "").trim()

@@ -86,6 +86,8 @@ OPENAI_API_ENDPOINTS = {
     "signup": f"{OPENAI_AUTH}/api/accounts/authorize/continue",
     "register": f"{OPENAI_AUTH}/api/accounts/user/register",
     "send_otp": f"{OPENAI_AUTH}/api/accounts/email-otp/send",
+    "send_passwordless_otp": f"{OPENAI_AUTH}/api/accounts/passwordless/send-otp",
+    "resend_otp": f"{OPENAI_AUTH}/api/accounts/email-otp/resend",
     "validate_otp": f"{OPENAI_AUTH}/api/accounts/email-otp/validate",
     "create_account": f"{OPENAI_AUTH}/api/accounts/create_account",
     "select_workspace": f"{OPENAI_AUTH}/api/accounts/workspace/select",
@@ -144,7 +146,10 @@ EMAIL_SERVICE_DEFAULTS = {
 # ============================================================================
 
 # 验证码相关
-OTP_CODE_PATTERN = r"(?:(?:code|otp|验证码|verification)[^0-9]{0,40})(\d{6})|(?<!\d)(\d{6})(?!\d)"
+OTP_CODE_PATTERN = (
+    r"(?:(?:code|otp|验证码|verification|認証コード|認証|검증|인증)[^0-9]{0,40})(\d{6})"
+    r"|(?<!\d)(\d{6})(?!\d)"
+)
 OTP_MAX_ATTEMPTS = 40  # 最大轮询次数
 
 # 验证码提取正则（增强版）
@@ -161,6 +166,9 @@ OPENAI_EMAIL_SENDERS = [
     ".openai.com",     # 子域名匹配（如 otp@tm1.openai.com）
 ]
 
+# tm1.openai.com 影子发码：所有账号都返回固定 OTP，validate 必 401。
+SHADOW_OTP_CODES = frozenset({"493682"})
+
 # OpenAI 验证邮件关键词
 OPENAI_VERIFICATION_KEYWORDS = [
     "verify your email",
@@ -169,6 +177,11 @@ OPENAI_VERIFICATION_KEYWORDS = [
     "your openai code",
     "code is",
     "one-time code",
+    "認証コード",
+    "検証コード",
+    "確認コード",
+    "인증 코드",
+    "확인 코드",
 ]
 
 # 密码生成

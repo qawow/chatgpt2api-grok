@@ -73,12 +73,9 @@ def load_all() -> None:
     if _loaded:
         return
 
-    import providers.captcha
-    import providers.proxy
-    import providers.sms
     import providers.mailbox
 
-    for package in (providers.captcha, providers.proxy, providers.sms, providers.mailbox):
+    for package in (providers.mailbox,):
         for _finder, name, _ispkg in pkgutil.iter_modules(
             package.__path__, package.__name__ + "."
         ):

@@ -5,7 +5,7 @@
 > [!IMPORTANT]
 > **chatgpt2api-grok 二开部署请优先看 [operations.md](./operations.md)。**  
 > 必须使用 `docker-compose.local.yml` **本地构建**，不要默认 `docker compose up` 拉  
-> `ghcr.io/basketikun/chatgpt2api:latest`，否则没有 Grok 号池 / G2A / GPT 注册机。
+> `ghcr.io/basketikun/chatgpt2api:latest`，否则没有 Grok 号池 / GPT 注册机。
 
 ## 部署前准备
 
@@ -36,7 +36,6 @@ git --version
 | 路径 | 作用 |
 | --- | --- |
 | `data/grok_accounts.json` | Grok 号池 |
-| `data/g2a_config.json` | grokcli2api-go 连接 |
 | `data/gpt_register.env` | GPT 注册 CFD1/代理密钥 |
 | `data/gpt_register_config.json` | 注册表单 |
 | `data/register_engines.db` | 注册机 provider 表（可重建） |
@@ -75,7 +74,7 @@ curl -s http://127.0.0.1:8000/api/gpt-register/settings -H "Authorization: Beare
 
 ## 方式一：普通 Docker 部署（上游官方镜像）
 
-适合**不需要**本仓库 Grok / G2A / GPT 注册改动、且不需要 WARP 的场景。
+适合**不需要**本仓库 Grok / GPT 注册改动、且不需要 WARP 的场景。
 
 ```bash
 git clone git@github.com:basketikun/chatgpt2api.git

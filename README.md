@@ -2,14 +2,12 @@
 
 <p align="center">
   基于 <a href="https://github.com/basketikun/chatgpt2api">basketikun/chatgpt2api</a> 的二次开发分支：<br/>
-  保留原版 ChatGPT 号池 / 生图能力，并新增<strong>独立 Grok 号池</strong>与
-  <a href="https://github.com/Futureppo/grokcli2api-go">grokcli2api-go</a> 设置页接入。
+  保留原版 ChatGPT 号池 / 生图能力，并新增<strong>独立 Grok 号池</strong>。
 </p>
 
 <p align="center">
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
-  <a href="./docs/g2a-bridge.md">GrokCLI2API 桥</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/operations.md">运维与调用</a> ·
   <a href="./docs/deployment.md">部署说明</a>
@@ -18,7 +16,7 @@
 > [!IMPORTANT]
 > **这是二开仓库，不是官方镜像。**
 > 部署时直接拉本仓库 GitHub Actions 构建的镜像：`ghcr.io/qawow/chatgpt2api:latest`。
-> 不要使用 `ghcr.io/basketikun/chatgpt2api:latest`（上游官方镜像，丢掉 Grok / G2A / GPT 注册改动）。
+> 不要使用 `ghcr.io/basketikun/chatgpt2api:latest`（上游官方镜像，丢掉 Grok / GPT 注册改动）。
 > 本地改源码构建用 `docker-compose.local.yml`。
 
 ## 本分支相对上游新增
@@ -27,9 +25,8 @@
 | --- | --- |
 | 独立 Grok 号池 | `data/grok_accounts.json`，管理接口 `/api/grok/accounts*`，与 ChatGPT 号池完全隔离 |
 | Grok 上游 | 默认 `cli-chat-proxy.grok.com`（Build/CLI），刷新走 `auth.x.ai` |
-| 生图分流 | `model=grok-2-image` / `grok-imagine` 走 Grok 池；另有 `/v1/grok/images/generations` |
+| 生图分流 | `model=grok-imagine-image` / `grok-2-image` 走 Grok 池；`grok-4.5` 是对话模型，不走生图 |
 | 文本探活 | `/v1/grok/chat/completions`（内部映射 Build `/responses`） |
-| 远程网关 | 设置页「Codex2API」：对接 [james-6-23/codex2api](https://github.com/james-6-23/codex2api) 的 `/v1/images/*` 与 `/api/admin/accounts` |
 | GPT Free 批量注册 | 设置页「GPT注册」：内置 `gpt_free_register` 纯协议注册 free 号并入库 ChatGPT 号池；入库后自动刷新额度；无 refresh 的 session 号标 fragile |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
 
@@ -92,9 +89,6 @@ export KEY='你的 auth-key'
 curl -s http://127.0.0.1:8000/api/grok/accounts \
   -H "Authorization: Bearer $KEY"
 
-curl -s http://127.0.0.1:8000/api/g2a/servers \
-  -H "Authorization: Bearer $KEY"
-
 curl -s http://127.0.0.1:8000/api/gpt-register/settings \
   -H "Authorization: Bearer $KEY"
 ```
@@ -120,15 +114,7 @@ curl -s -X POST http://127.0.0.1:8000/api/grok/accounts \
   -d '{"accounts":[{ ...cliproxy json... }]}'
 ```
 
-### 5. 对接 grokcli2api-go（可选）
-
-1. 远端启用 `GROK_ADMIN_KEY`（默认端口 `8088`）  
-2. Web 设置 → **GrokCLI2API** → 添加连接（base URL + Admin Key）  
-3. 探测连通 → **推送本地 Grok 号池**
-
-说明：远程 `GET /v1/admin/credentials` **不含 token**，只能「本地 → 远程」推送，不能反向拉号。详见 [docs/g2a-bridge.md](./docs/g2a-bridge.md)。
-
-### 6. GPT Free 批量注册（可选）
+### 5. GPT Free 批量注册（可选）
 
 1. 写 `data/gpt_register.env`（`CFD1_*`、`REGISTER_PROXY*` 等，勿提交 git）  
 2. Web 设置 → **GPT注册** → 填数量等 → 开始  
@@ -223,18 +209,15 @@ environment:
 - 兼容 `POST /v1/images/edits` 图片编辑接口
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
-- `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
-  `gpt-5-mini`；本地 Grok 号池或远程 G2A 生图代理就绪时还会注入 `grok-2-image` / `grok-imagine` / `grok-4.5` 等
+- `GET /v1/models` 只返回生图模型：`gpt-image-2`、`codex-gpt-image-2`（及 plus/team/pro 前缀）；本地 Grok 号池非空时注入 `grok-2-image` / `grok-imagine-image` / `grok-imagine`。**不暴露对话模型**（gpt-5* / auto / grok-4.5）
 - 支持通过 `n` 返回多张生成结果
-- 支持生成可编辑 PPT 文件
-- 支持生成可编辑 PSD 文件
 - 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
   `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
 
 ### 在线画图功能
 
 - 内置在线画图工作台，支持生成、图片编辑与多图组图编辑
-- 支持 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` 模型选择
+- 支持 `gpt-image-2`、`codex-gpt-image-2`；Grok 号池非空时还有 `grok-*-image*` / `grok-imagine`
 - 若 Grok 号池非空，模型列表也会出现 `grok-*-image*` / `grok-imagine`
 - 编辑模式支持参考图上传
 - 前端支持多图生成交互
@@ -253,8 +236,7 @@ environment:
 - 支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理
 - 支持 WARP / FlareSolverr 稳定代理运行时
 - 支持搜索、筛选、批量刷新、导出、手动编辑和清理账号
-- 支持四种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、`access_token` 导入
-- 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
+- 支持 `access_token` / 本地 JSON 导入，以及内置 GPT Free 协议注册入库
 
 ### Grok 号池（独立）
 
@@ -264,12 +246,10 @@ environment:
 - 生图：
   - `POST /v1/images/generations` + `model=grok-2-image|grok-imagine`（model 分流）
   - `POST /v1/grok/images/generations`（强制 Grok 池）
-  - G2A 优先：远程 `POST /v1/responses` + `image_generation` 工具（grokcli2api-go 0.4.x；无 Images API）
-  - 本地回退：免费 Build 同路径；**永不**落入 ChatGPT 号池
-- 文本：`POST /v1/grok/chat/completions`
-- 模型列表：`GET /v1/grok/models`；本地池或 G2A 代理就绪时也会注入总 `GET /v1/models`
-- 设置页对接 [grokcli2api-go](https://github.com/Futureppo/grokcli2api-go)：`/api/g2a/servers*`
-- 文档：[docs/grok-pool.md](./docs/grok-pool.md)、[docs/g2a-bridge.md](./docs/g2a-bridge.md)
+  - 本地免费 Build 路径；**永不**落入 ChatGPT 号池
+- 文本：已关闭（`POST /v1/grok/chat/completions` 返回 400）
+- 模型列表：`GET /v1/grok/models` 仅生图 id；本地池非空时注入总 `GET /v1/models`
+- 文档：[docs/grok-pool.md](./docs/grok-pool.md)
 
 ### GPT Free 批量注册
 
@@ -332,7 +312,7 @@ curl http://localhost:8000/v1/models \
 
 | 字段   | 说明                                                                                                         |
 |:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` |
+| 返回模型 | 仅生图：`gpt-image-2`、`codex-gpt-image-2`（及订阅前缀）、Grok 池非空时 `grok-imagine-image` / `grok-2-image` |
 | 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
 
 <br>
@@ -423,7 +403,7 @@ curl http://localhost:8000/v1/images/edits \
 <summary><code>POST /v1/chat/completions</code></summary>
 <br>
 
-面向文本、网页搜索与图片场景的 Chat Completions 兼容接口，不是完整通用聊天代理。
+仅面向**生图**的 Chat Completions 兼容接口。文本模型已关闭。
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -447,12 +427,10 @@ curl http://localhost:8000/v1/chat/completions \
 
 | 字段                   | 说明                                                                           |
 |:---------------------|:-----------------------------------------------------------------------------|
-| `model`              | 文本、搜索或图片模型；搜索模型会触发网页搜索兼容逻辑                                                   |
-| `messages`           | 消息数组，支持文本、搜索和图片请求内容                                                          |
-| `n`                  | 图片生成数量，按当前实现解析为图片数量                                                          |
-| `stream`             | 文本、搜索和图片场景均支持，仍在测试                                                           |
-| `tools`              | 文本场景支持 `web_search` / `web_search_preview` / `web_search_preview_2025_03_11` |
-| `web_search_options` | 传入时会触发网页搜索兼容逻辑                                                               |
+| `model`              | 生图模型：`gpt-image-2` / `codex-gpt-image-2` / `grok-2-image` |
+| `messages`           | 消息数组，从中解析生图提示词 |
+| `n`                  | 图片生成数量 |
+| `stream`             | 可选 |
 
 <br>
 </details>
@@ -462,14 +440,14 @@ curl http://localhost:8000/v1/chat/completions \
 <summary><code>POST /v1/responses</code></summary>
 <br>
 
-面向文本、网页搜索和图片生成工具调用的 Responses API 兼容接口，不是完整通用 Responses API 代理。
+仅面向**生图工具**的 Responses 兼容接口。纯文本请求返回 400。
 
 ```bash
 curl http://localhost:8000/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
-    "model": "gpt-5",
+    "model": "gpt-image-2",
     "input": "生成一张未来感城市天际线图片",
     "tools": [
       {
@@ -485,10 +463,10 @@ curl http://localhost:8000/v1/responses \
 
 | 字段       | 说明                                                                                      |
 |:---------|:----------------------------------------------------------------------------------------|
-| `model`  | 响应中会回显该模型字段，搜索和图片生成会走对应兼容逻辑                                                             |
-| `input`  | 输入内容；搜索使用最后一条用户文本，图片生成需能解析出提示词                                                          |
-| `tools`  | 支持 `image_generation`、`web_search`、`web_search_preview`、`web_search_preview_2025_03_11` |
-| `stream` | 已实现，但仍在测试                                                                               |
+| `model`  | 生图模型 |
+| `input`  | 提示词 |
+| `tools`  | 需含 `image_generation` |
+| `stream` | 已实现，但仍在测试 |
 
 <br>
 </details>

@@ -223,11 +223,13 @@ def register_chatgpt_once(
         ("CFD1_DATABASE_ID", "cfd1_database_id"),
         ("CFD1_LOCAL_PART_PREFIX", "cfd1_local_part_prefix"),
         ("CFD1_LOCAL_PART_LENGTH", "cfd1_local_part_length"),
-        ("REGISTER_PROXY", "proxy"),
     ):
         val = _clean(cfg.get(cfg_key))
         if val:
             os.environ[env_key] = val
+    # Per-account proxy is passed via RegisterConfig, not os.environ.
+    # Writing REGISTER_PROXY here races when the batch job uses a proxy pool
+    # with concurrency > 1 (gpt-auto-register auto_loop lesson).
 
     # skip_codex: free accounts almost always hit add_phone on Codex path.
     # Default True (OPENAI_SKIP_CODEX=1) so NextAuth session_only is used without a second OTP.
@@ -286,12 +288,14 @@ def register_chatgpt_once(
         extra=extra,
     )
 
-    # Cloudflare D1 / Email Routing APIs are independent of OpenAI egress.
-    # Forcing the register proxy here often causes read timeouts (seen on SOCKS)
-    # and is unnecessary for mail polling. Keep proxy only for OpenAI protocol.
-    mailbox_proxy = None
-    if mail_provider not in {"cloudflare_d1_api", "cloudflare_d1", "cfd1"}:
-        mailbox_proxy = proxy
+    # This host often cannot reach api.cloudflare.com directly. Use the register
+    # SOCKS for D1 as well; CFD1_PROXY overrides. Factory must not fall back to
+    # REGISTER_PROXY_DEFAULT (a dead SOCKS eats the whole OTP window).
+    mailbox_proxy = proxy
+    if mail_provider in {"cloudflare_d1_api", "cloudflare_d1", "cfd1"}:
+        override = str(os.environ.get("CFD1_PROXY") or "").strip()
+        if override:
+            mailbox_proxy = override
     mailbox = _create_mailbox(mail_provider, extra, mailbox_proxy)
     platform_cls = get_platform("chatgpt")
     platform = platform_cls(config=config, mailbox=mailbox)

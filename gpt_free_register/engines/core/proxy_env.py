@@ -54,10 +54,27 @@ def _first_env(*keys: str) -> str:
     return ""
 
 
+def normalize_proxy_url(proxy: Optional[str]) -> Optional[str]:
+    """Normalize proxy URLs for curl_cffi.
+
+    `socks5://` uses local DNS; `socks5h://` sends DNS through the proxy, which
+    avoids TLS handshake flakes when the local resolver and egress disagree.
+    """
+    if proxy is None:
+        return None
+    value = str(proxy).strip()
+    if not value:
+        return None
+    lowered = value.lower()
+    if lowered.startswith("socks5://") and not lowered.startswith("socks5h://"):
+        return "socks5h://" + value[len("socks5://"):]
+    return value
+
+
 def resolve_proxy(explicit: Optional[str] = None, *, allow_default: bool = True) -> Optional[str]:
     if explicit is not None:
         value = str(explicit).strip()
-        return value or None
+        return normalize_proxy_url(value or None)
 
     env_proxy = _first_env(
         "REGISTER_PROXY",
@@ -70,7 +87,7 @@ def resolve_proxy(explicit: Optional[str] = None, *, allow_default: bool = True)
         "http_proxy",
     )
     if env_proxy:
-        return env_proxy
+        return normalize_proxy_url(env_proxy)
 
     if not allow_default:
         return None
@@ -81,13 +98,14 @@ def resolve_proxy(explicit: Optional[str] = None, *, allow_default: bool = True)
     if disabled:
         return None
 
-    return _first_env("REGISTER_PROXY_DEFAULT") or None
+    return normalize_proxy_url(_first_env("REGISTER_PROXY_DEFAULT") or None)
 
 
 def proxy_dict(proxy: Optional[str]) -> Optional[dict]:
-    if not proxy:
+    value = normalize_proxy_url(proxy)
+    if not value:
         return None
-    return {"http": proxy, "https": proxy}
+    return {"http": value, "https": value}
 
 
 def mask_proxy(proxy: Optional[str]) -> str:

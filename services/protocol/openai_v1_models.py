@@ -3,30 +3,35 @@ from __future__ import annotations
 from typing import Any
 
 from services.account_service import account_service
-from services.g2a_service import g2a_bridge
 from services.grok_account_service import grok_account_service
-from services.openai_backend_api import OpenAIBackendAPI
-from utils.grok_models import DEFAULT_GROK_TEXT_MODEL, GROK_IMAGE_MODELS
+from utils.grok_models import GROK_IMAGE_MODELS
 from utils.helper import CODEX_IMAGE_MODEL
 
 
+def reset_models_cache() -> None:
+    """Kept for tests; public catalog is local image models only."""
+    return
+
+
+def _model_entry(model_id: str, owned_by: str = "chatgpt2api") -> dict[str, Any]:
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": owned_by,
+        "permission": [],
+        "root": model_id,
+        "parent": None,
+    }
+
+
 def list_models() -> dict[str, Any]:
-    backend = OpenAIBackendAPI()
-    try:
-        result = backend.list_models()
-    finally:
-        backend.close()
-    data = result.get("data")
-    if not isinstance(data, list):
-        return result
-    seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
+    """Public catalog is image-only. Text models (gpt-5*, grok-4.5, auto) are not exposed."""
+    data: list[dict[str, Any]] = []
+    seen: set[str] = set()
     dynamic_models: set[str] = set()
     accounts = account_service.list_accounts()
-    web_image_accounts = [
-        account
-        for account in accounts
-        if isinstance(account, dict)
-    ]
+    web_image_accounts = [account for account in accounts if isinstance(account, dict)]
     codex_types = {
         normalized
         for account in accounts
@@ -48,30 +53,12 @@ def list_models() -> dict[str, Any]:
 
     for model in sorted(dynamic_models):
         if model not in seen:
-            data.append({
-                "id": model,
-                "object": "model",
-                "created": 0,
-                "owned_by": "chatgpt2api",
-                "permission": [],
-                "root": model,
-                "parent": None,
-            })
+            data.append(_model_entry(model))
             seen.add(model)
 
-    # Grok models: local pool OR remote G2A image proxy (same gate as /v1/grok/models).
-    # Remote-only setups have 0 local accounts but can still serve grok-*image* via G2A.
-    if grok_account_service.count() > 0 or g2a_bridge.has_image_proxy():
-        for model in sorted(GROK_IMAGE_MODELS | {DEFAULT_GROK_TEXT_MODEL}):
+    if grok_account_service.count() > 0:
+        for model in sorted(GROK_IMAGE_MODELS):
             if model not in seen:
-                data.append({
-                    "id": model,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "grok",
-                    "permission": [],
-                    "root": model,
-                    "parent": None,
-                })
+                data.append(_model_entry(model, owned_by="grok"))
                 seen.add(model)
-    return result
+    return {"object": "list", "data": data}

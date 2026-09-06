@@ -5,7 +5,13 @@ import unittest
 from unittest import mock
 
 from services.config import config
-from services.openai_backend_api import OpenAIBackendAPI
+from types import SimpleNamespace
+
+from services.openai_backend_api import (
+    OpenAIBackendAPI,
+    image_poll_sleep_secs,
+    reset_pow_bootstrap_cache,
+)
 from services.protocol.conversation import ImageOutput, extract_conversation_ids
 from services.protocol.openai_v1_response import stream_image_response
 
@@ -34,8 +40,13 @@ class FakeBackend(OpenAIBackendAPI):
     def __init__(self, conversations: list[dict] | None = None) -> None:
         self.conversations = conversations or []
         self.calls = 0
+        self.task_calls = 0
         self.file_urls: dict[str, str] = {}
         self.sediment_urls: dict[str, str] = {}
+
+    def _query_backend_tasks(self, conversation_id: str = "", task_id: str = "", timeout_secs: float = 30.0):
+        self.task_calls += 1
+        return []
 
     def _get_conversation(self, conversation_id: str) -> dict:
         self.calls += 1
@@ -119,7 +130,16 @@ class MultiImageResultTests(unittest.TestCase):
         ])
 
         with (
-            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0, "image_poll_interval_secs": 0.5}),
+            mock.patch.dict(
+                config.data,
+                {
+                    "image_poll_initial_wait_secs": 0,
+                    "image_poll_interval_secs": 0.5,
+                    "image_settle_enabled": True,
+                    "image_check_before_hit_enabled": True,
+                    "image_settle_secs": 0.01,
+                },
+            ),
             mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
         ):
             file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=10)
@@ -127,6 +147,32 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(file_ids, ["file-one", "file-two"])
         self.assertEqual(sediment_ids, ["sed-one"])
         self.assertEqual(backend.calls, 3)
+
+    def test_poll_skips_tasks_probe_when_budget_is_healthy(self) -> None:
+        backend = FakeBackend([_conversation(["file-ready"])])
+        with (
+            mock.patch.dict(
+                config.data,
+                {
+                    "image_poll_initial_wait_secs": 0,
+                    "image_poll_interval_secs": 0.5,
+                    "image_settle_enabled": False,
+                    "image_check_before_hit_enabled": False,
+                },
+            ),
+            mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
+        ):
+            file_ids, _sediment = backend._poll_image_results("conv-1", timeout_secs=120)
+
+        self.assertEqual(file_ids, ["file-ready"])
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(backend.task_calls, 0)
+
+    def test_image_poll_sleep_is_faster_early(self) -> None:
+        self.assertEqual(image_poll_sleep_secs(12, 10), 4.0)
+        self.assertEqual(image_poll_sleep_secs(30, 10), 7.0)
+        self.assertEqual(image_poll_sleep_secs(50, 10), 10.0)
+        self.assertEqual(image_poll_sleep_secs(12, 2), 2.0)
 
     def test_resolver_uses_file_and_sediment_urls(self) -> None:
         backend = FakeBackend()
@@ -174,6 +220,39 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual([event["output_index"] for event in done_events], [0, 1])
         self.assertEqual([item["result"] for item in completed["output"]], [first, second])
+
+
+class PowBootstrapCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_pow_bootstrap_cache()
+
+    def tearDown(self) -> None:
+        reset_pow_bootstrap_cache()
+
+    def test_second_bootstrap_skips_homepage_get(self) -> None:
+        html = (
+            '<html data-build="prod-abc"><script src="'
+            'https://chatgpt.com/backend-api/sentinel/sdk.js"></script></html>'
+        )
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.gets = 0
+
+            def get(self, url, **kwargs):
+                self.gets += 1
+                return SimpleNamespace(status_code=200, text=html, headers={})
+
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.com"
+        backend.session = FakeSession()
+        backend._bootstrap_headers = lambda: {}  # type: ignore[method-assign]
+        backend._bootstrap()
+        first_sources = list(backend.pow_script_sources)
+        backend._bootstrap()
+        self.assertEqual(backend.session.gets, 1)
+        self.assertEqual(backend.pow_script_sources, first_sources)
+        self.assertTrue(any("sdk.js" in src for src in backend.pow_script_sources))
 
 
 if __name__ == "__main__":

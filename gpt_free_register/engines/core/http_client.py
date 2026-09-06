@@ -13,11 +13,129 @@ import logging
 from curl_cffi import requests as cffi_requests
 from curl_cffi.requests import Session, Response
 
+from core.proxy_env import normalize_proxy_url
+
 
 
 
 
 logger = logging.getLogger(__name__)
+
+# Proxy-path TLS handshake drops (curl 35) happen before any HTTP status exists.
+# Retry the same session so cookies / oai-did survive; rebuilding the session
+# after warmup is a common source of authorize/continue 409 invalid_state.
+_TLS_HANDSHAKE_MARKERS = (
+    "curl: (35)",
+    "tls connect error",
+    "openssl_internal",
+    "sslerror",
+    "ssl handshake",
+)
+
+# GET/HEAD only: empty reply / recv reset on a flaky proxy. POST retries can
+# double-submit create_account / OTP. From gpt-free-register follow_authorize.
+_GET_TRANSPORT_MARKERS = (
+    "curl: (52)",
+    "curl: (56)",
+    "curl: (28)",
+    "curl: (7)",
+    "empty reply from server",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "wrong_version_number",
+    "proxyerror",
+    "operation timed out",
+)
+
+
+def is_tls_handshake_error(exc: BaseException) -> bool:
+    msg = str(exc or "").lower()
+    return any(marker in msg for marker in _TLS_HANDSHAKE_MARKERS)
+
+
+def is_get_transport_error(exc: BaseException) -> bool:
+    if is_tls_handshake_error(exc):
+        return True
+    msg = str(exc or "").lower()
+    return any(marker in msg for marker in _GET_TRANSPORT_MARKERS)
+
+
+class TlsRetrySession:
+    """Proxy a curl_cffi Session so GET/POST retry TLS handshake drops in-place."""
+
+    def __init__(self, inner: Any, retries: int = 2, backoff: float = 1.2):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_retries", max(0, int(retries)))
+        object.__setattr__(self, "_backoff", float(backoff))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"_inner", "_retries", "_backoff"}:
+            object.__setattr__(self, name, value)
+            return
+        setattr(object.__getattribute__(self, "_inner"), name, value)
+
+    def __iter__(self):
+        return iter(object.__getattribute__(self, "_inner"))
+
+    def _call_with_retry(self, method: str, *args: Any, **kwargs: Any):
+        inner = object.__getattribute__(self, "_inner")
+        retries = object.__getattribute__(self, "_retries")
+        backoff = object.__getattribute__(self, "_backoff")
+        fn = getattr(inner, method)
+        last_exc: Optional[BaseException] = None
+        for attempt in range(retries + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                method_l = str(method or "").lower()
+                retry_tls = is_tls_handshake_error(exc)
+                retry_get = method_l in {"get", "head"} and is_get_transport_error(exc)
+                if (not retry_tls and not retry_get) or attempt >= retries:
+                    raise
+                wait = backoff * (attempt + 1)
+                url = args[0] if args else kwargs.get("url", "?")
+                logger.warning(
+                    "%s dropped, retrying same session in %.1fs (%d/%d): %s",
+                    "TLS handshake" if retry_tls else "GET transport",
+                    wait,
+                    attempt + 1,
+                    retries,
+                    str(url)[:80],
+                )
+                time.sleep(wait)
+        raise last_exc or RuntimeError("TLS retry exhausted")
+
+    def get(self, *args: Any, **kwargs: Any):
+        return self._call_with_retry("get", *args, **kwargs)
+
+    def post(self, *args: Any, **kwargs: Any):
+        return self._call_with_retry("post", *args, **kwargs)
+
+    def put(self, *args: Any, **kwargs: Any):
+        return self._call_with_retry("put", *args, **kwargs)
+
+    def delete(self, *args: Any, **kwargs: Any):
+        return self._call_with_retry("delete", *args, **kwargs)
+
+    def head(self, *args: Any, **kwargs: Any):
+        return self._call_with_retry("head", *args, **kwargs)
+
+    def patch(self, *args: Any, **kwargs: Any):
+        return self._call_with_retry("patch", *args, **kwargs)
+
+    def request(self, *args: Any, **kwargs: Any):
+        return self._call_with_retry("request", *args, **kwargs)
+
+
+def wrap_session_tls_retry(session: Any, retries: int = 2, backoff: float = 1.2) -> Any:
+    if isinstance(session, TlsRetrySession):
+        return session
+    return TlsRetrySession(session, retries=retries, backoff=backoff)
 
 
 @dataclass
@@ -57,14 +175,14 @@ class HTTPClient:
             config: 请求配置
             session: 可重用的会话对象
         """
-        self.proxy_url = proxy_url
+        self.proxy_url = normalize_proxy_url(proxy_url)
         self.config = config or RequestConfig()
         # runtime override for TLS fingerprint (e.g. HTTP_IMPERSONATE=chrome136)
         import os as _os
         env_imp = str(_os.environ.get("HTTP_IMPERSONATE") or _os.environ.get("CURL_CFFI_IMPERSONATE") or "").strip()
         if env_imp:
             self.config.impersonate = env_imp
-        self._session = session
+        self._session = wrap_session_tls_retry(session) if session is not None else None
 
     @property
     def proxies(self) -> Optional[Dict[str, str]]:
@@ -84,16 +202,27 @@ class HTTPClient:
     def session(self) -> Session:
         """获取会话对象（单例）"""
         if self._session is None:
-            self._session = Session(
+            raw = Session(
                 proxies=self.proxies,
                 impersonate=self.config.impersonate,
                 verify=self.config.verify_ssl,
                 timeout=self.config.timeout
             )
             try:
-                self._apply_default_session_headers(self._session)
+                raw.trust_env = False
             except Exception:
                 pass
+            if not self.proxy_url:
+                try:
+                    # Prevent leftover HTTP(S)_PROXY from leaking into libcurl.
+                    raw.proxies = {"http": "", "https": ""}
+                except Exception:
+                    pass
+            try:
+                self._apply_default_session_headers(raw)
+            except Exception:
+                pass
+            self._session = wrap_session_tls_retry(raw)
         return self._session
 
     def request(

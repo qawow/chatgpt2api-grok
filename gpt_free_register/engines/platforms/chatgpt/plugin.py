@@ -61,8 +61,6 @@ class ChatGPTPlatform(BasePlatform):
         "refresh_token",    # Refresh auth token
         "generate_link",    # Generate payment link
         "switch_desktop",   # Switch to Codex desktop
-        "upload_cpa",       # Upload to CPA system
-        "upload_tm",        # Upload to Team Manager
     ]
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
@@ -158,20 +156,14 @@ class ChatGPTPlatform(BasePlatform):
         )
 
     def build_browser_registration_adapter(self):
+        def _removed(*_a, **_k):
+            raise RuntimeError("浏览器注册已移除，请使用 protocol + mailbox")
+
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_chatgpt_result(result),
-            browser_worker_builder=lambda ctx, artifacts: __import__("platforms.chatgpt.browser_register", fromlist=["ChatGPTBrowserRegister"]).ChatGPTBrowserRegister(
-                headless=(ctx.executor_type == "headless"),
-                proxy=ctx.proxy,
-                otp_callback=artifacts.otp_callback,
-                phone_callback=artifacts.phone_callback,
-                log_fn=ctx.log,
-            ),
-            browser_register_runner=lambda worker, ctx, artifacts: worker.run(
-                email=ctx.identity.email or "",
-                password=ctx.password or "",
-            ),
-            oauth_runner=self._run_protocol_oauth,
+            browser_worker_builder=_removed,
+            browser_register_runner=_removed,
+            oauth_runner=None,
             capability=RegistrationCapability(oauth_headless_requires_browser_reuse=True),
             otp_spec=OtpSpec(wait_message="等待验证码...", timeout=600),
         )
@@ -235,16 +227,6 @@ class ChatGPTPlatform(BasePlatform):
                   "options": ["US","SG","TR","HK","JP","GB","AU","CA"]},
                  {"key": "plan", "label": "套餐", "type": "select",
                   "options": ["plus", "team"]},
-             ]},
-            {"id": "upload_cpa", "label": "上传 CPA",
-             "params": [
-                 {"key": "api_url", "label": "CPA API URL", "type": "text"},
-                 {"key": "api_key", "label": "CPA API Key", "type": "text"},
-             ]},
-            {"id": "upload_tm", "label": "上传 Team Manager",
-             "params": [
-                 {"key": "api_url", "label": "TM API URL", "type": "text"},
-                 {"key": "api_key", "label": "TM API Key", "type": "text"},
              ]},
         ]
 
@@ -318,19 +300,6 @@ class ChatGPTPlatform(BasePlatform):
             if remote_state.get("refresh_token"):
                 data["refresh_token"] = remote_state["refresh_token"]
             return {"ok": True, "data": data}
-
-        if action_id == "upload_cpa":
-            from platforms.chatgpt.cpa_upload import upload_to_cpa, generate_token_json
-            token_data = generate_token_json(a)
-            ok, msg = upload_to_cpa(token_data, api_url=params.get("api_url"),
-                                    api_key=params.get("api_key"))
-            return {"ok": ok, "data": msg}
-
-        if action_id == "upload_tm":
-            from platforms.chatgpt.cpa_upload import upload_to_team_manager
-            ok, msg = upload_to_team_manager(a, api_url=params.get("api_url"),
-                                             api_key=params.get("api_key"))
-            return {"ok": ok, "data": msg}
 
         raise NotImplementedError(f"Unknown action: {action_id}")
 
