@@ -1,6 +1,5 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useImperativeHandle, useRef, useState, type ChangeEvent, type Ref } from "react";
 import {
   ArrowLeft,
@@ -12,7 +11,6 @@ import {
   KeyRound,
   LoaderCircle,
   LogIn,
-  ServerCog,
   Upload,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -188,7 +186,6 @@ function MethodCard({
 }
 
 export function AccountImportDialog({ disabled, onImported, dialogRef }: AccountImportDialogProps) {
-  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [method, setMethod] = useState<ImportMethod>("menu");
   const [tokenInput, setTokenInput] = useState("");
@@ -808,26 +805,6 @@ export function AccountImportDialog({ disabled, onImported, dialogRef }: Account
           description="支持本项目导出的单账号 JSON 或全部账号数组，也兼容 CPA JSON 文件。"
           icon={Files}
           onClick={() => setMethod("account-json")}
-        />
-        <MethodCard
-          title="从远程 CPA 服务器导入"
-          description="前往设置页面配置远程 CPA 服务器后再执行导入。"
-          icon={Files}
-          onClick={() => {
-            setOpen(false);
-            resetState();
-            router.push("/settings");
-          }}
-        />
-        <MethodCard
-          title="从 Sub2API 服务器导入"
-          description="前往设置页面配置 Sub2API 服务器，再选择其中的 OpenAI 账号导入。"
-          icon={ServerCog}
-          onClick={() => {
-            setOpen(false);
-            resetState();
-            router.push("/settings");
-          }}
         />
       </div>
     );

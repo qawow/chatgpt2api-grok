@@ -80,20 +80,6 @@ STANDARD_CAPABILITIES: Dict[str, CapabilityDefinition] = {
         ui_hints={"inline": True, "priority": 5}
     ),
     
-    "upload_cpa": CapabilityDefinition(
-        id="upload_cpa",
-        label="上传至 CPA",
-        description="Upload account to CPA system",
-        category="integration",
-        icon="upload",
-        requires_params=True,
-        param_schema=[
-            {"key": "api_url", "label": "CPA API URL", "type": "text"},
-            {"key": "api_key", "label": "CPA API Key", "type": "text"},
-        ],
-        ui_hints={"inline": False, "priority": 6}
-    ),
-    
     "upload_tm": CapabilityDefinition(
         id="upload_tm",
         label="上传至 Team Manager",

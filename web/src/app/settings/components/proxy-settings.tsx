@@ -112,7 +112,7 @@ export function ProxySettingsCard() {
             <div>
               <h2 className="text-lg font-semibold tracking-tight">上游代理配置</h2>
               <p className="text-sm text-stone-500">
-                为 chatgpt.com 的请求配置出网代理，适合国内服务器部署；Sub2API / CPA 请求不受影响。
+                为 chatgpt.com 的请求配置出网代理，适合国内服务器部署。
               </p>
             </div>
           </div>

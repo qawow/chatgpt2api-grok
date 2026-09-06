@@ -4,8 +4,9 @@
 
 > [!IMPORTANT]
 > **chatgpt2api-grok 二开部署请优先看 [operations.md](./operations.md)。**  
-> 必须使用 `docker-compose.local.yml` **本地构建**，不要默认 `docker compose up` 拉  
-> `ghcr.io/basketikun/chatgpt2api:latest`，否则没有 Grok 号池 / GPT 注册机。
+> 部署机拉本仓库 GitHub Actions 镜像：`ghcr.io/qawow/chatgpt2api`。  
+> 不要用 `ghcr.io/basketikun/chatgpt2api:latest`（上游官方镜像，没有 Grok 号池 / GPT 注册机）。  
+> 本地改源码再用 `docker-compose.local.yml` 构建。
 
 ## 部署前准备
 
@@ -52,7 +53,9 @@ mkdir -p data
 # 可选：配置 GPT 注册密钥
 # cp 你的密钥到 data/gpt_register.env
 
-docker compose -f docker-compose.local.yml up -d --build
+docker compose pull
+docker compose up -d
+# 本地改源码：docker compose -f docker-compose.local.yml up -d --build
 ```
 
 访问：

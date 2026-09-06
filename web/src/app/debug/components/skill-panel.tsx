@@ -22,17 +22,17 @@ export function SkillPanel() {
 
   const apiBaseUrl = configuredBaseUrl || webConfig.apiUrl.replace(/\/$/, "") || browserBaseUrl;
   const skillZh = useMemo(() => `---
-name: chatgpt2api-search
-description: 当用户需要联网搜索、查询最新信息、核实事实或需要来源链接时，调用本地 chatgpt2api 搜索接口。
+name: chatgpt2api-image
+description: 当用户需要生成或编辑图片时，调用本地 chatgpt2api 生图接口。
 ---
 
-# ChatGPT2API 搜索
+# ChatGPT2API 生图
 
-当用户要求联网搜索、查询最新信息、核实资料、查新闻、查价格、查文档更新或需要来源链接时，使用这个 skill。
+当用户要求生成图片、改图、出海报或插画时，使用这个 skill。当前服务只开放生图模型，不要调用搜索或纯文本聊天接口。
 
 ## 接口
 
-POST ${apiBaseUrl}/v1/search
+POST ${apiBaseUrl}/v1/images/generations
 
 Headers:
 
@@ -42,33 +42,33 @@ Content-Type: application/json
 Body:
 
 {
-  "prompt": "<用户要搜索的问题>"
+  "model": "gpt-image-2",
+  "prompt": "<用户的生图提示词>",
+  "n": 1,
+  "response_format": "b64_json"
 }
+
+可用模型：\`gpt-image-2\`、\`codex-gpt-image-2\`、\`grok-imagine-image\`、\`grok-2-image\`。
+
+改图使用 \`POST ${apiBaseUrl}/v1/images/edits\`，上传参考图并附带 prompt。
 
 ## 返回处理
 
-- 使用接口返回的 \`answer\` 作为主要回答。
-- 如果有 \`sources\`，在回答里附上来源链接。
+- 优先使用 \`data[].url\`；没有 URL 时再解码 \`data[].b64_json\`。
 - 如果接口报错，简要说明错误并询问是否重试。`, [apiBaseUrl, authKey]);
 
   const skillEn = useMemo(() => `---
-name: chatgpt2api-search
-description: Use when current web search is needed through this chatgpt2api server. Call the configured HTTP search endpoint with a prompt and return the answer with source URLs.
+name: chatgpt2api-image
+description: Use when the user needs image generation or image edits through this chatgpt2api server.
 ---
 
-# ChatGPT2API Search
+# ChatGPT2API Image
 
-Use this skill when the user asks for current web search, online lookup, recent information, or source-backed answers. It calls the local chatgpt2api search endpoint and returns an answer with source links.
-
-## When to use
-
-- The user asks to search the web, look something up, verify current information, or find the latest status.
-- The answer needs source URLs, recent details, prices, releases, docs, laws, schedules, or news.
-- Do not use it for purely local codebase questions unless the user explicitly asks for web search.
+Use this skill when the user asks to generate or edit images. This backend only exposes image models. Do not call search or plain-text chat endpoints.
 
 ## Request
 
-POST ${apiBaseUrl}/v1/search
+POST ${apiBaseUrl}/v1/images/generations
 
 Headers:
 
@@ -78,21 +78,26 @@ Content-Type: application/json
 JSON body:
 
 {
-  "prompt": "<search question>"
+  "model": "gpt-image-2",
+  "prompt": "<image prompt>",
+  "n": 1,
+  "response_format": "b64_json"
 }
+
+Models: \`gpt-image-2\`, \`codex-gpt-image-2\`, \`grok-imagine-image\`, \`grok-2-image\`.
+
+For edits, POST ${apiBaseUrl}/v1/images/edits with a reference image and prompt.
 
 ## Response handling
 
-- Use \`answer\` as the main response.
-- Include source URLs from \`sources\` when available.
-- If the endpoint returns an error, summarize the error and ask the user whether to retry.
-- Keep the final answer concise unless the user asks for detail.`, [apiBaseUrl, authKey]);
+- Prefer \`data[].url\`; otherwise decode \`data[].b64_json\`.
+- If the endpoint returns an error, summarize it and ask whether to retry.`, [apiBaseUrl, authKey]);
 
-  const zhPrompt = useMemo(() => `请帮我在本机安装一个用于联网搜索的 skill。
+  const zhPrompt = useMemo(() => `请帮我在本机安装一个用于本地生图的 skill。
 
 要求：
 1. 请按你当前环境的 skill 安装规范，把它安装成本地 skill。
-2. skill 名称为：chatgpt2api-search
+2. skill 名称为：chatgpt2api-image
 3. 文件名为：SKILL.md
 4. 如果你无法确定本地 skills 目录在哪里，先告诉我需要放到哪个目录，不要猜路径。
 5. 只创建或更新这个 skill 文件，不要修改其他无关文件。
@@ -104,11 +109,11 @@ SKILL.md 内容：
 ${skillZh}
 \`\`\``, [skillZh]);
 
-  const enPrompt = useMemo(() => `Please install a local web-search skill on this machine.
+  const enPrompt = useMemo(() => `Please install a local image-generation skill on this machine.
 
 Requirements:
 1. Install this as a local skill according to the skill installation rules of your current environment.
-2. Skill name: chatgpt2api-search
+2. Skill name: chatgpt2api-image
 3. File name: SKILL.md
 4. If you cannot determine the local skills directory, tell me which directory is required before writing files.
 5. Only create or update this skill file. Do not modify unrelated files.

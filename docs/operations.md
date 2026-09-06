@@ -1,6 +1,6 @@
 # 运维与维护（chatgpt2api-grok）
 
-面向本二开仓库的日常使用、升级、备份与排障。上游官方文档见原项目；**本仓库必须以本地镜像构建部署**。
+面向本二开仓库的日常使用、升级、备份与排障。上游官方文档见原项目。部署机优先拉本仓库 GitHub Actions 构建的镜像，不要用上游官方 `ghcr.io/basketikun/chatgpt2api`。
 
 ## 1. 正确部署方式
 
@@ -9,6 +9,13 @@ git clone https://github.com/qawow/chatgpt2api-grok.git
 cd chatgpt2api-grok
 # 配置 config.json 中 auth-key
 mkdir -p data
+docker compose pull
+docker compose up -d
+```
+
+本地改源码再构建：
+
+```bash
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
@@ -21,7 +28,7 @@ docker compose -f docker-compose.local.yml up -d --build
 
 **禁止：**
 
-- `docker compose up` 默认拉 `ghcr.io/basketikun/chatgpt2api:latest`（无 Grok / GPT 注册）
+- 拉 `ghcr.io/basketikun/chatgpt2api:latest`（上游官方镜像，无 Grok / GPT 注册）
 - 空挂载 `./gpt_free_register` 盖掉镜像内 builtin engines
 
 WARP 场景：
@@ -127,10 +134,10 @@ tar czf backup-$(date +%Y%m%d).tgz config.json data
 ```bash
 cd chatgpt2api-grok
 git pull
-docker compose -f docker-compose.local.yml up -d --build
-# 或 warp：
-# docker compose -f docker-compose.warp.yml up -d --build
-docker logs -f chatgpt2api-local   # 容器名以 compose 为准
+docker compose pull && docker compose up -d
+# 本地改源码：docker compose -f docker-compose.local.yml up -d --build
+# WARP：docker compose -f docker-compose.warp.yml up -d --build
+docker logs -f chatgpt2api   # 容器名以 compose 为准（local 构建是 chatgpt2api-local）
 ```
 
 检查：
@@ -143,7 +150,7 @@ curl -s "$BASE/api/gpt-register/settings" -H "Authorization: Bearer $KEY" | head
 ## 6. 日志与排障
 
 ```bash
-docker logs -f chatgpt2api-local
+docker logs -f chatgpt2api
 # 过滤注册机 stdout：grep gpt-register
 
 # 设置页 GPT注册：logs / items / summary
@@ -154,7 +161,7 @@ docker logs -f chatgpt2api-local
 
 | 症状 | 方向 |
 | --- | --- |
-| 无 Grok / 注册 API | 是否用了官方镜像 → 改 local compose 重建 |
+| 无 Grok / 注册 API | 是否拉了上游官方镜像 → 改用 `ghcr.io/qawow/chatgpt2api` 或 local compose 重建 |
 | GPT 注册 engines 不存在 | 旧镜像或空 volume → rebuild；勿空挂 gpt_free_register |
 | provider_definitions 缺表 | `data/register_engines.db` 权限/损坏 → 删除后重启 |
 | SOCKS 报 Missing dependencies | 镜像缺 PySocks → rebuild |

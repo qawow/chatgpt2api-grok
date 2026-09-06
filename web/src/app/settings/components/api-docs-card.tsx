@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChevronDown, FileArchive, KeyRound, ListChecks, type LucideIcon } from "lucide-react";
+import { ChevronDown, FileArchive, FileText, KeyRound, ListChecks, type LucideIcon } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
 import webConfig from "@/constants/common-env";
@@ -77,24 +77,6 @@ const docs: ApiDoc[] = [
   -d '{"model":"gpt-image-2","input":"生成一张未来城市图片","tools":[{"type":"image_generation"}]}'`,
   },
   {
-    title: "搜索",
-    method: "POST",
-    path: "/v1/search",
-    icon: ListChecks,
-    input: [
-      ["prompt", "string", "搜索问题或检索指令。"],
-    ],
-    output: [
-      ["answer", "string", "搜索后的回答内容，具体字段以返回结果为准。"],
-      ["sources", "array", "可选，搜索引用来源。"],
-      ["_account_email", "string", "本次使用的账号邮箱。"],
-    ],
-    example: (baseUrl: string, key: string) => `curl ${baseUrl}/search \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${key}" \\
-  -d '{"prompt":"搜索 chatgpt2api 最新使用方式"}'`,
-  },
-  {
     title: "图片生成",
     method: "POST",
     path: "/v1/images/generations",
@@ -143,7 +125,7 @@ const docs: ApiDoc[] = [
   },
 ];
 
-const usableModels = ["gpt-image-2", "codex-gpt-image-2", "grok-2-image", "grok-imagine-image", "grok-imagine"];
+const usableModels = ["gpt-image-2", "codex-gpt-image-2", "grok-2-image", "grok-imagine-image"];
 
 function ParamTable({ rows }: { rows: ParamRow[] }) {
   return (
@@ -195,7 +177,7 @@ export function ApiDocsCard() {
             接口接入说明
           </div>
           <p className="mt-1 text-xs leading-6 text-stone-500">
-            第三方应用按 OpenAI 兼容接口接入；文件任务接口也使用同一套鉴权方式。
+            第三方应用按 OpenAI 兼容接口接入；当前对外只开放生图模型与图片接口。
           </p>
         </div>
 

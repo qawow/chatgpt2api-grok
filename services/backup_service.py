@@ -622,10 +622,6 @@ class BackupService:
             self._add_bytes_to_archive(archive, "backup-metadata.json", _json_bytes(metadata))
             if include.get("config"):
                 self._add_file_to_archive(archive, CONFIG_FILE, "config.json")
-            if include.get("cpa"):
-                self._add_file_to_archive(archive, DATA_DIR / "cpa_config.json", "data/cpa_config.json")
-            if include.get("sub2api"):
-                self._add_file_to_archive(archive, DATA_DIR / "sub2api_config.json", "data/sub2api_config.json")
             if include.get("logs"):
                 self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
             if include.get("image_tasks"):

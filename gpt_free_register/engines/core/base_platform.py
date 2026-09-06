@@ -211,8 +211,6 @@ class BasePlatform(ABC):
                 return self._handle_generate_link(account, params)
             elif capability_id == "switch_desktop":
                 return self._handle_switch_desktop(account, params)
-            elif capability_id == "upload_cpa":
-                return self._handle_upload_cpa(account, params)
             elif capability_id == "upload_tm":
                 return self._handle_upload_tm(account, params)
             elif capability_id == "check_trial":
@@ -262,10 +260,6 @@ class BasePlatform(ABC):
     def _handle_switch_desktop(self, account: Account, params: dict) -> dict:
         """Default switch_desktop handler - platform should override."""
         raise NotImplementedError(f"Desktop switch not implemented for {self.display_name}")
-    
-    def _handle_upload_cpa(self, account: Account, params: dict) -> dict:
-        """Default upload_cpa handler - platform should override."""
-        raise NotImplementedError(f"CPA upload not implemented for {self.display_name}")
     
     def _handle_upload_tm(self, account: Account, params: dict) -> dict:
         """Default upload_tm handler - platform should override."""
