@@ -89,10 +89,9 @@ def _read_json_object(path: Path) -> dict[str, object]:
 
 
 def _write_json_object(path: Path, data: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    from utils.atomic import atomic_write_json
+
+    atomic_write_json(path, data)
 
 
 class WebDAVClient:

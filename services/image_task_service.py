@@ -12,6 +12,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import grok_v1_image_generations, openai_v1_image_edit, openai_v1_image_generations
+from utils.atomic import atomic_write_json
 from utils.grok_models import is_grok_image_model, resolve_grok_image_model
 
 TASK_STATUS_QUEUED = "queued"
@@ -486,9 +487,7 @@ class ImageTaskService:
 
     def _save_locked(self) -> None:
         items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(self.path)
+        atomic_write_json(self.path, {"tasks": items})
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False
