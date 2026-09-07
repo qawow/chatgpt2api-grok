@@ -338,7 +338,15 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                usage=usage,
+                error="",
+                duration_ms=duration_ms,
+                account_email=account_email,
+            )
             self._log_call(
                 identity,
                 mode,
@@ -354,9 +362,15 @@ class ImageTaskService:
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
-                              duration_ms=duration_ms,
-                              **({"conversation_id": conversation_id} if conversation_id else {}))
+            self._update_task(
+                key,
+                status=TASK_STATUS_ERROR,
+                error=error_message,
+                data=[],
+                duration_ms=duration_ms,
+                account_email=account_email,
+                **({"conversation_id": conversation_id} if conversation_id else {}),
+            )
             self._log_call(
                 identity,
                 mode,
@@ -563,24 +577,49 @@ class ImageTaskService:
         started = time.time()
         backend = None
         try:
+            from services.account_service import account_service
             from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            from services.protocol.conversation import format_image_result, is_upstream_connection_error
+            from services.proxy_service import proxy_settings
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
-            file_ids, sediment_ids = backend._poll_image_results(
-                conversation_id,
-                extra_timeout_secs,
-            )
-            if not file_ids and not sediment_ids:
-                raise RuntimeError(
-                    f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
-                )
+            with self._lock:
+                email = _clean((self._tasks.get(key) or {}).get("account_email"))
+            token = account_service.find_access_token_by_email(email) if email else ""
+            if not token:
+                raise RuntimeError("续轮询失败：任务没有可用账号，无法读取上游对话")
 
-            image_urls = backend.resolve_conversation_image_urls(
-                conversation_id, file_ids, sediment_ids, poll=False,
-            )
-            if not image_urls:
-                raise RuntimeError("图片 URL 解析失败")
+            account = account_service.get_account(token) or {}
+            last_error: BaseException | None = None
+            file_ids: list[str] = []
+            sediment_ids: list[str] = []
+            image_urls: list[str] = []
+            for _source, proxy_url in proxy_settings.list_egress_candidates(account=account, upstream=True):
+                attempt = OpenAIBackendAPI(access_token=token, force_proxy=proxy_url)
+                try:
+                    file_ids, sediment_ids = attempt._poll_image_results(
+                        conversation_id,
+                        extra_timeout_secs,
+                    )
+                    if not file_ids and not sediment_ids:
+                        raise RuntimeError(
+                            f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
+                        )
+                    image_urls = attempt.resolve_conversation_image_urls(
+                        conversation_id, file_ids, sediment_ids, poll=False,
+                    )
+                    if not image_urls:
+                        raise RuntimeError("图片 URL 解析失败")
+                    backend = attempt
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if not is_upstream_connection_error(str(exc)):
+                        attempt.close()
+                        raise
+                    attempt.close()
+            if backend is None:
+                raise last_error or RuntimeError("续轮询失败：无法连接上游")
 
             image_items = [
                 {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}

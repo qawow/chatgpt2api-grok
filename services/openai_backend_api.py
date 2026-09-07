@@ -19,7 +19,7 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
-from services.proxy_service import proxy_settings
+from services.proxy_service import _is_egress_connect_error, normalize_proxy_url, proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -126,16 +126,18 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
         """初始化后端客户端。
 
         参数：
         - `access_token`：可选。传入后表示使用已登录链路；不传则使用未登录链路。
+        - `force_proxy`：可选。覆盖号池/runtime 选中的代理；空字符串表示直连。
         """
         self.base_url = "https://chatgpt.com"
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
+        self._force_proxy = force_proxy
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
         self.fp = self._build_fp()
@@ -149,7 +151,10 @@ class OpenAIBackendAPI:
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
+            upstream=True,
+            force_proxy=force_proxy,
         ))
+        self.resource_session = None
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -270,16 +275,43 @@ class OpenAIBackendAPI:
         except Exception:
             return False
 
+    def _resource_session(self):
+        """Return a session for signed image/CDN resources.
+
+        ChatGPT API traffic and image resource traffic may use different
+        runtime proxy URLs (``resource_proxy_url``). Keep the resource session
+        separate so the main upstream session can stay pinned to chatgpt.com.
+        """
+        session = getattr(self, "resource_session", None)
+        if session is None:
+            session = requests.Session(**proxy_settings.build_session_kwargs(
+                account=self.account,
+                resource=True,
+                upstream=True,
+                impersonate=self.fp["impersonate"],
+                verify=True,
+                force_proxy=self._force_proxy,
+            ))
+            session.headers.update({
+                "User-Agent": self.user_agent,
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            })
+            self.resource_session = session
+        return session
+
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        session = getattr(self, "session", None)
-        if session:
-            try:
-                session.close()
-            except Exception:
-                pass
+        for session in (
+            getattr(self, "session", None),
+            getattr(self, "resource_session", None),
+        ):
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     def __del__(self):
         self.close()
@@ -1761,15 +1793,39 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         seen_urls: set[str] = set()
+        used_proxy = (
+            normalize_proxy_url(self._force_proxy)
+            if self._force_proxy is not None
+            else proxy_settings.get_profile(account=self.account, resource=True, upstream=True).proxy_url
+        )
         for url in urls:
             if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
-            response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            # Do not de-dupe by image bytes: identical pixels from different
-            # URLs are still distinct results the client asked for (n>1).
-            images.append(response.content)
+            try:
+                response = self._resource_session().get(url, timeout=120)
+                ensure_ok(response, "image_download")
+                images.append(response.content)
+                continue
+            except Exception as exc:
+                if not _is_egress_connect_error(str(exc)):
+                    raise
+                response = proxy_settings.get_with_egress_fallback(
+                    url,
+                    account=self.account,
+                    resource=True,
+                    upstream=True,
+                    impersonate=self.fp["impersonate"],
+                    timeout=120,
+                    headers={
+                        "User-Agent": self.user_agent,
+                        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                    },
+                    skip_proxy_urls={used_proxy} if used_proxy else set(),
+                )
+                if not 200 <= response.status_code < 300:
+                    raise RuntimeError(f"image_download failed: HTTP {response.status_code}") from exc
+                images.append(response.content)
         return images
 
     def stream_conversation(

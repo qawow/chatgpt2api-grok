@@ -243,6 +243,54 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(token, "opaque-token")
             self.assertEqual(probed["n"], 1)
 
+    def test_get_available_access_token_honors_excluded_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-a",
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 5,
+                        "refresh_token": "rt-a",
+                    },
+                    {
+                        "access_token": "token-b",
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 5,
+                        "refresh_token": "rt-b",
+                    },
+                ]
+            )
+            service.fetch_remote_info = lambda access_token, event="fetch_remote_info": service.get_account(  # type: ignore[method-assign]
+                access_token
+            )
+            token = service.get_available_access_token(excluded_tokens={"token-a"})
+            service.release_image_slot(token)
+            self.assertEqual(token, "token-b")
+
+            with self.assertRaises(RuntimeError):
+                service.get_available_access_token(excluded_tokens={"token-a", "token-b"})
+
+    def test_find_access_token_by_email(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-mail",
+                        "email": "User@Example.com",
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 3,
+                    }
+                ]
+            )
+            self.assertEqual(service.find_access_token_by_email("user@example.com"), "token-mail")
+            self.assertEqual(service.find_access_token_by_email("missing@example.com"), "")
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True
@@ -744,6 +792,21 @@ class AccountCapabilityTests(unittest.TestCase):
             clearance = public.get("clearance", {})
             self.assertNotIn("pass", clearance.get("flaresolverr_url", ""))
 
+
+    def test_backend_session_uses_upstream_runtime_proxy(self) -> None:
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        with patch(
+            "services.openai_backend_api.proxy_settings.build_session_kwargs",
+            return_value={"proxy": "http://warp-privoxy:8118"},
+        ) as build_session:
+            backend = OpenAIBackendAPI(access_token="tok")
+            backend.close()
+            backend = OpenAIBackendAPI(access_token="tok", force_proxy="")
+            backend.close()
+
+        self.assertTrue(build_session.call_args_list[0].kwargs.get("upstream"))
+        self.assertEqual(build_session.call_args_list[-1].kwargs.get("force_proxy"), "")
 
     def test_backend_headers_inject_clearance_cookies(self) -> None:
         # Bugfix: OpenAIBackendAPI._headers must call proxy_settings.build_headers

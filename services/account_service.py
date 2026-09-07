@@ -557,7 +557,12 @@ class AccountService:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
-        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
+        session = requests.Session(**proxy_settings.build_session_kwargs(
+            account=account,
+            impersonate="chrome110",
+            verify=True,
+            upstream=True,
+        ))
         try:
             response = session.post(
                 self._OAUTH_TOKEN_URL,
@@ -674,7 +679,12 @@ class AccountService:
         from services.proxy_service import proxy_settings
 
         session = requests.Session(
-            **proxy_settings.build_session_kwargs(account=account or {}, impersonate="chrome110", verify=True)
+            **proxy_settings.build_session_kwargs(
+                account=account or {},
+                impersonate="chrome110",
+                verify=True,
+                upstream=True,
+            )
         )
         try:
             resp = session.get(
@@ -717,7 +727,12 @@ class AccountService:
             raise RuntimeError("session_token_empty")
         old_access = str((account or {}).get("access_token") or "").strip()
         session = requests.Session(
-            **proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True)
+            **proxy_settings.build_session_kwargs(
+                account=account,
+                impersonate="chrome110",
+                verify=True,
+                upstream=True,
+            )
         )
         try:
             session.cookies.set(
@@ -843,7 +858,7 @@ class AccountService:
                 password = str(account.get("password") or "").strip()
                 if email and password and force:
                     try:
-                        result = self._login_with_password(email, password)
+                        result = self._login_with_password(email, password, account=account)
                         if result.get("ok"):
                             token_data = {
                                 "access_token": str(result.get("access_token") or "").strip(),
@@ -922,7 +937,8 @@ class AccountService:
         """密码重新登录线程入口"""
         started_at = datetime.now(timezone.utc)
         try:
-            result = self._login_with_password(email, password)
+            current = self.get_account(access_token) or {}
+            result = self._login_with_password(email, password, account=current)
             if result.get("ok"):
                 # If another path already refreshed this account while we were
                 # logging in, do not overwrite the newer tokens.
@@ -1053,7 +1069,7 @@ class AccountService:
             if progress_id:
                 self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
 
-    def _login_with_password(self, email: str, password: str) -> dict:
+    def _login_with_password(self, email: str, password: str, account: dict | None = None) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
         from curl_cffi import requests
         
@@ -1069,7 +1085,12 @@ class AccountService:
         # matches the rest of the client. Legacy-only config.proxy left an IP
         # mismatch that could trigger ChatGPT risk checks.
         from services.proxy_service import proxy_settings
-        session_kwargs = proxy_settings.build_session_kwargs(impersonate="chrome110", verify=True)
+        session_kwargs = proxy_settings.build_session_kwargs(
+            account=account or {},
+            impersonate="chrome110",
+            verify=True,
+            upstream=True,
+        )
         session = requests.Session(**session_kwargs)
         
         try:
@@ -1519,6 +1540,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1527,7 +1549,7 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = set(excluded_tokens or set())
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1815,6 +1837,16 @@ class AccountService:
             access_token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(access_token)
             return dict(account) if account else None
+
+    def find_access_token_by_email(self, email: str) -> str:
+        needle = str(email or "").strip().lower()
+        if not needle:
+            return ""
+        with self._lock:
+            for item in self._accounts.values():
+                if str(item.get("email") or "").strip().lower() == needle:
+                    return str(item.get("access_token") or "")
+        return ""
 
     def list_accounts(self) -> list[dict]:
         """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。
@@ -2132,22 +2164,37 @@ class AccountService:
             raise ValueError("access_token is required")
 
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
-        try:
+
+        def _get_user_info(token: str):
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            backend = OpenAIBackendAPI(active_token)
-            try:
-                result = backend.get_user_info()
-            finally:
-                backend.close()
+            from services.proxy_service import _is_egress_connect_error, proxy_settings
+
+            account = self.get_account(token) or {}
+            last_error: Exception | None = None
+            for _source, proxy_url in proxy_settings.list_egress_candidates(account=account, upstream=True):
+                backend = OpenAIBackendAPI(token, force_proxy=proxy_url)
+                try:
+                    return backend.get_user_info()
+                except InvalidAccessTokenError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    if not _is_egress_connect_error(str(exc)):
+                        raise
+                finally:
+                    backend.close()
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("fetch_remote_info: no egress candidate")
+
+        try:
+            from services.openai_backend_api import InvalidAccessTokenError
+            result = _get_user_info(active_token)
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    backend = OpenAIBackendAPI(refreshed_token)
-                    try:
-                        result = backend.get_user_info()
-                    finally:
-                        backend.close()
+                    result = _get_user_info(refreshed_token)
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
                         refreshed_token,

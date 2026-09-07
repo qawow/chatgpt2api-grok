@@ -37,6 +37,37 @@ def normalize_proxy_url(url: str) -> str:
     return candidate
 
 
+def _is_egress_connect_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return any(
+        token in text
+        for token in (
+            "proxyerror",
+            "proxy error",
+            "tunnel connection failed",
+            "upstream socks failed",
+            "connection refused",
+            "failed to connect",
+            "could not connect",
+            "max retries exceeded",
+            "name or service not known",
+            "curl: (7)",
+            "curl: (28)",
+            "curl: (35)",
+            "curl: (56)",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
+@dataclass(frozen=True)
+class FetchedResponse:
+    content: bytes
+    status_code: int
+    headers: dict[str, str]
+
+
 @dataclass(frozen=True)
 class ProxyRuntimeProfile:
     proxy_url: str = ""
@@ -219,21 +250,125 @@ class ProxySettingsStore:
             clearance=clearance,
         )
 
+    def list_egress_candidates(
+        self,
+        account: dict | None = None,
+        resource: bool = False,
+        upstream: bool = False,
+    ) -> list[tuple[str, str]]:
+        """Unique ``(source, proxy_url)`` paths to try after a dead proxy.
+
+        First entry matches ``get_profile``. Later entries are remaining
+        account / runtime / global / direct URLs so a refused SOCKS does not
+        pin the whole image request. Empty ``proxy_url`` means direct.
+        """
+        primary = self.get_profile(account=account, resource=resource, upstream=upstream)
+        ordered: list[tuple[str, str]] = [(primary.proxy_source, primary.proxy_url)]
+        seen = {primary.proxy_url}
+
+        runtime = self._get_runtime_settings()
+        account_proxy = normalize_proxy_url(_clean((account or {}).get("proxy") if isinstance(account, dict) else ""))
+        legacy_proxy = normalize_proxy_url(_clean(self._config.get_proxy_settings()))
+        runtime_proxy = ""
+        resource_proxy = ""
+        runtime_enabled = bool(runtime.get("enabled"))
+        egress_mode = str(runtime.get("egress_mode") or "direct").strip().lower()
+        if upstream and runtime_enabled and egress_mode == "single_proxy":
+            resource_proxy = normalize_proxy_url(_clean(runtime.get("resource_proxy_url"))) if resource else ""
+            runtime_proxy = resource_proxy or normalize_proxy_url(_clean(runtime.get("proxy_url")))
+
+        extras: list[tuple[str, str]] = []
+        if account_proxy:
+            extras.append(("account", account_proxy))
+        if runtime_proxy:
+            extras.append(("runtime_resource" if resource_proxy else "runtime", runtime_proxy))
+        if legacy_proxy:
+            extras.append(("global", legacy_proxy))
+        extras.append(("direct", ""))
+
+        for source, url in extras:
+            if url in seen:
+                continue
+            seen.add(url)
+            ordered.append((source, url))
+        return ordered
+
     def build_session_kwargs(
         self,
         account: dict | None = None,
         proxy: str = "",
         resource: bool = False,
         upstream: bool = False,
+        force_proxy: str | None = None,
         **session_kwargs,
     ) -> dict[str, object]:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
         # Always set proxy so curl_cffi does not fall back to HTTP(S)_PROXY/ALL_PROXY
         # (a dead SOCKS in the environment would 502 every ChatGPT call).
-        session_kwargs["proxy"] = profile.proxy_url or ""
+        if force_proxy is not None:
+            session_kwargs["proxy"] = normalize_proxy_url(force_proxy)
+        else:
+            session_kwargs["proxy"] = profile.proxy_url or ""
         if profile.runtime_enabled and profile.skip_ssl_verify:
             session_kwargs["verify"] = False
         return session_kwargs
+
+    def get_with_egress_fallback(
+        self,
+        url: str,
+        *,
+        account: dict | None = None,
+        resource: bool = False,
+        upstream: bool = True,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = 60,
+        impersonate: str = "chrome",
+        verify: bool = True,
+        skip_proxy_urls: set[str] | frozenset[str] | None = None,
+    ) -> FetchedResponse:
+        """GET ``url``, walking remaining egress after a dead proxy."""
+        skipped = {normalize_proxy_url(item) for item in (skip_proxy_urls or set())}
+        last_error: Exception | None = None
+        request_headers = dict(headers or {})
+        for _source, proxy_url in self.list_egress_candidates(
+            account=account, resource=resource, upstream=upstream
+        ):
+            if proxy_url in skipped:
+                continue
+            session = Session(
+                **self.build_session_kwargs(
+                    account=account,
+                    resource=resource,
+                    upstream=upstream,
+                    impersonate=impersonate,
+                    verify=verify,
+                    force_proxy=proxy_url,
+                )
+            )
+            try:
+                response = session.get(
+                    url,
+                    headers=request_headers,
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                return FetchedResponse(
+                    content=response.content or b"",
+                    status_code=int(response.status_code),
+                    headers={str(key): str(value) for key, value in response.headers.items()},
+                )
+            except Exception as exc:
+                last_error = exc
+                if not _is_egress_connect_error(str(exc)):
+                    raise
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no egress candidate available")
 
     def build_headers(
         self,

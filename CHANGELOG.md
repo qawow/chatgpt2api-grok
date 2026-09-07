@@ -9,6 +9,9 @@
 + [修复] tiktoken 拉 `o200k_base` 不再走进程 SOCKS 代理；下载失败时回退估算，避免生图 usage 统计把整次请求打挂。
 + [修复] Grok / D1 / WebDAV / R2 / FlareSolverr / 号池 HTTP 推送不再继承环境 SOCKS；curl_cffi 无代理时显式清空 `proxy`。
 + [修复] `utils/atomic` 写入遇 Docker 单文件 bind mount 的 EBUSY 时改为就地覆盖，设置面板不再因 rename 失败报 500；图片索引/任务文件写入统一走 atomic。
++ [修复] ChatGPT 生图/刷新/登录主链路接上 proxy_runtime 单代理（WARP/privoxy），不再因直连被拒报 `upstream image connection failed`；图片下载走独立资源会话（可配 `resource_proxy_url`）。
++ [优化] 连接类错误（ProxyError/socks 隧道失败/connection refused/TLS/超时）同账号先换出口（runtime/全局/直连），再换健康账号；代理拒连不再空耗同出口重试。
++ [修复] 图片续轮询不再传已失效的 `proxy_url`；按任务账号换出口取图。参考图/CDN 下载与注册后 `fetch_remote_info` 同样走出口回退。
 + [移除] PPT/PSD 可编辑文件任务、搜索接口、Anthropic messages 实现、文本补全缓存；调试页仅保留 Skills。
 + [移除] 注册引擎非 ChatGPT / 非 Cloudflare D1 的邮箱、验证码、SMS、Playwright 执行器。
 + [移除] `openai_backend_api` 内 PPT/PSD/搜索实现；浏览器注册 `browser_register.py`（protocol 路径保留）。

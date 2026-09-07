@@ -13,6 +13,7 @@ from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.proxy_service import proxy_settings
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -103,6 +104,41 @@ def is_connection_timeout_error(message: str) -> bool:
         # Local hard caps on hung SSE via proxy half-open sockets.
         or "sse stream idle timeout" in text
         or "sse stream exceeded total timeout" in text
+        or "upstream connection timed out" in text
+    )
+
+
+def is_proxy_unreachable_error(message: str) -> bool:
+    """代理本身不可达（拒连/隧道失败），再打同一条出口没有意义。"""
+    text = str(message or "").lower()
+    return (
+        "proxyerror" in text
+        or "proxy error" in text
+        or "unable to connect to proxy" in text
+        or "could not connect to proxy" in text
+        or "failed to connect to proxy" in text
+        or "tunnel connection failed" in text
+        or "upstream socks failed" in text
+        or "connection refused" in text
+        or "name or service not known" in text
+    )
+
+
+def is_upstream_connection_error(message: str) -> bool:
+    """识别代理、连接建立和 TLS 失败，统一进入上游连接重试/换号路径。"""
+    text = str(message or "").lower()
+    return (
+        is_tls_connection_error(text)
+        or is_connection_timeout_error(text)
+        or is_proxy_unreachable_error(text)
+        or "curl: (7)" in text
+        or "curl: (35)" in text
+        or "curl: (56)" in text
+        or "proxy connect" in text
+        or "failed to connect" in text
+        or "could not connect" in text
+        or "max retries exceeded" in text
+        or "upstream image connection failed" in text
     )
 
 
@@ -110,10 +146,10 @@ def image_stream_error_message(message: str) -> str:
     text = str(message or "")
     if is_token_invalid_error(text):
         return "image generation failed"
-    if is_tls_connection_error(text):
-        return "upstream image connection failed, please retry later"
     if is_connection_timeout_error(text):
         return "upstream connection timed out, please retry later"
+    if is_upstream_connection_error(text):
+        return "upstream image connection failed, please retry later"
     return text or "image generation failed"
 
 
@@ -1273,19 +1309,96 @@ def _generate_single_image(
     """
     # 模型返回文本而非图片的最大重试次数
     MAX_TEXT_REPLY_RETRIES = 3
-    # TLS 连接错误最大重试次数
+    # TLS/超时：同出口短重试；代理拒连则立刻换下一条出口
     MAX_TLS_RETRIES = 3
-    # 连接超时错误最大重试次数（同账号短等待重试）
+    MAX_CONNECTION_ACCOUNT_RETRIES = 4
     MAX_CONN_TIMEOUT_RETRIES = 3
-    # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
 
     text_reply_retry_count = 0
-    tls_retry_count = 0
-    conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     account_email = ""
-    sticky_token = ""
+    state: dict[str, Any] = {
+        "tls_retry_count": 0,
+        "conn_timeout_retry_count": 0,
+        "sticky_token": "",
+        "egress_queue": [],
+        "current_proxy_url": "",
+        "current_proxy_source": "",
+        "failed_proxy_urls": set(),
+        "failed_connection_tokens": set(),
+        "last_connection_error": "",
+    }
+
+    def recover_connection(active_token: str, last_error: str) -> bool:
+        """同一账号换出口，或换号。返回 True 表示外层应 continue。"""
+        state["last_connection_error"] = last_error
+        if not is_proxy_unreachable_error(last_error):
+            if is_connection_timeout_error(last_error):
+                state["conn_timeout_retry_count"] += 1
+                retry_count = int(state["conn_timeout_retry_count"])
+                max_retries = MAX_CONN_TIMEOUT_RETRIES
+                wait_secs = min(1.0 * retry_count, 3.0)
+                retry_event = "image_stream_conn_timeout_retry"
+            else:
+                state["tls_retry_count"] += 1
+                retry_count = int(state["tls_retry_count"])
+                max_retries = MAX_TLS_RETRIES
+                wait_secs = min(0.4 * retry_count, 1.5)
+                retry_event = "image_stream_tls_retry"
+            if retry_count <= max_retries:
+                logger.warning({
+                    "event": retry_event,
+                    "request_token": active_token,
+                    "account_email": account_email,
+                    "retry_count": retry_count,
+                    "index": index,
+                    "wait_secs": wait_secs,
+                    "sticky": True,
+                    "proxy_source": state["current_proxy_source"],
+                    "error": last_error[:200],
+                })
+                time.sleep(wait_secs)
+                state["sticky_token"] = active_token
+                return True
+
+        dead_proxy = str(state["current_proxy_url"])
+        failed_proxies: set[str] = state["failed_proxy_urls"]
+        failed_proxies.add(dead_proxy)
+        queue: list[tuple[str, str]] = [
+            (src, url) for src, url in state["egress_queue"] if url not in failed_proxies
+        ]
+        state["egress_queue"] = queue
+        state["tls_retry_count"] = 0
+        state["conn_timeout_retry_count"] = 0
+        if queue:
+            logger.warning({
+                "event": "image_stream_connection_proxy_failover",
+                "request_token": active_token,
+                "account_email": account_email,
+                "from_proxy_source": state["current_proxy_source"],
+                "next_proxy_source": queue[0][0],
+                "index": index,
+                "error": last_error[:200],
+            })
+            state["sticky_token"] = active_token
+            return True
+
+        failed_tokens: set[str] = state["failed_connection_tokens"]
+        failed_tokens.add(active_token)
+        account_service.mark_image_result(active_token, False)
+        state["sticky_token"] = ""
+        if len(failed_tokens) >= MAX_CONNECTION_ACCOUNT_RETRIES:
+            return False
+        logger.warning({
+            "event": "image_stream_connection_account_failover",
+            "request_token": active_token,
+            "account_email": account_email,
+            "failed_accounts": len(failed_tokens),
+            "index": index,
+            "error": last_error[:200],
+        })
+        return True
 
     while True:
         try:
@@ -1293,15 +1406,21 @@ def _generate_single_image(
                 request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
-            if sticky_token:
-                token = sticky_token
+            if state["sticky_token"]:
+                token = str(state["sticky_token"])
             else:
                 token = account_service.get_available_access_token(
                     plan_type=plan_type,
                     source_type="codex" if codex_model else None,
                     plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                    excluded_tokens=state["failed_connection_tokens"],
                 )
         except RuntimeError as exc:
+            if state["failed_connection_tokens"] and state["last_connection_error"]:
+                raise ImageGenerationError(
+                    image_stream_error_message(str(state["last_connection_error"])),
+                    account_email=account_email,
+                ) from exc
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
         emitted_for_token = False
@@ -1316,9 +1435,28 @@ def _generate_single_image(
             "account_found": bool(account),
             "index": index,
         })
+        if not state["sticky_token"] or not state["egress_queue"]:
+            failed_proxies = state["failed_proxy_urls"]
+            candidates = proxy_settings.list_egress_candidates(account=account, upstream=True)
+            state["egress_queue"] = [(src, url) for src, url in candidates if url not in failed_proxies]
+            if not state["egress_queue"] and "" not in failed_proxies:
+                state["egress_queue"] = [("direct", "")]
+            if not state["egress_queue"]:
+                state["failed_connection_tokens"].add(token)
+                account_service.mark_image_result(token, False)
+                state["sticky_token"] = ""
+                if state["last_connection_error"] and len(state["failed_connection_tokens"]) >= MAX_CONNECTION_ACCOUNT_RETRIES:
+                    raise ImageGenerationError(
+                        image_stream_error_message(str(state["last_connection_error"])),
+                        account_email=account_email,
+                    )
+                continue
+        proxy_source, proxy_url = state["egress_queue"][0]
+        state["current_proxy_source"] = proxy_source
+        state["current_proxy_url"] = proxy_url
         backend = None
         try:
-            backend = OpenAIBackendAPI(access_token=token)
+            backend = OpenAIBackendAPI(access_token=token, force_proxy=proxy_url)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1401,12 +1539,12 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
             # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+                account_service.mark_image_result(token, False)
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
@@ -1434,6 +1572,21 @@ def _generate_single_image(
                     account_email=account_email,
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ) from exc
+            if not emitted_for_token and is_upstream_connection_error(error_text):
+                logger.warning({
+                    "event": "image_stream_fail",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "error": error_text,
+                    "index": index,
+                })
+                if recover_connection(token, error_text):
+                    continue
+                raise ImageGenerationError(
+                    image_stream_error_message(error_text),
+                    account_email=account_email,
+                ) from exc
+            account_service.mark_image_result(token, False)
             logger.warning({
                 "event": "image_stream_generation_error",
                 "request_token": token,
@@ -1451,44 +1604,14 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
-            # Transient SOCKS/TLS: keep the inflight slot and retry the same
-            # account. mark_image_result(False) would release the slot, bump
-            # fail, and the next loop would re-pick (often a different token).
-            if not emitted_for_token and is_tls_connection_error(last_error):
-                tls_retry_count += 1
-                if tls_retry_count <= MAX_TLS_RETRIES:
-                    wait_secs = min(0.4 * tls_retry_count, 1.5)
-                    logger.warning({
-                        "event": "image_stream_tls_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": tls_retry_count,
-                        "index": index,
-                        "wait_secs": wait_secs,
-                        "sticky": True,
-                        "error": last_error[:200],
-                    })
-                    time.sleep(wait_secs)
-                    sticky_token = token
+            if not emitted_for_token and is_upstream_connection_error(last_error):
+                if recover_connection(token, last_error):
                     continue
-            if not emitted_for_token and is_connection_timeout_error(last_error):
-                conn_timeout_retry_count += 1
-                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
-                    wait_secs = min(1.0 * conn_timeout_retry_count, 3.0)
-                    logger.warning({
-                        "event": "image_stream_conn_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": conn_timeout_retry_count,
-                        "index": index,
-                        "wait_secs": wait_secs,
-                        "sticky": True,
-                        "error": last_error[:200],
-                    })
-                    time.sleep(wait_secs)
-                    sticky_token = token
-                    continue
-            sticky_token = ""
+                raise ImageGenerationError(
+                    image_stream_error_message(last_error),
+                    account_email=account_email,
+                ) from exc
+            state["sticky_token"] = ""
             account_service.mark_image_result(token, False)
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")

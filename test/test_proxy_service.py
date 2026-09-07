@@ -108,6 +108,110 @@ class ProxyServiceTests(unittest.TestCase):
 
         self.assertEqual(kwargs["proxy"], "socks5h://resource.example:1080")
 
+    def test_force_proxy_overrides_account_and_runtime(self) -> None:
+        runtime = make_runtime(enabled=True, egress_mode="single_proxy", proxy_url="http://runtime.example:8080")
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="http://legacy.example:8080", runtime=runtime))
+
+        kwargs = store.build_session_kwargs(
+            account={"proxy": "socks5h://account.example:1080"},
+            upstream=True,
+            force_proxy="",
+        )
+        self.assertEqual(kwargs["proxy"], "")
+
+        kwargs = store.build_session_kwargs(
+            account={"proxy": "socks5h://account.example:1080"},
+            upstream=True,
+            force_proxy="http://fallback.example:8080",
+        )
+        self.assertEqual(kwargs["proxy"], "http://fallback.example:8080")
+
+    def test_list_egress_candidates_tries_account_then_runtime_then_direct(self) -> None:
+        runtime = make_runtime(enabled=True, egress_mode="single_proxy", proxy_url="http://runtime.example:8080")
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="http://legacy.example:8080", runtime=runtime))
+
+        candidates = store.list_egress_candidates(
+            account={"proxy": "socks5://account.example:1080"},
+            upstream=True,
+        )
+        self.assertEqual(
+            candidates,
+            [
+                ("account", "socks5h://account.example:1080"),
+                ("runtime", "http://runtime.example:8080"),
+                ("global", "http://legacy.example:8080"),
+                ("direct", ""),
+            ],
+        )
+
+    def test_list_egress_candidates_dedupes_identical_urls(self) -> None:
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://same.example:1080"))
+        candidates = store.list_egress_candidates(
+            account={"proxy": "socks5h://same.example:1080"},
+            upstream=True,
+        )
+        self.assertEqual(
+            candidates,
+            [
+                ("account", "socks5h://same.example:1080"),
+                ("direct", ""),
+            ],
+        )
+
+    def test_get_with_egress_fallback_skips_dead_proxy(self) -> None:
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://dead.example:1080"))
+        calls: list[str] = []
+
+        class FakeSession:
+            def __init__(self, **kwargs: object) -> None:
+                self.proxy = str(kwargs.get("proxy") or "")
+                calls.append(self.proxy)
+
+            def get(self, url: str, **kwargs: object) -> object:
+                if self.proxy:
+                    raise OSError("ProxyError: connection refused")
+
+                class Response:
+                    content = b"ok"
+                    status_code = 200
+                    headers = {"content-type": "image/png"}
+
+                return Response()
+
+            def close(self) -> None:
+                return None
+
+        with patch("services.proxy_service.Session", FakeSession):
+            fetched = store.get_with_egress_fallback("https://cdn.example/a.png", upstream=True)
+
+        self.assertEqual(fetched.content, b"ok")
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(calls, ["socks5h://dead.example:1080", ""])
+
+    def test_upstream_chat_session_uses_runtime_proxy(self) -> None:
+        runtime = make_runtime(
+            enabled=True,
+            egress_mode="single_proxy",
+            proxy_url="http://warp-privoxy:8118",
+        )
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="http://legacy.example:8080", runtime=runtime))
+
+        kwargs = store.build_session_kwargs(account={}, upstream=True)
+
+        self.assertEqual(kwargs["proxy"], "http://warp-privoxy:8118")
+
+    def test_non_upstream_session_does_not_implicitly_use_runtime_proxy(self) -> None:
+        runtime = make_runtime(
+            enabled=True,
+            egress_mode="single_proxy",
+            proxy_url="http://warp-privoxy:8118",
+        )
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="http://legacy.example:8080", runtime=runtime))
+
+        kwargs = store.build_session_kwargs(account={}, upstream=False)
+
+        self.assertEqual(kwargs["proxy"], "http://legacy.example:8080")
+
     def test_manual_clearance_merges_cookies_and_preserves_explicit_user_agent(self) -> None:
         runtime = make_runtime(
             enabled=True,

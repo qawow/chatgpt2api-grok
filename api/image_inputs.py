@@ -300,12 +300,12 @@ def _download_image_url(url: str) -> ImageInput:
             detail={"error": "image_url must not point to a private or local network address"},
         )
     try:
-        response = requests.get(
+        response = proxy_settings.get_with_egress_fallback(
             source,
+            resource=True,
+            upstream=True,
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
             timeout=60,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc

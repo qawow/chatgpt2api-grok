@@ -233,6 +233,63 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["data"][0]["url"], "http://example.test/grok.png")
             self.assertEqual(calls, ["grok-imagine"])
 
+    def test_resume_poll_uses_account_token_and_egress(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            service = self.make_service(path)
+            key = "owner-1:resume-task"
+            now = "2026-09-07 12:00:00"
+            service._tasks[key] = {
+                "id": "resume-task",
+                "owner_id": "owner-1",
+                "status": "error",
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "error": "图片任务超时（已等待 1 秒仍未完成）",
+                "conversation_id": "conv-1",
+                "account_email": "a@example.com",
+                "created_at": now,
+                "updated_at": now,
+            }
+            created: list[tuple[str, str | None]] = []
+
+            class FakeBackend:
+                def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                    self.access_token = access_token
+                    self.force_proxy = force_proxy
+                    created.append((access_token, force_proxy))
+
+                def _poll_image_results(self, conversation_id: str, extra_timeout_secs: float):
+                    if self.force_proxy:
+                        raise OSError("ProxyError: connection refused")
+                    return ["file-1"], []
+
+                def resolve_conversation_image_urls(self, conversation_id, file_ids, sediment_ids, poll=False):
+                    return ["https://cdn.example/a.png"]
+
+                def download_image_bytes(self, urls):
+                    return [b"png"]
+
+                def close(self) -> None:
+                    return None
+
+            with mock.patch("services.account_service.account_service") as accounts, mock.patch(
+                "services.openai_backend_api.OpenAIBackendAPI", FakeBackend
+            ), mock.patch(
+                "services.proxy_service.proxy_settings.list_egress_candidates",
+                return_value=[("account", "socks5h://dead.example:1080"), ("direct", "")],
+            ), mock.patch(
+                "services.protocol.conversation.format_image_result",
+                return_value={"data": [{"url": "http://example.test/ok.png"}]},
+            ):
+                accounts.find_access_token_by_email.return_value = "token-a"
+                accounts.get_account.return_value = {"email": "a@example.com", "access_token": "token-a"}
+                service.resume_poll(OWNER, "resume-task", extra_timeout_secs=1)
+                task = wait_for_task(service, OWNER, "resume-task", "success", timeout=3.0)
+
+            self.assertEqual(created, [("token-a", "socks5h://dead.example:1080"), ("token-a", "")])
+            self.assertTrue(task.get("data"))
+
 
 if __name__ == "__main__":
     unittest.main()
