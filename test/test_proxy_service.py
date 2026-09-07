@@ -166,6 +166,11 @@ class ProxyServiceTests(unittest.TestCase):
 
     def test_unusable_proxy_is_skipped_for_later_accounts(self) -> None:
         store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://dead.example:1080"))
+        mark_egress_unusable(
+            "socks5h://dead.example:1080",
+            "curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0)",
+        )
+        self.assertFalse(is_egress_unusable("socks5h://dead.example:1080"))
         mark_egress_unusable("socks5h://dead.example:1080", "curl: (28) Connection timed out")
         self.assertTrue(is_egress_unusable("socks5h://dead.example:1080"))
         candidates = store.list_egress_candidates(

@@ -67,6 +67,34 @@ DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 FILE_SERVICE_ID_RE = re.compile(r"file-service://([A-Za-z0-9_-]+)")
+_AUTH_FILE_HOSTS = ("chatgpt.com", "chat.openai.com")
+_AUTH_FILE_PATH_PREFIXES = (
+    "/backend-api/estuary",
+    "/backend-api/files/",
+    "/backend-api/conversation/",
+)
+
+
+def needs_chatgpt_file_auth(url: str) -> bool:
+    """Estuary / files / attachment URLs still require the ChatGPT Bearer token.
+
+    A signed ``sig`` query is not enough; anonymous GET returns
+    ``{"detail": "File stream access denied."}``.
+    """
+    parsed = urlparse(str(url or "").strip())
+    host = str(parsed.hostname or "").lower()
+    if not any(host == item or host.endswith("." + item) for item in _AUTH_FILE_HOSTS):
+        return False
+    path = parsed.path or ""
+    return any(path == prefix or path.startswith(prefix) for prefix in _AUTH_FILE_PATH_PREFIXES)
+
+
+def is_file_stream_denied(error: object) -> bool:
+    if isinstance(error, UpstreamHTTPError):
+        body = error.body
+        text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body or "")
+        return int(error.status_code or 0) == 403 and "file stream access denied" in text.lower()
+    return "file stream access denied" in str(error or "").lower()
 FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
 # 真正的图片文件 ID 格式：file_00000000 + 24位十六进制字符（共32字符）
 REAL_IMAGE_FILE_ID_RE = re.compile(r"\bfile_00000000[a-f0-9]{24}\b")
@@ -187,6 +215,26 @@ class OpenAIBackendAPI:
 
         # Free/passwordless register stores web session cookie for recovery.
         self._attach_session_cookie()
+        self._attach_device_cookie()
+        self._persist_client_identity()
+
+    def _chatgpt_account_id(self) -> str:
+        account = self.account if isinstance(self.account, dict) else {}
+        for key in ("account_id", "chatgpt_account_id"):
+            value = str(account.get(key) or "").strip()
+            if value:
+                return value
+        token = str(self.access_token or "").strip()
+        if not token:
+            return ""
+        try:
+            payload = account_service._decode_jwt_payload(token)
+            auth_claim = payload.get("https://api.openai.com/auth")
+            if isinstance(auth_claim, dict):
+                return str(auth_claim.get("chatgpt_account_id") or "").strip()
+        except Exception:
+            return ""
+        return ""
 
     def _attach_session_cookie(self) -> None:
         st = str((self.account or {}).get("session_token") or "").strip()
@@ -201,6 +249,83 @@ class OpenAIBackendAPI:
             )
         except Exception:
             pass
+
+    def _attach_device_cookie(self) -> None:
+        did = str(self.device_id or "").strip()
+        if not did:
+            return
+        try:
+            self.session.cookies.set("oai-did", did, domain=".chatgpt.com", path="/")
+        except Exception:
+            pass
+
+    def _persist_client_identity(self) -> None:
+        """Pin device/session ids on the account so TLS retries reuse the same browser."""
+        token = str(self.access_token or "").strip()
+        if not token:
+            return
+        account = self.account if isinstance(self.account, dict) else {}
+        updates: Dict[str, Any] = {}
+        device_id = str(self.device_id or "").strip()
+        session_id = str(self.session_id or "").strip()
+        if device_id and device_id != str(account.get("oai-device-id") or "").strip():
+            updates["oai-device-id"] = device_id
+        if session_id and session_id != str(account.get("oai-session-id") or "").strip():
+            updates["oai-session-id"] = session_id
+        raw_fp = account.get("fp")
+        next_fp = {str(k).lower(): str(v) for k, v in raw_fp.items()} if isinstance(raw_fp, dict) else {}
+        changed_fp = False
+        for key, value in self.fp.items():
+            text = str(value or "")
+            if text and str(next_fp.get(key) or "") != text:
+                next_fp[key] = text
+                changed_fp = True
+        if changed_fp:
+            updates["fp"] = next_fp
+        if not updates:
+            return
+        try:
+            saved = account_service.update_account(token, updates, quiet=True)
+            if isinstance(saved, dict):
+                self.account = saved
+            else:
+                self.account = {**account, **updates}
+        except Exception:
+            self.account = {**account, **updates}
+
+    def _current_session_cookie(self) -> str:
+        cookies = getattr(self.session, "cookies", None)
+        if cookies is None:
+            return ""
+        for name in ("__Secure-next-auth.session-token", "next-auth.session-token"):
+            for kwargs in ({}, {"domain": ".chatgpt.com"}):
+                try:
+                    value = str(cookies.get(name, **kwargs) or "").strip()
+                except Exception:
+                    value = ""
+                if value:
+                    return value
+        return ""
+
+    def _persist_session_cookie(self) -> None:
+        token = str(self.access_token or "").strip()
+        if not token:
+            return
+        value = self._current_session_cookie()
+        if not value:
+            return
+        current = str((self.account or {}).get("session_token") or "").strip()
+        if value == current:
+            return
+        try:
+            saved = account_service.update_account(token, {"session_token": value}, quiet=True)
+            if isinstance(saved, dict):
+                self.account = saved
+            elif isinstance(self.account, dict):
+                self.account["session_token"] = value
+        except Exception:
+            if isinstance(self.account, dict):
+                self.account["session_token"] = value
 
     def _try_refresh_access_from_session(self) -> bool:
         """If Bearer is revoked, mint a new accessToken from session cookie and retry once.
@@ -229,6 +354,7 @@ class OpenAIBackendAPI:
                             self.base_url + path, headers=self._headers(path), timeout=20
                         )
                         if probe.status_code == 200:
+                            self._persist_session_cookie()
                             return True
                     except Exception:
                         pass
@@ -363,6 +489,9 @@ class OpenAIBackendAPI:
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
+        account_id = self._chatgpt_account_id()
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
         # Inject Cloudflare clearance cookies / UA from proxy_runtime.
         # Previously build_headers existed but was never called from this client,
         # so FlareSolverr / manual cf_clearance had no effect on live traffic.
@@ -396,6 +525,7 @@ class OpenAIBackendAPI:
             response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
+        self._persist_session_cookie()
         return response.json()
 
     def _get_conversation_init(self) -> Dict[str, Any]:
@@ -463,6 +593,7 @@ class OpenAIBackendAPI:
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
+            "account_id": default_account.get("account_id") or None,
             "type": plan_type,
             "quota": quota,
             "limits_progress": limits_progress,
@@ -1794,6 +1925,19 @@ class OpenAIBackendAPI:
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
+    def _file_download_headers(self, url: str) -> dict[str, str]:
+        parsed = urlparse(str(url or ""))
+        path = parsed.path or "/backend-api/estuary/content"
+        return self._headers(
+            path,
+            {"Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"},
+        )
+
+    def _download_authenticated_file(self, url: str) -> bytes:
+        response = self.session.get(url, headers=self._file_download_headers(url), timeout=120)
+        ensure_ok(response, "image_download")
+        return response.content
+
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         seen_urls: set[str] = set()
@@ -1806,14 +1950,26 @@ class OpenAIBackendAPI:
             if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
+            if needs_chatgpt_file_auth(url):
+                images.append(self._download_authenticated_file(url))
+                continue
             try:
                 response = self._resource_session().get(url, timeout=120)
                 ensure_ok(response, "image_download")
                 images.append(response.content)
                 continue
             except Exception as exc:
+                if is_file_stream_denied(exc):
+                    images.append(self._download_authenticated_file(url))
+                    continue
                 if not _is_egress_connect_error(str(exc)):
                     raise
+                headers = {
+                    "User-Agent": self.user_agent,
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                }
+                if needs_chatgpt_file_auth(url):
+                    headers = self._file_download_headers(url)
                 response = proxy_settings.get_with_egress_fallback(
                     url,
                     account=self.account,
@@ -1821,10 +1977,7 @@ class OpenAIBackendAPI:
                     upstream=True,
                     impersonate=self.fp["impersonate"],
                     timeout=120,
-                    headers={
-                        "User-Agent": self.user_agent,
-                        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                    },
+                    headers=headers,
                     skip_proxy_urls={used_proxy} if used_proxy else set(),
                 )
                 if not 200 <= response.status_code < 300:
@@ -1946,7 +2099,17 @@ class OpenAIBackendAPI:
             json={"p": p_token},
             timeout=30,
         )
+        if response.status_code == 401 and self.access_token and self._try_refresh_access_from_session():
+            response = self.session.post(
+                self.base_url + prepare_path,
+                headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
+                json={"p": p_token},
+                timeout=30,
+            )
+        if response.status_code == 401:
+            raise InvalidAccessTokenError("token invalidated (chat_requirements_prepare)")
         ensure_ok(response, "chat_requirements_prepare")
+        self._persist_session_cookie()
         prepare_data = response.json()
 
         if (prepare_data.get("arkose") or {}).get("required"):

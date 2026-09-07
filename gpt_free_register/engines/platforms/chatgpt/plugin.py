@@ -138,6 +138,7 @@ class ChatGPTPlatform(BasePlatform):
                 "workspace_id": result.get("workspace_id", ""),
                 "cookies": result.get("cookies", ""),
                 "profile": result.get("profile", {}),
+                "oai-device-id": result.get("oai-device-id") or result.get("device_id") or "",
             },
         )
 
@@ -191,6 +192,7 @@ class ChatGPTPlatform(BasePlatform):
             access_token = result.access_token or ""
             refresh_token = result.refresh_token or ""
             session_token = result.session_token or ""
+            device_id = str(getattr(result, "device_id", "") or "")
 
             return RegistrationResult(
                 email=result.email,
@@ -204,6 +206,7 @@ class ChatGPTPlatform(BasePlatform):
                     "id_token": result.id_token,
                     "session_token": session_token,
                     "workspace_id": result.workspace_id,
+                    "oai-device-id": device_id,
                 },
             )
 

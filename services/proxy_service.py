@@ -25,6 +25,11 @@ _unusable_egress_lock = threading.Lock()
 
 def mark_egress_unusable(url: str, reason: str = "") -> None:
     """Remember a dead proxy so the next account does not wait on it again."""
+    from utils.curl_tls import is_openssl_invalid_library
+
+    # OPENSSL_internal is a local curl_cffi/HTTP2 bug, not a dead proxy.
+    if is_openssl_invalid_library(reason):
+        return
     key = normalize_proxy_url(url)
     if not key:
         return

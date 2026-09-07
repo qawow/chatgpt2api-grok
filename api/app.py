@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, gpt_register, grok_accounts, image_tasks, system
 from api.errors import install_exception_handlers
-from api.support import resolve_web_asset, start_grok_account_watcher, start_limited_account_watcher
+from api.support import resolve_web_asset, should_skip_spa_fallback, start_grok_account_watcher, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
@@ -68,7 +68,7 @@ def create_app() -> FastAPI:
         asset = resolve_web_asset(full_path)
         if asset is not None:
             return FileResponse(asset)
-        if full_path.strip("/").startswith("_next/"):
+        if should_skip_spa_fallback(full_path):
             raise HTTPException(status_code=404, detail="Not Found")
         fallback = resolve_web_asset("")
         if fallback is None:

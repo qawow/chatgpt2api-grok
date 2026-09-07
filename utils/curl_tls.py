@@ -1,8 +1,8 @@
 """Isolate curl_cffi (BoringSSL) from Debian OpenSSL on Linux/WSL2/Docker.
 
 ``OPENSSL_internal:invalid library`` is a local library-init failure, not a
-remote handshake problem. It shows up as ``curl: (35)`` and the image path
-wraps that as ``upstream image connection failed``.
+remote handshake problem. On SOCKS it shows up as ``curl: (35)`` when
+impersonate uses HTTP/2. The same proxy works with HTTP/1.1.
 """
 from __future__ import annotations
 
@@ -24,9 +24,29 @@ _LEGACY_IMPERSONATES = {
 }
 
 
+def _proxy_scheme(url: object) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return "direct"
+    if "://" not in text:
+        return "unknown"
+    return text.split("://", 1)[0]
+
+
+def is_socks_proxy(url: object) -> bool:
+    scheme = _proxy_scheme(url)
+    return scheme in {"socks", "socks5", "socks5h"}
+
+
 def is_openssl_invalid_library(message: str) -> bool:
     text = str(message or "").lower()
     return "openssl_internal" in text and "invalid library" in text
+
+
+def _http11_constant():
+    from curl_cffi import CurlHttpVersion
+
+    return CurlHttpVersion.V1_1
 
 
 def sanitize_curl_ssl_env() -> list[str]:
@@ -59,19 +79,11 @@ def resolve_session_impersonate(value: str | None) -> str:
 
 
 def impersonate_fallback_chain(value: str | None) -> list[str]:
-    start = resolve_session_impersonate(value)
-    # Chrome impersonates share one BoringSSL handle. chrome142 and chrome146
-    # both fail OPENSSL_internal on the same SOCKS, so the next step is a
-    # session with no fingerprint.
-    return [start, ""]
+    return [resolve_session_impersonate(value)]
 
 
 def create_cffi_session(**session_kwargs: Any):
-    """curl_cffi Session that retries OPENSSL_internal:invalid library.
-
-    Recreates the handle without impersonate after sanitizing OPENSSL_CONF.
-    Cookies/headers from a failed TLS connect are not useful.
-    """
+    """curl_cffi Session that retries OPENSSL_internal:invalid library via HTTP/1.1."""
     from curl_cffi.requests import Session
 
     sanitize_curl_ssl_env()
@@ -81,94 +93,65 @@ def create_cffi_session(**session_kwargs: Any):
         kwargs["impersonate"] = chain[0]
     else:
         kwargs.pop("impersonate", None)
-    return _TlsLibraryFallbackSession(Session, chain, kwargs)
+    # Impersonate forces HTTP/2 on Session(); that trips OPENSSL_internal on
+    # SOCKS. Force HTTP/1.1 on each request instead of the constructor.
+    prefer_http11 = is_socks_proxy(kwargs.get("proxy"))
+    return _TlsLibraryFallbackSession(Session, chain, kwargs, prefer_http11=prefer_http11)
 
 
 class _TlsLibraryFallbackSession:
-    def __init__(self, factory, chain: list[str], session_kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        factory,
+        chain: list[str],
+        session_kwargs: dict[str, Any],
+        *,
+        prefer_http11: bool = False,
+    ) -> None:
         self._factory = factory
         self._chain = list(chain)
         self._kwargs = dict(session_kwargs)
         self._idx = 0
+        self._http11 = bool(prefer_http11)
+        self._openssl_retries = 0
         self._inner = self._factory(**self._kwargs)
 
-    def _rebind(self) -> None:
+    def _recreate_inner(self) -> None:
         headers = {}
-        cookies = None
         try:
             headers = dict(self._inner.headers)
         except Exception:
             headers = {}
         try:
-            cookies = getattr(self._inner, "cookies", None)
-        except Exception:
-            cookies = None
-        try:
             self._inner.close()
         except Exception:
             pass
-        sanitize_curl_ssl_env()
-        value = self._chain[self._idx]
-        if value:
-            self._kwargs["impersonate"] = value
-        else:
-            self._kwargs.pop("impersonate", None)
         self._inner = self._factory(**self._kwargs)
         if headers:
             try:
                 self._inner.headers.update(headers)
             except Exception:
                 pass
-        if cookies is not None:
-            try:
-                self._inner.cookies.update(cookies)
-            except Exception:
-                try:
-                    self._inner.cookies = cookies
-                except Exception:
-                    pass
-
-    def _mark_dead_proxy(self, reason: str) -> None:
-        proxy = str(self._kwargs.get("proxy") or "")
-        if not proxy:
-            return
-        try:
-            from services.proxy_service import mark_egress_unusable
-
-            mark_egress_unusable(proxy, reason)
-        except Exception:
-            pass
-
-    def _next_fallback_idx(self) -> int | None:
-        none_idx = next((i for i, item in enumerate(self._chain) if not item), None)
-        if none_idx is not None and self._idx != none_idx:
-            return none_idx
-        nxt = self._idx + 1
-        if nxt < len(self._chain):
-            return nxt
-        return None
 
     def _call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         last: BaseException | None = None
         while True:
+            call_kwargs = dict(kwargs)
+            if self._http11:
+                call_kwargs.setdefault("http_version", _http11_constant())
             try:
-                return getattr(self._inner, name)(*args, **kwargs)
+                return getattr(self._inner, name)(*args, **call_kwargs)
             except Exception as exc:
                 last = exc
-                invalid_lib = is_openssl_invalid_library(str(exc))
-                nxt = self._next_fallback_idx() if invalid_lib else None
-                if nxt is None:
-                    if invalid_lib:
-                        self._mark_dead_proxy(str(exc))
+                if not is_openssl_invalid_library(str(exc)):
                     raise
-                self._idx = nxt
-                try:
-                    self._rebind()
-                except Exception as rebind_exc:
-                    last = rebind_exc
-                    if is_openssl_invalid_library(str(rebind_exc)):
-                        self._mark_dead_proxy(str(rebind_exc))
-                    raise last
+                self._http11 = True
+                if self._openssl_retries >= 2:
+                    raise
+                self._openssl_retries += 1
+                if self._openssl_retries > 1 or is_socks_proxy(self._kwargs.get("proxy")):
+                    self._recreate_inner()
+                continue
         raise last or RuntimeError("curl TLS library fallback exhausted")
 
     def get(self, *args: Any, **kwargs: Any) -> Any:

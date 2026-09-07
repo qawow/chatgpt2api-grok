@@ -218,12 +218,132 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(token, jwt)
             self.assertEqual(probed["n"], 0)
 
-    def test_get_available_access_token_probes_when_never_probed(self) -> None:
+    def test_get_available_access_token_skips_probe_when_never_probed_but_quota_ok(self) -> None:
         import base64
         import json
         import time as time_mod
 
         payload = {"exp": int(time_mod.time()) + 3600, "iat": int(time_mod.time())}
+        jwt = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=") + ".s"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": jwt,
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 5,
+                        "refresh_token": "rt-plus",
+                    }
+                ]
+            )
+            probed = {"n": 0}
+
+            def boom(_access_token, event="fetch_remote_info"):
+                probed["n"] += 1
+                raise AssertionError("remote probe should be skipped")
+
+            service.fetch_remote_info = boom  # type: ignore[method-assign]
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, jwt)
+            self.assertEqual(probed["n"], 0)
+
+    def test_get_available_skips_probe_when_last_error_is_timeout(self) -> None:
+        import base64
+        import json
+        import time as time_mod
+
+        payload = {"exp": int(time_mod.time()) + 3600, "iat": int(time_mod.time())}
+        jwt = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=") + ".s"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": jwt,
+                        "type": "free",
+                        "status": "正常",
+                        "quota": 25,
+                        "session_only": True,
+                        "last_refresh_error": "curl: (28) Connection timed out after 12074 milliseconds",
+                    }
+                ]
+            )
+            probed = {"n": 0}
+
+            def boom(_access_token, event="fetch_remote_info"):
+                probed["n"] += 1
+                raise AssertionError("network last_refresh_error must not force /me")
+
+            service.fetch_remote_info = boom  # type: ignore[method-assign]
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, jwt)
+            self.assertEqual(probed["n"], 0)
+
+    def test_get_available_access_token_skips_when_jwt_missing_but_quota_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "opaque-token",
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 5,
+                        "refresh_token": "rt-plus",
+                    }
+                ]
+            )
+            probed = {"n": 0}
+
+            def fake(access_token, event="fetch_remote_info"):
+                probed["n"] += 1
+                return service.get_account(access_token)
+
+            service.fetch_remote_info = fake  # type: ignore[method-assign]
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, "opaque-token")
+            self.assertEqual(probed["n"], 0)
+
+    def test_get_available_probes_when_quota_is_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "token-zero",
+                        "type": "free",
+                        "status": "正常",
+                        "quota": 0,
+                        "session_token": "sess",
+                        "success": 0,
+                    }
+                ]
+            )
+            probed = {"n": 0}
+
+            def fake(access_token, event="fetch_remote_info"):
+                probed["n"] += 1
+                account = service.get_account(access_token) or {}
+                account["quota"] = 3
+                return account
+
+            service.fetch_remote_info = fake  # type: ignore[method-assign]
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, "token-zero")
+            self.assertEqual(probed["n"], 1)
+
+    def test_get_available_probes_when_jwt_almost_expired(self) -> None:
+        import base64
+        import json
+        import time as time_mod
+
+        payload = {"exp": int(time_mod.time()) + 60, "iat": int(time_mod.time())}
         jwt = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=") + ".s"
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -250,31 +370,46 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(token, jwt)
             self.assertEqual(probed["n"], 1)
 
-    def test_get_available_access_token_probes_when_jwt_missing(self) -> None:
+    def test_get_available_does_not_net_soft_return_expired_jwt(self) -> None:
+        import base64
+        import json
+        import time as time_mod
+
+        payload = {"exp": int(time_mod.time()) - 3600, "iat": int(time_mod.time()) - 7200}
+        expired = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=") + ".s"
+        fresh_payload = {"exp": int(time_mod.time()) + 3600, "iat": int(time_mod.time())}
+        fresh = "h." + base64.urlsafe_b64encode(json.dumps(fresh_payload).encode()).decode().rstrip("=") + ".s"
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
                 [
                     {
-                        "access_token": "opaque-token",
+                        "access_token": expired,
+                        "type": "free",
+                        "status": "正常",
+                        "quota": 25,
+                        "session_only": True,
+                    },
+                    {
+                        "access_token": fresh,
                         "type": "Plus",
                         "status": "正常",
                         "quota": 5,
                         "refresh_token": "rt-plus",
-                    }
+                    },
                 ]
             )
-            probed = {"n": 0}
+            service.refresh_access_token = lambda access_token, force=False, event="": access_token  # type: ignore[method-assign]
 
-            def fake(access_token, event="fetch_remote_info"):
-                probed["n"] += 1
+            def timeout_or_ok(access_token, event="fetch_remote_info"):
+                if access_token == expired:
+                    raise RuntimeError("curl: (28) Connection timed out after 12074 milliseconds")
                 return service.get_account(access_token)
 
-            service.fetch_remote_info = fake  # type: ignore[method-assign]
+            service.fetch_remote_info = timeout_or_ok  # type: ignore[method-assign]
             token = service.get_available_access_token()
             service.release_image_slot(token)
-            self.assertEqual(token, "opaque-token")
-            self.assertEqual(probed["n"], 1)
+            self.assertEqual(token, fresh)
 
     def test_get_available_access_token_honors_excluded_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -398,7 +533,8 @@ class AccountCapabilityTests(unittest.TestCase):
                 self.assertFalse(removed)
                 kept = service.get_account("session-token")
                 self.assertIsNotNone(kept)
-                self.assertEqual(kept["status"], "异常")
+                # No hard /me revoke signal → keep 正常 so leftover quota stays selectable.
+                self.assertEqual(kept["status"], "正常")
                 self.assertTrue(kept["session_only"])
         finally:
             if original_value is None:
@@ -759,8 +895,9 @@ class AccountCapabilityTests(unittest.TestCase):
                 raise RuntimeError("upstream invalid_state from proxy")
 
             service.fetch_remote_info = boom  # type: ignore[method-assign]
-            with self.assertRaises(RuntimeError):
-                service.get_available_access_token()
+            with patch.object(service, "_can_skip_image_remote_probe", return_value=False):
+                with self.assertRaises(RuntimeError):
+                    service.get_available_access_token()
             kept = service.get_account("plus-rt")
             self.assertIsNotNone(kept)
             self.assertIsNone(kept.get("last_refresh_error"))
@@ -838,6 +975,14 @@ class AccountCapabilityTests(unittest.TestCase):
                 {"last_token_refresh_error": "oauth_refresh_http_400: app_session_terminated"}
             )
         )
+
+    def test_openssl_invalid_library_is_soft_not_revoked(self) -> None:
+        err = (
+            "curl: (35) TLS connect error: error:00000000:invalid library (0):"
+            "OPENSSL_internal:invalid library (0)"
+        )
+        self.assertTrue(AccountService._is_soft_network_refresh_error(err))
+        self.assertFalse(AccountService._token_looks_revoked({"last_token_refresh_error": err}))
 
     def test_remove_account_locked_cleans_aliases(self) -> None:
         # Bugfix S2: _remove_account_locked must clean up _token_aliases so
@@ -997,6 +1142,121 @@ class AccountCapabilityTests(unittest.TestCase):
                 backend.close()
         build_headers.assert_called()
         self.assertEqual(headers.get("Cookie"), "cf_clearance=manual-token")
+
+    def test_prepare_401_is_not_hard_revoke(self) -> None:
+        self.assertFalse(
+            AccountService._token_looks_revoked(
+                {"last_refresh_error": "token invalidated (chat_requirements_prepare)"}
+            )
+        )
+        self.assertFalse(
+            AccountService._token_looks_revoked(
+                {"last_token_refresh_error": "session_refresh_no_accessToken"}
+            )
+        )
+        self.assertTrue(
+            AccountService._token_looks_revoked(
+                {"last_refresh_error": "token invalidated (/backend-api/me)"}
+            )
+        )
+
+    def test_session_only_prepare_401_keeps_leftover_quota(self) -> None:
+        original_value = config.data.get("auto_remove_invalid_accounts")
+        config.data["auto_remove_invalid_accounts"] = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items(
+                    [
+                        {
+                            "access_token": "live-jwt",
+                            "status": "正常",
+                            "type": "free",
+                            "quota": 24,
+                            "session_token": "sess",
+                            "last_refresh_error": "token invalidated (chat_requirements_prepare)",
+                        }
+                    ]
+                )
+                with patch.object(service, "refresh_access_token", return_value=None):
+                    removed = service.remove_invalid_token("live-jwt", "image_stream")
+                self.assertFalse(removed)
+                kept = service.get_account("live-jwt")
+                self.assertEqual(kept["status"], "正常")
+                self.assertEqual(kept["quota"], 24)
+                self.assertTrue(AccountService._is_image_account_available(kept))
+        finally:
+            if original_value is None:
+                config.data.pop("auto_remove_invalid_accounts", None)
+            else:
+                config.data["auto_remove_invalid_accounts"] = original_value
+
+    def test_backend_reuses_persisted_device_id(self) -> None:
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "fp-tok",
+                        "status": "正常",
+                        "type": "free",
+                        "quota": 25,
+                        "session_token": "sess",
+                    }
+                ]
+            )
+            with (
+                patch("services.openai_backend_api.account_service", service),
+                patch(
+                    "services.openai_backend_api.proxy_settings.build_session_kwargs",
+                    return_value={},
+                ),
+            ):
+                first = OpenAIBackendAPI(access_token="fp-tok")
+                device_id = first.device_id
+                session_id = first.session_id
+                first.close()
+                second = OpenAIBackendAPI(access_token="fp-tok")
+                try:
+                    self.assertEqual(second.device_id, device_id)
+                    self.assertEqual(second.session_id, session_id)
+                finally:
+                    second.close()
+            kept = service.get_account("fp-tok")
+            self.assertEqual(kept["oai-device-id"], device_id)
+            self.assertEqual((kept.get("fp") or {}).get("oai-device-id"), device_id)
+
+    def test_validate_me_sends_session_cookie_and_device_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "at",
+                        "refresh_token": "rt",
+                        "session_token": "sess-cookie",
+                        "oai-device-id": "did-1",
+                    }
+                ]
+            )
+            account = service.get_account("at")
+            mock_session = mock.MagicMock()
+            mock_resp = mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_session.get.return_value = mock_resp
+            with patch("utils.curl_tls.create_cffi_session", return_value=mock_session):
+                result = service._validate_access_token_alive("at", account)
+            self.assertTrue(result)
+            mock_session.cookies.set.assert_any_call(
+                "__Secure-next-auth.session-token",
+                "sess-cookie",
+                domain=".chatgpt.com",
+                path="/",
+            )
+            headers = mock_session.get.call_args.kwargs.get("headers") or {}
+            self.assertEqual(headers.get("OAI-Device-Id"), "did-1")
 
 
 class TokenLogTests(unittest.TestCase):

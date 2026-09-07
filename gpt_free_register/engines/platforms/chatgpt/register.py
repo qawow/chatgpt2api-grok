@@ -56,6 +56,7 @@ class RegistrationResult:
     refresh_token: str = ""
     id_token: str = ""
     session_token: str = ""  # 会话令牌
+    device_id: str = ""  # 注册时种植的 oai-did，生图必须复用
     error_message: str = ""
     logs: list = None
     metadata: dict = None
@@ -2995,6 +2996,9 @@ class RegistrationEngine:
                 self.session_token = session_token
                 result.session_token = session_token
                 self._log(f"获取到 Session Token")
+
+            if self._device_id:
+                result.device_id = str(self._device_id)
 
             # 17. 完成
             self._log("=" * 60)

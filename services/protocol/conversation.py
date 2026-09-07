@@ -71,10 +71,21 @@ def is_token_invalid_error(message: str) -> bool:
     text = str(message or "").lower()
     return (
         "token_invalidated" in text
+        or "token invalidated" in text
         or "token_revoked" in text
         or "authentication token has been invalidated" in text
+        or "could not parse your authentication token" in text
+        or "unauthorized_unknown" in text
+        or "invalid_access_token" in text
         or "invalidated oauth token" in text
+        or "status=401" in text
     )
+
+
+def is_soft_prepare_auth_error(message: str) -> bool:
+    """chat-requirements 401 after TLS retry is often a new device-id, not a spent quota."""
+    text = str(message or "").lower()
+    return "chat_requirements_prepare" in text
 
 
 def is_tls_connection_error(message: str) -> bool:
@@ -109,7 +120,7 @@ def is_connection_timeout_error(message: str) -> bool:
 
 
 def is_openssl_invalid_library_error(message: str) -> bool:
-    """curl_cffi BoringSSL failed to init — retrying the same handle is useless."""
+    """curl_cffi BoringSSL/HTTP2 glitch. New session on the same SOCKS usually works."""
     text = str(message or "").lower()
     return "openssl_internal" in text and "invalid library" in text
 
@@ -1339,20 +1350,17 @@ def _generate_single_image(
     def recover_connection(active_token: str, last_error: str) -> bool:
         """同一账号换出口，或换号。返回 True 表示外层应 continue。"""
         state["last_connection_error"] = last_error
-        if (
-            is_proxy_unreachable_error(last_error)
-            or is_openssl_invalid_library_error(last_error)
-            or is_connection_timeout_error(last_error)
-        ):
+        if is_proxy_unreachable_error(last_error) or is_connection_timeout_error(last_error):
             try:
                 from services.proxy_service import mark_egress_unusable
 
                 mark_egress_unusable(str(state.get("current_proxy_url") or ""), last_error)
             except Exception:
                 pass
+        # OPENSSL_internal is a local curl handle glitch. Same SOCKS often
+        # works after a new session; jumping to direct just times out on WSL.
         if not (
             is_proxy_unreachable_error(last_error)
-            or is_openssl_invalid_library_error(last_error)
             or is_connection_timeout_error(last_error)
         ):
             if is_connection_timeout_error(last_error):
@@ -1389,6 +1397,8 @@ def _generate_single_image(
         queue: list[tuple[str, str]] = [
             (src, url) for src, url in state["egress_queue"] if url not in failed_proxies
         ]
+        if is_openssl_invalid_library_error(last_error):
+            queue = [(src, url) for src, url in queue if url]
         state["egress_queue"] = queue
         state["tls_retry_count"] = 0
         state["conn_timeout_retry_count"] = 0
@@ -1477,6 +1487,8 @@ def _generate_single_image(
         state["current_proxy_url"] = proxy_url
         backend = None
         try:
+            if request.progress_callback:
+                request.progress_callback("preparing_conversation")
             backend = OpenAIBackendAPI(access_token=token, force_proxy=proxy_url)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
@@ -1639,6 +1651,12 @@ def _generate_single_image(
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
                     continue
+                if is_soft_prepare_auth_error(last_error):
+                    raise ImageGenerationError(
+                        image_stream_error_message(last_error),
+                        account_email=account_email,
+                        conversation_id="",
+                    ) from exc
                 account_service.remove_invalid_token(token, "image_stream")
                 continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc

@@ -8,6 +8,7 @@ from utils.curl_tls import (
     create_cffi_session,
     impersonate_fallback_chain,
     is_openssl_invalid_library,
+    is_socks_proxy,
     resolve_session_impersonate,
     sanitize_curl_ssl_env,
 )
@@ -24,9 +25,12 @@ class CurlTlsHelperTests(unittest.TestCase):
         self.assertEqual(resolve_session_impersonate("chrome110"), "chrome142")
         self.assertEqual(resolve_session_impersonate("chrome"), "chrome142")
         self.assertEqual(resolve_session_impersonate("chrome136"), "chrome136")
-        chain = impersonate_fallback_chain("chrome110")
-        self.assertEqual(chain[0], "chrome142")
-        self.assertEqual(chain[-1], "")
+        self.assertEqual(impersonate_fallback_chain("chrome110"), ["chrome142"])
+
+    def test_detects_socks_proxy(self) -> None:
+        self.assertTrue(is_socks_proxy("socks5h://127.0.0.1:1080"))
+        self.assertFalse(is_socks_proxy("http://127.0.0.1:8080"))
+        self.assertFalse(is_socks_proxy(""))
 
     def test_detects_invalid_library(self) -> None:
         self.assertTrue(is_openssl_invalid_library(OPENSSL_INVALID))
@@ -45,14 +49,33 @@ class CurlTlsHelperTests(unittest.TestCase):
             else:
                 os.environ["OPENSSL_CONF"] = old
 
-    def test_session_retries_invalid_library_with_next_impersonate(self) -> None:
-        first = MagicMock()
-        first.get.side_effect = OSError(OPENSSL_INVALID)
-        first.headers = {"User-Agent": "ua"}
-        second = MagicMock()
-        second.get.return_value = "ok"
-        second.headers = {}
-        factory = MagicMock(side_effect=[first, second])
+    def test_socks_session_starts_on_http11(self) -> None:
+        factory = MagicMock()
+        inner = MagicMock()
+        inner.get.return_value = "ok"
+        inner.headers = {}
+        factory.return_value = inner
+
+        with patch("curl_cffi.requests.Session", factory):
+            session = create_cffi_session(
+                impersonate="chrome142",
+                proxy="socks5h://example.invalid:1080",
+                verify=True,
+            )
+            result = session.get("https://chatgpt.com")
+            session.close()
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(factory.call_count, 1)
+        self.assertNotIn("http_version", factory.call_args.kwargs)
+        self.assertIn("http_version", inner.get.call_args.kwargs)
+        self.assertEqual(factory.call_args.kwargs.get("impersonate"), "chrome142")
+
+    def test_invalid_library_retries_with_http11(self) -> None:
+        inner = MagicMock()
+        inner.get.side_effect = [OSError(OPENSSL_INVALID), "ok"]
+        inner.headers = {"User-Agent": "ua"}
+        factory = MagicMock(return_value=inner)
 
         with patch("curl_cffi.requests.Session", factory):
             session = create_cffi_session(impersonate="chrome142", proxy="", verify=True)
@@ -60,18 +83,16 @@ class CurlTlsHelperTests(unittest.TestCase):
             session.close()
 
         self.assertEqual(result, "ok")
-        self.assertEqual(factory.call_count, 2)
-        self.assertEqual(factory.call_args_list[0].kwargs.get("impersonate"), "chrome142")
-        self.assertNotIn("impersonate", factory.call_args_list[1].kwargs)
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(len(inner.get.call_args_list), 2)
+        self.assertNotIn("http_version", inner.get.call_args_list[0].kwargs)
+        self.assertIn("http_version", inner.get.call_args_list[1].kwargs)
 
-    def test_invalid_library_exhaust_marks_proxy(self) -> None:
-        first = MagicMock()
-        first.get.side_effect = OSError(OPENSSL_INVALID)
-        first.headers = {}
-        second = MagicMock()
-        second.get.side_effect = OSError(OPENSSL_INVALID)
-        second.headers = {}
-        factory = MagicMock(side_effect=[first, second])
+    def test_invalid_library_does_not_mark_proxy(self) -> None:
+        inner = MagicMock()
+        inner.get.side_effect = OSError(OPENSSL_INVALID)
+        inner.headers = {}
+        factory = MagicMock(return_value=inner)
 
         with patch("curl_cffi.requests.Session", factory):
             with patch("services.proxy_service.mark_egress_unusable") as mark:
@@ -83,4 +104,27 @@ class CurlTlsHelperTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     session.get("https://chatgpt.com")
                 session.close()
-                mark.assert_called_once()
+                mark.assert_not_called()
+        self.assertGreaterEqual(factory.call_count, 2)
+
+    def test_socks_openssl_recreates_session(self) -> None:
+        inner_fail = MagicMock()
+        inner_fail.get.side_effect = OSError(OPENSSL_INVALID)
+        inner_fail.headers = {"Authorization": "Bearer x"}
+        inner_ok = MagicMock()
+        inner_ok.get.return_value = "ok"
+        inner_ok.headers = {}
+        factory = MagicMock(side_effect=[inner_fail, inner_ok])
+
+        with patch("curl_cffi.requests.Session", factory):
+            session = create_cffi_session(
+                impersonate="chrome142",
+                proxy="socks5h://example.invalid:1080",
+                verify=True,
+            )
+            result = session.get("https://chatgpt.com")
+            session.close()
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(inner_ok.headers.get("Authorization"), "Bearer x")

@@ -10,6 +10,8 @@ from services.protocol.conversation import (
     _generate_single_image,
     image_stream_error_message,
     is_proxy_unreachable_error,
+    is_soft_prepare_auth_error,
+    is_token_invalid_error,
     is_upstream_connection_error,
 )
 
@@ -60,6 +62,19 @@ class ConnectionErrorClassifierTests(unittest.TestCase):
             image_stream_error_message("curl: (28) Operation timed out"),
             "upstream connection timed out, please retry later",
         )
+
+    def test_token_invalid_includes_parse_and_http_401(self) -> None:
+        self.assertTrue(
+            is_token_invalid_error(
+                'chat_requirements_prepare failed: status=401, body={"error": '
+                '{"message": "Could not parse your authentication token. Please try signing in again.", '
+                '"code": "unauthorized_unknown"}}'
+            )
+        )
+        self.assertTrue(is_token_invalid_error("token invalidated (chat_requirements_prepare)"))
+        self.assertTrue(is_soft_prepare_auth_error("token invalidated (chat_requirements_prepare)"))
+        self.assertFalse(is_soft_prepare_auth_error("token invalidated (/backend-api/me)"))
+        self.assertFalse(is_token_invalid_error("content policy violation"))
 
     def test_non_connection_errors_pass_through(self) -> None:
         self.assertFalse(is_upstream_connection_error("content policy violation"))
@@ -159,7 +174,7 @@ class ImageConnectionFailoverTests(unittest.TestCase):
         self.assertEqual(created, ["socks5h://dead.example:1080", ""])
         self.assertEqual(outputs[0].kind, "result")
 
-    def test_openssl_invalid_library_falls_back_to_direct_without_sticky_wait(self) -> None:
+    def test_openssl_invalid_library_retries_same_proxy(self) -> None:
         created: list[str | None] = []
         err = (
             "curl: (35) TLS connect error: error:00000000:invalid library (0):"
@@ -177,7 +192,7 @@ class ImageConnectionFailoverTests(unittest.TestCase):
                 return None
 
         def fake_stream(backend, request, index, total):
-            if backend.force_proxy:
+            if created.count(backend.force_proxy) < 2:
                 raise OSError(err)
             yield ImageOutput(
                 kind="result",
@@ -193,7 +208,7 @@ class ImageConnectionFailoverTests(unittest.TestCase):
             patch("services.protocol.conversation.stream_image_outputs", fake_stream),
             patch(
                 "services.protocol.conversation.proxy_settings.list_egress_candidates",
-                return_value=[("global", "socks5h://dead.example:1080"), ("direct", "")],
+                return_value=[("global", "socks5h://live.example:1080"), ("direct", "")],
             ),
             patch("services.protocol.conversation.time.sleep") as slept,
         ):
@@ -205,10 +220,41 @@ class ImageConnectionFailoverTests(unittest.TestCase):
                 1,
             )
 
-        self.assertEqual(created, ["socks5h://dead.example:1080", ""])
+        self.assertEqual(created, ["socks5h://live.example:1080", "socks5h://live.example:1080"])
         self.assertEqual(outputs[0].kind, "result")
-        slept.assert_not_called()
+        slept.assert_called()
 
+    def test_prepare_401_does_not_remove_account(self) -> None:
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
 
-if __name__ == "__main__":
-    unittest.main()
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            raise RuntimeError("token invalidated (chat_requirements_prepare)")
+            yield  # pragma: no cover
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://live.example:1080")],
+            ),
+        ):
+            accounts.get_available_access_token.return_value = "token-a"
+            accounts.get_account.return_value = {"email": "a@example.com"}
+            accounts.refresh_access_token.return_value = None
+            with self.assertRaises(ImageGenerationError):
+                _generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        accounts.remove_invalid_token.assert_not_called()
+        accounts.mark_image_result.assert_called_with("token-a", False)

@@ -10,6 +10,7 @@
 + [修复] Grok / D1 / WebDAV / R2 / FlareSolverr / 号池 HTTP 推送不再继承环境 SOCKS；curl_cffi 无代理时显式清空 `proxy`。
 + [修复] `utils/atomic` 写入遇 Docker 单文件 bind mount 的 EBUSY 时改为就地覆盖，设置面板不再因 rename 失败报 500；图片索引/任务文件写入统一走 atomic。
 + [修复] ChatGPT 生图/刷新/登录主链路接上 proxy_runtime 单代理（WARP/privoxy），不再因直连被拒报 `upstream image connection failed`；图片下载走独立资源会话（可配 `resource_proxy_url`）。
++ [修复] estuary / files 下载地址仍要带 Bearer 和 `ChatGPT-Account-Id`，匿名资源会话会 403 `File stream access denied`；这类 URL 改走主会话取图。
 + [优化] 连接类错误（ProxyError/socks 隧道失败/connection refused/TLS/超时）同账号先换出口（runtime/全局/直连），再换健康账号；代理拒连不再空耗同出口重试。
 + [修复] 图片续轮询不再传已失效的 `proxy_url`；按任务账号换出口取图。参考图/CDN 下载与注册后 `fetch_remote_info` 同样走出口回退。
 + [移除] PPT/PSD 可编辑文件任务、搜索接口、Anthropic messages 实现、文本补全缓存；调试页仅保留 Skills。
@@ -23,8 +24,12 @@
 + [优化] 生图首轮等待默认 10s→6s；Grok 免费路径只打 grok-4.5，不再试 grok-4/grok-3。
 + [优化] `GET /v1/models` 改为本地生图目录，不再每次 TLS 打 chatgpt.com。
 + [修复] 死 SOCKS 超时（curl 28）后 10 分钟内不再让每个账号重复空等；刷新/生图改走下一条出口。session 探活超时从 45s 降到 12s。
-+ [修复] `curl_cffi` 在 Linux/WSL2/Docker 上撞系统 OpenSSL 配置会报 `OPENSSL_internal:invalid library`（对外就是 `upstream image connection failed`）。启动时清掉 `OPENSSL_CONF`，旧指纹 `chrome110` 升到 `chrome142`；握手失败不再连换 Chrome 指纹（同库仍失败），改为无 impersonate 再试一次，仍失败则拉黑该出口。Grok 出站同样走出口回退，残留 grokcli2api-go / G2A 地址改回 `cli-chat-proxy.grok.com`。
-+ [修复] 账号检测对齐原项目：面板刷新强制打 `/me` 探活；定时巡检不再跳过正常 session_only；`/me` 成功会清掉废号标记。生图取号仅在最近一次探活仍新鲜时跳过远程校验。
++ [修复] `curl_cffi` 在 Linux/WSL2/Docker 上撞系统 OpenSSL 配置会报 `OPENSSL_internal:invalid library`（对外就是代理测试失败 / `upstream image connection failed`）。SOCKS 出站默认 HTTP/1.1；握手再失败时同指纹切 HTTP/1.1。该错误不再把代理拉黑、也不再写成号池废 token。Grok 出站同样走出口回退，残留 grokcli2api-go / G2A 地址改回 `cli-chat-proxy.grok.com`。
++ [修复] 账号检测对齐原项目：面板刷新强制打 `/me` 探活；定时巡检不再跳过正常 session_only；`/me` 成功会清掉废号标记。生图取号在本地额度>0 且状态正常时不再强打 `/me`（死 SOCKS 探活会把界面卡在「确认可用账号」）。
++ [修复] 本地设置页打不开：`web_dist` 仍是旧包，打开设置会请求已删除的 `/api/cpa/pools`；未知 `/api/*` 却回首页 HTML，前端把 `pools` 写成 `undefined` 后整页崩掉。已重编前端，未知 API/auth 路径改为 404。
++ [修复] 生图 `chat_requirements_prepare` 401 `Could not parse your authentication token`：过期 session JWT 在代理超时后仍被直接选用。过期号先走 session 续期（出口回退），401 会换号，不再把过期 Bearer 交给 ChatGPT。
++ [修复] SOCKS 上 `OPENSSL_internal:invalid library` 不再切直连（本机直连 chatgpt.com 会 30s 超时）。同代理重建 HTTP/1.1 会话重试；该错误仍不把代理拉黑。
++ [修复] 免费 session_only 号第一次生图成功、第二次立刻废号：TLS 重试会新建 `OpenAIBackendAPI` 并换 `OAI-Device-Id`，session 探活 `/me` 又不带 cookie，一次 `chat_requirements_prepare` 401 就把额度清零。设备指纹写入号池并复用；`/me` 带上 session cookie + `oai-did`；prepare 401 不再当 hard revoke、不再清零剩余额度。注册入库带上 `oai-did`。
 + [优化] Grok 上游：线程内 `requests.Session` keep-alive；免费路径 429 立即失败不再连打 grok-4/grok-3/付费接口；付费 401/403/429 跳过 `/models` catalog。
 + [优化] 生图轮询：15–35s 窗口用 4s/7s 间隔（不超过配置上限）；循环内不再每次打 `/backend-api/tasks`（只在接近超时补一次）。默认 `image_poll_interval_secs` 5。
 + [移除] grokcli2api-go / G2A 桥：删除 `/api/g2a*`、设置页 Codex2API、号池远程只读标签；Grok 生图只走本地号池。

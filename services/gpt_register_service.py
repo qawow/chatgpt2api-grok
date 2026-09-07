@@ -1113,6 +1113,10 @@ class GptRegisterService:
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
         }
+        device_id = _clean(extra.get("oai-device-id")) or _clean(extra.get("device_id"))
+        if device_id:
+            payload["oai-device-id"] = device_id
+            payload["fp"]["oai-device-id"] = device_id
         # Default free image quota until remote fetch fills real limits_progress.
         # Without this, quota stays 0 → "no available image quota" even for fresh accounts.
         if payload.get("quota") in (None, "", 0):

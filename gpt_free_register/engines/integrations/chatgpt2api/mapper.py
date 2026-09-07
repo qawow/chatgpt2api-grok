@@ -57,6 +57,7 @@ def map_register_result_to_account(
     password = _field(account, "password")
     account_id = _field(account, "account_id", "user_id")
     workspace_id = _field(account, "workspace_id")
+    device_id = _field(account, "oai-device-id", "oai_did", "device_id")
 
     # 有 refresh+id 时按 codex 源处理，chatgpt2api 可走 refresh_token 保活
     has_codex = bool(refresh_token and id_token)
@@ -83,6 +84,9 @@ def map_register_result_to_account(
         payload["session_token"] = session_token
     if workspace_id:
         payload["workspace_id"] = workspace_id
+    if device_id:
+        payload["oai-device-id"] = device_id
+        payload["fp"] = {"oai-device-id": device_id}
     if has_codex:
         payload["export_type"] = "codex"
     if proxy:

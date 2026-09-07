@@ -361,6 +361,35 @@ class ImportLocalTest(unittest.TestCase):
         self.assertTrue(payload["fragile"])
         self.assertEqual(payload["source_type"], "register")
         self.assertEqual(int(payload.get("quota") or 0), 30)
+
+    def test_import_local_persists_oai_device_id(self):
+        svc = GptRegisterService(config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg-import-did.json")))
+        settings = normalize_settings({"plan_type": "free", "bind_register_proxy": False})
+        account = {
+            "email": "d@x.com",
+            "token": "access-did",
+            "user_id": "u2",
+            "extra": {
+                "access_token": "access-did",
+                "session_token": "sess",
+                "oai-device-id": "did-from-register",
+            },
+        }
+        fake_svc = mock.Mock()
+        fake_svc.add_account_items.return_value = {"added": 1, "skipped": 0, "items": []}
+        fake_svc.list_accounts.return_value = []
+        fake_svc.fetch_remote_info.return_value = {
+            "access_token": "access-did",
+            "quota": 25,
+            "status": "正常",
+            "type": "free",
+        }
+        with mock.patch("services.account_service.account_service", fake_svc):
+            added = svc._import_local(account, settings)
+        self.assertEqual(added, 1)
+        payload = fake_svc.add_account_items.call_args[0][0][0]
+        self.assertEqual(payload["oai-device-id"], "did-from-register")
+        self.assertEqual(payload["fp"]["oai-device-id"], "did-from-register")
         # fetch_remote_info runs in a daemon thread; wait briefly
         import time as _time
         for _ in range(50):
@@ -368,7 +397,7 @@ class ImportLocalTest(unittest.TestCase):
                 break
             _time.sleep(0.02)
         fake_svc.fetch_remote_info.assert_called_once()
-        self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "access-only")
+        self.assertEqual(fake_svc.fetch_remote_info.call_args[0][0], "access-did")
 
     def test_import_local_codex_tokens_not_session_only(self):
         svc = GptRegisterService(config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg-import2.json")))

@@ -136,6 +136,18 @@ def start_grok_account_watcher(stop_event: Event) -> Thread:
     return thread
 
 
+_SPA_FALLBACK_BLOCKLIST = ("_next/", "api/", "v1/", "auth/")
+
+
+def should_skip_spa_fallback(requested_path: str) -> bool:
+    """Unknown API/auth/asset paths must 404, not the dashboard HTML.
+
+    The July settings UI still GETs removed /api/cpa/pools. Serving index.html
+    as 200 made axios treat the page as JSON and crash the settings tab.
+    """
+    return requested_path.strip("/").startswith(_SPA_FALLBACK_BLOCKLIST)
+
+
 def resolve_web_asset(requested_path: str) -> Path | None:
     if not WEB_DIST_DIR.exists():
         return None

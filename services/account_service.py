@@ -161,6 +161,25 @@ class AccountService:
         ]
         return " | ".join(p for p in parts if p).lower()
 
+    @staticmethod
+    def _is_soft_network_refresh_error(error: str) -> bool:
+        text = str(error or "").lower()
+        return any(
+            token in text
+            for token in (
+                "timeout",
+                "timed out",
+                "connection",
+                "curl: (28)",
+                "curl: (7)",
+                "curl: (35)",
+                "openssl_internal",
+                "invalid library",
+                "proxyerror",
+                "proxy error",
+            )
+        )
+
     @classmethod
     def _token_looks_revoked(cls, account: dict | None) -> bool:
         """True when local evidence says the access token is server-revoked/dead.
@@ -172,7 +191,10 @@ class AccountService:
         if not err:
             return False
         needles = (
-            "token invalidated",
+            # Prepare 401 after TLS/device-id churn is not a hard revoke.
+            # Only confirmed /me (or explicit token_revoked) should kill the row.
+            "token invalidated (/backend-api/me)",
+            "token invalidated (me)",
             "token_revoked",
             "invalidated oauth",
             "session_refresh_stale_token_revoked",
@@ -191,6 +213,45 @@ class AccountService:
             "app_session_terminated",
         )
         return any(n in err for n in needles)
+
+    @staticmethod
+    def _chatgpt_device_id(account: dict | None) -> str:
+        if not isinstance(account, dict):
+            return ""
+        direct = str(account.get("oai-device-id") or "").strip()
+        if direct:
+            return direct
+        raw_fp = account.get("fp")
+        if isinstance(raw_fp, dict):
+            return str(raw_fp.get("oai-device-id") or raw_fp.get("OAI-Device-Id") or "").strip()
+        return ""
+
+    @classmethod
+    def _apply_chatgpt_web_identity(cls, session: Any, account: dict | None) -> None:
+        """Attach NextAuth cookie + register device id so /me matches the web client."""
+        account = account if isinstance(account, dict) else {}
+        session_token = str(account.get("session_token") or "").strip()
+        if session_token:
+            try:
+                session.cookies.set(
+                    "__Secure-next-auth.session-token",
+                    session_token,
+                    domain=".chatgpt.com",
+                    path="/",
+                )
+            except Exception:
+                pass
+        device_id = cls._chatgpt_device_id(account)
+        if not device_id:
+            return
+        try:
+            session.cookies.set("oai-did", device_id, domain=".chatgpt.com", path="/")
+        except Exception:
+            pass
+        try:
+            session.headers["OAI-Device-Id"] = device_id
+        except Exception:
+            pass
 
     @classmethod
     def _revoked_error_at(cls, account: dict | None) -> datetime | None:
@@ -398,6 +459,11 @@ class AccountService:
         if exp <= 0:
             return None
         return exp - int(time.time())
+
+    @classmethod
+    def _jwt_fresh_enough(cls, access_token: str) -> bool:
+        remaining = cls._token_expires_in(access_token)
+        return remaining is None or remaining >= cls._IMAGE_PROBE_JWT_MIN_REMAINING
 
     @classmethod
     def _token_needs_refresh(cls, access_token: str, *, force: bool = False) -> bool:
@@ -649,43 +715,52 @@ class AccountService:
         access_token = str(access_token or "").strip()
         if not access_token:
             return False
-        from services.proxy_service import proxy_settings
+        from services.proxy_service import _is_egress_connect_error, mark_egress_unusable, proxy_settings
         from utils.curl_tls import create_cffi_session
 
-        session = create_cffi_session(
-            **proxy_settings.build_session_kwargs(
-                account=account or {},
-                impersonate="chrome142",
-                verify=True,
-                upstream=True,
+        saw_auth_dead = False
+        for _source, proxy_url in proxy_settings.list_egress_candidates(account=account or {}, upstream=True):
+            session = create_cffi_session(
+                **proxy_settings.build_session_kwargs(
+                    account=account or {},
+                    impersonate="chrome142",
+                    verify=True,
+                    upstream=True,
+                    force_proxy=proxy_url,
+                )
             )
-        )
-        try:
-            resp = session.get(
-                "https://chatgpt.com/backend-api/me",
-                headers={
+            try:
+                self._apply_chatgpt_web_identity(session, account)
+                headers = {
                     "Authorization": f"Bearer {access_token}",
                     "Accept": "application/json",
                     "User-Agent": self._OAUTH_USER_AGENT,
-                },
-                timeout=25,
-            )
-            if resp.status_code == 200:
-                return True
-            if resp.status_code in {401, 403}:
-                return False
-            # Unexpected status (5xx, 429, etc.) — inconclusive
-            return None
-        except Exception:
-            # Network error (timeout, connection reset, TLS failure) —
-            # must NOT be treated as token invalidation, otherwise a valid
-            # freshly-refreshed token gets discarded due to transient flakes.
-            return None
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
+                }
+                device_id = self._chatgpt_device_id(account)
+                if device_id:
+                    headers["OAI-Device-Id"] = device_id
+                resp = session.get(
+                    "https://chatgpt.com/backend-api/me",
+                    headers=headers,
+                    timeout=12,
+                )
+                if resp.status_code == 200:
+                    return True
+                if resp.status_code in {401, 403}:
+                    saw_auth_dead = True
+                    return False
+                return None
+            except Exception as exc:
+                if _is_egress_connect_error(str(exc)):
+                    mark_egress_unusable(proxy_url, str(exc))
+                    continue
+                return None
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+        return False if saw_auth_dead else None
 
     def _refresh_access_token_via_session(self, session_token: str, account: dict | None = None) -> dict[str, str]:
         """Refresh access_token using ChatGPT web session cookie.
@@ -693,82 +768,92 @@ class AccountService:
         Critical: /api/auth/session may return the *same* already-revoked accessToken.
         We only treat the result as success when /backend-api/me returns 200.
         """
-        from services.proxy_service import proxy_settings
+        from services.proxy_service import _is_egress_connect_error, mark_egress_unusable, proxy_settings
         from utils.curl_tls import create_cffi_session
 
         session_token = str(session_token or "").strip()
         if not session_token:
             raise RuntimeError("session_token_empty")
         old_access = str((account or {}).get("access_token") or "").strip()
-        session_kwargs = proxy_settings.build_session_kwargs(
-            account=account,
-            impersonate="chrome142",
-            verify=True,
-            upstream=True,
-        )
-        session = create_cffi_session(**session_kwargs)
-        try:
-            session.cookies.set(
-                "__Secure-next-auth.session-token",
-                session_token,
-                domain=".chatgpt.com",
-                path="/",
+        last_error: Exception | None = None
+        for _source, proxy_url in proxy_settings.list_egress_candidates(account=account, upstream=True):
+            session_kwargs = proxy_settings.build_session_kwargs(
+                account=account,
+                impersonate="chrome142",
+                verify=True,
+                upstream=True,
+                force_proxy=proxy_url,
             )
-            response = session.get(
-                "https://chatgpt.com/api/auth/session",
-                headers={
+            session = create_cffi_session(**session_kwargs)
+            try:
+                self._apply_chatgpt_web_identity(session, account)
+                session.cookies.set(
+                    "__Secure-next-auth.session-token",
+                    session_token,
+                    domain=".chatgpt.com",
+                    path="/",
+                )
+                headers = {
                     "Accept": "application/json",
                     "User-Agent": self._OAUTH_USER_AGENT,
                     "Referer": "https://chatgpt.com/",
-                },
-                timeout=12,
-            )
-            if response.status_code == 404:
-                raise RuntimeError("session_refresh_http_404")
-            data = response.json() if response.text else {}
-            if response.status_code != 200 or not isinstance(data, dict):
-                raise RuntimeError(f"session_refresh_http_{response.status_code}")
-            access = str(data.get("accessToken") or data.get("access_token") or "").strip()
-            if not access:
-                raise RuntimeError("session_refresh_no_accessToken")
+                }
+                device_id = self._chatgpt_device_id(account)
+                if device_id:
+                    headers["OAI-Device-Id"] = device_id
+                response = session.get(
+                    "https://chatgpt.com/api/auth/session",
+                    headers=headers,
+                    timeout=12,
+                )
+                if response.status_code == 404:
+                    raise RuntimeError("session_refresh_http_404")
+                data = response.json() if response.text else {}
+                if response.status_code != 200 or not isinstance(data, dict):
+                    raise RuntimeError(f"session_refresh_http_{response.status_code}")
+                access = str(data.get("accessToken") or data.get("access_token") or "").strip()
+                if not access:
+                    raise RuntimeError("session_refresh_no_accessToken")
 
-            # Reject fake refresh: same revoked JWT still returned by session endpoint.
-            # But a None result (network error) must NOT be treated as invalid —
-            # otherwise a valid token gets discarded on transient network flakes.
-            alive = self._validate_access_token_alive(access, account)
-            if alive is False:
-                if access == old_access:
-                    raise RuntimeError("session_refresh_stale_token_revoked")
-                raise RuntimeError("session_refresh_token_still_invalid")
-            # alive is True or None — accept the token
+                # Reject fake refresh: same revoked JWT still returned by session endpoint.
+                # But a None result (network error) must NOT be treated as invalid —
+                # otherwise a valid token gets discarded on transient network flakes.
+                alive = self._validate_access_token_alive(access, account)
+                if alive is False:
+                    if access == old_access:
+                        raise RuntimeError("session_refresh_stale_token_revoked")
+                    raise RuntimeError("session_refresh_token_still_invalid")
 
-            new_sess = ""
-            try:
-                new_sess = str(session.cookies.get("__Secure-next-auth.session-token") or "").strip()
-            except Exception:
                 new_sess = ""
-            return {
-                "access_token": access,
-                "refresh_token": str((account or {}).get("refresh_token") or "").strip(),
-                "id_token": str(
-                    data.get("idToken")
-                    or data.get("id_token")
-                    or (account or {}).get("id_token")
-                    or ""
-                ).strip(),
-                "session_token": new_sess or session_token,
-            }
-        except Exception as exc:
-            from services.proxy_service import _is_egress_connect_error, mark_egress_unusable
-
-            if _is_egress_connect_error(str(exc)):
-                mark_egress_unusable(str(session_kwargs.get("proxy") or ""), str(exc))
-            raise
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
+                try:
+                    new_sess = str(session.cookies.get("__Secure-next-auth.session-token") or "").strip()
+                except Exception:
+                    new_sess = ""
+                return {
+                    "access_token": access,
+                    "refresh_token": str((account or {}).get("refresh_token") or "").strip(),
+                    "id_token": str(
+                        data.get("idToken")
+                        or data.get("id_token")
+                        or (account or {}).get("id_token")
+                        or ""
+                    ).strip(),
+                    "session_token": new_sess or session_token,
+                }
+            except Exception as exc:
+                last_error = exc
+                if _is_egress_connect_error(str(exc)):
+                    mark_egress_unusable(proxy_url, str(exc))
+                    continue
+                raise
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("session_refresh_no_egress")
 
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
@@ -807,7 +892,8 @@ class AccountService:
                 except Exception as exc:
                     error_str = str(exc or "")
                     errors.append(f"oauth:{error_str}")
-                    self._record_token_refresh_error(active_token, event, error_str)
+                    if not self._is_soft_network_refresh_error(error_str):
+                        self._record_token_refresh_error(active_token, event, error_str)
                     if "app_session_terminated" in error_str.lower() and not force:
                         # force=True already has a sync password fallback below.
                         # Spawning a background thread here races that path and
@@ -829,7 +915,8 @@ class AccountService:
                 except Exception as exc:
                     error_str = str(exc or "")
                     errors.append(f"session:{error_str}")
-                    self._record_token_refresh_error(active_token, f"{event}:session", error_str)
+                    if not self._is_soft_network_refresh_error(error_str):
+                        self._record_token_refresh_error(active_token, f"{event}:session", error_str)
 
             # Last resort: email+password relogin (sync for force, else background)
             if token_data is None:
@@ -1483,7 +1570,6 @@ class AccountService:
             self._image_slot_condition.notify_all()
 
     _IMAGE_PROBE_JWT_MIN_REMAINING = 5 * 60
-    _IMAGE_PROBE_MAX_AGE_SECONDS = 5 * 60
 
     def _can_skip_image_remote_probe(
         self,
@@ -1493,25 +1579,24 @@ class AccountService:
         source_type: str | None = None,
         plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> bool:
-        """Skip /me+init+accounts when a recent successful probe is still fresh."""
+        """Skip /me when local quota still says the account can generate.
+
+        A missing/stale last_probed_at or a network last_refresh_error must not
+        block image pick: probing through a dead SOCKS freezes the UI on
+        确认可用账号 for tens of seconds per account.
+        """
         if not isinstance(account, dict):
             return False
         if int(account.get("quota") or 0) <= 0:
             return False
         if str(account.get("status") or "") != "正常":
             return False
-        if str(account.get("last_refresh_error") or "").strip():
-            return False
         if self._token_looks_revoked(account):
             return False
-        probed_at = self._parse_time(account.get("last_probed_at"))
-        if probed_at is None:
+        err = str(account.get("last_refresh_error") or "").strip()
+        if err and not self._is_soft_network_refresh_error(err):
             return False
-        probed_age = (datetime.now(timezone.utc) - probed_at).total_seconds()
-        if probed_age > self._IMAGE_PROBE_MAX_AGE_SECONDS:
-            return False
-        remaining = self._token_expires_in(str(account.get("access_token") or ""))
-        if remaining is None or remaining < self._IMAGE_PROBE_JWT_MIN_REMAINING:
+        if not self._jwt_fresh_enough(str(account.get("access_token") or "")):
             return False
         return (
             self._is_image_account_available(account)
@@ -1529,8 +1614,8 @@ class AccountService:
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
-        本地缓存只做初筛。最近一次 /me 探活仍新鲜、JWT 未过期、额度>0 时才跳过
-        fetch_remote_info；否则按原项目一样远程校验 token 和额度。
+        本地额度>0、状态正常、token 未吊销时跳过 /me。额度耗尽、状态异常、
+        硬认证错误或 JWT 剩余不足 5 分钟时仍远程校验。
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set(excluded_tokens or set())
@@ -1547,6 +1632,18 @@ class AccountService:
                 local_account, plan_type=plan_type, source_type=source_type, plan_types=plan_types
             ):
                 return access_token
+            if not self._jwt_fresh_enough(str(local_account.get("access_token") or access_token)):
+                refreshed = self.refresh_access_token(
+                    access_token, force=True, event="get_available_jwt_expired"
+                )
+                if refreshed and refreshed != access_token:
+                    attempted_tokens.add(refreshed)
+                    access_token = refreshed
+                    local_account = self.get_account(access_token) or local_account
+                    if self._can_skip_image_remote_probe(
+                        local_account, plan_type=plan_type, source_type=source_type, plan_types=plan_types
+                    ):
+                        return access_token
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
             except Exception as exc:
@@ -1572,6 +1669,9 @@ class AccountService:
                         "connection",
                         "curl: (28)",
                         "curl: (7)",
+                        "curl: (35)",
+                        "openssl_internal",
+                        "invalid library",
                         "network",
                         "temporarily",
                     )
@@ -1588,8 +1688,11 @@ class AccountService:
                     self.release_image_slot(access_token)
                     continue
                 # Proxy/network flake: trust local cache if account still looks image-ready
+                # and the Bearer JWT is not already expired (expired session JWTs
+                # make ChatGPT return 401 "Could not parse your authentication token").
                 if (
                     net_soft
+                    and self._jwt_fresh_enough(str(local_account.get("access_token") or access_token))
                     and self._is_image_account_available(local_account)
                     and int(local_account.get("quota") or 0) > 0
                     and self._account_matches_plan_type(local_account, plan_type)
@@ -1791,7 +1894,13 @@ class AccountService:
             or str(acc2.get("password") or "").strip()
             or self._is_session_only_account(acc2)
         ):
-            updates = {"status": "异常", "quota": 0}
+            leftover = int(acc2.get("quota") or 0)
+            # A single prepare 401 after TLS retry is not "quota spent".
+            # Zeroing leftover quota makes the only free account unselectable.
+            if self._token_looks_revoked(acc2):
+                updates = {"status": "异常", "quota": leftover}
+            else:
+                updates = {"status": "正常", "quota": leftover}
             if self._is_session_only_account(acc2):
                 updates["session_only"] = True
                 updates["fragile"] = True
@@ -1799,11 +1908,13 @@ class AccountService:
             if not quiet:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
-                    "保留异常 free 账号(不自动删除)",
+                    "保留异常 free 账号(不自动删除)" if updates["status"] == "异常" else "free 账号鉴权失败(保留额度)",
                     {
                         "source": event,
                         "token": anonymize_token(access_token),
                         "session_only": self._is_session_only_account(acc2),
+                        "quota": leftover,
+                        "status": updates["status"],
                     },
                 )
             return False
@@ -2390,7 +2501,8 @@ class AccountService:
                     error_str = str(exc)
                     # TLS/代理连接错误是网络问题，不计入账号失败
                     from services.protocol.conversation import is_tls_connection_error
-                    if not is_tls_connection_error(error_str):
+                    tls = is_tls_connection_error(error_str)
+                    if not tls:
                         errors.append({"token": anonymize_token(token), "error": error_str})
                 else:
                     if account is not None:
