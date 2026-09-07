@@ -20,6 +20,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import _is_egress_connect_error, normalize_proxy_url, proxy_settings
+from utils.curl_tls import create_cffi_session
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -147,7 +148,7 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self.session = create_cffi_session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
@@ -284,7 +285,7 @@ class OpenAIBackendAPI:
         """
         session = getattr(self, "resource_session", None)
         if session is None:
-            session = requests.Session(**proxy_settings.build_session_kwargs(
+            session = create_cffi_session(**proxy_settings.build_session_kwargs(
                 account=self.account,
                 resource=True,
                 upstream=True,
@@ -344,7 +345,10 @@ class OpenAIBackendAPI:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/142.0.7540.34 Safari/537.36",
         )
+        from utils.curl_tls import resolve_session_impersonate
+
         fp.setdefault("impersonate", "chrome142")
+        fp["impersonate"] = resolve_session_impersonate(fp.get("impersonate"))
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
         fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')

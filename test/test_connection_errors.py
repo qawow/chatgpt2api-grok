@@ -35,6 +35,20 @@ class ConnectionErrorClassifierTests(unittest.TestCase):
         self.assertTrue(is_proxy_unreachable_error(DEAD_SOCKS_ERROR))
         self.assertFalse(is_proxy_unreachable_error("curl: (35) TLS connect error"))
 
+    def test_openssl_invalid_library_skips_sticky_retry(self) -> None:
+        from services.protocol.conversation import is_openssl_invalid_library_error
+
+        err = (
+            "curl: (35) TLS connect error: error:00000000:invalid library (0):"
+            "OPENSSL_internal:invalid library (0)"
+        )
+        self.assertTrue(is_openssl_invalid_library_error(err))
+        self.assertTrue(is_upstream_connection_error(err))
+        self.assertEqual(
+            image_stream_error_message(err),
+            "upstream image connection failed, please retry later",
+        )
+
     def test_error_message_reports_upstream_connection_failure(self) -> None:
         msg = image_stream_error_message(
             "ProxyError: Tunnel connection failed: 502 upstream socks failed: [Errno 111] Connection refused"
@@ -144,6 +158,56 @@ class ImageConnectionFailoverTests(unittest.TestCase):
 
         self.assertEqual(created, ["socks5h://dead.example:1080", ""])
         self.assertEqual(outputs[0].kind, "result")
+
+    def test_openssl_invalid_library_falls_back_to_direct_without_sticky_wait(self) -> None:
+        created: list[str | None] = []
+        err = (
+            "curl: (35) TLS connect error: error:00000000:invalid library (0):"
+            "OPENSSL_internal:invalid library (0)"
+        )
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.force_proxy = force_proxy
+                self.progress_callback = None
+                created.append(force_proxy)
+
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            if backend.force_proxy:
+                raise OSError(err)
+            yield ImageOutput(
+                kind="result",
+                model=request.model,
+                index=index,
+                total=total,
+                data=[{"url": "http://example.test/ok.png"}],
+            )
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://dead.example:1080"), ("direct", "")],
+            ),
+            patch("services.protocol.conversation.time.sleep") as slept,
+        ):
+            accounts.get_available_access_token.return_value = "token-a"
+            accounts.get_account.return_value = {"email": "a@example.com"}
+            outputs = _generate_single_image(
+                ConversationRequest(model="gpt-image-2", prompt="cat"),
+                1,
+                1,
+            )
+
+        self.assertEqual(created, ["socks5h://dead.example:1080", ""])
+        self.assertEqual(outputs[0].kind, "result")
+        slept.assert_not_called()
 
 
 if __name__ == "__main__":

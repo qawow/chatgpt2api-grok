@@ -108,6 +108,12 @@ def is_connection_timeout_error(message: str) -> bool:
     )
 
 
+def is_openssl_invalid_library_error(message: str) -> bool:
+    """curl_cffi BoringSSL failed to init — retrying the same handle is useless."""
+    text = str(message or "").lower()
+    return "openssl_internal" in text and "invalid library" in text
+
+
 def is_proxy_unreachable_error(message: str) -> bool:
     """代理本身不可达（拒连/隧道失败），再打同一条出口没有意义。"""
     text = str(message or "").lower()
@@ -1333,7 +1339,22 @@ def _generate_single_image(
     def recover_connection(active_token: str, last_error: str) -> bool:
         """同一账号换出口，或换号。返回 True 表示外层应 continue。"""
         state["last_connection_error"] = last_error
-        if not is_proxy_unreachable_error(last_error):
+        if (
+            is_proxy_unreachable_error(last_error)
+            or is_openssl_invalid_library_error(last_error)
+            or is_connection_timeout_error(last_error)
+        ):
+            try:
+                from services.proxy_service import mark_egress_unusable
+
+                mark_egress_unusable(str(state.get("current_proxy_url") or ""), last_error)
+            except Exception:
+                pass
+        if not (
+            is_proxy_unreachable_error(last_error)
+            or is_openssl_invalid_library_error(last_error)
+            or is_connection_timeout_error(last_error)
+        ):
             if is_connection_timeout_error(last_error):
                 state["conn_timeout_retry_count"] += 1
                 retry_count = int(state["conn_timeout_retry_count"])

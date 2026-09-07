@@ -12,7 +12,10 @@ from services.proxy_service import (
     ClearanceBundle,
     FlareSolverrClearanceProvider,
     ProxySettingsStore,
+    is_egress_unusable,
+    mark_egress_unusable,
     normalize_proxy_url,
+    reset_unusable_egress,
 )
 
 
@@ -38,6 +41,9 @@ def make_runtime(**overrides: object) -> dict[str, object]:
 
 
 class ProxyServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_unusable_egress()
+
     def test_normalize_proxy_url_strips_and_converts_socks_schemes(self) -> None:
         self.assertEqual(normalize_proxy_url("  http://proxy.example:8080  "), "http://proxy.example:8080")
         self.assertEqual(normalize_proxy_url("\thttps://proxy.example:8443\n"), "https://proxy.example:8443")
@@ -51,7 +57,7 @@ class ProxyServiceTests(unittest.TestCase):
 
         kwargs = store.build_session_kwargs(impersonate="chrome")
 
-        self.assertEqual(kwargs["impersonate"], "chrome")
+        self.assertEqual(kwargs["impersonate"], "chrome142")
         self.assertEqual(kwargs["proxy"], "http://legacy.example:8080")
 
     def test_build_session_kwargs_sets_empty_proxy_when_direct(self) -> None:
@@ -158,6 +164,21 @@ class ProxyServiceTests(unittest.TestCase):
             ],
         )
 
+    def test_unusable_proxy_is_skipped_for_later_accounts(self) -> None:
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://dead.example:1080"))
+        mark_egress_unusable("socks5h://dead.example:1080", "curl: (28) Connection timed out")
+        self.assertTrue(is_egress_unusable("socks5h://dead.example:1080"))
+        candidates = store.list_egress_candidates(
+            account={"proxy": "socks5h://dead.example:1080"},
+            upstream=True,
+        )
+        self.assertEqual(candidates, [("direct", "")])
+        kwargs = store.build_session_kwargs(
+            account={"proxy": "socks5h://dead.example:1080"},
+            upstream=True,
+        )
+        self.assertEqual(kwargs["proxy"], "")
+
     def test_get_with_egress_fallback_skips_dead_proxy(self) -> None:
         store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://dead.example:1080"))
         calls: list[str] = []
@@ -181,7 +202,7 @@ class ProxyServiceTests(unittest.TestCase):
             def close(self) -> None:
                 return None
 
-        with patch("services.proxy_service.Session", FakeSession):
+        with patch("services.proxy_service.create_cffi_session", FakeSession):
             fetched = store.get_with_egress_fallback("https://cdn.example/a.png", upstream=True)
 
         self.assertEqual(fetched.content, b"ok")
@@ -465,7 +486,7 @@ class ProxyServiceTests(unittest.TestCase):
             def close(self) -> None:
                 pass
 
-        with patch("services.proxy_service.Session", FailingSession):
+        with patch("services.proxy_service.create_cffi_session", FailingSession):
             result = __import__("services.proxy_service", fromlist=["test_proxy"]).test_proxy(
                 "http://user:pass@proxy.example:8080"
             )

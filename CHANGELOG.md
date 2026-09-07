@@ -22,7 +22,9 @@
 + [优化] 生图选号改为最少在途、其次最高额度（不再纯 round-robin）。
 + [优化] 生图首轮等待默认 10s→6s；Grok 免费路径只打 grok-4.5，不再试 grok-4/grok-3。
 + [优化] `GET /v1/models` 改为本地生图目录，不再每次 TLS 打 chatgpt.com。
-+ [优化] 生图取号：JWT 剩余 >5 分钟且本地额度/状态正常时跳过 `fetch_remote_info`（少一轮 /me+init+accounts）。
++ [修复] 死 SOCKS 超时（curl 28）后 10 分钟内不再让每个账号重复空等；刷新/生图改走下一条出口。session 探活超时从 45s 降到 12s。
++ [修复] `curl_cffi` 在 Linux/WSL2/Docker 上撞系统 OpenSSL 配置会报 `OPENSSL_internal:invalid library`（对外就是 `upstream image connection failed`）。启动时清掉 `OPENSSL_CONF`，旧指纹 `chrome110` 升到 `chrome142`；握手失败不再连换 Chrome 指纹（同库仍失败），改为无 impersonate 再试一次，仍失败则拉黑该出口。Grok 出站同样走出口回退，残留 grokcli2api-go / G2A 地址改回 `cli-chat-proxy.grok.com`。
++ [修复] 账号检测对齐原项目：面板刷新强制打 `/me` 探活；定时巡检不再跳过正常 session_only；`/me` 成功会清掉废号标记。生图取号仅在最近一次探活仍新鲜时跳过远程校验。
 + [优化] Grok 上游：线程内 `requests.Session` keep-alive；免费路径 429 立即失败不再连打 grok-4/grok-3/付费接口；付费 401/403/429 跳过 `/models` catalog。
 + [优化] 生图轮询：15–35s 窗口用 4s/7s 间隔（不超过配置上限）；循环内不再每次打 `/backend-api/tasks`（只在接近超时补一次）。默认 `image_poll_interval_secs` 5。
 + [移除] grokcli2api-go / G2A 桥：删除 `/api/g2a*`、设置页 Codex2API、号池远程只读标签；Grok 生图只走本地号池。

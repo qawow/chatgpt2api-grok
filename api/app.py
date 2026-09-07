@@ -16,6 +16,9 @@ from services.image_service import start_image_cleanup_scheduler
 
 
 def create_app() -> FastAPI:
+    from utils.curl_tls import sanitize_curl_ssl_env
+
+    sanitize_curl_ssl_env()
     app_version = config.app_version
 
     @asynccontextmanager

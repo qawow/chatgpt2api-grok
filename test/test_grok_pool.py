@@ -72,6 +72,16 @@ class GrokAccountServiceTest(unittest.TestCase):
         self.assertIn("cli-chat-proxy.grok.com", normalized["base_url"])
         self.assertEqual(normalized["email"], "u@example.com")
 
+    def test_normalize_rewrites_removed_g2a_base_url(self):
+        item = {
+            "type": "xai",
+            "access_token": "at-g2a",
+            "base_url": "https://grokcli2api-go.com/v1",
+        }
+        normalized = self.svc.normalize_account(item)
+        assert normalized is not None
+        self.assertIn("cli-chat-proxy.grok.com", normalized["base_url"])
+
     def test_reject_openai_type_without_grok_markers(self):
         item = {
             "type": "codex",

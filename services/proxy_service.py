@@ -11,9 +11,45 @@ from typing import Callable, Mapping
 from urllib import request as urllib_request
 from urllib.parse import quote, urlparse
 
-from curl_cffi.requests import Session
-
 from services.config import config
+from utils.curl_tls import (
+    create_cffi_session,
+    resolve_session_impersonate,
+    sanitize_curl_ssl_env,
+)
+
+_UNUSABLE_EGRESS_TTL_SECS = 10 * 60
+_unusable_egress_until: dict[str, float] = {}
+_unusable_egress_lock = threading.Lock()
+
+
+def mark_egress_unusable(url: str, reason: str = "") -> None:
+    """Remember a dead proxy so the next account does not wait on it again."""
+    key = normalize_proxy_url(url)
+    if not key:
+        return
+    with _unusable_egress_lock:
+        _unusable_egress_until[key] = time.time() + _UNUSABLE_EGRESS_TTL_SECS
+
+
+def is_egress_unusable(url: str) -> bool:
+    key = normalize_proxy_url(url)
+    if not key:
+        return False
+    now = time.time()
+    with _unusable_egress_lock:
+        until = _unusable_egress_until.get(key)
+        if until is None:
+            return False
+        if now >= until:
+            _unusable_egress_until.pop(key, None)
+            return False
+        return True
+
+
+def reset_unusable_egress() -> None:
+    with _unusable_egress_lock:
+        _unusable_egress_until.clear()
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
@@ -57,6 +93,8 @@ def _is_egress_connect_error(message: str) -> bool:
             "curl: (56)",
             "timed out",
             "timeout",
+            "openssl_internal",
+            "invalid library",
         )
     )
 
@@ -291,7 +329,10 @@ class ProxySettingsStore:
                 continue
             seen.add(url)
             ordered.append((source, url))
-        return ordered
+        usable = [(source, url) for source, url in ordered if not url or not is_egress_unusable(url)]
+        if not usable:
+            usable = [("direct", "")]
+        return usable
 
     def build_session_kwargs(
         self,
@@ -308,9 +349,21 @@ class ProxySettingsStore:
         if force_proxy is not None:
             session_kwargs["proxy"] = normalize_proxy_url(force_proxy)
         else:
-            session_kwargs["proxy"] = profile.proxy_url or ""
+            chosen = profile.proxy_url or ""
+            if chosen and is_egress_unusable(chosen):
+                for _source, url in self.list_egress_candidates(
+                    account=account, resource=resource, upstream=upstream
+                ):
+                    chosen = url
+                    break
+            session_kwargs["proxy"] = chosen
         if profile.runtime_enabled and profile.skip_ssl_verify:
             session_kwargs["verify"] = False
+        if "impersonate" in session_kwargs:
+            session_kwargs["impersonate"] = resolve_session_impersonate(
+                str(session_kwargs.get("impersonate") or "")
+            )
+        sanitize_curl_ssl_env()
         return session_kwargs
 
     def get_with_egress_fallback(
@@ -335,7 +388,7 @@ class ProxySettingsStore:
         ):
             if proxy_url in skipped:
                 continue
-            session = Session(
+            session = create_cffi_session(
                 **self.build_session_kwargs(
                     account=account,
                     resource=resource,
@@ -705,8 +758,8 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
         }
     # Use the same session kwargs as production so the test actually
     # reflects live egress (impersonate / skip_ssl_verify / proxy).
-    kwargs = proxy_settings.build_session_kwargs(impersonate="chrome110", verify=True, proxy=candidate)
-    session = Session(**kwargs)
+    kwargs = proxy_settings.build_session_kwargs(impersonate="chrome142", verify=True, proxy=candidate)
+    session = create_cffi_session(**kwargs)
     started = time.perf_counter()
     try:
         response = session.get(

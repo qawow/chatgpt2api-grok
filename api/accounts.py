@@ -220,13 +220,20 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
         progress_id = str(uuid.uuid4())
-        # Init BEFORE create_task so UI poll never races a missing progress_id
-        # (also covers free/session_only filtered-to-empty refresh finishing immediately).
+        # Init BEFORE create_task so UI poll never races a missing progress_id.
         account_service.init_refresh_progress(progress_id, len(access_tokens))
 
         async def _do_refresh():
             try:
-                await run_in_threadpool(account_service.refresh_accounts, access_tokens, progress_id, False)
+                # force_probe: panel 检测 must hit /me like upstream, not skip session_only.
+                await run_in_threadpool(
+                    lambda: account_service.refresh_accounts(
+                        access_tokens,
+                        progress_id,
+                        False,
+                        force_probe=True,
+                    )
+                )
             except Exception as e:
                 account_service.finish_refresh_progress(progress_id, error=str(e))
 

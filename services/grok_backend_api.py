@@ -37,6 +37,7 @@ def _http() -> requests.Session:
 
 
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+_REMOVED_G2A_MARKERS = ("grokcli2api", "g2a.", "/api/g2a")
 DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_HEADERS = {
@@ -95,6 +96,10 @@ def grok_settings() -> dict[str, Any]:
                 headers[str(key)] = str(value)
     probe_model = str(raw.get("probe_model") or DEFAULT_GROK_TEXT_MODEL).strip() or DEFAULT_GROK_TEXT_MODEL
     backend_type = str(raw.get("backend_type") or "cli").strip()
+    # grokcli2api-go / G2A bridge was removed; leftover settings must not
+    # send Build traffic to a dead local TLS endpoint.
+    if backend_type.lower() in {"codex2api", "g2a", "grokcli2api", "grokcli2api-go"}:
+        backend_type = "cli"
     return {
         "base_url": normalize_base_url(base_url),
         "client_id": client_id,
@@ -108,8 +113,10 @@ def grok_settings() -> dict[str, Any]:
 
 def normalize_base_url(base_url: str) -> str:
     base = (base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
+    lowered = base.lower()
     # Free Build quota lives on cli-chat-proxy, not paid api.x.ai
-    if "api.x.ai" in base:
+    # and not the removed grokcli2api-go / G2A sidecar.
+    if "api.x.ai" in lowered or any(marker in lowered for marker in _REMOVED_G2A_MARKERS):
         return DEFAULT_BASE_URL
     return base.rstrip("/")
 
@@ -122,11 +129,49 @@ def _global_proxy() -> str:
         return str(os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
 
 
-def _proxies(proxy: str | None) -> dict[str, str] | None:
-    value = (proxy or _global_proxy() or "").strip()
+def _proxies(proxy: str | None, *, explicit: bool = False) -> dict[str, str] | None:
+    if explicit:
+        value = str(proxy or "").strip()
+    else:
+        value = (proxy or _global_proxy() or "").strip()
     if not value:
         return None
     return {"http": value, "https": value}
+
+
+def _request(
+    method: str,
+    url: str,
+    *,
+    account: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+    **kwargs: Any,
+):
+    """POST/GET grok.com walking account → runtime → global → direct egress."""
+    from services.proxy_service import _is_egress_connect_error, proxy_settings
+
+    last_error: Exception | None = None
+    for _source, proxy_url in proxy_settings.list_egress_candidates(
+        account=account or {}, upstream=True
+    ):
+        try:
+            resp = getattr(_http(), method)(
+                url,
+                timeout=timeout,
+                proxies=_proxies(proxy_url, explicit=True),
+                **kwargs,
+            )
+            return resp
+        except requests.RequestException as exc:
+            last_error = exc
+            if not _is_egress_connect_error(str(exc)):
+                raise
+            from services.proxy_service import mark_egress_unusable
+
+            mark_egress_unusable(proxy_url, str(exc))
+    if last_error is not None:
+        raise last_error
+    raise requests.RequestException("no grok egress candidate")
 
 
 def build_request_headers(account: dict[str, Any] | None = None) -> dict[str, str]:
@@ -188,12 +233,13 @@ def refresh_access_token(
         "refresh_token": rt,
     }
     try:
-        resp = _http().post(
+        resp = _request(
+            "post",
             endpoint,
+            account={"proxy": proxy} if proxy else {},
+            timeout=timeout,
             data=data,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=timeout,
-            proxies=_proxies(proxy),
         )
     except requests.RequestException as exc:
         raise GrokBackendError(f"refresh network error: {exc}") from exc
@@ -251,22 +297,14 @@ def probe_responses(
             "max_output_tokens": 8,
         }
     try:
-        if backend_type == "codex2api":
-            resp = _http().post(
-                url,
-                headers=build_request_headers(account),
-                json=body,
-                timeout=timeout,
-                proxies=_proxies(account_proxy(account)),
-            )
-        else:
-            resp = _http().post(
-                url,
-                headers=build_request_headers(account),
-                json=body,
-                timeout=timeout,
-                proxies=_proxies(account_proxy(account)),
-            )
+        resp = _request(
+            "post",
+            url,
+            account=account,
+            timeout=timeout,
+            headers=build_request_headers(account),
+            json=body,
+        )
     except requests.RequestException as exc:
         raise GrokBackendError(f"probe network error: {exc}") from exc
 
@@ -297,11 +335,12 @@ def list_upstream_models(account: dict[str, Any], *, timeout: float = 30.0) -> d
     base = account_base_url(account)
     url = urljoin(base.rstrip("/") + "/", "models")
     try:
-        resp = _http().get(
+        resp = _request(
+            "get",
             url,
-            headers=build_request_headers(account),
+            account=account,
             timeout=timeout,
-            proxies=_proxies(account_proxy(account)),
+            headers=build_request_headers(account),
         )
     except requests.RequestException as exc:
         raise GrokBackendError(f"models network error: {exc}") from exc
@@ -341,12 +380,13 @@ def create_response(
     if tool_choice is not None:
         body["tool_choice"] = tool_choice
     try:
-        resp = _http().post(
+        resp = _request(
+            "post",
             url,
+            account=account,
+            timeout=timeout,
             headers=build_request_headers(account),
             json=body,
-            timeout=timeout,
-            proxies=_proxies(account_proxy(account)),
         )
     except requests.RequestException as exc:
         raise GrokBackendError(f"responses network error: {exc}") from exc
@@ -396,7 +436,6 @@ def generate_image(
     settings = grok_settings()
     base = account_base_url(account)
     headers = build_request_headers(account)
-    proxies = _proxies(account_proxy(account))
     attempts: list[dict[str, Any]] = []
     want_n = max(1, min(int(n or 1), 4))
     prompt_text = str(prompt or "").strip()
@@ -510,12 +549,13 @@ def generate_image(
         body = dict(image_body)
         body["model"] = candidate_model
         try:
-            resp = _http().post(
+            resp = _request(
+                "post",
                 images_url,
+                account=account,
+                timeout=timeout,
                 headers=headers,
                 json=body,
-                timeout=timeout,
-                proxies=proxies,
             )
         except requests.RequestException as exc:
             attempts.append({"path": "images/generations", "model": candidate_model, "error": str(exc)})

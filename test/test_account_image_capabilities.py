@@ -202,6 +202,7 @@ class AccountCapabilityTests(unittest.TestCase):
                         "status": "正常",
                         "quota": 5,
                         "refresh_token": "rt-plus",
+                        "last_probed_at": datetime.now(timezone.utc).isoformat(),
                     }
                 ]
             )
@@ -216,6 +217,38 @@ class AccountCapabilityTests(unittest.TestCase):
             service.release_image_slot(token)
             self.assertEqual(token, jwt)
             self.assertEqual(probed["n"], 0)
+
+    def test_get_available_access_token_probes_when_never_probed(self) -> None:
+        import base64
+        import json
+        import time as time_mod
+
+        payload = {"exp": int(time_mod.time()) + 3600, "iat": int(time_mod.time())}
+        jwt = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=") + ".s"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": jwt,
+                        "type": "Plus",
+                        "status": "正常",
+                        "quota": 5,
+                        "refresh_token": "rt-plus",
+                    }
+                ]
+            )
+            probed = {"n": 0}
+
+            def fake(access_token, event="fetch_remote_info"):
+                probed["n"] += 1
+                return service.get_account(access_token)
+
+            service.fetch_remote_info = fake  # type: ignore[method-assign]
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, jwt)
+            self.assertEqual(probed["n"], 1)
 
     def test_get_available_access_token_probes_when_jwt_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -385,7 +418,7 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertFalse(durable["session_only"])
             self.assertFalse(durable["fragile"])
 
-    def test_free_session_only_skipped_from_periodic_watcher_lists(self) -> None:
+    def test_free_session_only_normal_stays_on_watcher_lists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
@@ -404,11 +437,18 @@ class AccountCapabilityTests(unittest.TestCase):
                         "refresh_token": "rt-plus",
                         "quota": 2,
                     },
+                    {
+                        "access_token": "dead-session",
+                        "status": "异常",
+                        "type": "free",
+                        "session_token": "sess",
+                    },
                 ]
             )
             normals = service.list_normal_tokens()
-            self.assertNotIn("free-session", normals)
+            self.assertIn("free-session", normals)
             self.assertIn("plus-oauth", normals)
+            self.assertNotIn("dead-session", service.list_abnormal_tokens())
 
     def test_revoked_cooldown_blocks_recover_and_refresh_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -582,21 +622,149 @@ class AccountCapabilityTests(unittest.TestCase):
             service.add_account_items(
                 [
                     {
-                        "access_token": "free-session",
-                        "status": "正常",
+                        "access_token": "dead-free",
+                        "status": "异常",
                         "type": "free",
                         "session_token": "sess",
+                        "last_refresh_error": "session_refresh_stale_token_revoked",
+                        "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
                     }
                 ]
             )
             progress_id = "pid-skip-all"
             service.init_refresh_progress(progress_id, 1)
-            result = service.refresh_accounts(["free-session"], progress_id=progress_id)
+            result = service.refresh_accounts(["dead-free"], progress_id=progress_id)
             self.assertEqual(result.get("skipped"), 1)
             progress = service.get_refresh_progress(progress_id)
             self.assertIsNotNone(progress)
             self.assertTrue(progress["done"])
             self.assertEqual(progress["result"]["skipped"], 1)
+
+    def test_refresh_accounts_force_probe_checks_session_only_and_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "free-session",
+                        "status": "正常",
+                        "type": "free",
+                        "session_token": "sess",
+                        "quota": 0,
+                    },
+                    {
+                        "access_token": "dead-free",
+                        "status": "异常",
+                        "type": "free",
+                        "session_token": "sess",
+                        "last_refresh_error": "session_refresh_stale_token_revoked",
+                        "last_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                ]
+            )
+            seen: list[str] = []
+
+            def fake_info(self_backend):
+                token = str(getattr(self_backend, "access_token", "") or "")
+                seen.append(token)
+                return {
+                    "email": f"{token}@example.com",
+                    "user_id": token,
+                    "type": "free",
+                    "quota": 3,
+                    "limits_progress": [],
+                    "default_model_slug": "gpt-5",
+                    "restore_at": None,
+                    "status": "正常",
+                }
+
+            with patch(
+                "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+                fake_info,
+            ):
+                skipped = service.refresh_accounts(["free-session", "dead-free"])
+                self.assertEqual(skipped.get("skipped"), 1)
+                self.assertNotIn("dead-free", seen)
+
+                forced = service.refresh_accounts(
+                    ["free-session", "dead-free"],
+                    force_probe=True,
+                )
+            self.assertEqual(forced.get("skipped"), 0)
+            self.assertIn("free-session", seen)
+            self.assertIn("dead-free", seen)
+            live = service.get_account("free-session")
+            self.assertIsNotNone(live)
+            self.assertEqual(live["quota"], 3)
+            self.assertEqual(live["status"], "正常")
+            self.assertIsNone(live.get("last_refresh_error"))
+
+    def test_refresh_success_clears_token_refresh_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "plus-rt",
+                        "status": "正常",
+                        "type": "Plus",
+                        "refresh_token": "rt",
+                        "quota": 2,
+                        "last_token_refresh_error": "session_refresh_stale_token_revoked",
+                        "last_token_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ]
+            )
+            self.assertTrue(AccountService._token_looks_revoked(service.get_account("plus-rt")))
+
+            def fake_info(_self_backend):
+                return {
+                    "email": "plus@example.com",
+                    "user_id": "u1",
+                    "type": "Plus",
+                    "quota": 8,
+                    "limits_progress": [],
+                    "default_model_slug": "gpt-5",
+                    "restore_at": None,
+                    "status": "正常",
+                }
+
+            with patch(
+                "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+                fake_info,
+            ):
+                account = service.fetch_remote_info("plus-rt", "test_clear")
+            self.assertIsNotNone(account)
+            self.assertFalse(AccountService._token_looks_revoked(account))
+            self.assertIsNone(account.get("last_token_refresh_error"))
+            self.assertIsNotNone(account.get("last_probed_at"))
+            self.assertEqual(account.get("quota"), 8)
+
+    def test_get_available_does_not_treat_invalid_state_as_hard_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "plus-rt",
+                        "status": "正常",
+                        "type": "Plus",
+                        "refresh_token": "rt",
+                        "quota": 4,
+                    }
+                ]
+            )
+
+            def boom(_access_token, event="fetch_remote_info"):
+                raise RuntimeError("upstream invalid_state from proxy")
+
+            service.fetch_remote_info = boom  # type: ignore[method-assign]
+            with self.assertRaises(RuntimeError):
+                service.get_available_access_token()
+            kept = service.get_account("plus-rt")
+            self.assertIsNotNone(kept)
+            self.assertIsNone(kept.get("last_refresh_error"))
+            self.assertEqual(kept.get("status"), "正常")
 
     def test_image_quota_message_explains_revoked_pool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

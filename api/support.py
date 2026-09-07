@@ -65,7 +65,7 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     def worker() -> None:
         while not stop_event.is_set():
             try:
-                # list_* already exclude free session-only + revoked-cooldown accounts.
+                # list_* exclude 禁用 / revoked-cooldown / unrecoverable 异常.
                 limited_tokens = account_service.list_limited_tokens()
                 normal_tokens = account_service.list_normal_tokens()
                 abnormal_tokens = account_service.list_abnormal_tokens()
@@ -85,7 +85,7 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                     result = account_service.refresh_accounts(tokens)
                     skipped = int((result or {}).get("skipped") or 0)
                     if skipped:
-                        print(f"[account-watcher] skipped {skipped} free/session_only/revoked-cooldown")
+                        print(f"[account-watcher] skipped {skipped} disabled/revoked-cooldown/unrecoverable")
                 else:
                     # Quiet idle tick: free session-only pools often have nothing to probe.
                     pass

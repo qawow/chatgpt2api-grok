@@ -25,6 +25,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
     REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db \
     TIKTOKEN_CACHE_DIR=/app/.tiktoken_cache
+# curl_cffi ships BoringSSL. Debian OPENSSL_CONF / openssl.cnf makes it raise
+# OPENSSL_internal:invalid library (curl 35) on Linux/WSL2 Docker hosts.
+ENV OPENSSL_CONF=
 
 WORKDIR /app
 
@@ -36,7 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
     gcc \
-    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv

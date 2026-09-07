@@ -4,6 +4,7 @@ HTTP 客户端封装
 基于 curl_cffi 的 HTTP 请求封装，支持代理和错误处理
 """
 
+import os
 import time
 import json
 from typing import Optional, Dict, Any, Union, Tuple
@@ -202,9 +203,17 @@ class HTTPClient:
     def session(self) -> Session:
         """获取会话对象（单例）"""
         if self._session is None:
+            try:
+                from utils.curl_tls import resolve_session_impersonate, sanitize_curl_ssl_env
+
+                sanitize_curl_ssl_env()
+                impersonate = resolve_session_impersonate(self.config.impersonate)
+            except Exception:
+                impersonate = self.config.impersonate
+                os.environ.pop("OPENSSL_CONF", None)
             raw = Session(
                 proxies=self.proxies,
-                impersonate=self.config.impersonate,
+                impersonate=impersonate,
                 verify=self.config.verify_ssl,
                 timeout=self.config.timeout
             )

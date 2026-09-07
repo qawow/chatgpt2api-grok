@@ -35,9 +35,6 @@ class AccountService:
     # Free/session-only tokens that OpenAI already revoked: stop hammering
     # /api/auth/session + password relogin every watcher cycle.
     _REVOKED_COOLDOWN_SECONDS = 60 * 60
-    # Free session-only accounts without OAuth refresh_token: skip periodic
-    # full refresh_accounts unless the token is near natural JWT expiry.
-    _FREE_SESSION_PERIODIC_REFRESH = False
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -224,50 +221,26 @@ class AccountService:
 
     @classmethod
     def _should_skip_periodic_refresh(cls, account: dict | None) -> bool:
-        """Watcher / bulk refresh_accounts should not re-probe these every few minutes."""
+        """Watcher-only filter. Manual refresh uses force_probe and ignores this.
+
+        Upstream probes every selected token on refresh. We only skip accounts
+        the watcher cannot usefully recover this cycle:
+        禁用, confirmed-revoke cooldown, and 异常 session-only with no password/refresh.
+        正常 / 限流 session_only stay in the probe set so quota and liveness update.
+        """
         if not isinstance(account, dict):
             return True
         if account.get("status") == "禁用":
             return True
         if cls._revoked_cooldown_active(account):
             return True
-        # 异常 accounts are skipped ONLY when they have no recovery material
-        # (refresh_token / session_token / password) — those have nothing the
-        # watcher can do. Accounts WITH recovery material should be probed so
-        # the watcher can clear 异常 if the token is actually alive again.
         if account.get("status") == "异常":
             has_refresh = bool(str(account.get("refresh_token") or "").strip())
-            has_session = bool(str(account.get("session_token") or "").strip())
             has_password = bool(str(account.get("password") or "").strip())
-            if not (has_refresh or has_session or has_password):
-                return True
-            # Free session-only without refresh_token AND without password:
-            # session endpoint returns the same revoked JWT, and there's no
-            # password to fall back on → skip to avoid thrashing. Confirmed
-            # revokes are already caught by _revoked_cooldown_active above.
-            # (Accounts with password are still recoverable via re-login.)
-            if (
-                not has_refresh
-                and not has_password
-                and cls._is_free_plan_account(account)
-                and cls._is_session_only_account(account)
-            ):
-                return True
-            return False
-        # Free session-only: no OAuth refresh_token; periodic /me just burns proxy + logs.
-        # Natural JWT expiry still handled by list_expiring_access_tokens when refresh_token exists.
-        if (
-            not cls._FREE_SESSION_PERIODIC_REFRESH
-            and cls._is_free_plan_account(account)
-            and cls._is_session_only_account(account)
-        ):
-            # Still allow one early probe while brand-new (no error yet) so import
-            # fetch_remote_info can establish quota; after first error, stay out.
-            if str(account.get("last_refresh_error") or "").strip() or str(
-                account.get("last_token_refresh_error") or ""
-            ).strip():
-                return True
-            # No error yet: still skip high-frequency watcher; import path calls fetch_remote_info directly.
+            if has_refresh or has_password:
+                return False
+            # 异常 + no OAuth refresh + no password: session cookie usually
+            # echoes the same JWT. Watcher cannot recover; manual 检测 still /me.
             return True
         return False
 
@@ -403,6 +376,7 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["last_probed_at"] = normalized.get("last_probed_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         # Durable tokens need refresh_token. Missing refresh ⇒ session-only / fragile:
         # keep in pool for inspection, but exclude from image selection and auto-remove.
@@ -554,12 +528,12 @@ class AccountService:
         return due_at if due_at <= now else None
 
     def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
-        from curl_cffi import requests
         from services.proxy_service import proxy_settings
+        from utils.curl_tls import create_cffi_session
 
-        session = requests.Session(**proxy_settings.build_session_kwargs(
+        session = create_cffi_session(**proxy_settings.build_session_kwargs(
             account=account,
-            impersonate="chrome110",
+            impersonate="chrome142",
             verify=True,
             upstream=True,
         ))
@@ -675,13 +649,13 @@ class AccountService:
         access_token = str(access_token or "").strip()
         if not access_token:
             return False
-        from curl_cffi import requests
         from services.proxy_service import proxy_settings
+        from utils.curl_tls import create_cffi_session
 
-        session = requests.Session(
+        session = create_cffi_session(
             **proxy_settings.build_session_kwargs(
                 account=account or {},
-                impersonate="chrome110",
+                impersonate="chrome142",
                 verify=True,
                 upstream=True,
             )
@@ -719,21 +693,20 @@ class AccountService:
         Critical: /api/auth/session may return the *same* already-revoked accessToken.
         We only treat the result as success when /backend-api/me returns 200.
         """
-        from curl_cffi import requests
         from services.proxy_service import proxy_settings
+        from utils.curl_tls import create_cffi_session
 
         session_token = str(session_token or "").strip()
         if not session_token:
             raise RuntimeError("session_token_empty")
         old_access = str((account or {}).get("access_token") or "").strip()
-        session = requests.Session(
-            **proxy_settings.build_session_kwargs(
-                account=account,
-                impersonate="chrome110",
-                verify=True,
-                upstream=True,
-            )
+        session_kwargs = proxy_settings.build_session_kwargs(
+            account=account,
+            impersonate="chrome142",
+            verify=True,
+            upstream=True,
         )
+        session = create_cffi_session(**session_kwargs)
         try:
             session.cookies.set(
                 "__Secure-next-auth.session-token",
@@ -748,7 +721,7 @@ class AccountService:
                     "User-Agent": self._OAUTH_USER_AGENT,
                     "Referer": "https://chatgpt.com/",
                 },
-                timeout=45,
+                timeout=12,
             )
             if response.status_code == 404:
                 raise RuntimeError("session_refresh_http_404")
@@ -785,6 +758,12 @@ class AccountService:
                 ).strip(),
                 "session_token": new_sess or session_token,
             }
+        except Exception as exc:
+            from services.proxy_service import _is_egress_connect_error, mark_egress_unusable
+
+            if _is_egress_connect_error(str(exc)):
+                mark_egress_unusable(str(session_kwargs.get("proxy") or ""), str(exc))
+            raise
         finally:
             try:
                 session.close()
@@ -1071,8 +1050,6 @@ class AccountService:
 
     def _login_with_password(self, email: str, password: str, account: dict | None = None) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
-        from curl_cffi import requests
-        
         # 常量
         auth_base = "https://auth.openai.com"
         platform_oauth_audience = "https://api.openai.com/v1"
@@ -1085,13 +1062,14 @@ class AccountService:
         # matches the rest of the client. Legacy-only config.proxy left an IP
         # mismatch that could trigger ChatGPT risk checks.
         from services.proxy_service import proxy_settings
+        from utils.curl_tls import create_cffi_session
         session_kwargs = proxy_settings.build_session_kwargs(
             account=account or {},
-            impersonate="chrome110",
+            impersonate="chrome142",
             verify=True,
             upstream=True,
         )
-        session = requests.Session(**session_kwargs)
+        session = create_cffi_session(**session_kwargs)
         
         try:
             device_id = str(uuid.uuid4())
@@ -1505,6 +1483,7 @@ class AccountService:
             self._image_slot_condition.notify_all()
 
     _IMAGE_PROBE_JWT_MIN_REMAINING = 5 * 60
+    _IMAGE_PROBE_MAX_AGE_SECONDS = 5 * 60
 
     def _can_skip_image_remote_probe(
         self,
@@ -1514,7 +1493,7 @@ class AccountService:
         source_type: str | None = None,
         plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> bool:
-        """Skip /me+init+accounts when local cache is enough to start an image job."""
+        """Skip /me+init+accounts when a recent successful probe is still fresh."""
         if not isinstance(account, dict):
             return False
         if int(account.get("quota") or 0) <= 0:
@@ -1524,6 +1503,12 @@ class AccountService:
         if str(account.get("last_refresh_error") or "").strip():
             return False
         if self._token_looks_revoked(account):
+            return False
+        probed_at = self._parse_time(account.get("last_probed_at"))
+        if probed_at is None:
+            return False
+        probed_age = (datetime.now(timezone.utc) - probed_at).total_seconds()
+        if probed_age > self._IMAGE_PROBE_MAX_AGE_SECONDS:
             return False
         remaining = self._token_expires_in(str(account.get("access_token") or ""))
         if remaining is None or remaining < self._IMAGE_PROBE_JWT_MIN_REMAINING:
@@ -1544,9 +1529,8 @@ class AccountService:
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
-        基于本地缓存做初筛；JWT 仍有效且本地额度>0 时跳过 fetch_remote_info
-        （那会新建 curl_cffi session 再打 /me + init + accounts，生图前多 0.5–2s）。
-        限制最大尝试次数防止 token rotation 导致无限循环。
+        本地缓存只做初筛。最近一次 /me 探活仍新鲜、JWT 未过期、额度>0 时才跳过
+        fetch_remote_info；否则按原项目一样远程校验 token 和额度。
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set(excluded_tokens or set())
@@ -1571,11 +1555,13 @@ class AccountService:
                 hard_auth = any(
                     x in err_l
                     for x in (
-                        "invalid",
-                        "revoked",
                         "token invalidated",
+                        "token_revoked",
+                        "invalidated oauth",
+                        "invalid_access_token",
                         "unauthorized",
                         "401",
+                        "app_session_terminated",
                     )
                 )
                 net_soft = any(
@@ -1874,7 +1860,7 @@ class AccountService:
             ]
 
     def list_normal_tokens(self) -> list[str]:
-        """Watcher candidates: 正常 only, excluding free session-only / revoked-cooldown."""
+        """Watcher candidates: 正常 accounts, including live session_only."""
         with self._lock:
             return [
                 token
@@ -1885,18 +1871,9 @@ class AccountService:
             ]
 
     def list_abnormal_tokens(self) -> list[str]:
-        """Watcher recovery candidates: 异常 accounts with recovery material.
+        """Watcher recovery candidates: 异常 accounts with refresh_token or password.
 
-        Excludes:
-        - 禁用 (explicitly disabled by user)
-        - revoked-cooldown (recent confirmed revoke, still cooling down)
-        - free session-only (no OAuth refresh_token; session endpoint returns
-          the same revoked JWT → skip to avoid thrashing)
-
-        Includes Plus/Pro/Team 异常 accounts with refresh_token, plus free
-        异常 accounts with email+password (re-loginable). The watcher's
-        refresh_accounts → fetch_remote_info → refresh_access_token flow will
-        attempt OAuth refresh / session / password recovery in that order.
+        Excludes 禁用, revoked-cooldown, and 异常 session-only with no password.
         """
         with self._lock:
             return [
@@ -2046,6 +2023,9 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            next_item["last_token_refresh_error"] = None
+            next_item["last_token_refresh_error_at"] = None
+            next_item["last_probed_at"] = datetime.now(timezone.utc).isoformat()
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
@@ -2181,6 +2161,9 @@ class AccountService:
                     last_error = exc
                     if not _is_egress_connect_error(str(exc)):
                         raise
+                    from services.proxy_service import mark_egress_unusable
+
+                    mark_egress_unusable(proxy_url, str(exc))
                 finally:
                     backend.close()
             if last_error is not None:
@@ -2345,28 +2328,27 @@ class AccountService:
         access_tokens: list[str],
         progress_id: str | None = None,
         defer_invalid_removal: bool = True,
+        force_probe: bool = False,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
-        # Drop free session-only / revoked-cooldown accounts so bulk refresh and
-        # account-watcher stop re-probing known-dead free tokens every interval.
-        filtered: list[str] = []
+        # Watcher keeps the skip filter. Manual 检测 (force_probe) matches upstream:
+        # every selected token is actually probed via /me.
         skipped = 0
-        for token in access_tokens:
-            acc = self.get_account(token)
-            if acc is not None and self._should_skip_periodic_refresh(acc):
-                skipped += 1
-                continue
-            if acc is not None and self._revoked_cooldown_active(acc):
-                skipped += 1
-                continue
-            filtered.append(token)
-        access_tokens = filtered
-        if skipped:
-            log_service.add(
-                LOG_TYPE_ACCOUNT,
-                "跳过周期性刷新(free/session_only/revoked冷却)",
-                {"skipped": skipped, "remaining": len(access_tokens)},
-            )
+        if not force_probe:
+            filtered: list[str] = []
+            for token in access_tokens:
+                acc = self.get_account(token)
+                if acc is not None and self._should_skip_periodic_refresh(acc):
+                    skipped += 1
+                    continue
+                filtered.append(token)
+            access_tokens = filtered
+            if skipped:
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "跳过周期性刷新(禁用/废号冷却/无恢复手段的异常号)",
+                    {"skipped": skipped, "remaining": len(access_tokens)},
+                )
 
         if not access_tokens:
             items = self.list_accounts()
@@ -2375,10 +2357,9 @@ class AccountService:
                 # API may have pre-inited; if called without API (watcher), init then finish.
                 if self.get_refresh_progress(progress_id) is None:
                     self.init_refresh_progress(progress_id, 0)
-                # Surface skip reason so UI does not look like a silent no-op.
                 if skipped:
                     result["message"] = (
-                        f"skipped {skipped} free/session_only/revoked-cooldown account(s); nothing to refresh"
+                        f"skipped {skipped} disabled/revoked-cooldown/unrecoverable account(s); nothing to refresh"
                     )
                 self.finish_refresh_progress(progress_id, result)
             return result

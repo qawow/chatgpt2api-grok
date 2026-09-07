@@ -19,8 +19,6 @@ import uuid
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from curl_cffi import requests
-
 from services.openai_oauth import (
     auth_base,
     common_headers,
@@ -33,6 +31,7 @@ from services.openai_oauth import (
     user_agent,
 )
 from services.proxy_service import proxy_settings
+from utils.curl_tls import create_cffi_session
 
 
 class OAuthLoginError(Exception):
@@ -193,8 +192,8 @@ class OAuthLoginService:
     @staticmethod
     def _exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict[str, str]:
         """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
-        kwargs = proxy_settings.build_session_kwargs(impersonate="chrome", verify=True, upstream=True)
-        session = requests.Session(**kwargs)
+        kwargs = proxy_settings.build_session_kwargs(impersonate="chrome142", verify=True, upstream=True)
+        session = create_cffi_session(**kwargs)
         try:
             response = session.post(
                 f"{auth_base}/api/accounts/oauth/token",
