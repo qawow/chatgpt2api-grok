@@ -151,7 +151,12 @@ class ImportLocalSchedulesCodexUpgradeTest(unittest.TestCase):
             config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg-import-auto.json"))
         )
         settings = normalize_settings(
-            {"plan_type": "free", "bind_register_proxy": False, "auto_codex_upgrade": True}
+            {
+                "plan_type": "free",
+                "bind_register_proxy": False,
+                "auto_codex_upgrade": True,
+                "skip_codex": False,
+            }
         )
         account = {
             "email": "s@x.com",
@@ -174,6 +179,29 @@ class ImportLocalSchedulesCodexUpgradeTest(unittest.TestCase):
         kwargs = sched.call_args.kwargs
         self.assertEqual(kwargs["email"], "s@x.com")
         self.assertEqual(kwargs["replace_access_token"], "access-only")
+
+    def test_import_local_skips_auto_upgrade_when_skip_codex(self):
+        svc = GptRegisterService(
+            config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg-import-skipcodex.json"))
+        )
+        settings = normalize_settings(
+            {"plan_type": "free", "auto_codex_upgrade": True, "skip_codex": True}
+        )
+        account = {
+            "email": "s@x.com",
+            "token": "access-only",
+            "extra": {"access_token": "access-only"},
+        }
+        fake_svc = mock.Mock()
+        fake_svc.add_account_items.return_value = {"added": 1}
+        fake_svc.list_accounts.return_value = []
+        fake_svc.fetch_remote_info.return_value = {}
+
+        with mock.patch("services.account_service.account_service", fake_svc), mock.patch(
+            "services.codex_upgrade_service.schedule_codex_upgrade"
+        ) as sched:
+            svc._import_local(account, settings)
+        sched.assert_not_called()
 
     def test_import_local_skips_auto_upgrade_when_disabled(self):
         svc = GptRegisterService(

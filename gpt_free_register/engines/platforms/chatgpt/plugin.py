@@ -193,6 +193,8 @@ class ChatGPTPlatform(BasePlatform):
             refresh_token = result.refresh_token or ""
             session_token = result.session_token or ""
             device_id = str(getattr(result, "device_id", "") or "")
+            meta = dict(getattr(result, "metadata", None) or {})
+            profile = meta.get("profile") if isinstance(meta.get("profile"), dict) else {}
 
             return RegistrationResult(
                 email=result.email,
@@ -207,6 +209,7 @@ class ChatGPTPlatform(BasePlatform):
                     "session_token": session_token,
                     "workspace_id": result.workspace_id,
                     "oai-device-id": device_id,
+                    "profile": profile,
                 },
             )
 

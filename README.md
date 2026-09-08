@@ -7,6 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
+  <a href="./CHANGELOG.md">v1.8.0</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/operations.md">运维与调用</a> ·
@@ -26,11 +27,12 @@
 | 独立 Grok 号池 | `data/grok_accounts.json`，管理接口 `/api/grok/accounts*`，与 ChatGPT 号池完全隔离 |
 | Grok 上游 | 默认 `cli-chat-proxy.grok.com`（Build/CLI），刷新走 `auth.x.ai` |
 | 生图分流 | `model=grok-imagine-image` / `grok-2-image` 走 Grok 池；`grok-4.5` 是对话模型，不走生图 |
-| 文本探活 | `/v1/grok/chat/completions`（内部映射 Build `/responses`） |
-| GPT Free 批量注册 | 设置页「GPT注册」：内置 `gpt_free_register` 纯协议注册 free 号并入库 ChatGPT 号池；入库后自动刷新额度；无 refresh 的 session 号标 fragile |
+| 文本接口 | 已关闭：`/v1/grok/chat/completions`、纯文本 `/v1/chat/completions` 返回 400；只保留生图兼容接口 |
+| GPT Free 批量注册 | 设置页「GPT注册」：内置 `gpt_free_register` 纯协议注册 free 号并入库 ChatGPT 号池；入库后自动刷新额度；无 refresh 的号标 `session_only`（**可生图**） |
+| 账号出口隔离 | 绑定了 `proxy` 的号只走该出口，不回落 runtime / 全局 / 直连；注册浏览器指纹写入号池。一号一 IP 需要注册代理池 |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
 
-隔离原则：ChatGPT 与 Grok **不同存储、不同管理 API、不同选号**，禁止混池。
+隔离原则：ChatGPT 与 Grok **不同存储、不同管理 API、不同选号**，禁止混池。ChatGPT 号池内，账号若绑定了 `proxy`，出站只走该代理；多个号绑同一 SOCKS 仍共享出口 IP。
 
 > [!WARNING]
 > 免责声明：
@@ -73,7 +75,7 @@ mkdir -p data
 docker compose up -d
 ```
 
-镜像由 GitHub Actions 在每次 push 到 `publish-root`/`main` 分支时构建并推送 `:sha` 标签，打 `v*` tag 时推送 `:latest` + 版本号。首次部署或升级时 `docker compose pull && docker compose up -d` 即可。
+镜像由 GitHub Actions 在每次 push 到 `publish-root`/`main` 分支时构建并推送 `:sha-<commit>` 标签；打 `v*` tag（例如 `v1.8.0`）时才推送 `:latest` 与版本号。`docker-compose.yml` 默认拉 `:latest`。要吃未打 tag 的分支构建，把 `image` 改成 `ghcr.io/qawow/chatgpt2api:sha-<commit>`。首次部署或升级：`docker compose pull && docker compose up -d`。
 
 - Web / API：`http://localhost:8000`
 - OpenAI 兼容前缀：`http://localhost:8000/v1`
@@ -230,7 +232,7 @@ environment:
 
 - 自动刷新账号邮箱、类型、额度和恢复时间（异步进度追踪）
 - 轮询可用账号执行图片生成与图片编辑
-- 遇到 Token 失效类错误时自动剔除无效 Token
+- 遇到 Token 失效类错误时自动剔除无效 Token（`session_only` 只标异常、保留剩余额度，不自动删）
 - 定时检查限流账号并自动刷新
 - 支持密码重新登录恢复异常账号，刷新后可自动重登
 - 支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理
@@ -257,8 +259,8 @@ environment:
 - 协议路径对齐 yukkcat：auto-OTP 默认 **passwordless**、Sentinel dual-header / SO collect、每号浏览器画像
 - **默认跳过 Codex 二次 OTP**（`skip_codex` / `OPENAI_SKIP_CODEX=1`），入库后后台刷新额度，缩短单号耗时
   - 取消勾选后需点 **保存配置** 再启动；API 模型已声明 `skip_codex` 等字段，避免旧版静默丢弃
-  - 跳过 Codex 的号为 `session_only`：不参与生图候选、401 不自动删除
-  - **默认入库后自动 Codex 补 refresh**（`auto_codex_upgrade`）：后台对同一邮箱再跑 Codex OTP；`add_phone` 等软失败保留 session 行
+  - 跳过 Codex 的号为 `session_only`：可生图，但无 `refresh_token`；默认不再后台二次登录补 refresh（会踢掉 session）
+  - **Codex 补 refresh**：仅当关掉「跳过 Codex」且打开 `auto_codex_upgrade` 时入库后后台再跑；号池行上钥匙图标可手动补（`POST /api/accounts/codex-upgrade`）
   - **已有 session 号补 refresh**：号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」（`POST /api/accounts/codex-upgrade`，无需浏览器粘贴 callback）
 - 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填
 - 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`、`/cancel`

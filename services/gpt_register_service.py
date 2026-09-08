@@ -25,6 +25,35 @@ GPT_REGISTER_JOBS_FILE = DATA_DIR / "gpt_register_jobs.json"
 
 _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}\s*$")
 
+_FP_KEY_ALIASES = {
+    "user_agent": "user-agent",
+    "user-agent": "user-agent",
+    "impersonate": "impersonate",
+    "sec_ch_ua": "sec-ch-ua",
+    "sec-ch-ua": "sec-ch-ua",
+    "sec_ch_ua_mobile": "sec-ch-ua-mobile",
+    "sec-ch-ua-mobile": "sec-ch-ua-mobile",
+    "sec_ch_ua_platform": "sec-ch-ua-platform",
+    "sec-ch-ua-platform": "sec-ch-ua-platform",
+    "oai-device-id": "oai-device-id",
+    "oai_device_id": "oai-device-id",
+    "device_id": "oai-device-id",
+    "oai-session-id": "oai-session-id",
+    "oai_session_id": "oai-session-id",
+}
+
+
+def _merge_register_fp(base: dict[str, Any], profile: object) -> dict[str, Any]:
+    merged = dict(base or {})
+    if not isinstance(profile, dict):
+        return merged
+    for raw_key, value in profile.items():
+        dest = _FP_KEY_ALIASES.get(str(raw_key).strip())
+        text = str(value or "").strip()
+        if dest and text:
+            merged[dest] = text
+    return merged
+
 def _builtin_engines_dir() -> str:
     try:
         from gpt_free_register.runner import default_engines_dir
@@ -1117,6 +1146,13 @@ class GptRegisterService:
         if device_id:
             payload["oai-device-id"] = device_id
             payload["fp"]["oai-device-id"] = device_id
+        payload["fp"] = _merge_register_fp(payload["fp"], extra.get("profile") or extra.get("fp"))
+        if payload["fp"].get("impersonate"):
+            payload["impersonate"] = payload["fp"]["impersonate"]
+        if payload["fp"].get("oai-device-id") and not payload.get("oai-device-id"):
+            payload["oai-device-id"] = payload["fp"]["oai-device-id"]
+        if payload["fp"].get("oai-session-id"):
+            payload["oai-session-id"] = payload["fp"]["oai-session-id"]
         # Default free image quota until remote fetch fills real limits_progress.
         # Without this, quota stays 0 → "no available image quota" even for fresh accounts.
         if payload.get("quota") in (None, "", 0):
@@ -1179,8 +1215,14 @@ class GptRegisterService:
             except Exception:
                 pass
 
-        # session_only 入库后后台 Codex 补 refresh（默认开；add_phone 等软失败保留 session 行）
-        if session_only and email and bool(settings.get("auto_codex_upgrade", True)):
+        # session_only 入库后可后台 Codex 补 refresh。skip_codex 时禁止：
+        # 二次 OAuth/authorize/continue 会把刚种下的 NextAuth session 踢掉（杀号）。
+        if (
+            session_only
+            and email
+            and bool(settings.get("auto_codex_upgrade", True))
+            and not bool(settings.get("skip_codex", True))
+        ):
             try:
                 from services.codex_upgrade_service import schedule_codex_upgrade
 

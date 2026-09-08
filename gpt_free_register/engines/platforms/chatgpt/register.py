@@ -1733,6 +1733,9 @@ class RegistrationEngine:
             self._otp_login_challenge = False
 
     def _otp_http(self, method: str, url: str, referer: str, label: str) -> bool:
+        if self.session is None:
+            self._log(f"{label} 跳过: session 未初始化", "warning")
+            return False
         headers = self._auth_api_headers(referer)
         if method == "POST":
             response = self.session.post(url, headers=headers, data="{}", timeout=15)
@@ -1771,6 +1774,9 @@ class RegistrationEngine:
         # Light session touch only. Full HTML navigation of email-verification
         # after passwordless authorize/continue has been observed to flip the
         # server state to login_challenge and later invalid_state on validate.
+        if self.session is None:
+            self._log("发送验证码跳过: session 未初始化", "warning")
+            return False
         try:
             dump_resp = self.session.get(
                 "https://auth.openai.com/api/accounts/client_auth_session_dump",
@@ -1829,6 +1835,8 @@ class RegistrationEngine:
 
     def _keep_auth_session_alive(self) -> None:
         """Light touch on auth.openai.com to reduce invalid_state during OTP wait."""
+        if self.session is None:
+            return
         try:
             # Prefer API dump over full HTML navigation (less chance of state reset).
             self.session.get(
@@ -2999,6 +3007,9 @@ class RegistrationEngine:
 
             if self._device_id:
                 result.device_id = str(self._device_id)
+            if self._browser_profile:
+                result.metadata = dict(result.metadata or {})
+                result.metadata["profile"] = dict(self._browser_profile)
 
             # 17. 完成
             self._log("=" * 60)

@@ -342,11 +342,16 @@ def obtain_codex_tokens_for_email(
         except Exception as exc:
             _append(f"OTP 收信失败: {exc}")
         if not code:
-            # Fallback to engine helper (may attempt resend on unset session — soft).
-            try:
-                code = engine._get_verification_code()
-            except Exception as exc:
-                _append(f"OTP 回退失败: {exc}")
+            # engine.session is never initialized on this path. Calling the
+            # register OTP helper would NoneType-crash and, if a session were
+            # later attached, resend OTP on a second client (kills the live web session).
+            if getattr(engine, "session", None) is None:
+                _append("OTP 回退跳过: register session 未初始化")
+            else:
+                try:
+                    code = engine._get_verification_code()
+                except Exception as exc:
+                    _append(f"OTP 回退失败: {exc}")
         if not code:
             return {
                 "ok": False,

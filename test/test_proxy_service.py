@@ -144,9 +144,6 @@ class ProxyServiceTests(unittest.TestCase):
             candidates,
             [
                 ("account", "socks5h://account.example:1080"),
-                ("runtime", "http://runtime.example:8080"),
-                ("global", "http://legacy.example:8080"),
-                ("direct", ""),
             ],
         )
 
@@ -160,7 +157,6 @@ class ProxyServiceTests(unittest.TestCase):
             candidates,
             [
                 ("account", "socks5h://same.example:1080"),
-                ("direct", ""),
             ],
         )
 
@@ -177,12 +173,34 @@ class ProxyServiceTests(unittest.TestCase):
             account={"proxy": "socks5h://dead.example:1080"},
             upstream=True,
         )
-        self.assertEqual(candidates, [("direct", "")])
+        self.assertEqual(candidates, [("account", "socks5h://dead.example:1080")])
         kwargs = store.build_session_kwargs(
             account={"proxy": "socks5h://dead.example:1080"},
             upstream=True,
         )
-        self.assertEqual(kwargs["proxy"], "")
+        self.assertEqual(kwargs["proxy"], "socks5h://dead.example:1080")
+        unbound = store.list_egress_candidates(upstream=True)
+        self.assertEqual(unbound, [("direct", "")])
+
+    def test_unbound_account_still_falls_back_across_egress(self) -> None:
+        runtime = make_runtime(enabled=True, egress_mode="single_proxy", proxy_url="http://runtime.example:8080")
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="http://legacy.example:8080", runtime=runtime))
+        self.assertEqual(
+            store.list_egress_candidates(account={}, upstream=True),
+            [
+                ("runtime", "http://runtime.example:8080"),
+                ("global", "http://legacy.example:8080"),
+                ("direct", ""),
+            ],
+        )
+
+    def test_clearance_cache_is_isolated_per_account(self) -> None:
+        store = ProxySettingsStore(FakeConfig())
+        key_a = store._cache_key("socks5h://same.example:1080", "chatgpt.com", {"email": "a@x.com"})
+        key_b = store._cache_key("socks5h://same.example:1080", "chatgpt.com", {"email": "b@x.com"})
+        self.assertNotEqual(key_a, key_b)
+        self.assertEqual(key_a[0], key_b[0])
+        self.assertEqual(key_a[1], key_b[1])
 
     def test_get_with_egress_fallback_skips_dead_proxy(self) -> None:
         store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://dead.example:1080"))

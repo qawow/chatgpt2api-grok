@@ -58,6 +58,18 @@ docker compose up -d
 # 本地改源码：docker compose -f docker-compose.local.yml up -d --build
 ```
 
+当前应用版本见仓库根目录 `VERSION`（现为 **1.8.0**，更新说明见 [CHANGELOG.md](../CHANGELOG.md)）。
+
+镜像标签：
+
+| 标签 | 何时更新 |
+| --- | --- |
+| `ghcr.io/qawow/chatgpt2api:latest` | 仅打 `v*` tag（例如 `v1.8.0`）时推送；`docker-compose.yml` 默认用这个 |
+| `ghcr.io/qawow/chatgpt2api:1.8.0` | 同上，随 `v1.8.0` tag |
+| `ghcr.io/qawow/chatgpt2api:sha-<commit>` | 每次 push `main` / `publish-root` 都会构建 |
+
+分支上的修复如果还没打 tag，`docker compose pull` **不会**更新 `:latest`。把 compose 的 `image` 改成对应 `:sha-<commit>`，或打 `v1.8.0` 后再拉 `:latest`。
+
 访问：
 
 ```text

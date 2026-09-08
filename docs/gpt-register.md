@@ -34,7 +34,8 @@ Cloudflare D1 自建邮箱（OTP） + OpenAI 协议注册
    │  成功拿到 access_token
    ▼
 account_service.add_account_items    # push_mode=local（默认）
-   │  无 refresh_token → session_only/fragile
+   │  无 refresh_token → session_only/fragile（可生图）
+   │  skip_codex 默认 true：不再后台 Codex 二次登录
    ▼
 account_service.fetch_remote_info    # 后台线程刷新真实 quota/status/type（不阻塞注册）
    │
@@ -49,6 +50,8 @@ data/accounts.json                   # ChatGPT 号池
 | 存储 | `data/accounts.json` | `data/grok_accounts.json` |
 | 管理 | `/api/accounts*` | `/api/grok/accounts*` |
 | 本功能写入 | ✅ | ❌ |
+
+账号出口隔离：默认 `bind_register_proxy=true`，入库把注册代理写到账号 `proxy`。绑了代理的号刷新/生图不再回落全局或直连。多个号共用同一 SOCKS 仍是同一出口 IP；一号一 IP 需要给注册机配多出口代理池。设备指纹（`oai-did` / UA）随注册 `profile` 写入号池并复用。
 
 ---
 
@@ -273,7 +276,7 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `mail_provider` | `cloudflare_d1_api` | 邮箱 provider |
 | `cfd1_domain` | 空 | 覆盖 `CFD1_DOMAIN` |
 | `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*` |
-| `bind_register_proxy` | true | 入库时把代理绑到账号 |
+| `bind_register_proxy` | true | 入库时把代理绑到账号；绑了代理的号不再回落到全局/直连（按号隔离出口） |
 | `plan_type` | `free` | 写入号池的 type |
 | `source_type` | 空 | 空则自动（register / codex） |
 | `push_enabled` | true | 成功后是否入库 |
@@ -285,7 +288,7 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `run_mode` | `inprocess` | `subprocess` 才需要外部 Python |
 | `python_bin` | 空 | 仅 subprocess |
 | `skip_codex` | **true** | 跳过注册流里的 Codex 二次 OTP；入库为 `session_only`（更快；见 §6.7.1） |
-| `auto_codex_upgrade` | **true** | `session_only` 入库后后台再跑 Codex 补 refresh；`add_phone` 等软失败保留 session 行 |
+| `auto_codex_upgrade` | **true** | 仅当 `skip_codex=false` 时，`session_only` 入库后后台再跑 Codex 补 refresh；`skip_codex` 默认开着时不再二次登录（会踢掉生图 session） |
 | `register_no_delay` | false | 关闭步骤间随机延迟；默认保留抖动，批量更稳 |
 | `so_collect_ms` | 空 | create_account 前 SO 采集等待毫秒；空=默认 0；需要旧行为时设 `5000` |
 
@@ -545,10 +548,9 @@ OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
 Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关闭步骤间随机延迟」。  
 保存/启动时字段经 `POST /api/gpt-register/settings` 与 `start` 的 Pydantic 模型（含 `skip_codex` / `register_no_delay` / `so_collect_ms`）；未声明字段会被丢弃，旧版因此无法取消「跳过 Codex」。
 
-> 跳过 Codex 后拿到的是 **session_only** 号：可入库排查，**不参与生图候选**、不因 401 自动删除。
+> 跳过 Codex 后拿到的是 **session_only** 号：可生图，但没有 `refresh_token`，二次登录很容易把 web session 踢掉。
 >
-> **默认会在入库后后台再跑 Codex 补 refresh**（`auto_codex_upgrade=true`）：对同一邮箱走 Codex client_id + CFD1 OTP。
-> 成功则写入 `refresh_token` 并替换旧 session 行；遇到 `add_phone` / OTP 失败则**软失败**，保留 session_only 行。
+> **`skip_codex=true`（默认）时不再自动 Codex 补 refresh**，避免后台 `authorize/continue` 杀号。只有关掉「跳过 Codex」且 `auto_codex_upgrade=true` 才会入库后再跑 Codex OTP。
 >
 > **已有 session_only 号怎么补 refresh？** 在 **号池管理 → ChatGPT**：
 > 1. 行操作点钥匙图标 **Codex 补 refresh**（或勾选后点工具栏同名按钮）  
@@ -603,8 +605,8 @@ curl -s "$BASE/api/gpt-register/jobs/$JOB_ID" -H "Authorization: Bearer $KEY" \
 | OTP `invalid_state` / session no longer valid | continue 二次提交或会话过期 | 保持 `OPENAI_SKIP_CONTINUE_ON_AUTO_OTP=1`；换干净代理重开流程 |
 | `IP 地理位置不支持` / OAuth reset | 出口被拦或代理不稳 | 换 TW 等可用出口；检查 `OPENAI_BLOCK_REGIONS` |
 | Codex CLI `add_phone required` | Codex 路径额外要手机 | **默认已跳过 Codex**（`skip_codex`/`OPENAI_SKIP_CODEX=1`）。若手动关闭跳过，会回退 NextAuth session token，任务仍可 `registered` |
-| 注册成功但生图额度 0 / 选不到号 | 入库默认 bootstrap quota；free 上游 `image_gen.remaining` 常为 0；无 refresh 的 session 号不参与生图 | 入库后**后台** `fetch_remote_info`；看号池 `quota/status/session_only`；session 号需 Codex refresh 才可生图 |
-| 注册号「秒死」被自动删 | NextAuth-only access 无 refresh，401 后 `auto_remove_invalid_accounts` 剔除 | 现已标 `session_only/fragile`：排除生图候选且**不自动删除**，只标异常保留排查 |
+| 注册成功但生图额度 0 / 选不到号 | 入库默认 bootstrap quota；free 上游 `image_gen.remaining` 常为 0 | 入库后**后台** `fetch_remote_info`；看号池本地 `quota/status`。`session_only` **可以生图**，不必先 Codex 补 refresh |
+| 注册号「秒死」被自动删 | 旧逻辑把 prepare 401 当 hard revoke 并清零额度；后台 Codex 二次登录会踢掉 NextAuth session | `session_only` 保留行与剩余额度、不自动删。默认 `skip_codex` 不再自动补 refresh。设备指纹写入号池并复用；秒死先查是否手动/旧配置触发了 Codex 二次登录 |
 
 ---
 
@@ -636,12 +638,12 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 | `gpt_free_register/engines/platforms/chatgpt/browser_profile.py` | 每号浏览器画像（TLS/UA/CH 一致） |
 | `gpt_free_register/engines/platforms/chatgpt/constants.py` | Sentinel SDK 版本、OAuth 端点 |
 | `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库（session_only + 后台 fetch_remote_info + 日志节流）+ 完成摘要 |
-| `services/account_service.py` | 号池：`session_only`/`fragile` 门禁、生图选号、invalid 自动移除策略 |
+| `services/account_service.py` | 号池：`session_only` 可生图、soft revoke 保留额度、按号隔离出口 |
 | `services/oauth_login_service.py` | 浏览器 OAuth PKCE；换 token 三件套 |
 | `api/gpt_register.py` | 管理 API（含 `skip_codex` 等 latency 字段） |
 | `api/accounts.py` | `codex-upgrade`（主路径）+ `oauth/start|finish`（备用，`replace_access_token`） |
 | `gpt_free_register/codex_upgrade.py` | 协议 Codex OTP 补齐既有邮箱 |
-| `services/codex_upgrade_service.py` | 入库后自动调度 + 写号池 |
+| `services/codex_upgrade_service.py` | 手动 / 条件自动 Codex 补 refresh + 写号池（`skip_codex` 时不自动跑） |
 | `web/.../gpt-register-card.tsx` | 设置页 UI |
 | `web/.../accounts/page.tsx` | 号池「Codex 补 refresh」按钮 / session 徽章 |
 | `web/.../account-import-dialog.tsx` | OAuth 导入 + 升级模式（备用；主路径为 Codex） |

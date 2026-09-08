@@ -329,6 +329,11 @@ class ProxySettingsStore:
             extras.append(("global", legacy_proxy))
         extras.append(("direct", ""))
 
+        # Codex2API / CPA: a bound account stays on its own proxy. Falling
+        # through to a shared runtime/global/direct IP looks like a new device.
+        if account_proxy:
+            return [("account", account_proxy)]
+
         for source, url in extras:
             if url in seen:
                 continue
@@ -354,14 +359,20 @@ class ProxySettingsStore:
         if force_proxy is not None:
             session_kwargs["proxy"] = normalize_proxy_url(force_proxy)
         else:
-            chosen = profile.proxy_url or ""
-            if chosen and is_egress_unusable(chosen):
-                for _source, url in self.list_egress_candidates(
-                    account=account, resource=resource, upstream=upstream
-                ):
-                    chosen = url
-                    break
-            session_kwargs["proxy"] = chosen
+            account_proxy = normalize_proxy_url(
+                _clean((account or {}).get("proxy") if isinstance(account, dict) else "")
+            )
+            if account_proxy:
+                session_kwargs["proxy"] = account_proxy
+            else:
+                chosen = profile.proxy_url or ""
+                if chosen and is_egress_unusable(chosen):
+                    for _source, url in self.list_egress_candidates(
+                        account=account, resource=resource, upstream=upstream
+                    ):
+                        chosen = url
+                        break
+                session_kwargs["proxy"] = chosen
         if profile.runtime_enabled and profile.skip_ssl_verify:
             session_kwargs["verify"] = False
         if "impersonate" in session_kwargs:
@@ -443,7 +454,7 @@ class ProxySettingsStore:
             return merged_headers
 
         target_host = _host_from_url(target_url)
-        bundle = self._bundle_for_headers(profile, target_host)
+        bundle = self._bundle_for_headers(profile, target_host, account=account)
         if bundle is None or not bundle.is_valid_for(target_host, profile.proxy_url):
             return merged_headers
 
@@ -472,7 +483,7 @@ class ProxySettingsStore:
             return None
 
         target_host = _host_from_url(target_url)
-        key = self._cache_key(profile.proxy_url, target_host)
+        key = self._cache_key(profile.proxy_url, target_host, account)
         if profile.clearance_mode == "manual":
             bundle = self._build_manual_bundle(profile, target_host)
             if bundle is not None:
@@ -528,14 +539,14 @@ class ProxySettingsStore:
     ) -> None:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
         target_host = _host_from_url(target_url)
-        key = self._cache_key(profile.proxy_url, target_host)
+        key = self._cache_key(profile.proxy_url, target_host, account)
         with self._lock:
             self._clearance_cache.pop(key, None)
 
     def get_runtime_status(self) -> dict[str, object]:
         profile = self.get_profile(upstream=True)
         with self._lock:
-            cached_hosts = [host for _proxy, host in self._clearance_cache]
+            cached_hosts = [key[1] for key in self._clearance_cache if len(key) >= 2]
             cached_count = len(self._clearance_cache)
         return {
             "enabled": profile.runtime_enabled,
@@ -555,8 +566,13 @@ class ProxySettingsStore:
             runtime = {}
         return runtime if isinstance(runtime, dict) else {}
 
-    def _bundle_for_headers(self, profile: ProxyRuntimeProfile, target_host: str) -> ClearanceBundle | None:
-        key = self._cache_key(profile.proxy_url, target_host)
+    def _bundle_for_headers(
+        self,
+        profile: ProxyRuntimeProfile,
+        target_host: str,
+        account: dict | None = None,
+    ) -> ClearanceBundle | None:
+        key = self._cache_key(profile.proxy_url, target_host, account)
         if profile.clearance_mode == "manual":
             bundle = self._build_manual_bundle(profile, target_host)
             if bundle is not None:
@@ -595,7 +611,7 @@ class ProxySettingsStore:
                 self._provider_cache[url] = provider
             return provider
 
-    def _get_flight_lock(self, key: tuple[str, str]) -> threading.Lock:
+    def _get_flight_lock(self, key: tuple) -> threading.Lock:
         with self._lock:
             lock = self._flight_locks.get(key)
             if lock is None:
@@ -603,17 +619,36 @@ class ProxySettingsStore:
                 self._flight_locks[key] = lock
             return lock
 
-    def _get_cached_bundle(self, key: tuple[str, str]) -> ClearanceBundle | None:
+    def _get_cached_bundle(self, key: tuple) -> ClearanceBundle | None:
         with self._lock:
             return self._clearance_cache.get(key)
 
-    def _set_cached_bundle(self, key: tuple[str, str], bundle: ClearanceBundle) -> None:
+    def _set_cached_bundle(self, key: tuple, bundle: ClearanceBundle) -> None:
         with self._lock:
             self._clearance_cache[key] = bundle
 
     @staticmethod
-    def _cache_key(proxy_url: str, target_host: str) -> tuple[str, str]:
-        return (normalize_proxy_url(proxy_url), _normalize_host(target_host))
+    def _account_isolation_id(account: dict | None) -> str:
+        if not isinstance(account, dict):
+            return ""
+        for key in ("oai-device-id", "email", "account_id", "user_id"):
+            text = str(account.get(key) or "").strip()
+            if text:
+                return text.lower()
+        raw_fp = account.get("fp")
+        if isinstance(raw_fp, dict):
+            text = str(raw_fp.get("oai-device-id") or "").strip()
+            if text:
+                return text.lower()
+        return ""
+
+    @classmethod
+    def _cache_key(cls, proxy_url: str, target_host: str, account: dict | None = None) -> tuple[str, str, str]:
+        return (
+            normalize_proxy_url(proxy_url),
+            _normalize_host(target_host),
+            cls._account_isolation_id(account),
+        )
 
 
 def _clean(value: object) -> str:

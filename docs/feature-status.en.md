@@ -24,7 +24,7 @@
 | 账号刷新异步进度追踪 | ✅  | 刷新和重新登录改为异步模式，前端轮询显示进度。 |
 | 密码重新登录恢复异常账号 | ✅  | 号池管理页面支持重新登录，刷新后可自动重登异常账号。 |
 | 账号额度刷新与恢复时间同步 | ✅  | 已支持账号信息刷新，限流账号也会自动继续检查。 |
-| 失效 Token 自动清理 | ✅  | 已支持自动移除失效 Token。 |
+| 失效 Token 自动清理 | ✅  | 有 `refresh_token` 的号自动移除失效 Token；`session_only` 只标异常、保留剩余额度，不自动删。 |
 | CPA / sub2api 导入 | ❌  | 已移除；号池走本地 JSON / access_token / GPT Free 注册。 |
 | Docker 自托管部署 | ✅  | 已支持 Docker Compose 部署，并提供多架构镜像。 |
 | 兼容接口中的多参考图能力 | ✅  | 已实现，支持在兼容接口中传入多参考图。 |
@@ -38,4 +38,6 @@
 | 图片尺寸参数 | ⚠️ | 网页会把 `WxH` 写入提示词；Codex 工具会带 `size`。不是严格按像素出图。 |
 | 服务端图片 URL 缓存 | ✅  | 已实现。 |
 | `rt_token` 刷新 | ❌  | 待实现。 |
-| 代理配置功能 | ✅  | 已支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理，并应用到出站请求。 |
+| 代理配置功能 | ✅  | 网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H；账号绑定 `proxy` 后不再回落 runtime / 全局 / 直连。 |
+| session_only 免费号生图 | ✅  | 无 `refresh_token` 也可生图；复用 `oai-device-id` / session cookie；`chat_requirements_prepare` 401 不 hard revoke。 |
+| 账号出口隔离 | ✅  | 绑定代理的号只走该出口；刷新锁与 Cloudflare clearance 按号；注册指纹写入号池。一号一 IP 需注册代理池。 |

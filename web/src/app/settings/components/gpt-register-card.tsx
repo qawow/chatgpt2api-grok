@@ -429,7 +429,7 @@ export function GptRegisterCard() {
                   onCheckedChange={(checked) => setField("bind_register_proxy", Boolean(checked))}
                   disabled={running}
                 />
-                把注册代理绑定到账号
+                把注册代理绑定到账号（绑了不再回落全局/直连）
               </label>
               <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
                 <Checkbox
@@ -453,7 +453,7 @@ export function GptRegisterCard() {
                   onCheckedChange={(checked) => setField("auto_codex_upgrade", Boolean(checked))}
                   disabled={running}
                 />
-                注册入库后自动 Codex 补 refresh（软失败保留 session 号）
+                入库后自动 Codex 补 refresh（仅当未跳过 Codex；二次登录可能踢 session）
               </label>
               <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
                 <Checkbox

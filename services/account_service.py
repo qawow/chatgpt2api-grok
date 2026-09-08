@@ -54,6 +54,7 @@ class AccountService:
         self.storage = storage_backend
         self._lock = Lock()
         self._token_refresh_lock = Lock()
+        self._token_refresh_locks: dict[str, Lock] = {}
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
@@ -855,11 +856,23 @@ class AccountService:
             raise last_error
         raise RuntimeError("session_refresh_no_egress")
 
+    def _refresh_lock_for(self, access_token: str) -> Lock:
+        key = str(access_token or "").strip() or "_"
+        with self._token_refresh_lock:
+            lock = self._token_refresh_locks.get(key)
+            if lock is None:
+                lock = Lock()
+                self._token_refresh_locks[key] = lock
+            return lock
+
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
-            resolved_token, account = self._get_account_for_token(access_token)
+        resolved_token, account = self._get_account_for_token(access_token)
+        if not account:
+            return access_token
+        with self._refresh_lock_for(resolved_token):
+            resolved_token, account = self._get_account_for_token(resolved_token)
             if not account:
                 return access_token
             active_token = str(account.get("access_token") or resolved_token or access_token)
@@ -1159,7 +1172,7 @@ class AccountService:
         session = create_cffi_session(**session_kwargs)
         
         try:
-            device_id = str(uuid.uuid4())
+            device_id = self._chatgpt_device_id(account) or str(uuid.uuid4())
             
             # ─── 方式2: OAuth authorize 流程 ──────────────────────────
             # 使用 Platform Client + PKCE

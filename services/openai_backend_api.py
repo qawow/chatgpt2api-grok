@@ -282,6 +282,15 @@ class OpenAIBackendAPI:
                 changed_fp = True
         if changed_fp:
             updates["fp"] = next_fp
+        if not str(account.get("proxy") or "").strip() and self._force_proxy is None:
+            try:
+                pinned = normalize_proxy_url(
+                    proxy_settings.get_profile(account=account, upstream=True).proxy_url
+                )
+            except Exception:
+                pinned = ""
+            if pinned:
+                updates["proxy"] = pinned
         if not updates:
             return
         try:

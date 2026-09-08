@@ -1344,7 +1344,7 @@ function AccountsPageContent() {
                               <Badge
                                 variant="outline"
                                 className="rounded-md border-sky-200 bg-sky-50 text-sky-700"
-                                title="无 refresh_token：不参与生图、不自动删除；可用「Codex 补 refresh」升级"
+                                title="无 refresh_token：可生图；401 不自动删除、保留剩余额度；「Codex 补 refresh」会二次登录，可能踢掉当前 session"
                               >
                                 session
                               </Badge>

@@ -373,6 +373,11 @@ class ImportLocalTest(unittest.TestCase):
                 "access_token": "access-did",
                 "session_token": "sess",
                 "oai-device-id": "did-from-register",
+                "profile": {
+                    "impersonate": "chrome142",
+                    "user_agent": "Mozilla/5.0 isolation-test",
+                    "sec_ch_ua": '"Chromium";v="142"',
+                },
             },
         }
         fake_svc = mock.Mock()
@@ -390,6 +395,8 @@ class ImportLocalTest(unittest.TestCase):
         payload = fake_svc.add_account_items.call_args[0][0][0]
         self.assertEqual(payload["oai-device-id"], "did-from-register")
         self.assertEqual(payload["fp"]["oai-device-id"], "did-from-register")
+        self.assertEqual(payload["fp"]["user-agent"], "Mozilla/5.0 isolation-test")
+        self.assertEqual(payload["fp"]["sec-ch-ua"], '"Chromium";v="142"')
         # fetch_remote_info runs in a daemon thread; wait briefly
         import time as _time
         for _ in range(50):

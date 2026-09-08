@@ -2,8 +2,12 @@
 
 ## Unreleased
 
+## 1.8.0 - 2026-09-08
+
 ### chatgpt2api-grok（本分支）
 
++ [发布] 版本 1.8.0：对外仅生图；独立 Grok 号池与 GPT Free 注册；`session_only` 可生图；绑定代理的号按账号隔离出口。
++ [文档] 更正 session_only「不参与生图」过时说明；补充账号隔离、`skip_codex` 门禁与镜像标签（`:latest` 仅 `v*` tag）。
 + [清理] 去掉 CPA/sub2api 前端残骸、备份项、引擎 `upload_cpa`、本地 `MERGE_REPORT.md`；接口文档与调试 Skill 改为生图。
 + [修复] 注册设置只保留 protocol + Cloudflare D1；Grok 模型禁用图生图；补齐并行生图/轮询间隔/先确认再取图开关。
 + [修复] tiktoken 拉 `o200k_base` 不再走进程 SOCKS 代理；下载失败时回退估算，避免生图 usage 统计把整次请求打挂。
@@ -30,6 +34,8 @@
 + [修复] 生图 `chat_requirements_prepare` 401 `Could not parse your authentication token`：过期 session JWT 在代理超时后仍被直接选用。过期号先走 session 续期（出口回退），401 会换号，不再把过期 Bearer 交给 ChatGPT。
 + [修复] SOCKS 上 `OPENSSL_internal:invalid library` 不再切直连（本机直连 chatgpt.com 会 30s 超时）。同代理重建 HTTP/1.1 会话重试；该错误仍不把代理拉黑。
 + [修复] 免费 session_only 号第一次生图成功、第二次立刻废号：TLS 重试会新建 `OpenAIBackendAPI` 并换 `OAI-Device-Id`，session 探活 `/me` 又不带 cookie，一次 `chat_requirements_prepare` 401 就把额度清零。设备指纹写入号池并复用；`/me` 带上 session cookie + `oai-did`；prepare 401 不再当 hard revoke、不再清零剩余额度。注册入库带上 `oai-did`。
++ [修复] `skip_codex` 入库后再后台 Codex 补 refresh：会对同一邮箱二次 OAuth/`authorize/continue`，把刚用来生图的 NextAuth session 踢掉。默认跳过 Codex 时不再自动补齐；OTP 回退也不再拿空 `session` 打认证。
++ [优化] 账号隔离对齐 CPA / [codex2api](https://github.com/james-6-23/codex2api)：绑定了 `proxy` 的号不再回落到 runtime/全局/直连；注册浏览器指纹写入号池；刷新锁按号拆开；密码重登复用 `oai-device-id`；Cloudflare clearance 按号缓存。
 + [优化] Grok 上游：线程内 `requests.Session` keep-alive；免费路径 429 立即失败不再连打 grok-4/grok-3/付费接口；付费 401/403/429 跳过 `/models` catalog。
 + [优化] 生图轮询：15–35s 窗口用 4s/7s 间隔（不超过配置上限）；循环内不再每次打 `/backend-api/tasks`（只在接近超时补一次）。默认 `image_poll_interval_secs` 5。
 + [移除] grokcli2api-go / G2A 桥：删除 `/api/g2a*`、设置页 Codex2API、号池远程只读标签；Grok 生图只走本地号池。
@@ -41,11 +47,11 @@
 + [优化] GPT 注册再对照 [gpt-auto-register](https://github.com/Regert888/gpt-auto-register)：`oai-did` warmup 失败不建邮箱、document 导航头 / auth XHR 补 Origin+did+Datadog、auto-OTP 只 resend、OTP 401 补发新码、代理池 round-robin、熔断识别 `invalid_state`/CF 403、并发不再写全局 `REGISTER_PROXY`。
 + [优化] GPT 注册对照 [gpt-auto-register](https://github.com/Regert888/gpt-auto-register) 补齐稳定性：`socks5://` 规范化为 `socks5h://`、TLS 握手瞬断原 session 重试、passwordless/send-otp + email-otp/resend 发码顺序、session_token cookie/JSON 三路兜底、过滤 tm1 影子 OTP `493682`、批量任务连续网络错误熔断。
 + [调整] session_only **补 refresh 主路径**改为协议 **Codex OTP 补齐**（`POST /api/accounts/codex-upgrade` + 号池「Codex 补 refresh」），不再依赖浏览器粘贴 callback。
-+ [新增] 注册入库 `session_only` 后默认后台 **自动 Codex 补 refresh**（`auto_codex_upgrade=true`）；`add_phone`/OTP 失败软保留 session 行。
++ [新增] `auto_codex_upgrade`：仅当关掉「跳过 Codex」时，入库后后台 Codex 补 refresh；`skip_codex` 默认开启时不二次登录（会踢掉生图 session）。`add_phone`/OTP 失败软保留 session 行。
 + [新增] `gpt_free_register/codex_upgrade.py` + `services/codex_upgrade_service.py`：绑定既有邮箱 + CFD1 收 OTP + 写入 refresh/id 并替换旧行。
 + [修复] GPT 注册「跳过 Codex」取消不生效：`GptRegisterSettingsUpdate` 补齐 `skip_codex` / `register_no_delay` / `so_collect_ms`，避免 Pydantic 静默丢字段。
 + [保留] 浏览器 OAuth `oauth/start|finish` + `replace_access_token` 仍可作为备用导入/升级路径。
-+ [文档] `docs/gpt-register.md` / `docs/operations.md` / README 更新 Codex 自动升级与号池入口说明。
++ [文档] `docs/gpt-register.md` / `docs/operations.md` / README 更新 Codex 门禁、session_only 生图与账号隔离说明。
 
 ## 1.7.0 - 2026-07-05
 

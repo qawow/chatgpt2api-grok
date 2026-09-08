@@ -46,7 +46,7 @@ export type Account = {
   proxy?: string | null;
   /**
    * 无 refresh_token 的 NextAuth/session 号（如跳过 Codex 的 free 注册结果）。
-   * 不参与生图候选，401 不自动删除；可用「Codex 补 refresh」升级。
+   * 可参与生图；401 不自动删除、不清零剩余额度；可用「Codex 补 refresh」升级。
    */
   session_only?: boolean;
   fragile?: boolean;
@@ -910,7 +910,7 @@ export type GptRegisterSettings = {
   dry_run: boolean;
   /** 默认 true：跳过 Codex 二次 OTP（free 号几乎总是 add_phone 失败） */
   skip_codex?: boolean;
-  /** 默认 true：session_only 入库后后台再跑 Codex 补 refresh（软失败保留 session 行） */
+  /** 默认 true，但仅当 skip_codex=false 时才会入库后后台 Codex 补 refresh（软失败保留 session 行） */
   auto_codex_upgrade?: boolean;
   /** 关闭步骤间随机抖动（OPENAI_REGISTER_NO_DELAY） */
   register_no_delay?: boolean;

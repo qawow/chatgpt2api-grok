@@ -84,9 +84,37 @@ def map_register_result_to_account(
         payload["session_token"] = session_token
     if workspace_id:
         payload["workspace_id"] = workspace_id
+    extra = _extra(account)
+    profile = extra.get("profile") if isinstance(extra.get("profile"), dict) else extra.get("fp")
+    fp: dict[str, Any] = {}
     if device_id:
         payload["oai-device-id"] = device_id
-        payload["fp"] = {"oai-device-id": device_id}
+        fp["oai-device-id"] = device_id
+    if isinstance(profile, dict):
+        aliases = {
+            "user_agent": "user-agent",
+            "user-agent": "user-agent",
+            "impersonate": "impersonate",
+            "sec_ch_ua": "sec-ch-ua",
+            "sec-ch-ua": "sec-ch-ua",
+            "sec_ch_ua_mobile": "sec-ch-ua-mobile",
+            "sec-ch-ua-mobile": "sec-ch-ua-mobile",
+            "sec_ch_ua_platform": "sec-ch-ua-platform",
+            "sec-ch-ua-platform": "sec-ch-ua-platform",
+        }
+        for raw_key, dest in aliases.items():
+            text = _text(profile.get(raw_key))
+            if text:
+                fp[dest] = text
+        if not device_id:
+            nested_did = _text(profile.get("oai-device-id") or profile.get("device_id"))
+            if nested_did:
+                payload["oai-device-id"] = nested_did
+                fp["oai-device-id"] = nested_did
+    if fp:
+        payload["fp"] = fp
+        if fp.get("impersonate"):
+            payload["impersonate"] = fp["impersonate"]
     if has_codex:
         payload["export_type"] = "codex"
     if proxy:
