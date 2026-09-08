@@ -136,6 +136,39 @@ def start_grok_account_watcher(stop_event: Event) -> Thread:
     return thread
 
 
+def start_account_replenish_watcher(stop_event: Event) -> Thread:
+    """Keep the ChatGPT image pool at auto_replenish_min_available accounts."""
+
+    def worker() -> None:
+        # Let startup import / first /me settle before the first register.
+        if stop_event.wait(20):
+            return
+        while not stop_event.is_set():
+            wait_secs = 90
+            try:
+                from services.gpt_register_service import gpt_register_service
+
+                result = gpt_register_service.maybe_replenish_pool()
+                wait_secs = max(30, int((result or {}).get("wait_secs") or 90))
+                action = str((result or {}).get("action") or "skip")
+                reason = str((result or {}).get("reason") or "")
+                if action == "started" or reason not in {"stocked", "disabled"}:
+                    print(
+                        "[account-replenish] "
+                        f"{action} reason={reason} "
+                        f"available={(result or {}).get('available')} "
+                        f"min={(result or {}).get('min_available')}"
+                    )
+            except Exception as exc:
+                print(f"[account-replenish] fail {exc}")
+                wait_secs = 90
+            stop_event.wait(wait_secs)
+
+    thread = Thread(target=worker, name="account-replenish", daemon=True)
+    thread.start()
+    return thread
+
+
 _SPA_FALLBACK_BLOCKLIST = ("_next/", "api/", "v1/", "auth/")
 
 

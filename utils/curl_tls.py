@@ -116,12 +116,55 @@ class _TlsLibraryFallbackSession:
         self._openssl_retries = 0
         self._inner = self._factory(**self._kwargs)
 
+    def _snapshot_cookies(self) -> list[tuple[str, str, str, str]]:
+        """Copy real CookieJar entries. Cap/abort on mock or corrupt jars."""
+        try:
+            jar = getattr(self._inner, "cookies", None)
+        except Exception:
+            return []
+        if jar is None:
+            return []
+        snapped: list[tuple[str, str, str, str]] = []
+        try:
+            for index, cookie in enumerate(jar):
+                if index >= 64:
+                    return []
+                name = getattr(cookie, "name", None)
+                value = getattr(cookie, "value", None)
+                if not isinstance(name, str) or not name or value is None:
+                    return []
+                snapped.append((
+                    name,
+                    str(value),
+                    str(getattr(cookie, "domain", "") or ""),
+                    str(getattr(cookie, "path", "") or "/"),
+                ))
+        except Exception:
+            return []
+        return snapped
+
+    def _restore_cookies(self, cookies: list[tuple[str, str, str, str]]) -> None:
+        dest = getattr(self._inner, "cookies", None)
+        if dest is None or not cookies:
+            return
+        for name, value, domain, path in cookies:
+            try:
+                dest.set(name, value, domain=domain, path=path)
+            except TypeError:
+                try:
+                    dest.set(name, value)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
     def _recreate_inner(self) -> None:
         headers = {}
         try:
             headers = dict(self._inner.headers)
         except Exception:
             headers = {}
+        cookies = self._snapshot_cookies()
         try:
             self._inner.close()
         except Exception:
@@ -132,6 +175,7 @@ class _TlsLibraryFallbackSession:
                 self._inner.headers.update(headers)
             except Exception:
                 pass
+        self._restore_cookies(cookies)
 
     def _call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         last: BaseException | None = None
@@ -140,7 +184,9 @@ class _TlsLibraryFallbackSession:
             if self._http11:
                 call_kwargs.setdefault("http_version", _http11_constant())
             try:
-                return getattr(self._inner, name)(*args, **call_kwargs)
+                result = getattr(self._inner, name)(*args, **call_kwargs)
+                self._openssl_retries = 0
+                return result
             except Exception as exc:
                 last = exc
                 if not is_openssl_invalid_library(str(exc)):

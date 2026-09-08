@@ -56,6 +56,21 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertEqual(s["concurrency"], 1)
         self.assertEqual(s["interval_secs"], 3)
         self.assertFalse(s["register_no_delay"])
+        self.assertTrue(s["auto_replenish_enabled"])
+        self.assertEqual(s["auto_replenish_min_available"], 1)
+        self.assertEqual(s["auto_replenish_batch"], 1)
+
+    def test_auto_replenish_clamps(self):
+        s = normalize_settings(
+            {
+                "auto_replenish_min_available": 99,
+                "auto_replenish_batch": 0,
+                "auto_replenish_interval_secs": 5,
+            }
+        )
+        self.assertEqual(s["auto_replenish_min_available"], 20)
+        self.assertEqual(s["auto_replenish_batch"], 1)
+        self.assertEqual(s["auto_replenish_interval_secs"], 30)
 
     def test_api_model_accepts_latency_fields(self):
         """Regression: undeclared fields were dropped by Pydantic → UI could not uncheck skip_codex."""
@@ -66,6 +81,8 @@ class NormalizeSettingsTest(unittest.TestCase):
             register_no_delay=True,
             so_collect_ms="1000",
             count=2,
+            auto_replenish_enabled=False,
+            auto_replenish_min_available=3,
         )
         patch = body.model_dump(exclude_none=True)
         self.assertIn("skip_codex", patch)
@@ -73,6 +90,8 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertTrue(patch["register_no_delay"])
         self.assertEqual(patch["so_collect_ms"], "1000")
         self.assertEqual(patch["count"], 2)
+        self.assertFalse(patch["auto_replenish_enabled"])
+        self.assertEqual(patch["auto_replenish_min_available"], 3)
 
 
 class ConfigStoreTest(unittest.TestCase):
@@ -476,3 +495,77 @@ class ProxyPoolTest(unittest.TestCase):
         pool = parse_proxy_pool("socks5h://a:1\nsocks5h://b:2")
         self.assertEqual(len(pool), 2)
         self.assertEqual(min(5, len(pool)), 2)
+
+
+class ReplenishPoolTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg_path = Path(self.tmp.name) / "gpt_reg.json"
+        self.svc = GptRegisterService(config_store=GptRegisterConfig(path=self.cfg_path))
+        self.svc.config_store.update(
+            {
+                "auto_replenish_enabled": True,
+                "auto_replenish_min_available": 2,
+                "auto_replenish_batch": 1,
+                "push_enabled": True,
+                "dry_run": False,
+            }
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_skips_when_disabled(self):
+        self.svc.config_store.update({"auto_replenish_enabled": False})
+        with mock.patch.object(self.svc, "start_job") as start:
+            out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["reason"], "disabled")
+        start.assert_not_called()
+
+    def test_skips_when_stocked(self):
+        with mock.patch("services.account_service.account_service") as acc:
+            acc.count_image_available_accounts.return_value = 2
+            with mock.patch.object(self.svc, "start_job") as start:
+                out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["reason"], "stocked")
+        start.assert_not_called()
+
+    def test_skips_when_job_running(self):
+        with mock.patch.object(self.svc, "has_active_job", return_value=True):
+            with mock.patch.object(self.svc, "start_job") as start:
+                out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["reason"], "job_running")
+        start.assert_not_called()
+
+    def test_starts_when_below_min(self):
+        with mock.patch("services.account_service.account_service") as acc:
+            acc.count_image_available_accounts.return_value = 0
+            with mock.patch.object(
+                self.svc, "start_job", return_value={"job_id": "auto1"}
+            ) as start:
+                out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["action"], "started")
+        self.assertEqual(out["count"], 1)
+        start.assert_called_once()
+        self.assertEqual(start.call_args.args[0]["count"], 1)
+        self.assertEqual(start.call_args.kwargs["trigger"], "auto_replenish")
+
+    def test_fail_cooldown_after_empty_auto_job(self):
+        from datetime import datetime, timezone
+
+        self.svc._jobs["old"] = {
+            "job_id": "old",
+            "trigger": "auto_replenish",
+            "status": "done",
+            "added": 0,
+            "failed": 1,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with mock.patch("services.account_service.account_service") as acc:
+            acc.count_image_available_accounts.return_value = 0
+            with mock.patch.object(self.svc, "start_job") as start:
+                out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["reason"], "fail_cooldown")
+        start.assert_not_called()

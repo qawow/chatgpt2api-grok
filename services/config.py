@@ -441,12 +441,12 @@ class ConfigStore:
     @property
     def image_poll_initial_wait_secs(self) -> float:
         """Image generation upstream takes ~30s; polling immediately wastes requests
-        and trips a transient 429. Default 6s (yukkcat uses 5s) lets the conversation
-        document commit before the first poll without waiting a full 10s."""
+        and trips a transient 429. Default 4s lets the conversation document commit
+        before the first poll without waiting a full 6–10s."""
         try:
-            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 6.0)))
+            return max(0.0, float(self.data.get("image_poll_initial_wait_secs", 4.0)))
         except (TypeError, ValueError):
-            return 6.0
+            return 4.0
 
     @property
     def image_account_concurrency(self) -> int:

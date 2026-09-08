@@ -1,6 +1,6 @@
 # 运维与维护（chatgpt2api-grok）
 
-面向本二开仓库的日常使用、升级、备份与排障。当前版本 **1.8.0**（仓库根目录 `VERSION`，说明见 [CHANGELOG.md](../CHANGELOG.md)）。上游官方文档见原项目。部署机优先拉本仓库 GitHub Actions 构建的镜像，不要用上游官方 `ghcr.io/basketikun/chatgpt2api`。`docker-compose.yml` 默认 `:latest`，只在打 `v*` tag 时更新；分支 push 只出 `:sha-<commit>`。
+面向本二开仓库的日常使用、升级、备份与排障。当前版本 **1.8.1**（仓库根目录 `VERSION`，说明见 [CHANGELOG.md](../CHANGELOG.md)）。上游官方文档见原项目。部署机优先拉本仓库 GitHub Actions 构建的镜像，不要用上游官方 `ghcr.io/basketikun/chatgpt2api`。`docker-compose.yml` 默认 `:latest`，只在打 `v*` tag 时更新；分支 push 只出 `:sha-<commit>`。
 
 ## 1. 正确部署方式
 
@@ -56,7 +56,8 @@ docker compose -f docker-compose.warp.yml up -d --build
 - 注册默认 `bind_register_proxy=true`：入库时把注册代理写到账号。多个号绑同一 SOCKS **仍是同一出口 IP**；真要一号一 IP，给注册机配多出口代理池。
 - 设备指纹（`oai-device-id` / UA / impersonate）按号写入并复用；token 刷新锁、Cloudflare clearance 按号拆开。
 - `session_only`（无 `refresh_token`）**可以生图**。`chat_requirements_prepare` 401 不当 hard revoke、不清零剩余额度、不自动删号。
-- 默认 `skip_codex=true` 时**不会**入库后再跑 Codex 二次登录（会踢掉刚用来生图的 NextAuth session）。要补 `refresh_token`：关掉跳过 Codex 再注册，或号池页手动「Codex 补 refresh」。
+- 入库后**不会**自动 Codex 二次登录。5 分钟巡检也不再打健康 session_only 的 `/me`。要补 `refresh_token` 用号池页手动「Codex 补 refresh」（会踢当前 web session）。
+- **自动补号**（设置 → GPT注册，默认开）：可生图账号低于最少数量时，用当前注册配置自动开任务。已有任务会等待；连续入库 0 冷却 10 分钟。
 
 ## 3. 调用速查
 
@@ -178,8 +179,8 @@ docker logs -f chatgpt2api
 | Grok 生图 502（非 401） | Build 通道可能无 images / 额度；不会回落 ChatGPT 池 |
 | GPT 注册 `account_creation_failed` + OTP 失效 | 勿强制 auto-OTP 密码路径；见 [gpt-register.md](gpt-register.md) §6.7 |
 | GPT 注册成功但 Codex `add_phone` | 默认已跳过 Codex（`skip_codex`/`OPENAI_SKIP_CODEX=1`），入库为可生图的 `session_only`；手动关闭跳过才会走 Codex，失败则软保留 session 行 |
-| 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；free 上游 `image_gen.remaining` 常为 0，看号池本地 `quota`。`session_only` **可生图**；prepare 401 / 软网络错误不自动删、不清零额度。秒死常见原因：后台 Codex 二次登录踢 session、换了 `oai-device-id`、绑了死 SOCKS |
-| session_only 要补 refresh | 号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」（`POST /api/accounts/codex-upgrade`）。默认 `skip_codex=true` 时**不会**入库后自动补；只有关掉跳过 Codex 且 `auto_codex_upgrade=true` 才后台再跑。手动补会二次登录，可能踢掉当前 web session。见 [gpt-register.md](gpt-register.md) §6.7.1 |
+| 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；free 上游 `image_gen.remaining` 常为 0，看号池本地 `quota`。`session_only` **可生图**。约 5 分钟被标异常：以前是入库后自动 Codex / 巡检 `/me`+密码重登二次登录；现已关掉。手动「Codex 补 refresh」仍会踢 session |
+| session_only 要补 refresh | 号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」。**不会**入库后自动补。手动补是二次登录，可能踢掉当前 web session。见 [gpt-register.md](gpt-register.md) §6.7.1 |
 | OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 
 ## 7. 开发

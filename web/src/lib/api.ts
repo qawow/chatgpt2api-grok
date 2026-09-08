@@ -910,12 +910,25 @@ export type GptRegisterSettings = {
   dry_run: boolean;
   /** 默认 true：跳过 Codex 二次 OTP（free 号几乎总是 add_phone 失败） */
   skip_codex?: boolean;
-  /** 默认 true，但仅当 skip_codex=false 时才会入库后后台 Codex 补 refresh（软失败保留 session 行） */
+  /** 已停用自动调度：入库后不再后台 Codex（二次登录会踢 session） */
   auto_codex_upgrade?: boolean;
   /** 关闭步骤间随机抖动（OPENAI_REGISTER_NO_DELAY） */
   register_no_delay?: boolean;
   /** 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 */
   so_collect_ms?: string;
+  /** 可用账号低于阈值时自动开注册任务 */
+  auto_replenish_enabled?: boolean;
+  auto_replenish_min_available?: number;
+  auto_replenish_batch?: number;
+  auto_replenish_interval_secs?: number;
+  auto_replenish_fail_cooldown_secs?: number;
+};
+
+export type GptRegisterPoolSnapshot = {
+  total: number;
+  available: number;
+  normal: number;
+  abnormal: number;
 };
 
 export type GptRegisterJobLog = {
@@ -974,10 +987,13 @@ export type GptRegisterJob = {
   summary?: GptRegisterJobSummary;
   error?: string | null;
   cancel_requested?: boolean;
+  trigger?: string;
 };
 
 export async function fetchGptRegisterSettings() {
-  return httpRequest<{ settings: GptRegisterSettings }>("/api/gpt-register/settings");
+  return httpRequest<{ settings: GptRegisterSettings; pool?: GptRegisterPoolSnapshot }>(
+    "/api/gpt-register/settings",
+  );
 }
 
 export async function saveGptRegisterSettings(settings: Partial<GptRegisterSettings>) {

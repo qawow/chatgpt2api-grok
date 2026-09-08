@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
-  <a href="./CHANGELOG.md">v1.8.0</a> ·
+  <a href="./CHANGELOG.md">v1.8.1</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/operations.md">运维与调用</a> ·
@@ -75,7 +75,7 @@ mkdir -p data
 docker compose up -d
 ```
 
-镜像由 GitHub Actions 在每次 push 到 `publish-root`/`main` 分支时构建并推送 `:sha-<commit>` 标签；打 `v*` tag（例如 `v1.8.0`）时才推送 `:latest` 与版本号。`docker-compose.yml` 默认拉 `:latest`。要吃未打 tag 的分支构建，把 `image` 改成 `ghcr.io/qawow/chatgpt2api:sha-<commit>`。首次部署或升级：`docker compose pull && docker compose up -d`。
+镜像由 GitHub Actions 在每次 push 到 `publish-root`/`main` 分支时构建并推送 `:sha-<commit>` 标签；打 `v*` tag（例如 `v1.8.1`）时才推送 `:latest` 与版本号。`docker-compose.yml` 默认拉 `:latest`。要吃未打 tag 的分支构建，把 `image` 改成 `ghcr.io/qawow/chatgpt2api:sha-<commit>`。首次部署或升级：`docker compose pull && docker compose up -d`。
 
 - Web / API：`http://localhost:8000`
 - OpenAI 兼容前缀：`http://localhost:8000/v1`
@@ -260,9 +260,9 @@ environment:
 - **默认跳过 Codex 二次 OTP**（`skip_codex` / `OPENAI_SKIP_CODEX=1`），入库后后台刷新额度，缩短单号耗时
   - 取消勾选后需点 **保存配置** 再启动；API 模型已声明 `skip_codex` 等字段，避免旧版静默丢弃
   - 跳过 Codex 的号为 `session_only`：可生图，但无 `refresh_token`；默认不再后台二次登录补 refresh（会踢掉 session）
-  - **Codex 补 refresh**：仅当关掉「跳过 Codex」且打开 `auto_codex_upgrade` 时入库后后台再跑；号池行上钥匙图标可手动补（`POST /api/accounts/codex-upgrade`）
+  - **Codex 补 refresh**：入库后不再自动跑；号池行上钥匙图标可手动补（`POST /api/accounts/codex-upgrade`）。手动补是二次登录，可能踢掉当前 session
   - **已有 session 号补 refresh**：号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」（`POST /api/accounts/codex-upgrade`，无需浏览器粘贴 callback）
-- 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填
+- 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填；默认自动补号，保持号池至少 1 个可生图账号
 - 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`、`/cancel`
 - 成功账号进入 **ChatGPT 号池**（不进 Grok）；默认 `push_mode=local` 进程内入库
 - 密钥放 `data/gpt_register.env` 或环境变量；SOCKS 需 `PySocks`

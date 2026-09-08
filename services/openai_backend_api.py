@@ -130,15 +130,17 @@ def _is_content_policy_error(error_msg: str) -> bool:
 def image_poll_sleep_secs(elapsed: float, interval: float) -> float:
     """Wait between conversation polls.
 
-    Keep the configured interval as a ceiling. In the typical 15–35s generation
-    window, poll a bit faster so a ready image is not stuck behind a 10s tick.
-    After ~40s honor the full interval to avoid hammering a slow/queued job.
+    Keep the configured interval as a ceiling. Images are often ready in the
+    first 15–30s after SSE; poll faster there so a finished file is not stuck
+    behind a 5–10s tick. After ~45s honor the full interval.
     """
     interval = max(0.5, float(interval))
     elapsed = max(0.0, float(elapsed))
-    if elapsed < 22.0:
+    if elapsed < 15.0:
+        return min(interval, 2.0)
+    if elapsed < 28.0:
         return min(interval, 4.0)
-    if elapsed < 40.0:
+    if elapsed < 45.0:
         return min(interval, 7.0)
     return interval
 
@@ -1515,10 +1517,10 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - Sleeps image_poll_initial_wait_secs first (default 10s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
+        - Sleeps image_poll_initial_wait_secs first (default 4s, +jitter) only when
+          SSE did not already give file ids. ChatGPT image generation takes ~30s;
+          polling immediately wastes requests and trips a transient 429 the upstream
+          returns within ~200ms of the SSE stream closing (document not committed).
         - Subsequent polls use image_poll_sleep_secs (faster in the 15–35s window,
           then the configured interval). /backend-api/tasks is only probed near
           timeout — conversation.py already checked it before poll, and in-loop
@@ -1552,10 +1554,11 @@ class OpenAIBackendAPI:
         def _remaining() -> float:
             return timeout_secs - (time.time() - start)
 
-        if has_initial_ids and config.image_settle_enabled:
-            settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
-            if settle_for > 0:
-                time.sleep(settle_for)
+        if has_initial_ids:
+            if config.image_settle_enabled:
+                settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
+                if settle_for > 0:
+                    time.sleep(settle_for)
         elif initial_wait > 0:
             jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
             sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
@@ -1797,7 +1800,21 @@ class OpenAIBackendAPI:
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
+        last_connect_exc: BaseException | None = None
         skip_patterns = {"file_upload"}
+
+        def _record_fetch_error(source: str, item_id: str, exc: BaseException) -> None:
+            nonlocal last_connect_exc
+            logger.warning({
+                "event": "image_download_url_failed",
+                "source": source,
+                "conversation_id": conversation_id,
+                "id": item_id,
+                "error": repr(exc),
+            })
+            if _is_egress_connect_error(str(exc)):
+                last_connect_exc = exc
+
         for file_id in file_ids:
             if file_id in skip_patterns:
                 logger.debug({
@@ -1810,13 +1827,7 @@ class OpenAIBackendAPI:
             try:
                 url = self._get_file_download_url(file_id)
             except Exception as exc:
-                logger.debug({
-                    "event": "image_download_url_failed",
-                    "source": "file",
-                    "conversation_id": conversation_id,
-                    "id": file_id,
-                    "error": repr(exc),
-                })
+                _record_fetch_error("file", file_id, exc)
                 continue
             if url:
                 if url not in urls:
@@ -1828,37 +1839,23 @@ class OpenAIBackendAPI:
                     "conversation_id": conversation_id,
                     "id": file_id,
                 })
-        if not conversation_id or not sediment_ids:
-            logger.debug({
-                "event": "image_urls_resolved",
-                "conversation_id": conversation_id,
-                "file_ids": file_ids,
-                "sediment_ids": sediment_ids,
-                "urls": urls,
-            })
-            return urls
-        for sediment_id in sediment_ids:
-            try:
-                url = self._get_attachment_download_url(conversation_id, sediment_id)
-            except Exception as exc:
-                logger.debug({
-                    "event": "image_download_url_failed",
-                    "source": "sediment",
-                    "conversation_id": conversation_id,
-                    "id": sediment_id,
-                    "error": repr(exc),
-                })
-                continue
-            if url:
-                if url not in urls:
-                    urls.append(url)
-            else:
-                logger.debug({
-                    "event": "image_download_url_empty",
-                    "source": "sediment",
-                    "conversation_id": conversation_id,
-                    "id": sediment_id,
-                })
+        if conversation_id and sediment_ids:
+            for sediment_id in sediment_ids:
+                try:
+                    url = self._get_attachment_download_url(conversation_id, sediment_id)
+                except Exception as exc:
+                    _record_fetch_error("sediment", sediment_id, exc)
+                    continue
+                if url:
+                    if url not in urls:
+                        urls.append(url)
+                else:
+                    logger.debug({
+                        "event": "image_download_url_empty",
+                        "source": "sediment",
+                        "conversation_id": conversation_id,
+                        "id": sediment_id,
+                    })
         logger.debug({
             "event": "image_urls_resolved",
             "conversation_id": conversation_id,
@@ -1866,6 +1863,8 @@ class OpenAIBackendAPI:
             "sediment_ids": sediment_ids,
             "urls": urls,
         })
+        if not urls and last_connect_exc is not None:
+            raise last_connect_exc
         return urls
 
     def resolve_conversation_image_urls(

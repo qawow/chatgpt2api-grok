@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 1.8.1 - 2026-09-08
+
+### chatgpt2api-grok（本分支）
+
++ [发布] 版本 1.8.1：自动补号、避免入库/巡检二次登录踢 session，并修好取图 OPENSSL 与模型追问误判。
++ [新增] 自动保持 ChatGPT 号池有可用账号：低于最少数量时用 GPT 注册配置补号；已有任务等待，连续失败冷却 10 分钟。设置页可开关。
++ [修复] 注册入库后不再自动 Codex 补 refresh：关「跳过 Codex」时 Codex 常 add_phone 失败，后台再跑 authorize/continue 会在约 5 分钟巡检里把刚生过图的 NextAuth session 踢死。
++ [修复] 巡检不再每 5 分钟打健康 session_only 的 `/me`，也不再对 session_only 走密码重登（都会变成二次登录）。JWT 快过期时仍可用 session cookie 续期；号池手动检测 / 重新登录不受影响。
++ [修复] SSE 已给出 file_id 时，取下载地址撞 OPENSSL/curl 35 不再吞成空 URL，再把模型追问当成 content_policy_violation。连接错误会重试同出口。
++ [修复] curl_cffi 会话 OPENSSL 重试成功后计数不复位，后续取图会立刻失败；重建会话会丢掉 session cookie。
++ [修复] `chat_requirements_prepare` 401 不再直接对外 `image generation failed`，同请求换号；对外改成 session expired。SSE 进度事件不再挡住连接重试。
++ [修复] 模型追问（「你更喜欢…？」）不再标成内容政策违规。
++ [优化] 已有 file_id 时跳过 poll 首轮等待；轮询前 15s 用 2s 间隔；tasks 预检查不再空等 1s；首轮等待默认 6s→4s。
+
 ## 1.8.0 - 2026-09-08
 
 ### chatgpt2api-grok（本分支）

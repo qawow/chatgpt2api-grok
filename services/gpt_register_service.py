@@ -69,6 +69,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "python_bin": "",  # only for subprocess mode
     "count": 1,
     "concurrency": 1,
+    "max_per_proxy": 0,
+    "stagger_secs": 0.15,
     "interval_secs": 3,
     "timeout_secs": 600,
     "executor": "protocol",
@@ -87,17 +89,36 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "dry_run": False,
     # free 号 Codex 二次 OTP 几乎总是 add_phone 失败 → 默认跳过，直接 NextAuth session
     "skip_codex": True,
-    # 入库 session_only 后后台再跑 Codex 补 refresh（软失败保留 session 行）
-    "auto_codex_upgrade": True,
+    # 不再默认入库后自动 Codex：二次 OAuth 会踢掉刚用来生图的 NextAuth session
+    "auto_codex_upgrade": False,
     # 步骤间随机抖动（OPENAI_REGISTER_NO_DELAY）；默认保留，批量更稳
     "register_no_delay": False,
     # 覆盖 OPENAI_SO_COLLECT_MS；空=引擎默认 0ms（现网 create_account 不需要 5s collect）
     "so_collect_ms": "",
+    # 号池自动补号：可用账号低于阈值时用当前注册配置开任务
+    "auto_replenish_enabled": True,
+    "auto_replenish_min_available": 1,
+    "auto_replenish_batch": 1,
+    "auto_replenish_interval_secs": 90,
+    "auto_replenish_fail_cooldown_secs": 600,
 }
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(value: object) -> datetime | None:
+    text = _clean(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _clean(value: object) -> str:
@@ -115,6 +136,8 @@ def _is_network_register_error(error: object) -> bool:
         "curl: (28)",
         "curl: (56)",
         "curl: (55)",
+        "curl: (6)",
+        "curl: (52)",
         "tls connect",
         "tls handshake",
         "openssl_internal",
@@ -129,18 +152,6 @@ def _is_network_register_error(error: object) -> bool:
         "socks",
         "proxy error",
         "proxyerror",
-        "开始 oauth 流程失败",
-        "初始化会话失败",
-        "检查 ip",
-        "oai_did_missing",
-        "invalid_state",
-        "403 forbidden",
-        "cloudflare",
-        "just a moment",
-        "csrf token",
-        "curl: (6)",
-        "curl: (52)",
-        "curl: (56)",
     )
     return any(marker in text for marker in markers)
 
@@ -164,12 +175,152 @@ def parse_proxy_pool(text: object) -> list[str]:
     return out
 
 
+_PROXY_SEMS: dict[str, threading.Semaphore] = {}
+_PROXY_SEMS_LOCK = threading.Lock()
+
+
+def _proxy_semaphore(proxy: str, max_per: int) -> threading.Semaphore | None:
+    if max_per <= 0:
+        return None
+    key = f"{max_per}|{proxy or '_default'}"
+    with _PROXY_SEMS_LOCK:
+        sem = _PROXY_SEMS.get(key)
+        if sem is None:
+            sem = threading.Semaphore(max_per)
+            _PROXY_SEMS[key] = sem
+        return sem
+
+
+def _batch_network_trip(outcomes: list[dict[str, Any]], *, min_fails: int = 5, rate: float = 0.5) -> bool:
+    n = len(outcomes)
+    if n == 0:
+        return False
+    net = sum(
+        1
+        for row in outcomes
+        if not row.get("ok") and _is_network_register_error(row.get("error"))
+    )
+    return net >= min_fails and (net / n) >= rate
+
+
 def pick_proxy(pool: list[str], index: int) -> str:
     if not pool:
         return ""
     if index <= 0:
         index = 1
     return pool[(index - 1) % len(pool)]
+
+
+def _proxy_endpoint(proxy: str) -> tuple[str, int] | None:
+    from urllib.parse import urlparse
+
+    lines = str(proxy or "").strip().splitlines()
+    raw = (lines[0].split(",")[0].strip() if lines else "")
+    if not raw or raw.lower() in {"direct", "none", "-"}:
+        return None
+    parsed = urlparse(raw if "://" in raw else f"socks5h://{raw}")
+    host = parsed.hostname
+    port = parsed.port
+    if not host:
+        return None
+    if not port:
+        port = 1080
+    return host, int(port)
+
+
+def _proxy_tcp_open(host: str, port: int, timeout: float = 1.5) -> bool:
+    import socket
+
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.close()
+        return True
+    except Exception:
+        return False
+
+
+def _local_clash_dir() -> Path:
+    candidates = [
+        Path("/root/gpt-register-study/data/clash"),
+        Path(globals().get("__file__") or ".").resolve().parent.parent / "data" / "clash",
+    ]
+    for cand in candidates:
+        if (cand / "mihomo").is_file():
+            return cand
+    return candidates[0]
+
+
+def _ensure_local_mihomo(host: str, port: int) -> str:
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return "remote"
+    if _proxy_tcp_open(host, port, timeout=0.4):
+        return "already_up"
+    clash = _local_clash_dir()
+    binary = clash / "mihomo"
+    cfg = clash / "config.yaml"
+    if not binary.is_file() or not cfg.is_file():
+        return "no_binary"
+    log_f = open(clash / "mihomo.log", "ab")
+    subprocess.Popen(
+        [str(binary), "-d", str(clash), "-f", str(cfg)],
+        stdout=log_f,
+        stderr=log_f,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        if _proxy_tcp_open(host, port, timeout=0.3):
+            return "started"
+        time.sleep(0.15)
+    return "start_failed"
+
+
+def _refresh_local_clash_nodes(host: str) -> str:
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return ""
+    script = _local_clash_dir() / "healthcheck.py"
+    if not script.is_file():
+        return ""
+    import sys
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        tail = lines[-1] if lines else f"exit={proc.returncode}"
+        if proc.returncode != 0:
+            return f"节点健康检查失败 {tail}"
+        return f"节点健康检查 {tail}"
+    except Exception as exc:
+        return f"节点健康检查跳过: {exc}"
+
+
+def preflight_register_proxy(proxy: str) -> str:
+    pool = parse_proxy_pool(proxy) if str(proxy or "").strip() else []
+    target = pool[0] if pool else str(proxy or "").strip()
+    ep = _proxy_endpoint(target)
+    if ep is None:
+        return "出口预检：直连（未配置代理）"
+    host, port = ep
+    status = "already_up" if _proxy_tcp_open(host, port) else _ensure_local_mihomo(host, port)
+    if status not in {"already_up", "started"} or not _proxy_tcp_open(host, port):
+        raise RuntimeError(
+            f"注册代理不可达 {host}:{port} (mihomo={status})。"
+            "32 并发会在开跑前集体失败，先把 SOCKS 拉起来。"
+        )
+    health = _refresh_local_clash_nodes(host)
+    bits = [f"出口预检通过 {_mask_proxy_url(target)}"]
+    if status == "started":
+        bits.append("mihomo started")
+    if health:
+        bits.append(health)
+    return "；".join(bits)
 
 
 def _mask_proxy_url(proxy: object) -> str:
@@ -262,8 +413,10 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
         run_mode = "inprocess"
     out["run_mode"] = run_mode
     out["python_bin"] = _clean(out.get("python_bin"))
-    out["count"] = _clamp_int(out.get("count"), 1, 1, 50)
-    out["concurrency"] = _clamp_int(out.get("concurrency"), 1, 1, 5)
+    out["count"] = _clamp_int(out.get("count"), 1, 1, 128)
+    out["concurrency"] = _clamp_int(out.get("concurrency"), 1, 1, 32)
+    out["max_per_proxy"] = _clamp_int(out.get("max_per_proxy"), 0, 0, 32)
+    out["stagger_secs"] = _clamp_float(out.get("stagger_secs"), 0.15, 0, 5)
     out["interval_secs"] = _clamp_float(out.get("interval_secs"), 3, 0, 600)
     out["timeout_secs"] = _clamp_int(out.get("timeout_secs"), 600, 60, 3600)
     executor = _clean(out.get("executor")).lower() or "protocol"
@@ -290,13 +443,27 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
         out["skip_codex"] = True
     else:
         out["skip_codex"] = bool(out.get("skip_codex"))
-    # default True: after session_only import, background Codex OTP upgrade
+    # default False: auto Codex after import is a second login and kills session
     if "auto_codex_upgrade" not in src:
-        out["auto_codex_upgrade"] = True
+        out["auto_codex_upgrade"] = False
     else:
         out["auto_codex_upgrade"] = bool(out.get("auto_codex_upgrade"))
     out["register_no_delay"] = bool(out.get("register_no_delay"))
     out["so_collect_ms"] = _clean(out.get("so_collect_ms"))
+    if "auto_replenish_enabled" not in src:
+        out["auto_replenish_enabled"] = True
+    else:
+        out["auto_replenish_enabled"] = bool(out.get("auto_replenish_enabled"))
+    out["auto_replenish_min_available"] = _clamp_int(
+        out.get("auto_replenish_min_available"), 1, 1, 20
+    )
+    out["auto_replenish_batch"] = _clamp_int(out.get("auto_replenish_batch"), 1, 1, 5)
+    out["auto_replenish_interval_secs"] = _clamp_int(
+        out.get("auto_replenish_interval_secs"), 90, 30, 3600
+    )
+    out["auto_replenish_fail_cooldown_secs"] = _clamp_int(
+        out.get("auto_replenish_fail_cooldown_secs"), 600, 60, 7200
+    )
     return out
 
 
@@ -424,7 +591,101 @@ class GptRegisterService:
                 self._save_jobs()
             return dict(self._jobs[jid])
 
-    def start_job(self, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    def has_active_job(self) -> bool:
+        with self._lock:
+            return any(job.get("status") in {"pending", "running"} for job in self._jobs.values())
+
+    def _last_finished_auto_job(self) -> dict[str, Any] | None:
+        finished: list[dict[str, Any]] = []
+        with self._lock:
+            for job in self._jobs.values():
+                if job.get("trigger") != "auto_replenish":
+                    continue
+                if job.get("status") not in {"done", "failed", "cancelled"}:
+                    continue
+                finished.append(dict(job))
+        if not finished:
+            return None
+        return max(finished, key=lambda job: str(job.get("finished_at") or job.get("updated_at") or ""))
+
+    def maybe_replenish_pool(self) -> dict[str, Any]:
+        """Start a register job when the image pool is below the configured floor."""
+        settings = normalize_settings(self.config_store.get())
+        interval = int(settings["auto_replenish_interval_secs"])
+        result: dict[str, Any] = {
+            "action": "skip",
+            "reason": "",
+            "available": 0,
+            "min_available": int(settings["auto_replenish_min_available"]),
+            "wait_secs": interval,
+        }
+        if not settings.get("auto_replenish_enabled"):
+            result["reason"] = "disabled"
+            return result
+        if settings.get("dry_run"):
+            result["reason"] = "dry_run"
+            return result
+        if not settings.get("push_enabled"):
+            result["reason"] = "push_disabled"
+            return result
+        if self.has_active_job():
+            result["reason"] = "job_running"
+            return result
+
+        from services.account_service import account_service
+
+        available = int(account_service.count_image_available_accounts())
+        min_available = int(settings["auto_replenish_min_available"])
+        result["available"] = available
+        result["min_available"] = min_available
+        if available >= min_available:
+            result["reason"] = "stocked"
+            return result
+
+        last = self._last_finished_auto_job()
+        cooldown = int(settings["auto_replenish_fail_cooldown_secs"])
+        if last is not None and int(last.get("added") or 0) <= 0:
+            finished_at = _parse_iso(last.get("finished_at"))
+            if finished_at is not None:
+                elapsed = (datetime.now(timezone.utc) - finished_at).total_seconds()
+                if elapsed < cooldown:
+                    result["reason"] = "fail_cooldown"
+                    result["wait_secs"] = max(30, int(cooldown - elapsed))
+                    return result
+
+        need = min(max(1, min_available - available), int(settings["auto_replenish_batch"]))
+        try:
+            job = self.start_job({"count": need}, trigger="auto_replenish")
+        except RuntimeError as exc:
+            result["reason"] = str(exc)[:120]
+            return result
+
+        result["action"] = "started"
+        result["reason"] = "below_min"
+        result["count"] = need
+        result["job_id"] = job.get("job_id")
+        try:
+            from services.log_service import LOG_TYPE_ACCOUNT, log_service
+
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "自动补号已启动",
+                {
+                    "available": available,
+                    "min_available": min_available,
+                    "count": need,
+                    "job_id": job.get("job_id"),
+                },
+            )
+        except Exception:
+            pass
+        print(
+            f"[account-replenish] start count={need} available={available} "
+            f"min={min_available} job={str(job.get('job_id') or '')[:8]}"
+        )
+        return result
+
+    def start_job(self, overrides: dict[str, Any] | None = None, *, trigger: str = "manual") -> dict[str, Any]:
         base = self.config_store.get()
         if overrides:
             # empty auth key keep stored
@@ -445,6 +706,7 @@ class GptRegisterService:
             job = {
                 "job_id": job_id,
                 "status": "pending",
+                "trigger": _clean(trigger) or "manual",
                 "created_at": _now_iso(),
                 "updated_at": _now_iso(),
                 "started_at": None,
@@ -1215,37 +1477,10 @@ class GptRegisterService:
             except Exception:
                 pass
 
-        # session_only 入库后可后台 Codex 补 refresh。skip_codex 时禁止：
-        # 二次 OAuth/authorize/continue 会把刚种下的 NextAuth session 踢掉（杀号）。
-        if (
-            session_only
-            and email
-            and bool(settings.get("auto_codex_upgrade", True))
-            and not bool(settings.get("skip_codex", True))
-        ):
-            try:
-                from services.codex_upgrade_service import schedule_codex_upgrade
-
-                schedule_codex_upgrade(
-                    email=email,
-                    replace_access_token=access,
-                    password=password,
-                    settings=settings,
-                    name_hint=email[:16],
-                )
-            except Exception as exc:
-                try:
-                    log_service.add(
-                        LOG_TYPE_ACCOUNT,
-                        "注册入库后调度 Codex 补齐失败",
-                        {
-                            "token": anonymize_token(access),
-                            "email": email,
-                            "error": str(exc)[:300],
-                        },
-                    )
-                except Exception:
-                    pass
+        # Never auto-schedule Codex after import. skip_codex=false still often
+        # lands as NextAuth session (Codex add_phone); a follow-up
+        # authorize/continue on the same email kicks that session in ~minutes.
+        # Manual 号池「Codex 补 refresh」 remains available.
         return added
 
 

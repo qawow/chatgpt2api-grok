@@ -13,11 +13,11 @@ from services.gpt_register_service import (
 
 
 class AutoCodexUpgradeSettingsTest(unittest.TestCase):
-    def test_auto_codex_upgrade_default_true(self):
+    def test_auto_codex_upgrade_default_false(self):
         s = normalize_settings(None)
-        self.assertTrue(s["auto_codex_upgrade"])
-        s2 = normalize_settings({"auto_codex_upgrade": False})
-        self.assertFalse(s2["auto_codex_upgrade"])
+        self.assertFalse(s["auto_codex_upgrade"])
+        s2 = normalize_settings({"auto_codex_upgrade": True})
+        self.assertTrue(s2["auto_codex_upgrade"])
 
     def test_api_model_accepts_auto_codex_upgrade(self):
         from api.gpt_register import GptRegisterSettingsUpdate
@@ -146,7 +146,7 @@ class CodexUpgradeServiceTest(unittest.TestCase):
 
 
 class ImportLocalSchedulesCodexUpgradeTest(unittest.TestCase):
-    def test_import_local_schedules_auto_upgrade_for_session_only(self):
+    def test_import_local_never_auto_schedules_codex_upgrade(self):
         svc = GptRegisterService(
             config_store=GptRegisterConfig(path=Path("/tmp/nope-gpt-reg-import-auto.json"))
         )
@@ -175,10 +175,7 @@ class ImportLocalSchedulesCodexUpgradeTest(unittest.TestCase):
         ) as sched:
             added = svc._import_local(account, settings)
         self.assertEqual(added, 1)
-        sched.assert_called_once()
-        kwargs = sched.call_args.kwargs
-        self.assertEqual(kwargs["email"], "s@x.com")
-        self.assertEqual(kwargs["replace_access_token"], "access-only")
+        sched.assert_not_called()
 
     def test_import_local_skips_auto_upgrade_when_skip_codex(self):
         svc = GptRegisterService(

@@ -19,8 +19,10 @@ class GptRegisterSettingsUpdate(BaseModel):
     engines_dir: str | None = None
     run_mode: str | None = None
     python_bin: str | None = None
-    count: int | None = Field(default=None, ge=1, le=50)
-    concurrency: int | None = Field(default=None, ge=1, le=5)
+    count: int | None = Field(default=None, ge=1, le=128)
+    concurrency: int | None = Field(default=None, ge=1, le=32)
+    max_per_proxy: int | None = Field(default=None, ge=0, le=32)
+    stagger_secs: float | None = Field(default=None, ge=0, le=5)
     interval_secs: float | None = Field(default=None, ge=0, le=600)
     timeout_secs: int | None = Field(default=None, ge=60, le=3600)
     executor: str | None = None
@@ -43,6 +45,11 @@ class GptRegisterSettingsUpdate(BaseModel):
     auto_codex_upgrade: bool | None = None
     register_no_delay: bool | None = None
     so_collect_ms: str | None = None
+    auto_replenish_enabled: bool | None = None
+    auto_replenish_min_available: int | None = Field(default=None, ge=1, le=20)
+    auto_replenish_batch: int | None = Field(default=None, ge=1, le=5)
+    auto_replenish_interval_secs: int | None = Field(default=None, ge=30, le=3600)
+    auto_replenish_fail_cooldown_secs: int | None = Field(default=None, ge=60, le=7200)
 
 
 class GptRegisterStartRequest(GptRegisterSettingsUpdate):
@@ -57,7 +64,12 @@ def create_router() -> APIRouter:
     @router.get("/api/gpt-register/settings")
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"settings": public_settings(gpt_register_config.get())}
+        from services.account_service import account_service
+
+        return {
+            "settings": public_settings(gpt_register_config.get()),
+            "pool": account_service.image_pool_snapshot(),
+        }
 
     @router.post("/api/gpt-register/settings")
     async def save_settings(

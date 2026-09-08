@@ -128,3 +128,62 @@ class CurlTlsHelperTests(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(factory.call_count, 2)
         self.assertEqual(inner_ok.headers.get("Authorization"), "Bearer x")
+
+    def test_socks_openssl_recreate_keeps_session_cookie(self) -> None:
+        class FakeCookie:
+            def __init__(self) -> None:
+                self.name = "__Secure-next-auth.session-token"
+                self.value = "sess"
+                self.domain = ".chatgpt.com"
+                self.path = "/"
+
+        class FakeJar(list):
+            def set(self, name, value, domain="", path="/"):
+                self.append(type("C", (), {
+                    "name": name, "value": value, "domain": domain, "path": path,
+                })())
+
+        inner_fail = MagicMock()
+        inner_fail.get.side_effect = OSError(OPENSSL_INVALID)
+        inner_fail.headers = {"Authorization": "Bearer x"}
+        inner_fail.cookies = [FakeCookie()]
+        inner_ok = MagicMock()
+        inner_ok.get.return_value = "ok"
+        inner_ok.headers = {}
+        inner_ok.cookies = FakeJar()
+        factory = MagicMock(side_effect=[inner_fail, inner_ok])
+
+        with patch("curl_cffi.requests.Session", factory):
+            session = create_cffi_session(
+                impersonate="chrome142",
+                proxy="socks5h://example.invalid:1080",
+                verify=True,
+            )
+            result = session.get("https://chatgpt.com")
+            session.close()
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(inner_ok.cookies[0].name, "__Secure-next-auth.session-token")
+        self.assertEqual(inner_ok.cookies[0].value, "sess")
+
+    def test_invalid_library_counter_resets_after_success(self) -> None:
+        inner = MagicMock()
+        inner.get.side_effect = [
+            OSError(OPENSSL_INVALID),
+            "ok1",
+            OSError(OPENSSL_INVALID),
+            "ok2",
+            OSError(OPENSSL_INVALID),
+            "ok3",
+        ]
+        inner.headers = {}
+        factory = MagicMock(return_value=inner)
+
+        with patch("curl_cffi.requests.Session", factory):
+            session = create_cffi_session(impersonate="chrome142", proxy="", verify=True)
+            self.assertEqual(session.get("https://chatgpt.com/a"), "ok1")
+            self.assertEqual(session.get("https://chatgpt.com/b"), "ok2")
+            self.assertEqual(session.get("https://chatgpt.com/c"), "ok3")
+            session.close()
+
+        self.assertEqual(len(inner.get.call_args_list), 6)

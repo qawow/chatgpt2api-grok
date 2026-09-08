@@ -19,6 +19,37 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_count_image_available_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "live",
+                        "status": "正常",
+                        "quota": 5,
+                        "session_token": "sess",
+                    },
+                    {
+                        "access_token": "dead",
+                        "status": "异常",
+                        "quota": 24,
+                        "session_token": "sess",
+                    },
+                    {
+                        "access_token": "revoked",
+                        "status": "正常",
+                        "quota": 8,
+                        "session_token": "sess",
+                        "last_refresh_error": "token invalidated (/backend-api/me)",
+                    },
+                ]
+            )
+            self.assertEqual(service.count_image_available_accounts(), 1)
+            snap = service.image_pool_snapshot()
+            self.assertEqual(snap["available"], 1)
+            self.assertEqual(snap["total"], 3)
+
     def test_image_accounts_require_positive_quota(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(
@@ -554,7 +585,7 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertFalse(durable["session_only"])
             self.assertFalse(durable["fragile"])
 
-    def test_free_session_only_normal_stays_on_watcher_lists(self) -> None:
+    def test_free_session_only_normal_skipped_by_watcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
@@ -582,9 +613,46 @@ class AccountCapabilityTests(unittest.TestCase):
                 ]
             )
             normals = service.list_normal_tokens()
-            self.assertIn("free-session", normals)
+            self.assertNotIn("free-session", normals)
             self.assertIn("plus-oauth", normals)
             self.assertNotIn("dead-session", service.list_abnormal_tokens())
+            acc = service.get_account("free-session")
+            self.assertTrue(AccountService._should_skip_periodic_refresh(acc))
+            with patch(
+                "services.openai_backend_api.OpenAIBackendAPI.get_user_info",
+            ) as get_user_info:
+                result = service.refresh_accounts(["free-session"])
+                get_user_info.assert_not_called()
+            self.assertEqual(result.get("skipped"), 1)
+
+    def test_session_only_near_expiry_stays_on_watcher(self) -> None:
+        import base64
+        import json
+        import time as time_mod
+
+        payload = {"exp": int(time_mod.time()) + 3600, "iat": int(time_mod.time())}
+        jwt = (
+            "h."
+            + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+            + ".s"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": jwt,
+                        "status": "正常",
+                        "type": "free",
+                        "session_token": "sess",
+                        "quota": 24,
+                    }
+                ]
+            )
+            self.assertFalse(
+                AccountService._should_skip_periodic_refresh(service.get_account(jwt))
+            )
+            self.assertIn(jwt, service.list_normal_tokens())
 
     def test_revoked_cooldown_blocks_recover_and_refresh_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -819,8 +887,8 @@ class AccountCapabilityTests(unittest.TestCase):
                 fake_info,
             ):
                 skipped = service.refresh_accounts(["free-session", "dead-free"])
-                self.assertEqual(skipped.get("skipped"), 1)
-                self.assertNotIn("dead-free", seen)
+                self.assertEqual(skipped.get("skipped"), 2)
+                self.assertEqual(seen, [])
 
                 forced = service.refresh_accounts(
                     ["free-session", "dead-free"],

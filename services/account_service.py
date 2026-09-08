@@ -304,6 +304,15 @@ class AccountService:
             # 异常 + no OAuth refresh + no password: session cookie usually
             # echoes the same JWT. Watcher cannot recover; manual 检测 still /me.
             return True
+        # Healthy session_only: a 5-minute /me (+ password fallback) is a
+        # second client and often revokes the NextAuth session. Image pick
+        # already skips /me when quota>0. Probe only when JWT is near expiry
+        # (session cookie can mint a new accessToken). Manual 检测 still /me.
+        if cls._is_session_only_account(account) and account.get("status") in {"正常", "限流"}:
+            token = str(account.get("access_token") or "").strip()
+            if token and cls._token_needs_refresh(token):
+                return False
+            return True
         return False
 
     @staticmethod
@@ -931,11 +940,20 @@ class AccountService:
                     if not self._is_soft_network_refresh_error(error_str):
                         self._record_token_refresh_error(active_token, f"{event}:session", error_str)
 
-            # Last resort: email+password relogin (sync for force, else background)
+            # Last resort: email+password relogin (sync for force, else background).
+            # session_only + password is another OAuth on the same mailbox and
+            # kicks the live NextAuth session. Only the explicit 重新登录 button
+            # should do that.
             if token_data is None:
                 email = str(account.get("email") or "").strip()
                 password = str(account.get("password") or "").strip()
-                if email and password and force:
+                ev = str(event or "")
+                allow_password = bool(email and password) and (
+                    not self._is_session_only_account(account)
+                    or "relogin" in ev
+                    or "re_login" in ev
+                )
+                if allow_password and force:
                     try:
                         result = self._login_with_password(email, password, account=account)
                         if result.get("ok"):
@@ -949,7 +967,7 @@ class AccountService:
                             errors.append(f"password:{result.get('error')}")
                     except Exception as exc:
                         errors.append(f"password:{exc}")
-                elif email and password and not refresh_token:
+                elif allow_password and not refresh_token:
                     t = Thread(
                         target=self._password_re_login_thread,
                         args=(active_token, email, password, event),
@@ -1457,6 +1475,22 @@ class AccountService:
     def list_tokens(self) -> list[str]:
         with self._lock:
             return list(self._accounts)
+
+    def count_image_available_accounts(self) -> int:
+        """Accounts the image picker can use right now (status/quota/revoke)."""
+        with self._lock:
+            return sum(1 for item in self._accounts.values() if self._is_image_account_available(item))
+
+    def image_pool_snapshot(self) -> dict[str, int]:
+        with self._lock:
+            items = list(self._accounts.values())
+        available = sum(1 for item in items if self._is_image_account_available(item))
+        return {
+            "total": len(items),
+            "available": available,
+            "normal": sum(1 for item in items if item.get("status") == "正常"),
+            "abnormal": sum(1 for item in items if item.get("status") == "异常"),
+        }
 
     def _list_ready_candidate_tokens(
             self,

@@ -9,6 +9,7 @@ from services.protocol.conversation import (
     ImageOutput,
     _generate_single_image,
     image_stream_error_message,
+    is_clarifying_image_followup,
     is_proxy_unreachable_error,
     is_soft_prepare_auth_error,
     is_token_invalid_error,
@@ -75,6 +76,17 @@ class ConnectionErrorClassifierTests(unittest.TestCase):
         self.assertTrue(is_soft_prepare_auth_error("token invalidated (chat_requirements_prepare)"))
         self.assertFalse(is_soft_prepare_auth_error("token invalidated (/backend-api/me)"))
         self.assertFalse(is_token_invalid_error("content policy violation"))
+        self.assertEqual(
+            image_stream_error_message("token invalidated (chat_requirements_prepare)"),
+            "upstream session expired, please retry",
+        )
+
+    def test_clarifying_followup_is_not_policy(self) -> None:
+        question = "你更喜欢她的眼睛偏梦幻紫还是更明亮通透的紫？"
+        self.assertTrue(is_clarifying_image_followup(question))
+        self.assertTrue(is_clarifying_image_followup("Which do you prefer, A or B?"))
+        self.assertFalse(is_clarifying_image_followup("This violates our content policy."))
+        self.assertFalse(is_clarifying_image_followup('{"size":"1920x1088","n":1}'))
 
     def test_non_connection_errors_pass_through(self) -> None:
         self.assertFalse(is_upstream_connection_error("content policy violation"))
@@ -237,6 +249,12 @@ class ImageConnectionFailoverTests(unittest.TestCase):
             raise RuntimeError("token invalidated (chat_requirements_prepare)")
             yield  # pragma: no cover
 
+        def get_token(**kwargs):
+            excluded = kwargs.get("excluded_tokens") or set()
+            if "token-a" in excluded:
+                raise RuntimeError("no available ChatGPT account")
+            return "token-a"
+
         with (
             patch("services.protocol.conversation.account_service") as accounts,
             patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
@@ -246,15 +264,144 @@ class ImageConnectionFailoverTests(unittest.TestCase):
                 return_value=[("global", "socks5h://live.example:1080")],
             ),
         ):
-            accounts.get_available_access_token.return_value = "token-a"
+            accounts.get_available_access_token.side_effect = get_token
             accounts.get_account.return_value = {"email": "a@example.com"}
             accounts.refresh_access_token.return_value = None
-            with self.assertRaises(ImageGenerationError):
+            with self.assertRaises(ImageGenerationError) as ctx:
                 _generate_single_image(
                     ConversationRequest(model="gpt-image-2", prompt="cat"),
                     1,
                     1,
                 )
 
+        self.assertIn("session expired", str(ctx.exception).lower())
         accounts.remove_invalid_token.assert_not_called()
         accounts.mark_image_result.assert_called_with("token-a", False)
+
+    def test_prepare_401_fails_over_to_another_account(self) -> None:
+        created: list[str] = []
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+                created.append(access_token)
+
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            if backend.access_token == "token-a":
+                raise RuntimeError("token invalidated (chat_requirements_prepare)")
+            yield ImageOutput(
+                kind="result",
+                model=request.model,
+                index=index,
+                total=total,
+                data=[{"url": "http://example.test/ok.png"}],
+            )
+
+        def get_token(**kwargs):
+            excluded = kwargs.get("excluded_tokens") or set()
+            if "token-a" in excluded:
+                return "token-b"
+            return "token-a"
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://live.example:1080")],
+            ),
+        ):
+            accounts.get_available_access_token.side_effect = get_token
+            accounts.get_account.side_effect = lambda token: {"email": f"{token}@example.com"}
+            accounts.refresh_access_token.return_value = None
+            outputs = _generate_single_image(
+                ConversationRequest(model="gpt-image-2", prompt="cat"),
+                1,
+                1,
+            )
+
+        self.assertEqual(created, ["token-a", "token-b"])
+        self.assertEqual(outputs[0].kind, "result")
+        accounts.remove_invalid_token.assert_not_called()
+
+    def test_progress_events_do_not_block_openssl_retry(self) -> None:
+        created: list[str | None] = []
+        err = (
+            "curl: (35) TLS connect error: error:00000000:invalid library (0):"
+            "OPENSSL_internal:invalid library (0)"
+        )
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.force_proxy = force_proxy
+                self.progress_callback = None
+                created.append(force_proxy)
+
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            yield ImageOutput(kind="progress", model=request.model, index=index, total=total, text="working")
+            if created.count(backend.force_proxy) < 2:
+                raise RuntimeError(err)
+            yield ImageOutput(
+                kind="result",
+                model=request.model,
+                index=index,
+                total=total,
+                data=[{"url": "http://example.test/ok.png"}],
+            )
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://live.example:1080"), ("direct", "")],
+            ),
+            patch("services.protocol.conversation.time.sleep"),
+        ):
+            accounts.get_available_access_token.return_value = "token-a"
+            accounts.get_account.return_value = {"email": "a@example.com"}
+            outputs = _generate_single_image(
+                ConversationRequest(model="gpt-image-2", prompt="cat"),
+                1,
+                1,
+            )
+
+        self.assertEqual(created, ["socks5h://live.example:1080", "socks5h://live.example:1080"])
+        self.assertEqual(outputs[-1].kind, "result")
+
+    def test_file_ids_without_urls_do_not_surface_followup_as_policy(self) -> None:
+        from services.protocol.conversation import stream_image_outputs
+
+        class Backend:
+            def resolve_conversation_image_urls(self, *args, **kwargs):
+                return []
+
+        def fake_events(*args, **kwargs):
+            yield {
+                "type": "conversation.completed",
+                "conversation_id": "conv-1",
+                "file_ids": ["file_000000009b60822fbf5a3299f1a290b4"],
+                "sediment_ids": [],
+                "text": "你更喜欢她的眼睛偏梦幻紫还是更明亮通透的紫？",
+                "tool_invoked": True,
+                "turn_use_case": "image gen",
+            }
+
+        with patch("services.protocol.conversation.conversation_events", fake_events):
+            with self.assertRaises(RuntimeError) as ctx:
+                list(stream_image_outputs(
+                    Backend(),
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                ))
+        self.assertIn("download url unresolved", str(ctx.exception))
+        self.assertTrue(is_upstream_connection_error(str(ctx.exception)))

@@ -288,9 +288,14 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `run_mode` | `inprocess` | `subprocess` 才需要外部 Python |
 | `python_bin` | 空 | 仅 subprocess |
 | `skip_codex` | **true** | 跳过注册流里的 Codex 二次 OTP；入库为 `session_only`（更快；见 §6.7.1） |
-| `auto_codex_upgrade` | **true** | 仅当 `skip_codex=false` 时，`session_only` 入库后后台再跑 Codex 补 refresh；`skip_codex` 默认开着时不再二次登录（会踢掉生图 session） |
+| `auto_codex_upgrade` | **false** | 已停用自动调度。入库后不再后台 Codex（二次登录会踢 session）。补 refresh 请用号池按钮 |
 | `register_no_delay` | false | 关闭步骤间随机延迟；默认保留抖动，批量更稳 |
 | `so_collect_ms` | 空 | create_account 前 SO 采集等待毫秒；空=默认 0；需要旧行为时设 `5000` |
+| `auto_replenish_enabled` | **true** | 可生图账号低于阈值时，用当前注册配置自动开任务 |
+| `auto_replenish_min_available` | 1 | 号池最少可用（`_is_image_account_available`）账号数 |
+| `auto_replenish_batch` | 1 | 每次自动任务注册几个（1–5） |
+| `auto_replenish_interval_secs` | 90 | 检查间隔；已有任务时跳过 |
+| `auto_replenish_fail_cooldown_secs` | 600 | 自动任务入库 0 后的冷却，避免空转烧代理/邮箱 |
 
 ### 号池侧相关 API（补 refresh）
 
@@ -550,7 +555,7 @@ Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关�
 
 > 跳过 Codex 后拿到的是 **session_only** 号：可生图，但没有 `refresh_token`，二次登录很容易把 web session 踢掉。
 >
-> **`skip_codex=true`（默认）时不再自动 Codex 补 refresh**，避免后台 `authorize/continue` 杀号。只有关掉「跳过 Codex」且 `auto_codex_upgrade=true` 才会入库后再跑 Codex OTP。
+> **入库后不再自动 Codex 补 refresh**（无论 `skip_codex` / `auto_codex_upgrade`）。后台 `authorize/continue` 会把刚用来生图的 NextAuth session 踢掉，约 5 分钟后巡检 `/me` 标异常。
 >
 > **已有 session_only 号怎么补 refresh？** 在 **号池管理 → ChatGPT**：
 > 1. 行操作点钥匙图标 **Codex 补 refresh**（或勾选后点工具栏同名按钮）  
@@ -647,7 +652,7 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 | `web/.../gpt-register-card.tsx` | 设置页 UI |
 | `web/.../accounts/page.tsx` | 号池「Codex 补 refresh」按钮 / session 徽章 |
 | `web/.../account-import-dialog.tsx` | OAuth 导入 + 升级模式（备用；主路径为 Codex） |
-| `web/.../gpt-register-card.tsx` | `auto_codex_upgrade` 开关 |
+| `web/.../gpt-register-card.tsx` | 注册设置（自动 Codex 已关闭） |
 | `test/test_gpt_register.py` | 服务层单测 |
 | `test/test_gpt_register_engine.py` | 引擎路径单测 |
 | `test/test_oauth_login_api.py` | OAuth finish 模型与 replace 逻辑（备用） |

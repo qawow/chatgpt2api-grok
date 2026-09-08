@@ -169,10 +169,35 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(backend.task_calls, 0)
 
     def test_image_poll_sleep_is_faster_early(self) -> None:
-        self.assertEqual(image_poll_sleep_secs(12, 10), 4.0)
+        self.assertEqual(image_poll_sleep_secs(8, 10), 2.0)
+        self.assertEqual(image_poll_sleep_secs(20, 10), 4.0)
         self.assertEqual(image_poll_sleep_secs(30, 10), 7.0)
         self.assertEqual(image_poll_sleep_secs(50, 10), 10.0)
-        self.assertEqual(image_poll_sleep_secs(12, 2), 2.0)
+        self.assertEqual(image_poll_sleep_secs(8, 2), 2.0)
+
+    def test_poll_skips_initial_wait_when_sse_already_has_ids(self) -> None:
+        backend = FakeBackend([_conversation(["file-ready"])])
+        slept: list[float] = []
+        with (
+            mock.patch.dict(
+                config.data,
+                {
+                    "image_poll_initial_wait_secs": 6,
+                    "image_poll_interval_secs": 0.5,
+                    "image_settle_enabled": False,
+                    "image_check_before_hit_enabled": False,
+                },
+            ),
+            mock.patch("services.openai_backend_api.time.sleep", side_effect=lambda seconds: slept.append(seconds)),
+        ):
+            file_ids, _sediment = backend._poll_image_results(
+                "conv-1",
+                timeout_secs=10,
+                initial_file_ids=["file-ready"],
+            )
+
+        self.assertEqual(file_ids, ["file-ready"])
+        self.assertFalse(any(value >= 6 for value in slept))
 
     def test_resolver_uses_file_and_sediment_urls(self) -> None:
         backend = FakeBackend()
@@ -189,6 +214,30 @@ class MultiImageResultTests(unittest.TestCase):
             "https://attachments.test/one.png",
             "https://attachments.test/two.png",
         ])
+
+    def test_resolver_reraises_connection_errors_when_all_urls_fail(self) -> None:
+        backend = FakeBackend()
+        err = OSError(
+            "curl: (35) TLS connect error: error:00000000:invalid library (0):"
+            "OPENSSL_internal:invalid library (0)"
+        )
+        backend._get_file_download_url = mock.Mock(side_effect=err)
+        with self.assertRaises(OSError):
+            backend._resolve_image_urls("conv-1", ["file-one"], [])
+
+    def test_resolver_swallows_non_connection_errors(self) -> None:
+        backend = FakeBackend()
+        backend._get_file_download_url = mock.Mock(side_effect=RuntimeError("HTTP 404"))
+        self.assertEqual(backend._resolve_image_urls("conv-1", ["file-one"], []), [])
+
+    def test_resolver_returns_partial_urls_without_raising(self) -> None:
+        backend = FakeBackend()
+        backend._get_file_download_url = mock.Mock(side_effect=[
+            OSError("curl: (35) OPENSSL_internal:invalid library (0)"),
+            "https://files.test/two.png",
+        ])
+        urls = backend._resolve_image_urls("conv-1", ["file-one", "file-two"], [])
+        self.assertEqual(urls, ["https://files.test/two.png"])
 
     def test_resolver_keeps_stream_ids_when_poll_extension_fails(self) -> None:
         backend = FakeBackend()

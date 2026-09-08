@@ -162,7 +162,7 @@ def is_upstream_connection_error(message: str) -> bool:
 def image_stream_error_message(message: str) -> str:
     text = str(message or "")
     if is_token_invalid_error(text):
-        return "image generation failed"
+        return "upstream session expired, please retry"
     if is_connection_timeout_error(text):
         return "upstream connection timed out, please retry later"
     if is_upstream_connection_error(text):
@@ -197,6 +197,29 @@ def is_model_text_reply_instead_of_image(message: str) -> bool:
     if TOOL_PARAMS_JSON_RE.search(message):
         return True
     return False
+
+
+_CLARIFYING_FOLLOWUP_HINTS = (
+    "你更喜欢",
+    "哪一种",
+    "哪种风格",
+    "选哪个",
+    "which do you prefer",
+    "would you prefer",
+)
+
+
+def is_clarifying_image_followup(message: str) -> bool:
+    """Model asked a follow-up instead of treating the image as the final result."""
+    text = str(message or "").strip()
+    if not text or is_model_text_reply_instead_of_image(text):
+        return False
+    lower = text.lower()
+    if "content policy" in lower or "内容政策" in text or "防护限制" in text:
+        return False
+    if "?" in text or "？" in text:
+        return True
+    return any(hint in text or hint in lower for hint in _CLARIFYING_FOLLOWUP_HINTS)
 
 
 def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
@@ -964,7 +987,11 @@ def stream_image_outputs(
     # 此时应继续轮询图片。
     detailed_error = ""
     if not file_ids and not sediment_ids and conversation_id:
-        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, timeout_secs=5.0, wait_secs=1.0)
+        # Image-gen turns already poll next; skip the extra 1s tasks settle.
+        task_wait = 0.0 if (should_poll_for_image or is_text_reply) else 1.0
+        detailed_error = _get_detailed_error_from_tasks(
+            backend, conversation_id, timeout_secs=5.0, wait_secs=task_wait,
+        )
         if detailed_error and not should_poll_for_image and not is_text_reply:
             logger.info({
                 "event": "image_task_error_before_poll",
@@ -1022,6 +1049,18 @@ def stream_image_outputs(
         else:
             raise
 
+    pending_file_ids = [item for item in file_ids if item and item != "file_upload"]
+    if not image_urls and (pending_file_ids or sediment_ids):
+        logger.warning({
+            "event": "image_stream_retry_resolve_after_empty_urls",
+            "conversation_id": conversation_id,
+            "file_ids": pending_file_ids,
+            "sediment_ids": sediment_ids,
+        })
+        image_urls = backend.resolve_conversation_image_urls(
+            conversation_id, pending_file_ids, sediment_ids, poll=False,
+        )
+
     if image_urls:
         if request.progress_callback:
             request.progress_callback("receiving_image")
@@ -1040,6 +1079,11 @@ def stream_image_outputs(
             _remove_image_conversation_later(backend, conversation_id)
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
         return
+
+    if pending_file_ids or sediment_ids:
+        # SSE already produced an image id. Do not surface a model follow-up
+        # (「你更喜欢…？」) as content_policy_violation.
+        raise RuntimeError("upstream image connection failed: download url unresolved")
 
     if message:
         # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
@@ -1446,6 +1490,11 @@ def _generate_single_image(
                     plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                     excluded_tokens=state["failed_connection_tokens"],
                 )
+            if token in state["failed_connection_tokens"]:
+                raise ImageGenerationError(
+                    image_stream_error_message(str(state["last_connection_error"] or "image generation failed")),
+                    account_email=account_email,
+                )
         except RuntimeError as exc:
             if state["failed_connection_tokens"] and state["last_connection_error"]:
                 raise ImageGenerationError(
@@ -1497,9 +1546,22 @@ def _generate_single_image(
             for output in stream_fn(backend, request, index, total):
                 if account_email and not output.account_email:
                     output.account_email = account_email
+                if output.kind == "progress":
+                    outputs.append(output)
+                    continue
                 if output.kind == "message" and request.message_as_error:
+                    text = output.text or ""
+                    if is_clarifying_image_followup(text):
+                        raise ImageGenerationError(
+                            text or "Image generation did not complete.",
+                            status_code=502,
+                            error_type="server_error",
+                            code="upstream_text_reply",
+                            account_email=account_email,
+                            conversation_id=output.conversation_id,
+                        )
                     raise ImageGenerationError(
-                        output.text or "Image generation was rejected by upstream policy.",
+                        text or "Image generation was rejected by upstream policy.",
                         status_code=400,
                         error_type="invalid_request_error",
                         code="content_policy_violation",
@@ -1576,7 +1638,14 @@ def _generate_single_image(
                 exc.account_email = account_email
             error_text = str(exc)
             # 如果是模型返回文本而非图片，尝试换账号重试
-            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+            if (
+                not emitted_for_token
+                and (
+                    is_model_text_reply_instead_of_image(error_text)
+                    or is_clarifying_image_followup(error_text)
+                    or getattr(exc, "code", "") == "upstream_text_reply"
+                )
+            ):
                 account_service.mark_image_result(token, False)
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
@@ -1649,14 +1718,28 @@ def _generate_single_image(
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
-                    token = refreshed_token
+                    state["sticky_token"] = refreshed_token
                     continue
                 if is_soft_prepare_auth_error(last_error):
-                    raise ImageGenerationError(
-                        image_stream_error_message(last_error),
-                        account_email=account_email,
-                        conversation_id="",
-                    ) from exc
+                    state["last_connection_error"] = last_error
+                    state["failed_connection_tokens"].add(token)
+                    state["sticky_token"] = ""
+                    account_service.mark_image_result(token, False)
+                    logger.warning({
+                        "event": "image_stream_soft_prepare_auth_failover",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "failed_accounts": len(state["failed_connection_tokens"]),
+                        "index": index,
+                        "error": last_error[:200],
+                    })
+                    if len(state["failed_connection_tokens"]) >= MAX_CONNECTION_ACCOUNT_RETRIES:
+                        raise ImageGenerationError(
+                            image_stream_error_message(last_error),
+                            account_email=account_email,
+                            conversation_id="",
+                        ) from exc
+                    continue
                 account_service.remove_invalid_token(token, "image_stream")
                 continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc

@@ -24,6 +24,7 @@ import {
   saveGptRegisterSettings,
   startGptRegisterJob,
   type GptRegisterJob,
+  type GptRegisterPoolSnapshot,
   type GptRegisterSettings,
 } from "@/lib/api";
 
@@ -49,9 +50,13 @@ const DEFAULT_FORM: GptRegisterSettings = {
   has_chatgpt2api_auth_key: false,
   dry_run: false,
   skip_codex: true,
-  auto_codex_upgrade: true,
+  auto_codex_upgrade: false,
   register_no_delay: false,
   so_collect_ms: "",
+  auto_replenish_enabled: true,
+  auto_replenish_min_available: 1,
+  auto_replenish_batch: 1,
+  auto_replenish_interval_secs: 90,
 };
 
 function isActiveJob(job?: GptRegisterJob | null) {
@@ -84,6 +89,7 @@ export function GptRegisterCard() {
   const [isStarting, setIsStarting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [job, setJob] = useState<GptRegisterJob | null>(null);
+  const [pool, setPool] = useState<GptRegisterPoolSnapshot | null>(null);
 
   const setField = <K extends keyof GptRegisterSettings>(key: K, value: GptRegisterSettings[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -101,6 +107,7 @@ export function GptRegisterCard() {
         ...settingsRes.settings,
         chatgpt2api_auth_key: "",
       });
+      setPool(settingsRes.pool || null);
       const jobs = jobsRes.jobs || [];
       const active = jobs.find((item) => isActiveJob(item)) || jobs[0] || null;
       setJob(active);
@@ -149,6 +156,9 @@ export function GptRegisterCard() {
         concurrency: Number(form.concurrency) || 1,
         interval_secs: Number(form.interval_secs) || 0,
         timeout_secs: Number(form.timeout_secs) || 600,
+        auto_replenish_min_available: Number(form.auto_replenish_min_available) || 1,
+        auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
+        auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
         executor: "protocol",
         mail_provider: "cloudflare_d1_api",
         captcha: "",
@@ -180,6 +190,9 @@ export function GptRegisterCard() {
         concurrency: Number(form.concurrency) || 1,
         interval_secs: Number(form.interval_secs) || 0,
         timeout_secs: Number(form.timeout_secs) || 600,
+        auto_replenish_min_available: Number(form.auto_replenish_min_available) || 1,
+        auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
+        auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
         executor: "protocol",
         mail_provider: "cloudflare_d1_api",
         captcha: "",
@@ -226,6 +239,7 @@ export function GptRegisterCard() {
               <h2 className="text-lg font-semibold tracking-tight">GPT Free 批量注册</h2>
               <p className="text-sm text-stone-500">
                 内置 gpt_free_register 纯协议 + Cloudflare D1 邮箱注册 ChatGPT free 号，成功后写入本机号池。
+                {pool ? ` 当前可生图 ${pool.available} / 共 ${pool.total}。` : ""}
               </p>
             </div>
           </div>
@@ -414,6 +428,57 @@ export function GptRegisterCard() {
               </Field>
             </div>
 
+            <div className="space-y-3 rounded-xl border border-stone-200 bg-stone-50 px-4 py-4">
+              <label className="flex items-center gap-3 text-sm text-stone-700">
+                <Checkbox
+                  checked={form.auto_replenish_enabled !== false}
+                  onCheckedChange={(checked) => setField("auto_replenish_enabled", Boolean(checked))}
+                  disabled={running}
+                />
+                自动保持号池有可用账号
+              </label>
+              <p className="text-xs text-stone-500">
+                可生图账号低于最少数量时，用上面的注册配置自动开任务。已有任务会等待；连续补号失败会冷却 10 分钟。
+              </p>
+              <div className="grid gap-3 md:grid-cols-3">
+                <Field label="最少可用账号">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={form.auto_replenish_min_available ?? 1}
+                    onChange={(e) => setField("auto_replenish_min_available", Number(e.target.value) || 1)}
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                    disabled={running || form.auto_replenish_enabled === false}
+                  />
+                </Field>
+                <Field label="每次补几个">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={5}
+                    value={form.auto_replenish_batch ?? 1}
+                    onChange={(e) => setField("auto_replenish_batch", Number(e.target.value) || 1)}
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                    disabled={running || form.auto_replenish_enabled === false}
+                  />
+                </Field>
+                <Field label="检查间隔(秒)">
+                  <Input
+                    type="number"
+                    min={30}
+                    max={3600}
+                    value={form.auto_replenish_interval_secs ?? 90}
+                    onChange={(e) =>
+                      setField("auto_replenish_interval_secs", Number(e.target.value) || 90)
+                    }
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                    disabled={running || form.auto_replenish_enabled === false}
+                  />
+                </Field>
+              </div>
+            </div>
+
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
                 <Checkbox
@@ -447,14 +512,9 @@ export function GptRegisterCard() {
                 />
                 跳过 Codex 二次 OTP（推荐，省 ~15–30s）
               </label>
-              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
-                <Checkbox
-                  checked={form.auto_codex_upgrade !== false}
-                  onCheckedChange={(checked) => setField("auto_codex_upgrade", Boolean(checked))}
-                  disabled={running}
-                />
-                入库后自动 Codex 补 refresh（仅当未跳过 Codex；二次登录可能踢 session）
-              </label>
+              <p className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm text-stone-600 md:col-span-2">
+                入库后不再自动 Codex 补 refresh（二次登录会踢掉刚用来生图的 session）。要补 refresh 请用号池「Codex 补 refresh」。
+              </p>
               <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
                 <Checkbox
                   checked={Boolean(form.register_no_delay)}
@@ -482,6 +542,7 @@ export function GptRegisterCard() {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-xs font-medium tracking-[0.16em] text-stone-400 uppercase">
                     最近任务 {job.job_id.slice(0, 8)}
+                    {job.trigger === "auto_replenish" ? " · 自动补号" : ""}
                   </div>
                   <div className="text-xs text-stone-500">
                     状态 {job.status} · 成功 {job.success} · 失败 {job.failed} · 入库 {job.added}
