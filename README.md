@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
-  <a href="./CHANGELOG.md">v1.8.1</a> ·
+  <a href="./CHANGELOG.md">v1.8.2</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/operations.md">运维与调用</a> ·
@@ -218,8 +218,9 @@ environment:
 
 ### 在线画图功能
 
-- 内置在线画图工作台，支持生成、图片编辑与多图组图编辑
+- 在线画图工作台，支持生成、图片编辑与多图组图编辑
 - 支持 `gpt-image-2`、`codex-gpt-image-2`；Grok 号池非空时还有 `grok-*-image*` / `grok-imagine`
+- 画图档位追随官网：`gpt-image-2` 出的已是 [ChatGPT Images 2.5](https://openai.com/index/introducing-chatgpt-images-2-5/)（2026-09-08 起免费档可用）。官网链路的画图模型由服务端决定，payload 只发对话 slug（`gpt-5-3`）+ `system_hints:["picture_v2"]`，客户端无法选档；官方 API 的 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` 属 `api.openai.com` 模型，与本项目逆向链路无关，仅 Codex 链路（Plus/Team/Pro）显式带 `tools[0].model`
 - 若 Grok 号池非空，模型列表也会出现 `grok-*-image*` / `grok-imagine`
 - 编辑模式支持参考图上传
 - 前端支持多图生成交互

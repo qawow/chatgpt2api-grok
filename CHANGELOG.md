@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 1.8.2 - 2026-09-10
+
+### chatgpt2api-grok（本分支）
+
++ [发布] 版本 1.8.2：`/v1/images/edits` 支持 `image_url` 远程参考图（保留 SSRF 防护），文档/测试对齐 1.8.1 实况，并补充 ChatGPT Images 2.5 与模型 slug 变更说明。
++ [新增] `/v1/images/edits` 支持 JSON 提交 `image_url` / `images[]: {image_url}` 远程参考图（http/https），自动下载并复用既有的 SSRF 防护：拒绝 `127.0.0.1` / `192.168.x` / `10.x` / `169.254.x` / `[::1]` / 链路本地 / 多播地址，避免被当作内网跳板。下载走 `proxy_settings.get_with_egress_fallback(resource=True)`，50 MB 上限与 `image/*` MIME 校验同本地文件。`file_id` 仍明确拒绝并提示改用 `image_url`。
++ [说明] ChatGPT Images 2.5（2026-09-08 全档位含 free 上线）在本项目**不需要新增模型 id**：官网生图链路的画图档位完全由服务端决定，`gpt-image-2` 出的已经是 2.5 图。free 号已实测可用。
+  - 官网链路 payload 里没有画图模型字段：`/backend-api/f/conversation` 只发对话 slug（`model: gpt-5-3`）+ `system_hints: ["picture_v2"]`，画图模型由服务端挑。
+  - 2026-09-09 用新注册 free 号实测：`/backend-api/me` 200、`limits_progress.image_gen.remaining=25`、生图成功出图 1448x1086。SSE 里搜不到 `2.5` / `flare` / `sunburst` / `gpt-image-*` 任何画图版本号，图片 metadata 仍是 `dalle` + `generation`（`serialization_title: "DALL-E generation metadata"`）——即官网侧无法选档、也读不到档位。
+  - 官方 API 的 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` 是 `api.openai.com` 的模型 id，需要组织实名 + Tier 1 付费，和本项目走的官网逆向链路无关；只有 Codex 链路（`tools[0].model`，仅 Plus/Team/Pro）才显式带画图模型 id。
++ [观察] 实测发现我们发的 `model: gpt-5-3` 已不在 `/backend-api/models` 目录里，服务端会把它 `resolved_model_slug` 成 `gpt-5-6`（GPT-5.6 Luna）。目前照旧可用，但 `gpt-5-3` 属于将来可能被拒的过期 slug，值得后续跟进。
++ [文档] 对齐 1.8.1：去掉「条件自动 Codex」残留，补 `settings.pool`、自动补号功能状态与出图排障（`upstream session expired` / `upstream image connection failed` / 追问误判）。
++ [测试] `test_v1_images_edits.py` 在 `assets/` 缺失时回退到 PIL 生成的 512x512 占位图，CI 缺二进制资源时整组测试不再失败。`test_v1_images_edits_json.py` 跟进新行为：JSON `image_url` 现在受支持（仍拦私网/回环），空图片体与多图字段命名同步更新。
+
 ## 1.8.1 - 2026-09-08
 
 ### chatgpt2api-grok（本分支）

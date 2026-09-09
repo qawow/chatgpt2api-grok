@@ -324,8 +324,8 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/gpt-register/settings` | 读配置（密钥脱敏） |
-| POST | `/api/gpt-register/settings` | 写配置（含 `skip_codex` / `auto_codex_upgrade` 等） |
+| GET | `/api/gpt-register/settings` | 读配置（密钥脱敏）+ `pool` 快照（`total` / `available` / `normal` / `abnormal`） |
+| POST | `/api/gpt-register/settings` | 写配置（含 `skip_codex` / `auto_replenish_*`；`auto_codex_upgrade` 仍可写但不再自动调度） |
 | POST | `/api/gpt-register/start` | 启动任务（可带覆盖） |
 | GET | `/api/gpt-register/jobs` | 任务列表 |
 | GET | `/api/gpt-register/jobs/{id}` | 任务详情 |
@@ -555,7 +555,7 @@ Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关�
 
 > 跳过 Codex 后拿到的是 **session_only** 号：可生图，但没有 `refresh_token`，二次登录很容易把 web session 踢掉。
 >
-> **入库后不再自动 Codex 补 refresh**（无论 `skip_codex` / `auto_codex_upgrade`）。后台 `authorize/continue` 会把刚用来生图的 NextAuth session 踢掉，约 5 分钟后巡检 `/me` 标异常。
+> **入库后不再自动 Codex 补 refresh**（无论 `skip_codex` / `auto_codex_upgrade`）。后台 `authorize/continue` 会把刚用来生图的 NextAuth session 踢掉。健康 `session_only` 的 5 分钟巡检不再打 `/me`、也不再密码重登。
 >
 > **已有 session_only 号怎么补 refresh？** 在 **号池管理 → ChatGPT**：
 > 1. 行操作点钥匙图标 **Codex 补 refresh**（或勾选后点工具栏同名按钮）  
@@ -642,21 +642,20 @@ ENV REGISTER_ENGINES_DATABASE_URL=sqlite:////app/data/register_engines.db
 | `gpt_free_register/engines/platforms/chatgpt/register.py` | 协议注册主流程（passwordless / Sentinel dual-header） |
 | `gpt_free_register/engines/platforms/chatgpt/browser_profile.py` | 每号浏览器画像（TLS/UA/CH 一致） |
 | `gpt_free_register/engines/platforms/chatgpt/constants.py` | Sentinel SDK 版本、OAuth 端点 |
-| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库（session_only + 后台 fetch_remote_info + 日志节流）+ 完成摘要 |
-| `services/account_service.py` | 号池：`session_only` 可生图、soft revoke 保留额度、按号隔离出口 |
+| `services/gpt_register_service.py` | 批量任务 + 本地/HTTP 入库（session_only + 后台 fetch_remote_info）+ 自动补号 + 完成摘要 |
+| `services/account_service.py` | 号池：`session_only` 可生图、soft revoke 保留额度、按号隔离出口、巡检跳过健康 session_only |
 | `services/oauth_login_service.py` | 浏览器 OAuth PKCE；换 token 三件套 |
 | `api/gpt_register.py` | 管理 API（含 `skip_codex` 等 latency 字段） |
 | `api/accounts.py` | `codex-upgrade`（主路径）+ `oauth/start|finish`（备用，`replace_access_token`） |
 | `gpt_free_register/codex_upgrade.py` | 协议 Codex OTP 补齐既有邮箱 |
-| `services/codex_upgrade_service.py` | 手动 / 条件自动 Codex 补 refresh + 写号池（`skip_codex` 时不自动跑） |
-| `web/.../gpt-register-card.tsx` | 设置页 UI |
+| `services/codex_upgrade_service.py` | 号池手动「Codex 补 refresh」；入库后不再自动调度 |
+| `web/.../gpt-register-card.tsx` | 设置页 UI（自动补号；自动 Codex 已关闭） |
 | `web/.../accounts/page.tsx` | 号池「Codex 补 refresh」按钮 / session 徽章 |
 | `web/.../account-import-dialog.tsx` | OAuth 导入 + 升级模式（备用；主路径为 Codex） |
-| `web/.../gpt-register-card.tsx` | 注册设置（自动 Codex 已关闭） |
-| `test/test_gpt_register.py` | 服务层单测 |
+| `test/test_gpt_register.py` | 服务层单测（含自动补号） |
 | `test/test_gpt_register_engine.py` | 引擎路径单测 |
 | `test/test_oauth_login_api.py` | OAuth finish 模型与 replace 逻辑（备用） |
-| `test/test_codex_upgrade.py` | Codex 补 refresh + 入库自动调度 |
+| `test/test_codex_upgrade.py` | 手动 Codex 补 refresh；确认入库不再自动调度 |
 
 运行测试：
 

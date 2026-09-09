@@ -9,6 +9,7 @@
 | 面向图片工作流的 `POST /v1/chat/completions` | ✅  | 仅生图；纯文本返回 400。 |
 | 面向图片工作流的 `POST /v1/responses` | ✅  | 仅 `image_generation` 工具；纯文本返回 400。 |
 | `GET /v1/models` 接口 | ✅  | 仅生图：`gpt-image-2`、`codex-gpt-image-2`（及 plus/team/pro 前缀）、本地 Grok 池非空时 `grok-2-image` / `grok-imagine-image`。`grok-4.5` 是对话模型，不列出。 |
+| 画图档位追随官网（Images 2.5） | ✅  | `gpt-image-2` 出的已是 [ChatGPT Images 2.5](https://openai.com/index/introducing-chatgpt-images-2-5/)（2026-09-08 全档位含 free 上线）。官网链路画图模型由服务端决定，payload 只发对话 slug + `system_hints:["picture_v2"]`，客户端无法选档。官方 API 的 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` 是 `api.openai.com` 模型，与本项目逆向链路无关；仅 Codex 链路（Plus/Team/Pro）显式带 `tools[0].model`。 |
 | 同时生成多张图片 | ✅  | 已支持，后端与前端都可进行多图生成。 |
 | 图片并行生成 | ✅  | 多张图片使用独立线程和账号同时生成，设置页可关闭 `image_parallel_generation`。 |
 | 图片生成进度追踪 | ✅  | 任务显示当前步骤（上传/预热/获取token/生成中等），支持耗时统计。 |
@@ -22,8 +23,9 @@
 | New API 接入 | ✅  | 已支持接入 New API。 |
 | 账号池管理 | ✅  | 已支持列表、筛选、批量操作、导出、手动编辑、刷新和删除。 |
 | 账号刷新异步进度追踪 | ✅  | 刷新和重新登录改为异步模式，前端轮询显示进度。 |
-| 密码重新登录恢复异常账号 | ✅  | 号池管理页面支持重新登录，刷新后可自动重登异常账号。 |
+| 密码重新登录恢复异常账号 | ✅  | 号池页「重新登录」会走密码重登。健康 `session_only` 的定时巡检不再 `/me`、也不再自动密码重登（二次登录会踢 session）。 |
 | 账号额度刷新与恢复时间同步 | ✅  | 已支持账号信息刷新，限流账号也会自动继续检查。 |
+| GPT 号池自动补号 | ✅  | 可生图账号低于阈值时用当前注册配置自动开任务；设置页可开关。已有任务等待，连续入库 0 冷却 10 分钟。 |
 | 失效 Token 自动清理 | ✅  | 有 `refresh_token` 的号自动移除失效 Token；`session_only` 只标异常、保留剩余额度，不自动删。 |
 | CPA / sub2api 导入 | ❌  | 已移除；号池走本地 JSON / access_token / GPT Free 注册。 |
 | Docker 自托管部署 | ✅  | 已支持 Docker Compose 部署，并提供多架构镜像。 |
@@ -39,5 +41,6 @@
 | 服务端图片 URL 缓存 | ✅  | 已实现。 |
 | `rt_token` 刷新 | ❌  | 待实现。 |
 | 代理配置功能 | ✅  | 网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H；账号绑定 `proxy` 后不再回落 runtime / 全局 / 直连。 |
-| session_only 免费号生图 | ✅  | 无 `refresh_token` 也可生图；复用 `oai-device-id` / session cookie；`chat_requirements_prepare` 401 不 hard revoke。 |
+| session_only 免费号生图 | ✅  | 无 `refresh_token` 也可生图；复用 `oai-device-id` / session cookie；`chat_requirements_prepare` 401 不 hard revoke，同请求换号，对外 `upstream session expired`。 |
 | 账号出口隔离 | ✅  | 绑定代理的号只走该出口；刷新锁与 Cloudflare clearance 按号；注册指纹写入号池。一号一 IP 需注册代理池。 |
+| 生图取图连接重试 | ✅  | SSE 已有 `file_id` 时 OPENSSL/curl 35 不再吞成空 URL；同出口重试，不把模型追问当成内容政策违规。 |

@@ -1,6 +1,6 @@
 # 运维与维护（chatgpt2api-grok）
 
-面向本二开仓库的日常使用、升级、备份与排障。当前版本 **1.8.1**（仓库根目录 `VERSION`，说明见 [CHANGELOG.md](../CHANGELOG.md)）。上游官方文档见原项目。部署机优先拉本仓库 GitHub Actions 构建的镜像，不要用上游官方 `ghcr.io/basketikun/chatgpt2api`。`docker-compose.yml` 默认 `:latest`，只在打 `v*` tag 时更新；分支 push 只出 `:sha-<commit>`。
+面向本二开仓库的日常使用、升级、备份与排障。当前版本 **1.8.2**（仓库根目录 `VERSION`，说明见 [CHANGELOG.md](../CHANGELOG.md)）。上游官方文档见原项目。部署机优先拉本仓库 GitHub Actions 构建的镜像，不要用上游官方 `ghcr.io/basketikun/chatgpt2api`。`docker-compose.yml` 默认 `:latest`，只在打 `v*` tag 时更新；分支 push 只出 `:sha-<commit>`。
 
 ## 1. 正确部署方式
 
@@ -181,6 +181,9 @@ docker logs -f chatgpt2api
 | GPT 注册成功但 Codex `add_phone` | 默认已跳过 Codex（`skip_codex`/`OPENAI_SKIP_CODEX=1`），入库为可生图的 `session_only`；手动关闭跳过才会走 Codex，失败则软保留 session 行 |
 | 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；free 上游 `image_gen.remaining` 常为 0，看号池本地 `quota`。`session_only` **可生图**。约 5 分钟被标异常：以前是入库后自动 Codex / 巡检 `/me`+密码重登二次登录；现已关掉。手动「Codex 补 refresh」仍会踢 session |
 | session_only 要补 refresh | 号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」。**不会**入库后自动补。手动补是二次登录，可能踢掉当前 web session。见 [gpt-register.md](gpt-register.md) §6.7.1 |
+| 生图报模型追问 / `content_policy_violation` 但其实出过图 | 旧版取下载地址撞 OPENSSL 后把「你更喜欢…？」当成违规。1.8.1 会重试同出口，不再把追问当政策拦截 |
+| `upstream session expired, please retry` | `chat_requirements_prepare` 401：不当废号、同请求换号。不是额度用尽 |
+| `upstream image connection failed` | OPENSSL / curl 35 / 代理失败：同出口短重试后再换号。SOCKS 上不要切直连（本机直连 chatgpt.com 会超时） |
 | OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 
 ## 7. 开发

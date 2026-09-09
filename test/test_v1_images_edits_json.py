@@ -65,7 +65,7 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         payload = self.calls[0]
-        self.assertEqual(payload["images"], [(b"fake-png", "image_1.png", "image/png")])
+        self.assertEqual(payload["images"], [(b"fake-png", "image_url.png", "image/png")])
         self.assertEqual(payload["size"], "1024x1536")
 
     def test_image_edit_accepts_json_multiple_images_and_b64_json(self):
@@ -83,9 +83,9 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.calls[0]["images"], [
-            (b"fake-png", "image_1.png", "image/png"),
+            (b"fake-png", "image_url.png", "image/png"),
             (b"raw-jpeg", "two.jpg", "image/jpeg"),
-            (b"fake-jpeg", "image_3.jpg", "image/jpeg"),
+            (b"fake-jpeg", "image_url.jpg", "image/jpeg"),
         ])
 
     def test_image_edit_keeps_original_multipart_multiple_image_logic(self):
@@ -109,16 +109,21 @@ class ImageEditsJsonApiTests(unittest.TestCase):
     def test_image_edit_rejects_json_without_image(self):
         response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "缺少图片"})
         self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn("image file is required", response.text)
+        self.assertIn("image file or image_url is required", response.text)
 
-    def test_image_edit_rejects_remote_json_url(self):
-        response = self.client.post(
-            "/v1/images/edits",
-            headers=AUTH_HEADERS,
-            json={"prompt": "不允许远程拉图", "images": [{"image_url": "https://example.com/a.png"}]},
-        )
-        self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn("remote image URLs are not supported", response.text)
+    def test_image_edit_rejects_private_network_json_url(self):
+        """远程图片已支持，但 SSRF 防护仍须拦住内网 / 回环地址。"""
+        for url in ("http://127.0.0.1/a.png", "http://192.168.1.5/a.png", "http://[::1]/a.png"):
+            with self.subTest(url=url):
+                self.calls.clear()
+                response = self.client.post(
+                    "/v1/images/edits",
+                    headers=AUTH_HEADERS,
+                    json={"prompt": "不允许拉内网图", "images": [{"image_url": url}]},
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn("private or local network address", response.text)
+                self.assertFalse(self.calls)
 
     def test_image_edit_rejects_json_n_out_of_range(self):
         response = self.client.post("/v1/images/edits", headers=AUTH_HEADERS, json={"prompt": "n 越界", "n": 5, "image": PNG_DATA_URL})

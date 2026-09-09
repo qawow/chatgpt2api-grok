@@ -16,7 +16,22 @@ ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 
 def load_asset_bytes(name: str) -> bytes:
-    return (ASSETS_DIR / name).read_bytes()
+    """读取参考图；assets/ 未提供时回退到本地生成的图片，避免测试依赖未入库的二进制资源。"""
+    path = ASSETS_DIR / name
+    if path.is_file():
+        return path.read_bytes()
+    from io import BytesIO
+
+    from PIL import Image
+
+    image = Image.new("RGB", (512, 512))
+    pixels = image.load()
+    for y in range(512):
+        for x in range(512):
+            pixels[x, y] = (x % 256, y % 256, (x * y) % 256)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def summarize_chunk(chunk: dict[str, object]) -> dict[str, object]:

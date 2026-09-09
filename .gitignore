@@ -43,3 +43,6 @@ issues/
 .tmp-research/
 .ref/
 .jspace/
+
+# IDE / editor local state
+.cursor/
