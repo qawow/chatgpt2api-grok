@@ -33,6 +33,7 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+utils/output/
 # Local backups (may contain secrets)
 backups/
 

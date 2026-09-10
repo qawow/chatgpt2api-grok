@@ -98,7 +98,7 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 ```
 
 识别为 Grok 的 model：`grok-2-image`、`grok-2-image-1212`、`grok-imagine`，以及 `grok*` 且含 `image`/`imagine` 的 id。  
-`gpt-image-2` / `codex-gpt-image-2` **仍只走 ChatGPT 池**。
+`gpt-image-2.5` / `codex-gpt-image-2` **仍只走 ChatGPT 池**。
 
 生图只走本地 `data/grok_accounts.json` 免费 Build（`/responses` + `image_generation` tool），**永不**落入 ChatGPT 号池。
 
@@ -120,7 +120,7 @@ curl -s http://127.0.0.1:8000/v1/grok/images/generations \
 - `grok-2-image` / `grok-imagine` 等 → Grok 本地池
 - 其它 → ChatGPT `IMAGE_MODELS` 白名单
 
-若看到 `unsupported image model, supported models: gpt-image-2, codex-...`，说明请求仍进了 ChatGPT 校验（旧进程或未分流）；重启服务后选 Grok 模型即可。
+若看到 `unsupported image model, supported models: gpt-image-2.5, codex-...`，说明请求仍进了 ChatGPT 校验（旧进程或未分流）；重启服务后选 Grok 模型即可。
 
 ### 上游说明
 

@@ -24,11 +24,12 @@ from utils.grok_models import (
     is_grok_text_model,
     resolve_grok_image_model,
 )
+from utils.helper import WEB_IMAGE_MODEL
 
 
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
-    model: str = "gpt-image-2"
+    model: str = WEB_IMAGE_MODEL
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"

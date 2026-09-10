@@ -211,16 +211,16 @@ environment:
 - 兼容 `POST /v1/images/edits` 图片编辑接口
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
-- `GET /v1/models` 只返回生图模型：`gpt-image-2`、`codex-gpt-image-2`（及 plus/team/pro 前缀）；本地 Grok 号池非空时注入 `grok-2-image` / `grok-imagine-image` / `grok-imagine`。**不暴露对话模型**（gpt-5* / auto / grok-4.5）
+- `GET /v1/models` 只返回生图模型：`gpt-image-2.5`、`codex-gpt-image-2`（及 plus/team/pro 前缀）；本地 Grok 号池非空时注入 `grok-2-image` / `grok-imagine-image` / `grok-imagine`。**不暴露对话模型**（gpt-5* / auto / grok-4.5）
 - 支持通过 `n` 返回多张生成结果
 - 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
-  `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
+  `gpt-image-2.5`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
 
 ### 在线画图功能
 
 - 在线画图工作台，支持生成、图片编辑与多图组图编辑
-- 支持 `gpt-image-2`、`codex-gpt-image-2`；Grok 号池非空时还有 `grok-*-image*` / `grok-imagine`
-- 画图档位追随官网：`gpt-image-2` 出的已是 [ChatGPT Images 2.5](https://openai.com/index/introducing-chatgpt-images-2-5/)（2026-09-08 起免费档可用）。官网链路的画图模型由服务端决定，payload 只发对话 slug（`gpt-5-3`）+ `system_hints:["picture_v2"]`，客户端无法选档；官方 API 的 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` 属 `api.openai.com` 模型，与本项目逆向链路无关，仅 Codex 链路（Plus/Team/Pro）显式带 `tools[0].model`
+- 支持 `gpt-image-2.5`、`codex-gpt-image-2`；Grok 号池非空时还有 `grok-*-image*` / `grok-imagine`
+- 画图档位追随官网：`gpt-image-2.5` 出的已是 [ChatGPT Images 2.5](https://openai.com/index/introducing-chatgpt-images-2-5/)（2026-09-08 起免费档可用）。官网链路的画图模型由服务端决定，payload 只发对话 slug（`gpt-5-3`）+ `system_hints:["picture_v2"]`，客户端无法选档；官方 API 的 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` 属 `api.openai.com` 模型，与本项目逆向链路无关，仅 Codex 链路（Plus/Team/Pro）显式带 `tools[0].model`
 - 若 Grok 号池非空，模型列表也会出现 `grok-*-image*` / `grok-imagine`
 - 编辑模式支持参考图上传
 - 前端支持多图生成交互
@@ -315,7 +315,7 @@ curl http://localhost:8000/v1/models \
 
 | 字段   | 说明                                                                                                         |
 |:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | 仅生图：`gpt-image-2`、`codex-gpt-image-2`（及订阅前缀）、Grok 池非空时 `grok-imagine-image` / `grok-2-image` |
+| 返回模型 | 仅生图：`gpt-image-2.5`、`codex-gpt-image-2`（及订阅前缀）、Grok 池非空时 `grok-imagine-image` / `grok-2-image` |
 | 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
 
 <br>
@@ -333,7 +333,7 @@ curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "gpt-image-2.5",
     "prompt": "一只漂浮在太空里的猫",
     "n": 1,
     "response_format": "b64_json"
@@ -346,7 +346,7 @@ curl http://localhost:8000/v1/images/generations \
 
 | 字段                | 说明                                                 |
 |:------------------|:---------------------------------------------------|
-| `model`           | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2` |
+| `model`           | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2.5` |
 | `prompt`          | 图片生成提示词                                            |
 | `n`               | 生成数量，当前后端限制为 `1-4`                                 |
 | `response_format` | 当前请求模型中包含该字段，默认值为 `b64_json`                       |
@@ -364,7 +364,7 @@ OpenAI 兼容图片编辑接口，可上传图片文件，也可按官方 JSON �
 ```bash
 curl http://localhost:8000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
-  -F "model=gpt-image-2" \
+  -F "model=gpt-image-2.5" \
   -F "prompt=把这张图改成赛博朋克夜景风格" \
   -F "n=1" \
   -F "image=@./input.png"
@@ -377,7 +377,7 @@ curl http://localhost:8000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "gpt-image-2.5",
     "prompt": "把这张图改成赛博朋克夜景风格",
     "images": [
       {"image_url": "https://example.com/input.png"}
@@ -391,7 +391,7 @@ curl http://localhost:8000/v1/images/edits \
 
 | 字段          | 说明                                            |
 |:------------|:----------------------------------------------|
-| `model`     | 图片模型， `gpt-image-2`                           |
+| `model`     | 图片模型， `gpt-image-2.5`                           |
 | `prompt`    | 图片编辑提示词                                       |
 | `n`         | 生成数量，当前后端限制为 `1-4`                            |
 | `image`     | 需要编辑的图片文件，使用 multipart/form-data 上传           |
@@ -413,7 +413,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "gpt-image-2.5",
     "messages": [
       {
         "role": "user",
@@ -430,7 +430,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 | 字段                   | 说明                                                                           |
 |:---------------------|:-----------------------------------------------------------------------------|
-| `model`              | 生图模型：`gpt-image-2` / `codex-gpt-image-2` / `grok-2-image` |
+| `model`              | 生图模型：`gpt-image-2.5` / `codex-gpt-image-2` / `grok-2-image` |
 | `messages`           | 消息数组，从中解析生图提示词 |
 | `n`                  | 图片生成数量 |
 | `stream`             | 可选 |
@@ -450,7 +450,7 @@ curl http://localhost:8000/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "gpt-image-2.5",
     "input": "生成一张未来感城市天际线图片",
     "tools": [
       {

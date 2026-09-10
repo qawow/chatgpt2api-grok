@@ -15,7 +15,7 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.grok_models import is_grok_image_model, resolve_grok_image_model
-from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from utils.helper import WEB_IMAGE_MODEL, extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
 from utils.image_tokens import (
     count_image_content_tokens,
     count_image_output_items_tokens,
@@ -415,7 +415,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     prompt = extract_response_prompt(body.get("input"))
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
-    model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
+    model = str(body.get("model") or WEB_IMAGE_MODEL).strip() or WEB_IMAGE_MODEL
     if is_grok_image_model(model):
         image_info = extract_response_image(body.get("input"))
         if image_info:

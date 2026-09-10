@@ -772,6 +772,34 @@ class AccountService:
                     pass
         return False if saw_auth_dead else None
 
+    def confirm_token_revoked(self, access_token: str) -> bool:
+        """True only when /backend-api/me confirms the token is dead (401/403).
+
+        A `chat_requirements_prepare` 401 on its own is not proof of a revoke —
+        a TLS retry can churn the device id and produce a soft 401 (see 1.8.1).
+        This is the "confirmed /me" check `_token_looks_revoked` already treats
+        as authoritative. A network error probes to None and stays *unconfirmed*,
+        so a flaky egress never kills a healthy account.
+        """
+        resolved_token, account = self._get_account_for_token(access_token)
+        token = str((account or {}).get("access_token") or resolved_token or access_token).strip()
+        if not token:
+            return False
+        confirmed = self._validate_access_token_alive(token, account) is False
+        if confirmed:
+            # Record the confirmed cause so _token_looks_revoked / the image
+            # probe-skip stop handing this row out even if the row survives
+            # (session_only accounts are marked 异常 rather than deleted).
+            try:
+                self.update_account(
+                    token,
+                    {"last_refresh_error": "token invalidated (/backend-api/me)"},
+                    quiet=True,
+                )
+            except Exception:
+                pass
+        return confirmed
+
     def _refresh_access_token_via_session(self, session_token: str, account: dict | None = None) -> dict[str, str]:
         """Refresh access_token using ChatGPT web session cookie.
 

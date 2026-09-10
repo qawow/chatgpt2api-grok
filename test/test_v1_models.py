@@ -33,7 +33,7 @@ class ModelListTests(unittest.TestCase):
             result = openai_v1_models.list_models()
 
         ids = {item["id"] for item in result["data"]}
-        self.assertIn("gpt-image-2", ids)
+        self.assertIn("gpt-image-2.5", ids)
         self.assertIn("codex-gpt-image-2", ids)
         self.assertIn("team-codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
@@ -61,7 +61,7 @@ class ModelListTests(unittest.TestCase):
             result = openai_v1_models.list_models()
 
         ids = {item["id"] for item in result["data"]}
-        self.assertIn("gpt-image-2", ids)
+        self.assertIn("gpt-image-2.5", ids)
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
         self.assertNotIn("grok-2-image", ids)
@@ -89,7 +89,7 @@ class ModelListTests(unittest.TestCase):
             mock.patch.object(openai_v1_models.grok_account_service, "count", return_value=0),
         ):
             result = openai_v1_models.list_models()
-        self.assertEqual({item["id"] for item in result["data"]}, {"gpt-image-2"})
+        self.assertEqual({item["id"] for item in result["data"]}, {"gpt-image-2.5"})
 
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""

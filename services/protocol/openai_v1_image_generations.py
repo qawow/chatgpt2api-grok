@@ -10,11 +10,12 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_output_items_tokens, image_usage
+from utils.helper import WEB_IMAGE_MODEL
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
-    model = str(body.get("model") or "gpt-image-2")
+    model = str(body.get("model") or WEB_IMAGE_MODEL)
     n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")

@@ -57,7 +57,7 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertEqual(s["interval_secs"], 3)
         self.assertFalse(s["register_no_delay"])
         self.assertTrue(s["auto_replenish_enabled"])
-        self.assertEqual(s["auto_replenish_min_available"], 1)
+        self.assertEqual(s["auto_replenish_min_available"], 2)
         self.assertEqual(s["auto_replenish_batch"], 1)
 
     def test_auto_replenish_clamps(self):
@@ -540,12 +540,15 @@ class ReplenishPoolTest(unittest.TestCase):
         start.assert_not_called()
 
     def test_starts_when_below_min(self):
+        # 不要读真实 data/gpt_register_jobs.json：那里若有刚跑完的自动补号任务，
+        # 会命中 fail_cooldown 让本用例莫名 skip。
         with mock.patch("services.account_service.account_service") as acc:
             acc.count_image_available_accounts.return_value = 0
-            with mock.patch.object(
-                self.svc, "start_job", return_value={"job_id": "auto1"}
-            ) as start:
-                out = self.svc.maybe_replenish_pool()
+            with mock.patch.object(self.svc, "_last_finished_auto_job", return_value=None):
+                with mock.patch.object(
+                    self.svc, "start_job", return_value={"job_id": "auto1"}
+                ) as start:
+                    out = self.svc.maybe_replenish_pool()
         self.assertEqual(out["action"], "started")
         self.assertEqual(out["count"], 1)
         start.assert_called_once()

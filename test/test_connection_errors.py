@@ -267,6 +267,8 @@ class ImageConnectionFailoverTests(unittest.TestCase):
             accounts.get_available_access_token.side_effect = get_token
             accounts.get_account.return_value = {"email": "a@example.com"}
             accounts.refresh_access_token.return_value = None
+            # /me 没有确认吊销（TLS/device-id 抖动导致的假 401）→ 只换号，不删号。
+            accounts.confirm_token_revoked.return_value = False
             with self.assertRaises(ImageGenerationError) as ctx:
                 _generate_single_image(
                     ConversationRequest(model="gpt-image-2", prompt="cat"),
@@ -277,6 +279,53 @@ class ImageConnectionFailoverTests(unittest.TestCase):
         self.assertIn("session expired", str(ctx.exception).lower())
         accounts.remove_invalid_token.assert_not_called()
         accounts.mark_image_result.assert_called_with("token-a", False)
+
+    def test_prepare_401_removes_account_when_me_confirms_revoke(self) -> None:
+        """prepare 401 且 /me 也 401 → 确认吊销，必须清掉这行，否则下次还会选中它。"""
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            raise RuntimeError("token invalidated (chat_requirements_prepare)")
+            yield  # pragma: no cover
+
+        def get_token(**kwargs):
+            excluded = kwargs.get("excluded_tokens") or set()
+            if "token-a" in excluded:
+                raise RuntimeError("no available ChatGPT account")
+            return "token-a"
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://live.example:1080")],
+            ),
+        ):
+            accounts.get_available_access_token.side_effect = get_token
+            accounts.get_account.return_value = {"email": "a@example.com"}
+            accounts.refresh_access_token.return_value = None
+            accounts.confirm_token_revoked.return_value = True
+            with self.assertRaises(ImageGenerationError):
+                _generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        accounts.confirm_token_revoked.assert_called_with("token-a")
+        self.assertEqual(
+            [call.args[0] for call in accounts.remove_invalid_token.call_args_list],
+            ["token-a"],
+        )
 
     def test_prepare_401_fails_over_to_another_account(self) -> None:
         created: list[str] = []
@@ -319,6 +368,7 @@ class ImageConnectionFailoverTests(unittest.TestCase):
             accounts.get_available_access_token.side_effect = get_token
             accounts.get_account.side_effect = lambda token: {"email": f"{token}@example.com"}
             accounts.refresh_access_token.return_value = None
+            accounts.confirm_token_revoked.return_value = False
             outputs = _generate_single_image(
                 ConversationRequest(model="gpt-image-2", prompt="cat"),
                 1,

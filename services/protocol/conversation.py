@@ -1721,6 +1721,24 @@ def _generate_single_image(
                     state["sticky_token"] = refreshed_token
                     continue
                 if is_soft_prepare_auth_error(last_error):
+                    # Prepare 401 is only "soft" until /me disagrees. Without this
+                    # confirmation a server-revoked token keeps its 正常 status and
+                    # unexpired JWT, so the picker skips the probe and hands it out
+                    # again on every request — the pool silently serves dead rows.
+                    if account_service.confirm_token_revoked(token):
+                        state["failed_connection_tokens"].add(token)
+                        state["sticky_token"] = ""
+                        logger.warning({
+                            "event": "image_stream_prepare_auth_revoke_confirmed",
+                            "request_token": token,
+                            "account_email": account_email,
+                            "index": index,
+                            "error": last_error[:200],
+                        })
+                        account_service.remove_invalid_token(
+                            token, "image_stream:prepare_401_confirmed_on_me"
+                        )
+                        continue
                     state["last_connection_error"] = last_error
                     state["failed_connection_tokens"].add(token)
                     state["sticky_token"] = ""

@@ -160,7 +160,7 @@ function normalizeStoredImageModel(value: string | null, availableModels: ImageM
   if (normalized && availableModels.includes(normalized)) {
     return normalized;
   }
-  return availableModels[0] || "gpt-image-2";
+  return availableModels[0] || "gpt-image-2.5";
 }
 
 function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
@@ -474,8 +474,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
-  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
-  const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2"]);
+  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2.5");
+  const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2.5"]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
@@ -710,7 +710,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         });
       } catch {
         if (!cancelled) {
-          setImageModels(["gpt-image-2"]);
+          setImageModels(["gpt-image-2.5"]);
         }
       }
     };
@@ -1133,7 +1133,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const handleContinueEdit = useCallback(
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
       if (isGrokImageModel(imageModel)) {
-        toast.error("当前模型是 Grok，不支持图生图，请先切回 gpt-image-2");
+        toast.error("当前模型是 Grok，不支持图生图，请先切回 gpt-image-2.5");
         return;
       }
       try {

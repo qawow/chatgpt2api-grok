@@ -14,15 +14,21 @@ from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+# 官网生图链路自 2026-09-08 起出的就是 ChatGPT Images 2.5，故对外正名为
+# gpt-image-2.5。画图档位由服务端决定，改名不改上游请求（仍发 gpt-5-3 +
+# picture_v2）。老 id 继续接受，避免打挂在用的客户端，但不再对外列出。
+WEB_IMAGE_MODEL = "gpt-image-2.5"
+LEGACY_WEB_IMAGE_MODELS = {"gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
+# Codex 链路的 tools[0].model 是上游显式的画图模型 id，与本次改名无关，保持不动。
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES
 }
+BASE_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL} | LEGACY_WEB_IMAGE_MODELS
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
-PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
+PUBLIC_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL} | PREFIXED_CODEX_IMAGE_MODELS
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}

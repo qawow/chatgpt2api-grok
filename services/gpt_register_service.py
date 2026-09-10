@@ -97,7 +97,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "so_collect_ms": "",
     # 号池自动补号：可用账号低于阈值时用当前注册配置开任务
     "auto_replenish_enabled": True,
-    "auto_replenish_min_available": 1,
+    # 免费号被上游吊销得快（实测约 2 小时），阈值 1 时经常「补一个死一个」，
+    # 请求侧就撞 upstream session expired。留 2 个可用号做缓冲。
+    "auto_replenish_min_available": 2,
     "auto_replenish_batch": 1,
     "auto_replenish_interval_secs": 90,
     "auto_replenish_fail_cooldown_secs": 600,

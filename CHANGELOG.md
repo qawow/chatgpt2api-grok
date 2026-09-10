@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.8.3 - 2026-09-11
+
+### chatgpt2api-grok（本分支）
+
++ [发布] 版本 1.8.3：生图模型对外改名 `gpt-image-2.5`（老 id 兼容），修复被吊销免费号反复发出导致 `upstream session expired` 的选号缺陷，补号阈值提为 2。
++ [调整] 生图模型对外正名 `gpt-image-2` → **`gpt-image-2.5`**（官网 2026-09-08 起出的就是 Images 2.5 的图）。`/v1/models`、前端画图工作台、各接口缺省 model 全部改用新 id；老 id `gpt-image-2` 继续接受，只是不再对外列出，两者上游请求完全一致（仍发 `gpt-5-3` + `system_hints:["picture_v2"]`）。Codex 链路的 `codex-gpt-image-2` 不改名——它的 `tools[0].model` 是上游显式的画图模型 id。
++ [修复] `chat_requirements_prepare` 401 后补一次 `/backend-api/me` 确认，`/me` 也 401 才 `remove_invalid_token`（新增 `account_service.confirm_token_revoked`）。此前 prepare-401 一律当软失败：被上游吊销的号 `status` 仍是「正常」、`quota` 还有余、JWT 的 `exp` 还有约 10 天，于是 `_can_skip_image_remote_probe` 跳过探活把死号发出去，连试 4 个号后对外报 `upstream session expired, please retry`，且**没有任何号被标记**，下个请求原样重来。网络错误（探活返回 None）仍算未确认，不会误杀好号，1.8.1 防 TLS/device-id 抖动误杀的保证不变。
++ [调整] `auto_replenish_min_available` 默认 1 → 2。免费号被上游吊销得很快（实测约 2 小时），阈值 1 时经常「补一个死一个」，请求侧直接撞上空池。
++ [说明] 免费号 NextAuth session 活着（`/api/auth/session` 200、`expires` 三个月后）但 oauth token 已被服务端吊销时，该接口会一直返回**同一个已死的 JWT** 直到它自然过期，所以 `session_refresh_stale_token_revoked` 无法自愈——只能靠补号。已验证 `/api/auth/session` **不会**轮换 session cookie，重复调用不会自伤。
 
 ## 1.8.2 - 2026-09-10
 

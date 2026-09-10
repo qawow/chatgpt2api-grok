@@ -8,8 +8,8 @@
 | OpenAI 兼容 `POST /v1/images/edits` | ✅  | 已支持，可上传图片进行编辑。 |
 | 面向图片工作流的 `POST /v1/chat/completions` | ✅  | 仅生图；纯文本返回 400。 |
 | 面向图片工作流的 `POST /v1/responses` | ✅  | 仅 `image_generation` 工具；纯文本返回 400。 |
-| `GET /v1/models` 接口 | ✅  | 仅生图：`gpt-image-2`、`codex-gpt-image-2`（及 plus/team/pro 前缀）、本地 Grok 池非空时 `grok-2-image` / `grok-imagine-image`。`grok-4.5` 是对话模型，不列出。 |
-| 画图档位追随官网（Images 2.5） | ✅  | `gpt-image-2` 出的已是 [ChatGPT Images 2.5](https://openai.com/index/introducing-chatgpt-images-2-5/)（2026-09-08 全档位含 free 上线）。官网链路画图模型由服务端决定，payload 只发对话 slug + `system_hints:["picture_v2"]`，客户端无法选档。官方 API 的 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` 是 `api.openai.com` 模型，与本项目逆向链路无关；仅 Codex 链路（Plus/Team/Pro）显式带 `tools[0].model`。 |
+| `GET /v1/models` 接口 | ✅  | 仅生图：`gpt-image-2.5`、`codex-gpt-image-2`（及 plus/team/pro 前缀）、本地 Grok 池非空时 `grok-2-image` / `grok-imagine-image`。`grok-4.5` 是对话模型，不列出。 |
+| 画图档位追随官网（Images 2.5） | ✅  | `gpt-image-2.5` 出的已是 [ChatGPT Images 2.5](https://openai.com/index/introducing-chatgpt-images-2-5/)（2026-09-08 全档位含 free 上线）。官网链路画图模型由服务端决定，payload 只发对话 slug + `system_hints:["picture_v2"]`，客户端无法选档。官方 API 的 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` 是 `api.openai.com` 模型，与本项目逆向链路无关；仅 Codex 链路（Plus/Team/Pro）显式带 `tools[0].model`。 |
 | 同时生成多张图片 | ✅  | 已支持，后端与前端都可进行多图生成。 |
 | 图片并行生成 | ✅  | 多张图片使用独立线程和账号同时生成，设置页可关闭 `image_parallel_generation`。 |
 | 图片生成进度追踪 | ✅  | 任务显示当前步骤（上传/预热/获取token/生成中等），支持耗时统计。 |
@@ -18,7 +18,7 @@
 | 前端图片工作台 | ✅  | 已支持图片生成、图片编辑、模型选择、历史记录与查看大图。 |
 | 前端图片懒加载与滚动优化 | ✅  | LazyImage 懒加载、会话切换滚动位置保存与恢复、bfcache 页面恢复同步。 |
 | 前端图片输入 / 参考图交互 | ✅  | 已支持参考图上传、预览、移除和编辑模式工作流。 |
-| Codex 画图接口逆向 | ✅  | 已支持，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`；如有需要可自行在其他场景映射回 `gpt-image-2`。这是 Codex 逆向链路，用于和官网画图区分，同一账号通常会同时支持官网和 Codex 两份生图额度。 |
+| Codex 画图接口逆向 | ✅  | 已支持，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`；如有需要可自行在其他场景映射回 `gpt-image-2.5`。这是 Codex 逆向链路，用于和官网画图区分，同一账号通常会同时支持官网和 Codex 两份生图额度。 |
 | Cherry Studio 接入 | ✅  | 已支持作为绘图接口接入 Cherry Studio。 |
 | New API 接入 | ✅  | 已支持接入 New API。 |
 | 账号池管理 | ✅  | 已支持列表、筛选、批量操作、导出、手动编辑、刷新和删除。 |
