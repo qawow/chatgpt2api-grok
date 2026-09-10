@@ -103,6 +103,23 @@ def is_file_stream_denied(error: object) -> bool:
         text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body or "")
         return int(error.status_code or 0) == 403 and "file stream access denied" in text.lower()
     return "file stream access denied" in str(error or "").lower()
+
+
+def is_sentinel_proof_rejected(error: object) -> bool:
+    """Conversation 403 with an empty/sentinel body means the PoW proof token was rejected.
+
+    Upstream enforces `proofofwork.required` at the conversation endpoint: a
+    requirements token finalized without a valid proof gets a bare 403. A stale
+    bootstrap snapshot (sdk.js URL / data-build) produces the same rejection.
+    File-stream 403s carry "file stream access denied" and are unrelated.
+    """
+    if not isinstance(error, UpstreamHTTPError):
+        return False
+    if int(error.status_code or 0) != 403:
+        return False
+    if is_file_stream_denied(error):
+        return False
+    return str(error.context or "").endswith("/conversation")
 FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
 # 真正的图片文件 ID 格式：file_00000000 + 24位十六进制字符（共32字符）
 REAL_IMAGE_FILE_ID_RE = re.compile(r"\bfile_00000000[a-f0-9]{24}\b")
@@ -2051,14 +2068,31 @@ class OpenAIBackendAPI:
             raise RuntimeError("access_token is required for image endpoints")
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
-        self._report_progress("bootstrapping")
-        self._bootstrap()
-        self._report_progress("getting_token")
-        requirements = self._get_chat_requirements()
-        self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
-        self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response: Optional[requests.Response] = None
+        for attempt in range(2):
+            self._report_progress("bootstrapping")
+            self._bootstrap()
+            self._report_progress("getting_token")
+            requirements = self._get_chat_requirements()
+            self._report_progress("preparing_conversation")
+            conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+            self._report_progress("starting_generation")
+            try:
+                response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+                break
+            except UpstreamHTTPError as exc:
+                if attempt == 0 and is_sentinel_proof_rejected(exc):
+                    # PoW proof rejected: the cached bootstrap snapshot (sdk.js
+                    # URL / data-build) may be stale. Drop it and resolve once.
+                    reset_pow_bootstrap_cache()
+                    logger.warning({
+                        "event": "image_pow_rejected_refreshing_requirements",
+                        "error": str(exc)[:200],
+                    })
+                    continue
+                raise
+        if response is None:
+            raise RuntimeError("image generation did not start")
         self._report_progress("generating")
         try:
             yield from iter_sse_payloads(response)

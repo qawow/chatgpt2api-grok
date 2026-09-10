@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.4 - 2026-09-11
+
+### chatgpt2api-grok（本分支）
+
++ [发布] 版本 1.8.4：应对官网生图链路强制 PoW——conversation 403 时刷新 PoW bootstrap 缓存并重解一次。
++ [加固] 官网生图链路 PoW 现已在 conversation 端点强制校验：实测 `chat-requirements/prepare` 返回 `proofofwork.required=true`，不带 proof token finalize 出的 token 调 `/backend-api/f/conversation` 直接 403（空 body）。本项目的 prepare→finalize 流程本就会解 PoW 并带 `OpenAI-Sentinel-Proof-Token`，实测新注册 free 号全流程出图正常。本次补齐容错：conversation 403（proof 被拒）时丢弃 PoW bootstrap 缓存（sdk.js URL / data-build 可能过期），重取 requirements 重新解 PoW 后再试一次（`is_sentinel_proof_rejected` + `_stream_picture_conversation` 单次重试）。
+
 ## 1.8.3 - 2026-09-11
 
 ### chatgpt2api-grok（本分支）
