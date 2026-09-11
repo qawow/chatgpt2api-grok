@@ -318,7 +318,7 @@ export function ImageComposer({
                   <Button
                     type="button"
                     variant="outline"
-                    className="h-9 shrink-0 rounded-full border-stone-200 bg-white px-3 text-xs font-medium text-stone-700 shadow-none sm:h-10 sm:px-4 sm:text-sm"
+                    className="h-10 shrink-0 rounded-full border-stone-200 bg-white px-3 text-xs font-medium text-stone-700 shadow-none sm:px-4 sm:text-sm"
                     onClick={onPickReferenceImage}
                     disabled={grokEditsDisabled}
                     title={grokEditsDisabled ? "Grok 本地池不支持图生图" : undefined}
@@ -336,11 +336,11 @@ export function ImageComposer({
                       {activeTaskCount}<span className="hidden sm:inline"> 个任务处理中</span>
                     </div>
                   )}
-                  <div className="relative flex h-9 min-w-0 shrink items-center rounded-full bg-transparent text-[11px] sm:h-auto sm:shrink-0 sm:text-[13px]">
+                  <div className="relative flex h-10 min-w-0 shrink items-center rounded-full bg-transparent text-[11px] sm:h-auto sm:shrink-0 sm:text-[13px]">
                     <button
                       ref={sizeMenuBtnRef}
                       type="button"
-                      className="inline-flex h-9 w-fit max-w-[calc(100vw-12rem)] items-center justify-between gap-2 rounded-full bg-stone-100 px-4 text-left text-xs font-semibold text-stone-900 sm:h-10 sm:max-w-none sm:text-sm"
+                      className="inline-flex h-10 w-fit max-w-[calc(100vw-12rem)] items-center justify-between gap-2 rounded-full bg-stone-100 px-4 text-left text-xs font-semibold text-stone-900 sm:max-w-none sm:text-sm"
                       onClick={() => {
                         if (!isSizeMenuOpen && sizeMenuBtnRef.current) {
                           const rect = sizeMenuBtnRef.current.getBoundingClientRect();

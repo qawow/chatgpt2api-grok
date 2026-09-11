@@ -8,6 +8,43 @@ from services.openai_backend_api import (
     is_sentinel_proof_rejected,
 )
 from utils.helper import UpstreamHTTPError
+from utils.pow import _fnv1a32, _pow_generate, build_pow_config
+
+
+class PowAlgorithmTests(unittest.TestCase):
+    def test_fnv1a32_matches_reference_vector(self) -> None:
+        # 与注册引擎 _SentinelTokenGenerator._fnv1a32 的同一算法互证
+        h = 2166136261
+        for ch in "abc":
+            h ^= ord(ch)
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= (h >> 16)
+        h = (h * 2246822507) & 0xFFFFFFFF
+        h ^= (h >> 13)
+        h = (h * 3266489909) & 0xFFFFFFFF
+        h ^= (h >> 16)
+        self.assertEqual(_fnv1a32("abc"), f"{h & 0xFFFFFFFF:08x}")
+        self.assertEqual(len(_fnv1a32("seed")), 8)
+
+    def test_pow_generate_appends_sync_suffix(self) -> None:
+        config = build_pow_config("ua-test", script_sources=["https://chatgpt.com/backend-api/sentinel/sdk.js"])
+        answer, solved = _pow_generate("0.5", "ffffff", config)
+        self.assertTrue(solved)
+        self.assertTrue(answer.endswith("~S"))
+
+    def test_pow_generate_respects_difficulty(self) -> None:
+        config = build_pow_config("ua-test")
+        answer, solved = _pow_generate("0.123456", "069976", config)
+        self.assertTrue(solved)
+        # 解必须真的满足校验：fnv(seed + answer_without_suffix) 前缀不超过 difficulty
+        raw = answer[:-2]
+        self.assertLessEqual(_fnv1a32("0.123456" + raw)[:6], "069976")
+
+    def test_pow_generate_unsolvable_returns_fallback(self) -> None:
+        config = build_pow_config("ua-test")
+        answer, solved = _pow_generate("0.5", "00000000", config, limit=100)
+        self.assertFalse(solved)
+        self.assertTrue(answer.startswith("wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"))
 
 
 class SentinelProofRejectedTests(unittest.TestCase):
@@ -47,7 +84,7 @@ class PictureConversationPowRetryTests(unittest.TestCase):
         start_mock = MagicMock(side_effect=start_side_effects)
         patches = [
             patch.object(api, "_bootstrap", lambda: None),
-            patch.object(api, "_get_chat_requirements", lambda: object()),
+            patch.object(api, "_get_chat_requirements", lambda **kw: object()),
             patch.object(api, "_prepare_image_conversation", lambda *a, **k: "conduit"),
             patch.object(api, "_start_image_generation", start_mock),
             patch("services.openai_backend_api.iter_sse_payloads", lambda resp: iter(["chunk"])),

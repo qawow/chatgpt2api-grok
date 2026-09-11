@@ -447,6 +447,9 @@ def assistant_message_text(message: dict[str, Any]) -> str:
     # Fallback: content_type "code" stores text in the "text" field instead of "parts"
     text_field = str(content.get("text") or "")
     if text_field:
+        # 生图回合的内部编排标记（隐藏 code cell），不是用户可见内容
+        if text_field.strip().startswith('{"skipped_mainline"'):
+            return ""
         return text_field
     return ""
 

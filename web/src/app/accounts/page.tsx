@@ -139,6 +139,26 @@ function formatRestoreAt(value?: string | null) {
   return { absolute, relative };
 }
 
+function formatCreatedAt(raw: unknown) {
+  if (!raw) {
+    return "—";
+  }
+  try {
+    const d = new Date(String(raw) + "Z");
+    if (Number.isNaN(d.getTime())) {
+      return String(raw).slice(0, 10);
+    }
+    return d.toLocaleDateString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return String(raw).slice(0, 10);
+  }
+}
+
 function formatQuotaSummary(accounts: Account[]) {
   const availableAccounts = accounts.filter((account) => account.status === "正常");
   return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
@@ -1057,7 +1077,7 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = (refreshSummary ?? summary)[item.key];
@@ -1202,7 +1222,7 @@ function AccountsPageContent() {
               <div className="flex flex-wrap items-center gap-2 text-sm text-stone-500">
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
+                  className="h-10 rounded-lg px-3 text-stone-500 hover:bg-stone-100 sm:h-8"
                   onClick={() => void handleRefreshAccounts(selectedTokens)}
                   disabled={selectedTokens.length === 0 || isRefreshing}
                 >
@@ -1212,7 +1232,7 @@ function AccountsPageContent() {
                 {!isGrok ? (
                   <Button
                     variant="ghost"
-                    className="h-8 rounded-lg px-3 text-amber-600 hover:bg-amber-50 hover:text-amber-700"
+                    className="h-10 rounded-lg px-3 text-amber-600 hover:bg-amber-50 hover:text-amber-700 sm:h-8"
                     onClick={() => void handleReLogin(selectedTokens)}
                     disabled={selectedTokens.length === 0 || isRelogining}
                     title="尝试密码登录恢复账号"
@@ -1224,7 +1244,7 @@ function AccountsPageContent() {
                 {!isGrok ? (
                   <Button
                     variant="ghost"
-                    className="h-8 rounded-lg px-3 text-sky-600 hover:bg-sky-50 hover:text-sky-700"
+                    className="h-10 rounded-lg px-3 text-sky-600 hover:bg-sky-50 hover:text-sky-700 sm:h-8"
                     onClick={handleCodexUpgradeSelected}
                     disabled={
                       sessionOnlySelected.length === 0 ||
@@ -1243,7 +1263,7 @@ function AccountsPageContent() {
                 ) : null}
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                  className="h-10 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600 sm:h-8"
                   onClick={() => void handleDeleteTokens(abnormalTokens)}
                   disabled={abnormalTokens.length === 0 || isDeleting}
                 >
@@ -1252,7 +1272,7 @@ function AccountsPageContent() {
                 </Button>
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                  className="h-10 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600 sm:h-8"
                   onClick={() => void handleDeleteTokens(selectedTokens)}
                   disabled={selectedTokens.length === 0 || isDeleting}
                 >
@@ -1267,7 +1287,7 @@ function AccountsPageContent() {
               </div>
             </div>
 
-            <div className="overflow-x-auto">
+            <div className="hidden overflow-x-auto md:block">
               <table className="w-full min-w-[1000px] text-left">
                 <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
                   <tr>
@@ -1371,22 +1391,7 @@ function AccountsPageContent() {
                           </div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {(() => {
-                            const raw = (account as any).created_at;
-                            if (!raw) return "—";
-                            try {
-                              const d = new Date(raw + "Z");
-                              if (isNaN(d.getTime())) return String(raw).slice(0, 10);
-                              return d.toLocaleDateString("zh-CN", {
-                                month: "2-digit",
-                                day: "2-digit",
-                                hour: "2-digit",
-                                minute: "2-digit",
-                              });
-                            } catch {
-                              return String(raw).slice(0, 10);
-                            }
-                          })()}
+                          {formatCreatedAt((account as any).created_at)}
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant="info" className="rounded-md">
@@ -1493,26 +1498,173 @@ function AccountsPageContent() {
                   })}
                 </tbody>
               </table>
-
-              {!isLoading && currentRows.length === 0 ? (
-                <div className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
-                  <div className="rounded-xl bg-stone-100 p-3 text-stone-500">
-                    <Search className="size-5" />
-                  </div>
-                  <div className="space-y-1">
-                    <p className="text-sm font-medium text-stone-700">没有匹配的账户</p>
-                    <p className="text-sm text-stone-500">调整筛选条件或搜索关键字后重试。</p>
-                  </div>
-                </div>
-              ) : null}
             </div>
 
+            {/* 手机端卡片列表 */}
+            <div className="md:hidden">
+              <label className="flex items-center gap-2 border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
+                <Checkbox
+                  className="size-5"
+                  checked={allCurrentSelected}
+                  onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))}
+                />
+                本页全选
+              </label>
+              {currentRows.map((account) => {
+                const status = statusMeta[account.status];
+                const StatusIcon = status.icon;
+                const inflight = account.image_inflight ?? 0;
+                const restore = formatRestoreAt(
+                  isGrok ? account.expired || account.restore_at : account.restore_at,
+                );
+                return (
+                  <div key={account.access_token} className="space-y-2.5 border-b border-stone-100/80 px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        className="size-5"
+                        checked={selectedIds.includes(account.access_token)}
+                        onCheckedChange={(checked) => {
+                          setSelectedIds((prev) =>
+                            checked
+                              ? Array.from(new Set([...prev, account.access_token]))
+                              : prev.filter((item) => item !== account.access_token),
+                          );
+                        }}
+                      />
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium text-stone-700">
+                        {account.email ?? maskToken(account.access_token)}
+                      </span>
+                      <Badge
+                        variant={status.badge}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1"
+                      >
+                        <StatusIcon className="size-3.5" />
+                        {account.status}
+                      </Badge>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                      <span className="font-medium tracking-tight text-stone-500">
+                        {maskToken(account.access_token)}
+                      </span>
+                      <button
+                        type="button"
+                        className="rounded-lg p-1.5 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(account.access_token);
+                          toast.success("token 已复制");
+                        }}
+                        aria-label="复制 token"
+                      >
+                        <Copy className="size-4" />
+                      </button>
+                      <Badge variant="secondary" className="rounded-md bg-stone-100 text-stone-700">
+                        {displayAccountType(account)}
+                      </Badge>
+                      <Badge variant="outline" className="rounded-md border-stone-200 text-stone-600">
+                        {isGrok ? "xAI Build" : displayAccountSource(account)}
+                      </Badge>
+                      {!isGrok && isSessionOnlyAccount(account) ? (
+                        <Badge variant="outline" className="rounded-md border-sky-200 bg-sky-50 text-sky-700">
+                          session
+                        </Badge>
+                      ) : null}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-stone-500">
+                      <span>
+                        {isGrok ? "tokens" : "额度"}{" "}
+                        <span className="font-medium text-sky-600">{formatQuota(account)}</span>
+                      </span>
+                      <span>成功 {account.success}</span>
+                      <span>失败 {account.fail}</span>
+                      {!isGrok ? (
+                        <span className={inflight > 0 ? "font-semibold text-amber-600" : "text-stone-400"}>
+                          在途 {inflight}
+                        </span>
+                      ) : null}
+                      <span>创建 {formatCreatedAt((account as any).created_at)}</span>
+                      {restore.relative ? (
+                        <span>
+                          {isGrok ? "过期" : "恢复"} {restore.relative}
+                        </span>
+                      ) : null}
+                    </div>
+                    {isGrok && account.last_error ? (
+                      <div className="text-xs leading-5 break-all text-rose-500">{account.last_error}</div>
+                    ) : null}
+                    <div className="flex items-center gap-2 pt-0.5">
+                      <Button
+                        variant="outline"
+                        className="h-10 flex-1 rounded-lg border-stone-200 bg-white px-2 text-stone-600"
+                        onClick={() => openEditDialog(account)}
+                        disabled={isUpdating}
+                      >
+                        <Pencil className="size-4" />
+                        编辑
+                      </Button>
+                      {!isGrok && isSessionOnlyAccount(account) ? (
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-10 w-11 shrink-0 rounded-lg border-sky-200 bg-white text-sky-600"
+                          onClick={() => void runCodexUpgrade(account)}
+                          disabled={codexUpgradingTokens.has(account.access_token)}
+                          title="Codex 补 refresh"
+                          aria-label="Codex 补 refresh"
+                        >
+                          {codexUpgradingTokens.has(account.access_token) ? (
+                            <LoaderCircle className="size-4 animate-spin" />
+                          ) : (
+                            <KeyRound className="size-4" />
+                          )}
+                        </Button>
+                      ) : null}
+                      <Button
+                        variant="outline"
+                        className="h-10 flex-1 rounded-lg border-stone-200 bg-white px-2 text-stone-600"
+                        onClick={() => void handleRefreshAccounts([account.access_token])}
+                        disabled={isRefreshing || refreshingTokens.has(account.access_token)}
+                      >
+                        <RefreshCw
+                          className={cn(
+                            "size-4",
+                            isRefreshing || refreshingTokens.has(account.access_token) ? "animate-spin" : "",
+                          )}
+                        />
+                        刷新
+                      </Button>
+                      <Button
+                        variant="outline"
+                        className="h-10 flex-1 rounded-lg border-rose-200 bg-white px-2 text-rose-500"
+                        onClick={() => void handleDeleteTokens([account.access_token])}
+                        disabled={isDeleting}
+                      >
+                        <Trash2 className="size-4" />
+                        删除
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {!isLoading && currentRows.length === 0 ? (
+              <div className="flex flex-col items-center justify-center gap-3 px-6 py-14 text-center">
+                <div className="rounded-xl bg-stone-100 p-3 text-stone-500">
+                  <Search className="size-5" />
+                </div>
+                <div className="space-y-1">
+                  <p className="text-sm font-medium text-stone-700">没有匹配的账户</p>
+                  <p className="text-sm text-stone-500">调整筛选条件或搜索关键字后重试。</p>
+                </div>
+              </div>
+            ) : null}
+
             <div className="border-t border-stone-100 px-4 py-4">
-              <div className="flex items-center justify-center gap-3 overflow-x-auto whitespace-nowrap">
-                <div className="shrink-0 text-sm text-stone-500">
-                显示第 {filteredAccounts.length === 0 ? 0 : startIndex + 1} -{" "}
-                {Math.min(startIndex + Number(pageSize), filteredAccounts.length)} 条，共{" "}
-                {filteredAccounts.length} 条
+              <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 sm:flex-nowrap sm:overflow-x-auto sm:whitespace-nowrap">
+                <div className="w-full shrink-0 text-center text-sm text-stone-500 sm:w-auto">
+                  显示第 {filteredAccounts.length === 0 ? 0 : startIndex + 1} -{" "}
+                  {Math.min(startIndex + Number(pageSize), filteredAccounts.length)} 条，共{" "}
+                  {filteredAccounts.length} 条
                 </div>
 
                 <span className="shrink-0 text-sm leading-none text-stone-500">

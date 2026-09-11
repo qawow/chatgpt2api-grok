@@ -919,8 +919,12 @@ export type GptRegisterSettings = {
   /** 可用账号低于阈值时自动开注册任务 */
   auto_replenish_enabled?: boolean;
   auto_replenish_min_available?: number;
+  /** 主动维持的目标水位，低于它就小步补号（>= min_available） */
+  auto_replenish_target_available?: number;
   auto_replenish_batch?: number;
   auto_replenish_interval_secs?: number;
+  /** 两次成功补号的最小间隔，拉开各号注册/死亡时间 */
+  auto_replenish_spacing_secs?: number;
   auto_replenish_fail_cooldown_secs?: number;
 };
 

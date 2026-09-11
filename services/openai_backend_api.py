@@ -21,6 +21,7 @@ from services.account_service import account_service
 from services.config import config
 from services.proxy_service import _is_egress_connect_error, normalize_proxy_url, proxy_settings
 from utils.curl_tls import create_cffi_session
+from utils.egress_locale import resolve_egress_locale
 from utils.helper import (
     LEGACY_WEB_IMAGE_MODELS,
     WEB_IMAGE_MODEL,
@@ -31,7 +32,13 @@ from utils.helper import (
     split_image_model,
 )
 from utils.log import logger
-from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
+from utils.pow import (
+    POW_CORES,
+    SCREEN_RESOLUTIONS,
+    build_legacy_requirements_token,
+    build_proof_token,
+    parse_pow_resources,
+)
 from utils.turnstile import solve_turnstile_token
 
 
@@ -42,6 +49,13 @@ class InvalidAccessTokenError(RuntimeError):
 _POW_BOOTSTRAP_TTL_SECS = 12 * 60
 _pow_cache_lock = threading.Lock()
 _pow_bootstrap_cache: tuple[float, list[str], str] | None = None
+
+# 现网前端把 finalized chat-requirements token 缓存约 9 分钟，但实测（2026-09-11，
+# A/B 对照）生图链路复用同一 requirements+proof 会被 conversation 端点 403，
+# 每次生图仍按 fresh prepare+finalize 获取，不做缓存。
+
+# 会话 payload 的客户端时区随出口地理解析（utils/egress_locale），
+# OAI_CLIENT_TIMEZONE / OAI_CLIENT_COUNTRY 环境变量可强制覆盖。
 
 
 def reset_pow_bootstrap_cache() -> None:
@@ -202,6 +216,7 @@ class OpenAIBackendAPI:
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
+        self.locale = self._resolve_locale()
         self.progress_callback: Callable[[str], None] | None = None
         self.session = create_cffi_session(**proxy_settings.build_session_kwargs(
             account=self.account,
@@ -486,6 +501,41 @@ class OpenAIBackendAPI:
         self.close()
         return False
 
+    def _resolve_locale(self):
+        """按本实例的出口（force_proxy 或号池/运行时画像）解析客户端环境画像。"""
+        if self._force_proxy is not None:
+            proxy_url = normalize_proxy_url(self._force_proxy) or None
+        else:
+            try:
+                proxy_url = proxy_settings.get_profile(account=self.account, upstream=True).proxy_url or None
+            except Exception:
+                proxy_url = None
+        try:
+            return resolve_egress_locale(proxy_url)
+        except Exception:
+            from utils.egress_locale import default_locale
+            return default_locale()
+
+    def _pow_profile(self) -> Dict[str, Any]:
+        """PoW config 的账号级稳定画像：屏幕/核数/sid 与账号指纹一致。"""
+        fp = self.fp if isinstance(self.fp, dict) else {}
+        try:
+            screen = (int(fp.get("screen_width") or 0), int(fp.get("screen_height") or 0))
+            if not all(screen):
+                screen = None
+        except (TypeError, ValueError):
+            screen = None
+        try:
+            cores = int(fp.get("hardware_concurrency") or 0) or None
+        except (TypeError, ValueError):
+            cores = None
+        return {
+            "locale": self.locale,
+            "screen": screen,
+            "cores": cores,
+            "sid": str(self.session_id or "") or None,
+        }
+
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
         raw_fp = account.get("fp")
@@ -516,6 +566,11 @@ class OpenAIBackendAPI:
         fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
         fp.setdefault("sec-ch-ua-mobile", "?0")
         fp.setdefault("sec-ch-ua-platform", '"Windows"')
+        if "screen_width" not in fp or "screen_height" not in fp:
+            width, height = random.choice(SCREEN_RESOLUTIONS)
+            fp.setdefault("screen_width", str(width))
+            fp.setdefault("screen_height", str(height))
+        fp.setdefault("hardware_concurrency", str(random.choice(POW_CORES)))
         return fp
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -570,7 +625,7 @@ class OpenAIBackendAPI:
             "gizmo_id": None,
             "requested_default_model": None,
             "conversation_id": None,
-            "timezone_offset_min": -480,
+            "timezone_offset_min": self.locale.offset_min,
         }
         response = self.session.post(
             self.base_url + path,
@@ -591,7 +646,7 @@ class OpenAIBackendAPI:
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
+        response = self.session.get(self.base_url + path + "?timezone_offset_min=-540", headers=self._headers(path),
                                     timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -679,6 +734,7 @@ class OpenAIBackendAPI:
                 self.user_agent,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                **self._pow_profile(),
             )
 
         turnstile_token = ""
@@ -792,6 +848,28 @@ class OpenAIBackendAPI:
             return "extended"
         return ""
 
+    def _client_contextual_info(self, *, app_name: bool = False, time_since_loaded: int = 120) -> Dict[str, Any]:
+        """屏幕尺寸随账号指纹，窗口比屏幕略小一档，贴合真实浏览器。"""
+        fp = self.fp if isinstance(self.fp, dict) else {}
+        try:
+            screen_w = int(fp.get("screen_width") or 2560)
+            screen_h = int(fp.get("screen_height") or 1440)
+        except (TypeError, ValueError):
+            screen_w, screen_h = 2560, 1440
+        ratio = 2 if screen_w >= 2560 else 1
+        info: Dict[str, Any] = {
+            "is_dark_mode": False,
+            "time_since_loaded": time_since_loaded,
+            "page_height": min(1072, screen_h - 68),
+            "page_width": min(1724, screen_w),
+            "pixel_ratio": ratio,
+            "screen_height": screen_h,
+            "screen_width": screen_w,
+        }
+        if app_name:
+            info["app_name"] = "chatgpt.com"
+        return info
+
     def _conversation_payload(
             self,
             messages: list[Dict[str, Any]],
@@ -817,18 +895,10 @@ class OpenAIBackendAPI:
             "supported_encodings": [],
             "system_hints": [],
             "timezone": timezone,
-            "timezone_offset_min": -480,
+            "timezone_offset_min": self.locale.offset_min,
             "variant_purpose": "comparison_implicit",
             "websocket_request_id": new_uuid(),
-            "client_contextual_info": {
-                "is_dark_mode": False,
-                "time_since_loaded": 120,
-                "page_height": 900,
-                "page_width": 1400,
-                "pixel_ratio": 2,
-                "screen_height": 1440,
-                "screen_width": 2560,
-            },
+            "client_contextual_info": self._client_contextual_info(),
         }
         normalized_effort = self._normalize_thinking_effort(thinking_effort)
         if normalized_effort:
@@ -1149,9 +1219,9 @@ class OpenAIBackendAPI:
             "fork_from_shared_post": False,
             "parent_message_id": new_uuid(),
             "model": self._image_model_slug(model),
-            "client_prepare_state": "success",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "client_prepare_state": "none",
+            "timezone_offset_min": self.locale.offset_min,
+            "timezone": self.locale.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": ["picture_v2"],
             "partial_query": {
@@ -1287,24 +1357,15 @@ class OpenAIBackendAPI:
             }],
             "parent_message_id": new_uuid(),
             "model": self._image_model_slug(model),
-            "client_prepare_state": "sent",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "client_prepare_state": "success",
+            "timezone_offset_min": self.locale.offset_min,
+            "timezone": self.locale.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
             "system_hints": ["picture_v2"],
             "supports_buffering": True,
             "supported_encodings": ["v1"],
-            "client_contextual_info": {
-                "is_dark_mode": False,
-                "time_since_loaded": 1200,
-                "page_height": 1072,
-                "page_width": 1724,
-                "pixel_ratio": 1.2,
-                "screen_height": 1440,
-                "screen_width": 2560,
-                "app_name": "chatgpt.com",
-            },
+            "client_contextual_info": self._client_contextual_info(app_name=True, time_since_loaded=1200),
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
@@ -2073,7 +2134,7 @@ class OpenAIBackendAPI:
             self._report_progress("bootstrapping")
             self._bootstrap()
             self._report_progress("getting_token")
-            requirements = self._get_chat_requirements()
+            requirements = self._get_chat_requirements(force=attempt > 0)
             self._report_progress("preparing_conversation")
             conduit_token = self._prepare_image_conversation(prompt, requirements, model)
             self._report_progress("starting_generation")
@@ -2137,10 +2198,19 @@ class OpenAIBackendAPI:
                 return
             raise
 
-    def _get_chat_requirements(self) -> ChatRequirements:
-        """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
+    def _get_chat_requirements(self, *, force: bool = False) -> ChatRequirements:
+        """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。
+
+        `force` 保留给 proof 被拒后的重取路径；缓存已实测不可用（复用会 403）。
+        """
+        return self._fetch_chat_requirements()
+
+    def _fetch_chat_requirements(self) -> ChatRequirements:
+        """prepare + finalize 两步拿到 sentinel token。"""
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
-        p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+        p_token = build_legacy_requirements_token(
+            self.user_agent, self.pow_script_sources, self.pow_data_build, **self._pow_profile()
+        )
 
         prepare_path = base + "/prepare"
         response = self.session.post(
@@ -2174,6 +2244,7 @@ class OpenAIBackendAPI:
                 self.user_agent,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                **self._pow_profile(),
             )
 
         turnstile_token = ""
@@ -2187,8 +2258,8 @@ class OpenAIBackendAPI:
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
                 "prepare_token": prepare_data.get("prepare_token", ""),
-                "proof_token": proof_token,
-                "turnstile_token": turnstile_token,
+                "proofofwork": proof_token,
+                "turnstile": turnstile_token,
             },
             timeout=30,
         )
@@ -2210,8 +2281,8 @@ class OpenAIBackendAPI:
 
     def _chat_target(self) -> tuple[str, str]:
         if self.access_token:
-            return "/backend-api/conversation", "Asia/Shanghai"
-        return "/backend-anon/conversation", "America/Los_Angeles"
+            return "/backend-api/conversation", self.locale.timezone
+        return "/backend-anon/conversation", self.locale.timezone
 
     def list_models(self) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""

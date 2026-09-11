@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.8.5 - 2026-09-11
+
+### chatgpt2api-grok（本分支）
+
++ [发布] 版本 1.8.5：按现网前端 bundle 逆向校正生图链路（PoW FNV-1a、prepare 状态、finalize 键名），客户端环境画像随出口地理动态化，自动补号改目标水位+分批摊开，修复 `skipped_mainline` 泄漏，管理界面手机端适配。
++ [修正] 对照现网前端 bundle（`8b34dbc2` chunk 的 `bZt` 构造器）校正生图链路 `client_prepare_state`：prepare 请求带的是 prepare 前的状态（首轮 `none`），conversation 在 prepare 成功后带 `success` + `x-conduit-token`。此前两处写反（prepare 发 `success`、conversation 发 `sent`）。
++ [逆向] 对照现网前端 bundle（`4813494d` chunk 的 sentinel 实现与 `8b34dbc2` 的 `bZt` 构造器）全面校正生图链路：
+  - PoW 校验哈希由 sha3_512 改为现网实际的 **FNV-1a-32**（`tFt`：2166136261 种子 + 终态混合，8 位 hex），解出的 proof token 补 `~S` 同步求解后缀；config[9] 由 `i>>1` 改为真实求解耗时 ms。均与注册引擎 `_SentinelTokenGenerator` 及现网 `_runCheck` 语义一致。
+  - `chat-requirements/finalize` 请求体键名对齐现网：`proofofwork` / `turnstile`（原 `proof_token` / `turnstile_token`）。
+  - 会话 payload 时区由硬编码 `Asia/Shanghai`(-480) 改为与出口地理一致的 `Asia/Tokyo`(-540)（`OAI_CLIENT_TIMEZONE` / `OAI_CLIENT_TIMEZONE_OFFSET_MIN` 环境变量可覆盖）；PoW config 的日期串同步改为 GMT+0900。此前 payload 写上海、PoW 日期写美东、出口在东京，三处时区互不一致。
+  - 实测确认现网前端虽把 finalized requirements token 缓存约 9 分钟（`$It=1e3*60*9`），但**生图链路复用同一 requirements+proof 会被 conversation 端点 403**（A/B：新号首发全过，复用首发连拒；旧代码逐次 fresh 无此现象），故不做 requirements 缓存，保持逐次 prepare+finalize。
++ [说明] 本轮逆向基于登录态 app shell 的官方 JS bundle 静态分析 + 新注册 free 号实测交叉验证；浏览器抓包因代理网络持续抖动未能完成，相关结论均以 bundle 源码与实测为准。
++ [新增] 自动补号改为「目标水位 + 分批摊开」：新增 `auto_replenish_target_available`（默认 4）与 `auto_replenish_spacing_secs`（默认 600）。可用号低于 target 就小步补（每次 `batch` 个），不再等跌破 min 才抢救——同时死 2 个号时仍保有 min 缓冲；两次成功补号间隔 spacing 秒，各号注册时间错开，死亡时间跟着错开，避免同一时刻集体被吊销导致「全死完没号可用」；跌破 min_available 的紧急情况无视 spacing 立即补。设置页同步加「目标可用账号」「补号间隔」两项。
++ [修复] 注册网络错误分类器补回被 1.8.1 收窄时丢掉的瞬时错误标记（`开始 oauth 流程失败` / `invalid_state` / `oai_did_missing` / `cloudflare` / `csrf token` 等 1c327b4 设计内标记）。代理抖动期这些错误被当成业务硬失败，会拖累自动补号的恢复节奏。顺带校正两处过时测试（count 钳制上限 50→128 为现设计）。
++ [修复] 生图回合上游会下发一个隐藏编排 cell（assistant 消息 `content_type:"code"`，`text` 为 `{"skipped_mainline":true}`），被 code 回退取值路径当成正文透出到 `/v1/chat/completions` 的 delta 内容里。现已在 `assistant_message_text` 过滤该标记，真实上游流回放验证零泄漏（`test_conversation_markers`）。
++ [调整] 客户端环境画像全部改为随出口环境动态解析（新模块 `utils/egress_locale.py`）：会话 payload 时区、PoW config 的日期串（`""+new Date` 格式，含 GMT 偏移与时区显示名）、`navigator.language/languages` 均按出口 IP 地理（ip-api.com，经账号代理探测，按出口缓存 6h）解析；`OAI_CLIENT_TIMEZONE` / `OAI_CLIENT_COUNTRY` 可强制覆盖，探测失败回退东京默认。PoW config 的屏幕分辨率、`hardware_concurrency`、`sid` 改为账号级稳定值（屏幕/核数落在账号 `fp` 并随 `_persist_client_identity` 持久化，sid 用账号的 `oai-session-id`），不再每次求解随机漂移；`client_contextual_info` 的屏幕尺寸同步跟随账号 fp。
++ [优化] 管理界面手机端适配（390px 视口逐页验证）：号池/日志页表格在窄屏切换为卡片列表（信息完整、40px 触控目标、操作按钮齐全），统计卡 2 列网格，分页栏窄屏换行修复，图片管理工具栏断字修复，生图工作台上传/参数/结果操作按钮加大到触控尺寸。桌面端布局不变。
+
 ## 1.8.4 - 2026-09-11
 
 ### chatgpt2api-grok（本分支）

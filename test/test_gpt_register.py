@@ -24,7 +24,7 @@ from services.gpt_register_service import (
 class NormalizeSettingsTest(unittest.TestCase):
     def test_defaults_and_clamps(self):
         s = normalize_settings({"count": 999, "concurrency": 0, "executor": "weird"})
-        self.assertEqual(s["count"], 50)
+        self.assertEqual(s["count"], 128)
         self.assertEqual(s["concurrency"], 1)
         self.assertEqual(s["executor"], "protocol")
         self.assertTrue(s["push_enabled"])
@@ -525,12 +525,66 @@ class ReplenishPoolTest(unittest.TestCase):
 
     def test_skips_when_stocked(self):
         with mock.patch("services.account_service.account_service") as acc:
-            acc.count_image_available_accounts.return_value = 2
+            acc.count_image_available_accounts.return_value = 4
             with mock.patch.object(self.svc, "start_job") as start:
                 out = self.svc.maybe_replenish_pool()
         self.assertEqual(out["action"], "skip")
         self.assertEqual(out["reason"], "stocked")
         start.assert_not_called()
+
+    def test_starts_when_below_target(self):
+        # available=3 >= min=2 但低于 target=4：主动补，不等跌破底线
+        self.svc.config_store.update({"auto_replenish_target_available": 4})
+        with mock.patch("services.account_service.account_service") as acc:
+            acc.count_image_available_accounts.return_value = 3
+            with mock.patch.object(self.svc, "_last_finished_auto_job", return_value=None):
+                with mock.patch.object(
+                    self.svc, "start_job", return_value={"job_id": "auto2"}
+                ) as start:
+                    out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["action"], "started")
+        self.assertEqual(out["reason"], "below_target")
+        self.assertEqual(out["count"], 1)
+
+    def test_spacing_blocks_non_urgent_topup(self):
+        from datetime import datetime, timezone
+
+        self.svc.config_store.update({"auto_replenish_target_available": 4})
+        self.svc._jobs["ok1"] = {
+            "job_id": "ok1",
+            "trigger": "auto_replenish",
+            "status": "done",
+            "added": 1,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with mock.patch("services.account_service.account_service") as acc:
+            acc.count_image_available_accounts.return_value = 3  # >= min，不紧急
+            with mock.patch.object(self.svc, "start_job") as start:
+                out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["reason"], "spacing")
+        start.assert_not_called()
+
+    def test_spacing_bypassed_when_below_min(self):
+        from datetime import datetime, timezone
+
+        self.svc.config_store.update({"auto_replenish_target_available": 4})
+        self.svc._jobs["ok1"] = {
+            "job_id": "ok1",
+            "trigger": "auto_replenish",
+            "status": "done",
+            "added": 1,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with mock.patch("services.account_service.account_service") as acc:
+            acc.count_image_available_accounts.return_value = 1  # < min=2，紧急
+            with mock.patch.object(
+                self.svc, "start_job", return_value={"job_id": "auto3"}
+            ) as start:
+                out = self.svc.maybe_replenish_pool()
+        self.assertEqual(out["action"], "started")
+        self.assertEqual(out["reason"], "below_min")
+        start.assert_called_once()
 
     def test_skips_when_job_running(self):
         with mock.patch.object(self.svc, "has_active_job", return_value=True):

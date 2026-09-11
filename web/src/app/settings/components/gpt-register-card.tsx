@@ -55,8 +55,10 @@ const DEFAULT_FORM: GptRegisterSettings = {
   so_collect_ms: "",
   auto_replenish_enabled: true,
   auto_replenish_min_available: 1,
+  auto_replenish_target_available: 4,
   auto_replenish_batch: 1,
   auto_replenish_interval_secs: 90,
+  auto_replenish_spacing_secs: 600,
 };
 
 function isActiveJob(job?: GptRegisterJob | null) {
@@ -157,8 +159,10 @@ export function GptRegisterCard() {
         interval_secs: Number(form.interval_secs) || 0,
         timeout_secs: Number(form.timeout_secs) || 600,
         auto_replenish_min_available: Number(form.auto_replenish_min_available) || 1,
+        auto_replenish_target_available: Number(form.auto_replenish_target_available) || 4,
         auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
         auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
+        auto_replenish_spacing_secs: Number(form.auto_replenish_spacing_secs) || 600,
         executor: "protocol",
         mail_provider: "cloudflare_d1_api",
         captcha: "",
@@ -191,8 +195,10 @@ export function GptRegisterCard() {
         interval_secs: Number(form.interval_secs) || 0,
         timeout_secs: Number(form.timeout_secs) || 600,
         auto_replenish_min_available: Number(form.auto_replenish_min_available) || 1,
+        auto_replenish_target_available: Number(form.auto_replenish_target_available) || 4,
         auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
         auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
+        auto_replenish_spacing_secs: Number(form.auto_replenish_spacing_secs) || 600,
         executor: "protocol",
         mail_provider: "cloudflare_d1_api",
         captcha: "",
@@ -438,7 +444,7 @@ export function GptRegisterCard() {
                 自动保持号池有可用账号
               </label>
               <p className="text-xs text-stone-500">
-                可生图账号低于最少数量时，用上面的注册配置自动开任务。已有任务会等待；连续补号失败会冷却 10 分钟。
+                可生图账号低于目标数量时分批小步补号（每次补几个、间隔拉开），跌破最少数量时紧急补。注册时间摊开后死亡时间也错开，避免集中暴毙。连续失败冷却 10 分钟。
               </p>
               <div className="grid gap-3 md:grid-cols-3">
                 <Field label="最少可用账号">
@@ -448,6 +454,17 @@ export function GptRegisterCard() {
                     max={20}
                     value={form.auto_replenish_min_available ?? 1}
                     onChange={(e) => setField("auto_replenish_min_available", Number(e.target.value) || 1)}
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                    disabled={running || form.auto_replenish_enabled === false}
+                  />
+                </Field>
+                <Field label="目标可用账号" hint="低于它就小步补号">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={form.auto_replenish_target_available ?? 4}
+                    onChange={(e) => setField("auto_replenish_target_available", Number(e.target.value) || 4)}
                     className="h-10 rounded-xl border-stone-200 bg-white"
                     disabled={running || form.auto_replenish_enabled === false}
                   />
@@ -471,6 +488,19 @@ export function GptRegisterCard() {
                     value={form.auto_replenish_interval_secs ?? 90}
                     onChange={(e) =>
                       setField("auto_replenish_interval_secs", Number(e.target.value) || 90)
+                    }
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                    disabled={running || form.auto_replenish_enabled === false}
+                  />
+                </Field>
+                <Field label="补号间隔(秒)" hint="两次成功补号的最小间隔">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={7200}
+                    value={form.auto_replenish_spacing_secs ?? 600}
+                    onChange={(e) =>
+                      setField("auto_replenish_spacing_secs", Number(e.target.value) || 600)
                     }
                     className="h-10 rounded-xl border-stone-200 bg-white"
                     disabled={running || form.auto_replenish_enabled === false}

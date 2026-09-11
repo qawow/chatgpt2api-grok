@@ -1,19 +1,22 @@
-import hashlib
 import json
 import random
 import re
 import time
-from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import pybase64
 
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
+from utils.egress_locale import default_locale
 from utils.helper import new_uuid
+
+if TYPE_CHECKING:
+    from utils.egress_locale import EgressLocale
 
 
 CORES = [8, 16, 24, 32]
+POW_CORES = CORES
 DOCUMENT_KEYS = ["__reactContainer$fzelfjyxej8", "_reactListening5dehydibo78", "location"]
 SCREEN_RESOLUTIONS = [[1920, 1080], [1440, 900], [2560, 1440], [3840, 2160]]
 
@@ -49,16 +52,37 @@ def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
     return script_sources, data_build
 
 
-def _legacy_parse_time() -> str:
-    now = datetime.now(timezone(timedelta(hours=-5)))
-    return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
+def _fnv1a32(text: str) -> str:
+    """现网 sentinel sdk 的 PoW 校验哈希（tFt）：FNV-1a 32 + 终态混合，输出 8 位 hex。"""
+    h = 2166136261
+    for ch in text:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    h ^= (h >> 16)
+    h = (h * 2246822507) & 0xFFFFFFFF
+    h ^= (h >> 13)
+    h = (h * 3266489909) & 0xFFFFFFFF
+    h ^= (h >> 16)
+    return f"{h & 0xFFFFFFFF:08x}"
+
+
+def _legacy_parse_time(locale: "EgressLocale | None" = None) -> str:
+    """浏览器 `""+new Date` 格式，时区/显示名随出口环境。"""
+    loc = locale or default_locale()
+    return loc.format_browser_date()
 
 
 def build_pow_config(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    *,
+    locale: "EgressLocale | None" = None,
+    screen: tuple[int, int] | None = None,
+    cores: int | None = None,
+    sid: str | None = None,
 ) -> list[Any]:
+    loc = locale or default_locale()
     navigator_key = random.choice([
         "registerProtocolHandler−function registerProtocolHandler() { [native code] }",
         "storage−[object StorageManager]",
@@ -141,24 +165,25 @@ def build_pow_config(
         "__NEXT_PRELOADREADY",
     ])
     script_source = random.choice(list(script_sources)) if script_sources else DEFAULT_POW_SCRIPT
+    width, height = screen if screen else random.choice(SCREEN_RESOLUTIONS)
     return [
-        sum(random.choices(SCREEN_RESOLUTIONS, k=1)[0]),
-        _legacy_parse_time(),
+        width + height,
+        _legacy_parse_time(loc),
         4294705152,
         1,
         user_agent,
         script_source,
         data_build,
-        "en-US",
-        "en-US,es-US,en,es",
+        loc.language,
+        loc.languages,
         random.random(),
         navigator_key,
         random.choice(DOCUMENT_KEYS),
         window_key,
         time.perf_counter() * 1000,
-        new_uuid(),
+        sid or new_uuid(),
         "",
-        random.choice(CORES),
+        cores or random.choice(CORES),
         time.time() * 1000 - (time.perf_counter() * 1000),
         0, 0, 0, 0, 0, 0,
         0,  # 0 = edge/chrome, 1 = firefox
@@ -166,19 +191,24 @@ def build_pow_config(
 
 
 def _pow_generate(seed: str, difficulty: str, config: list[Any], limit: int = 500000) -> tuple[str, bool]:
-    target = bytes.fromhex(difficulty)
-    diff_len = len(difficulty) // 2
-    seed_bytes = seed.encode()
+    """按现网 sdk 语义求解：config[3]=nonce、config[9]=求解耗时 ms，
+    FNV-1a(seed + b64(config)) 的 hex 前缀按字符串比较不超过 difficulty。
+    成功 token 带 `~S` 后缀（同步求解标记）。
+    """
+    target = str(difficulty or "0")
+    diff_len = len(target)
+    start = time.perf_counter()
     static_1 = (json.dumps(config[:3], separators=(",", ":"), ensure_ascii=False)[:-1] + ",").encode()
     static_2 = ("," + json.dumps(config[4:9], separators=(",", ":"), ensure_ascii=False)[1:-1] + ",").encode()
     static_3 = ("," + json.dumps(config[10:], separators=(",", ":"), ensure_ascii=False)[1:]).encode()
     for i in range(limit):
-        final_json = static_1 + str(i).encode() + static_2 + str(i >> 1).encode() + static_3
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        final_json = static_1 + str(i).encode() + static_2 + str(elapsed_ms).encode() + static_3
         encoded = pybase64.b64encode(final_json)
-        digest = hashlib.sha3_512(seed_bytes + encoded).digest()
+        digest = _fnv1a32(seed + encoded.decode())
         if digest[:diff_len] <= target:
-            return encoded.decode(), True
-    fallback = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + pybase64.b64encode(f'"{seed}"'.encode()).decode()
+            return encoded.decode() + "~S", True
+    fallback = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + pybase64.b64encode(json.dumps("e").encode()).decode()
     return fallback, False
 
 
@@ -186,8 +216,9 @@ def build_legacy_requirements_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    **profile: Any,
 ) -> str:
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, **profile)
     return "gAAAAAC" + pybase64.b64encode(
         json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
     ).decode()
@@ -199,8 +230,9 @@ def build_proof_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    **profile: Any,
 ) -> str:
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, **profile)
     answer, solved = _pow_generate(seed, difficulty, config)
     if not solved:
         raise RuntimeError(f"failed to solve proof token: difficulty={difficulty}")

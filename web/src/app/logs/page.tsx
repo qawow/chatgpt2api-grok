@@ -175,20 +175,20 @@ function LogsContent() {
               {selectedIds.length > 0 ? <span>已选 {selectedIds.length} 条</span> : null}
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadLogs()} disabled={isLoading}>
+              <Button variant="ghost" className="h-10 rounded-lg px-3 text-stone-500 sm:h-8" onClick={() => void loadLogs()} disabled={isLoading}>
                 <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
                 刷新
               </Button>
-              <button type="button" className="text-sm text-stone-500 hover:text-stone-900 disabled:text-stone-300" onClick={() => setSelectedIds([])} disabled={selectedIds.length === 0 || isDeleting}>
+              <button type="button" className="shrink-0 whitespace-nowrap rounded-lg px-2 py-2 text-sm text-stone-500 hover:text-stone-900 disabled:text-stone-300" onClick={() => setSelectedIds([])} disabled={selectedIds.length === 0 || isDeleting}>
                 取消选择
               </button>
-              <Button variant="outline" className="h-8 rounded-lg border-rose-200 bg-white px-3 text-rose-600 hover:bg-rose-50" onClick={() => setDeletingItems(items.filter((item) => selectedSet.has(item.id)))} disabled={selectedIds.length === 0 || isDeleting}>
+              <Button variant="outline" className="h-10 rounded-lg border-rose-200 bg-white px-3 text-rose-600 hover:bg-rose-50 sm:h-8" onClick={() => setDeletingItems(items.filter((item) => selectedSet.has(item.id)))} disabled={selectedIds.length === 0 || isDeleting}>
                 <Trash2 className="size-4" />
                 删除所选
               </Button>
             </div>
           </div>
-          <div className="overflow-x-auto">
+          <div className="hidden overflow-x-auto md:block">
             <Table className="min-w-[900px]">
               <TableHeader>
                 <TableRow>
@@ -263,6 +263,63 @@ function LogsContent() {
                 })}
               </TableBody>
             </Table>
+          </div>
+          {/* 手机端卡片列表 */}
+          <div className="md:hidden">
+            {currentRows.map((item) => {
+              const urls = getUrls(item);
+              return (
+                <div key={item.id} className="space-y-2 border-b border-stone-100/80 px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      className="size-5"
+                      checked={selectedSet.has(item.id)}
+                      onCheckedChange={(checked) => toggleIds([item.id], Boolean(checked))}
+                    />
+                    <span className="whitespace-nowrap text-xs text-stone-400">{item.time}</span>
+                    <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                      <Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge>
+                      {isCallLog ? (
+                        <Badge variant={item.detail?.status === "failed" ? "danger" : "success"} className="rounded-md">
+                          {getStatus(item)}
+                        </Badge>
+                      ) : null}
+                    </span>
+                  </div>
+                  {isCallLog ? (
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-stone-500">
+                      <span>令牌 {getDetailText(item, "key_name")}</span>
+                      <span>耗时 {formatDuration(item)}</span>
+                    </div>
+                  ) : null}
+                  <div className="break-all text-sm leading-6 text-stone-600">{item.summary || "-"}</div>
+                  {isCallLog && urls.length ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {urls.slice(0, 4).map((url, imageIndex) => (
+                        <button
+                          key={`${url}-${imageIndex}`}
+                          type="button"
+                          className="relative size-11 overflow-hidden rounded-lg border border-stone-200 bg-stone-100"
+                          onClick={() => openLogImage(item, imageIndex)}
+                          title="预览图片"
+                        >
+                          <ImageThumbnail src={url} thumbnailSrc={getImageThumbnailUrl(url)} className="h-full w-full" />
+                        </button>
+                      ))}
+                      {urls.length > 4 ? <span className="text-xs text-stone-400">+{urls.length - 4}</span> : null}
+                    </div>
+                  ) : null}
+                  <div className="flex items-center gap-2 pt-1">
+                    <Button variant="outline" className="h-10 flex-1 rounded-lg border-stone-200 bg-white text-stone-600" onClick={() => openDetail(item)}>
+                      查看详情
+                    </Button>
+                    <Button variant="outline" className="h-10 flex-1 rounded-lg border-rose-200 bg-white text-rose-600 hover:bg-rose-50" onClick={() => setDeletingItems([item])}>
+                      删除
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
           <div className="flex items-center justify-end gap-2 border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
             <span>第 {safePage} / {pageCount} 页，共 {items.length} 条</span>

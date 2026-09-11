@@ -286,7 +286,7 @@ export function ImageResults({
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
+                                  className="h-9 w-9 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
                                   onClick={() => onContinueEdit(selectedConversation.id, image)}
                                   disabled={!canEditImages}
                                   title={!canEditImages ? "当前模型不支持图生图" : undefined}
@@ -298,7 +298,7 @@ export function ImageResults({
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
+                                  className="h-9 w-9 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
                                   onClick={() => void downloadStoredImage(image, index)}
                                   aria-label="下载"
                                 >

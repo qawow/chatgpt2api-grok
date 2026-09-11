@@ -100,8 +100,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 免费号被上游吊销得快（实测约 2 小时），阈值 1 时经常「补一个死一个」，
     # 请求侧就撞 upstream session expired。留 2 个可用号做缓冲。
     "auto_replenish_min_available": 2,
+    # 主动维持的目标水位：可用号低于 target 就小步补，而不是等跌破 min 再抢救。
+    # target > min_available 时，即使同时死 2 个号也还有 min 可用，避免「全死完」窗口。
+    "auto_replenish_target_available": 4,
     "auto_replenish_batch": 1,
     "auto_replenish_interval_secs": 90,
+    # 两次「成功」自动补号的最小间隔：把注册时间摊开，死亡时间跟着摊开，
+    # 号池各号年龄错开，不会同一时刻集体被吊销。跌破 min 的紧急情况不受此限。
+    "auto_replenish_spacing_secs": 600,
     "auto_replenish_fail_cooldown_secs": 600,
 }
 
@@ -154,6 +160,15 @@ def _is_network_register_error(error: object) -> bool:
         "socks",
         "proxy error",
         "proxyerror",
+        "开始 oauth 流程失败",
+        "初始化会话失败",
+        "检查 ip",
+        "oai_did_missing",
+        "invalid_state",
+        "403 forbidden",
+        "cloudflare",
+        "just a moment",
+        "csrf token",
     )
     return any(marker in text for marker in markers)
 
@@ -459,9 +474,17 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["auto_replenish_min_available"] = _clamp_int(
         out.get("auto_replenish_min_available"), 1, 1, 20
     )
+    out["auto_replenish_target_available"] = _clamp_int(
+        out.get("auto_replenish_target_available"), 4, 1, 20
+    )
+    if out["auto_replenish_target_available"] < out["auto_replenish_min_available"]:
+        out["auto_replenish_target_available"] = out["auto_replenish_min_available"]
     out["auto_replenish_batch"] = _clamp_int(out.get("auto_replenish_batch"), 1, 1, 5)
     out["auto_replenish_interval_secs"] = _clamp_int(
         out.get("auto_replenish_interval_secs"), 90, 30, 3600
+    )
+    out["auto_replenish_spacing_secs"] = _clamp_int(
+        out.get("auto_replenish_spacing_secs"), 600, 0, 7200
     )
     out["auto_replenish_fail_cooldown_secs"] = _clamp_int(
         out.get("auto_replenish_fail_cooldown_secs"), 600, 60, 7200
@@ -611,7 +634,11 @@ class GptRegisterService:
         return max(finished, key=lambda job: str(job.get("finished_at") or job.get("updated_at") or ""))
 
     def maybe_replenish_pool(self) -> dict[str, Any]:
-        """Start a register job when the image pool is below the configured floor."""
+        """Keep the image pool topped up with age-staggered batches.
+
+        低于 target 小步补（一次 batch 个），低于 min 紧急补（无视 spacing）；
+        成功补号间隔 spacing 秒，把各号注册/死亡时间摊开，避免集中暴毙。
+        """
         settings = normalize_settings(self.config_store.get())
         interval = int(settings["auto_replenish_interval_secs"])
         result: dict[str, Any] = {
@@ -619,6 +646,7 @@ class GptRegisterService:
             "reason": "",
             "available": 0,
             "min_available": int(settings["auto_replenish_min_available"]),
+            "target_available": int(settings["auto_replenish_target_available"]),
             "wait_secs": interval,
         }
         if not settings.get("auto_replenish_enabled"):
@@ -638,24 +666,34 @@ class GptRegisterService:
 
         available = int(account_service.count_image_available_accounts())
         min_available = int(settings["auto_replenish_min_available"])
+        target = max(int(settings["auto_replenish_target_available"]), min_available)
         result["available"] = available
         result["min_available"] = min_available
-        if available >= min_available:
+        result["target_available"] = target
+        if available >= target:
             result["reason"] = "stocked"
             return result
 
         last = self._last_finished_auto_job()
         cooldown = int(settings["auto_replenish_fail_cooldown_secs"])
-        if last is not None and int(last.get("added") or 0) <= 0:
+        spacing = int(settings["auto_replenish_spacing_secs"])
+        if last is not None:
             finished_at = _parse_iso(last.get("finished_at"))
             if finished_at is not None:
                 elapsed = (datetime.now(timezone.utc) - finished_at).total_seconds()
-                if elapsed < cooldown:
-                    result["reason"] = "fail_cooldown"
-                    result["wait_secs"] = max(30, int(cooldown - elapsed))
+                added = int(last.get("added") or 0)
+                if added <= 0:
+                    if elapsed < cooldown:
+                        result["reason"] = "fail_cooldown"
+                        result["wait_secs"] = max(30, int(cooldown - elapsed))
+                        return result
+                elif available >= min_available and elapsed < spacing:
+                    # 非紧急（还没到硬底线）：摊开来补，拉开各号注册/死亡时间。
+                    result["reason"] = "spacing"
+                    result["wait_secs"] = max(30, int(spacing - elapsed))
                     return result
 
-        need = min(max(1, min_available - available), int(settings["auto_replenish_batch"]))
+        need = min(max(1, target - available), int(settings["auto_replenish_batch"]))
         try:
             job = self.start_job({"count": need}, trigger="auto_replenish")
         except RuntimeError as exc:
@@ -663,7 +701,7 @@ class GptRegisterService:
             return result
 
         result["action"] = "started"
-        result["reason"] = "below_min"
+        result["reason"] = "below_min" if available < min_available else "below_target"
         result["count"] = need
         result["job_id"] = job.get("job_id")
         try:
@@ -675,6 +713,7 @@ class GptRegisterService:
                 {
                     "available": available,
                     "min_available": min_available,
+                    "target_available": target,
                     "count": need,
                     "job_id": job.get("job_id"),
                 },
@@ -683,7 +722,7 @@ class GptRegisterService:
             pass
         print(
             f"[account-replenish] start count={need} available={available} "
-            f"min={min_available} job={str(job.get('job_id') or '')[:8]}"
+            f"min={min_available} target={target} job={str(job.get('job_id') or '')[:8]}"
         )
         return result
 
