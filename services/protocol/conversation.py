@@ -1597,27 +1597,32 @@ def _generate_single_image(
             account_service.mark_image_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
-            # 轮询超时：换账号重试
-            if not emitted_for_token:
-                poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
-                    logger.warning({
-                        "event": "image_poll_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": poll_timeout_retry_count,
-                        "index": index,
-                        "error": str(exc)[:200],
-                    })
-                    continue
+            # 结果已到手：收尾阶段的流错误不能把已生成的图片判死。
+            if returned_result and outputs:
+                return outputs
+            # 轮询超时：把超时号排除出候选，下一次选号必然换号续传，
+            # 而不是反复扎进同一个可能已挂死的账号。
+            state["failed_connection_tokens"].add(token)
+            state["last_connection_error"] = str(exc)
+            state["sticky_token"] = ""
+            poll_timeout_retry_count += 1
+            if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                 logger.warning({
-                    "event": "image_poll_timeout_exhausted_retries",
+                    "event": "image_poll_timeout_retry",
                     "request_token": token,
                     "account_email": account_email,
                     "retry_count": poll_timeout_retry_count,
                     "index": index,
+                    "error": str(exc)[:200],
                 })
-                raise
+                continue
+            logger.warning({
+                "event": "image_poll_timeout_exhausted_retries",
+                "request_token": token,
+                "account_email": account_email,
+                "retry_count": poll_timeout_retry_count,
+                "index": index,
+            })
             raise
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)
@@ -1640,6 +1645,9 @@ def _generate_single_image(
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
+            # 结果已到手：收尾阶段的错误不能把已生成的图片判死，直接返回。
+            if returned_result and outputs:
+                return outputs
             # 如果是模型返回文本而非图片，尝试换账号重试
             if (
                 not emitted_for_token
@@ -1709,6 +1717,9 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            # 结果已到手：收尾阶段的流错误不能把已生成的图片判死，直接返回。
+            if returned_result and outputs:
+                return outputs
             if not emitted_for_token and is_upstream_connection_error(last_error):
                 if recover_connection(token, last_error):
                     continue

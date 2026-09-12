@@ -33,6 +33,7 @@ class GptRegisterSettingsUpdate(BaseModel):
     plan_type: str | None = None
     source_type: str | None = None
     cfd1_domain: str | None = None
+    cfd1_domains: str | None = None
     push_enabled: bool | None = None
     push_mode: str | None = None
     chatgpt2api_base_url: str | None = None
@@ -47,8 +48,10 @@ class GptRegisterSettingsUpdate(BaseModel):
     so_collect_ms: str | None = None
     auto_replenish_enabled: bool | None = None
     auto_replenish_min_available: int | None = Field(default=None, ge=1, le=20)
+    auto_replenish_target_available: int | None = Field(default=None, ge=1, le=20)
     auto_replenish_batch: int | None = Field(default=None, ge=1, le=5)
     auto_replenish_interval_secs: int | None = Field(default=None, ge=30, le=3600)
+    auto_replenish_spacing_secs: int | None = Field(default=None, ge=0, le=7200)
     auto_replenish_fail_cooldown_secs: int | None = Field(default=None, ge=60, le=7200)
 
 

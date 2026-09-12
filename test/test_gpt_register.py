@@ -93,6 +93,21 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertFalse(patch["auto_replenish_enabled"])
         self.assertEqual(patch["auto_replenish_min_available"], 3)
 
+    def test_api_model_accepts_target_spacing_and_domains(self):
+        """Regression: target_available/spacing_secs were missing from the Pydantic
+        model → settings page saves were silently dropped."""
+        from api.gpt_register import GptRegisterSettingsUpdate
+
+        body = GptRegisterSettingsUpdate(
+            auto_replenish_target_available=5,
+            auto_replenish_spacing_secs=300,
+            cfd1_domains="a.example.com\nb.example.com",
+        )
+        patch = body.model_dump(exclude_none=True)
+        self.assertEqual(patch["auto_replenish_target_available"], 5)
+        self.assertEqual(patch["auto_replenish_spacing_secs"], 300)
+        self.assertIn("b.example.com", patch["cfd1_domains"])
+
 
 class ConfigStoreTest(unittest.TestCase):
     def setUp(self):
@@ -495,6 +510,88 @@ class ProxyPoolTest(unittest.TestCase):
         pool = parse_proxy_pool("socks5h://a:1\nsocks5h://b:2")
         self.assertEqual(len(pool), 2)
         self.assertEqual(min(5, len(pool)), 2)
+
+
+class DomainPoolTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name)
+        self.cfg_path = self.data / "gpt_reg.json"
+        self.jobs_path = self.data / "jobs.json"
+
+    def test_parse_domain_pool(self):
+        from services.gpt_register_service import parse_domain_pool
+
+        pool = parse_domain_pool(
+            "@Mail1.Example.com\n# skip\nmail2.example.com, mail1.example.com\ninvalid_no_dot"
+        )
+        self.assertEqual(pool, ["mail1.example.com", "mail2.example.com"])
+        self.assertEqual(parse_domain_pool(""), [])
+        self.assertEqual(parse_domain_pool(None), [])
+
+    def test_normalize_keeps_cfd1_domains(self):
+        settings = normalize_settings({"cfd1_domains": "a.example.com,b.example.com"})
+        self.assertEqual(settings["cfd1_domains"], "a.example.com,b.example.com")
+        self.assertEqual(normalize_settings(None)["cfd1_domains"], "")
+
+    def test_job_picks_random_domain_per_registration(self):
+        import services.gpt_register_service as mod
+
+        with mock.patch.object(mod, "DATA_DIR", self.data):
+            with mock.patch.object(mod, "GPT_REGISTER_JOBS_FILE", self.jobs_path):
+                svc = GptRegisterService(config_store=GptRegisterConfig(path=self.cfg_path))
+                settings = normalize_settings(
+                    {
+                        "count": 3,
+                        "concurrency": 1,
+                        "interval_secs": 0,
+                        "run_mode": "inprocess",
+                        "push_enabled": False,
+                        "cfd1_domains": "a.example.com\nb.example.com",
+                    }
+                )
+                seen_domains: list[str] = []
+
+                def fake_register(per_settings):
+                    seen_domains.append(per_settings.get("cfd1_domain"))
+                    return {
+                        "ok": True,
+                        "email": "ok@example.com",
+                        "has_token": True,
+                        "added": 0,
+                        "push": {"ok": True},
+                        "error": None,
+                        "logs": [],
+                        "mode": "inprocess",
+                    }
+
+                with mock.patch.object(svc, "_register_once", side_effect=fake_register):
+                    job = svc.start_job(settings)
+                    import time
+
+                    for _ in range(100):
+                        cur = svc.get_job(job["job_id"])
+                        if cur and cur.get("status") in {"done", "failed", "cancelled"}:
+                            break
+                        time.sleep(0.05)
+                    cur = svc.get_job(job["job_id"])
+                self.assertIsNotNone(cur)
+                assert cur is not None
+                self.assertEqual(cur["status"], "done")
+                self.assertEqual(len(seen_domains), 3)
+                for domain in seen_domains:
+                    self.assertIn(domain, {"a.example.com", "b.example.com"})
+                self.assertTrue(
+                    any("域名池" in (x.get("message") or "") for x in cur.get("logs") or [])
+                )
+                # per-item log carries the picked domain
+                self.assertTrue(
+                    any(
+                        "mail_domain=" in (x.get("message") or "")
+                        for x in cur.get("logs") or []
+                    )
+                )
 
 
 class ReplenishPoolTest(unittest.TestCase):

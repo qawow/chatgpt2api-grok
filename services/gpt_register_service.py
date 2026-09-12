@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import subprocess
 import threading
@@ -81,6 +82,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "plan_type": "free",
     "source_type": "",
     "cfd1_domain": "",  # optional override CFD1_DOMAIN for this job
+    # 域名池：多条按行/逗号分隔，每次注册随机取一个作为 cfd1_domain。
+    # 对抗上游按邮箱域名的批量封禁波（实测整池同域名号在同一分钟内集体被吊销）。
+    # 所有域名必须已配置 Cloudflare Email Routing catch-all 到同一个 Worker/D1。
+    "cfd1_domains": "",
     "push_enabled": True,
     "push_mode": "local",  # local | http
     # empty → auto (local in-process import; http mode uses container-aware default)
@@ -189,6 +194,25 @@ def parse_proxy_pool(text: object) -> list[str]:
         if item not in seen:
             seen.add(item)
             out.append(item)
+    return out
+
+
+def parse_domain_pool(text: object) -> list[str]:
+    """Split a domain field into a pool for per-registration random pick.
+
+    Same separators as parse_proxy_pool. Domains are lowercased, leading
+    ``@`` stripped. All domains must route (Cloudflare Email Routing
+    catch-all) into the same Worker/D1 mailbox the job reads from.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in parse_proxy_pool(text):
+        domain = item.lstrip("@").strip().lower()
+        if not domain or "." not in domain:
+            continue
+        if domain not in seen:
+            seen.add(domain)
+            out.append(domain)
     return out
 
 
@@ -447,6 +471,7 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["plan_type"] = _clean(out.get("plan_type")) or "free"
     out["source_type"] = _clean(out.get("source_type"))
     out["cfd1_domain"] = _clean(out.get("cfd1_domain"))
+    out["cfd1_domains"] = _clean(out.get("cfd1_domains"))
     out["push_enabled"] = bool(out.get("push_enabled", True))
     push_mode = _clean(out.get("push_mode")).lower() or "local"
     if push_mode not in {"local", "http"}:
@@ -849,6 +874,9 @@ class GptRegisterService:
         concurrency = int(settings["concurrency"])
         interval = float(settings["interval_secs"])
         proxy_pool = parse_proxy_pool(settings.get("proxy"))
+        domain_pool = parse_domain_pool(settings.get("cfd1_domains"))
+        if domain_pool:
+            self._append_log(job_id, f"邮箱域名池启用：{len(domain_pool)} 个域名随机轮换")
         if proxy_pool and concurrency > len(proxy_pool):
             self._append_log(
                 job_id,
@@ -903,19 +931,28 @@ class GptRegisterService:
             per_settings = dict(settings)
             if proxy_pool:
                 per_settings["proxy"] = pick_proxy(proxy_pool, index)
+            if domain_pool:
+                # random, not index round-robin: auto-replenish jobs are count=1
+                # (always index 1), which would pin every registration to pool[0].
+                per_settings["cfd1_domain"] = random.choice(domain_pool)
             if concurrency > 1:
                 # gpt-auto-register: stagger workers so N accounts don't hit
                 # the same egress in the same second.
                 time.sleep(0.8 * ((max(index, 1) - 1) % concurrency))
             try:
                 result = self._register_once(per_settings)
+                prefix_logs: list[str] = []
                 if proxy_pool:
+                    prefix_logs.append(
+                        f"proxy={_mask_proxy_url(per_settings.get('proxy'))} "
+                        f"pool={len(proxy_pool)}"
+                    )
+                if domain_pool:
+                    prefix_logs.append(f"mail_domain={per_settings.get('cfd1_domain')}")
+                if prefix_logs:
                     result.setdefault("logs", [])
                     if isinstance(result.get("logs"), list):
-                        result["logs"] = [
-                            f"proxy={_mask_proxy_url(per_settings.get('proxy'))} "
-                            f"pool={len(proxy_pool)}"
-                        ] + list(result["logs"])
+                        result["logs"] = prefix_logs + list(result["logs"])
                 return {"index": index, **result}
             except Exception as exc:
                 return {

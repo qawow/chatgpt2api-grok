@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
@@ -612,6 +612,7 @@ class AccountCapabilityTests(unittest.TestCase):
     def test_free_session_only_normal_skipped_by_watcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            fresh_probe = datetime.now(timezone.utc).isoformat()
             service.add_account_items(
                 [
                     {
@@ -619,6 +620,9 @@ class AccountCapabilityTests(unittest.TestCase):
                         "status": "正常",
                         "type": "free",
                         "session_token": "sess",
+                        # freshly probed → watcher skips (5-min cadence would
+                        # look bot-like and historically revoked sessions)
+                        "last_probed_at": fresh_probe,
                         # no refresh_token → session_only
                     },
                     {
@@ -648,6 +652,40 @@ class AccountCapabilityTests(unittest.TestCase):
                 result = service.refresh_accounts(["free-session"])
                 get_user_info.assert_not_called()
             self.assertEqual(result.get("skipped"), 1)
+
+    def test_session_only_stale_probe_rejoins_watcher(self) -> None:
+        """Ban-wave deaths must be discovered: a session_only account whose last
+        successful probe is older than the stale threshold is probed again even
+        with a long-lived JWT (fresh ones stay skipped)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            stale_probe = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=AccountService._SESSION_ONLY_PROBE_STALE_SECONDS + 60)
+            ).isoformat()
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "stale-session",
+                        "status": "正常",
+                        "type": "free",
+                        "session_token": "sess",
+                        "last_probed_at": stale_probe,
+                    },
+                    {
+                        "access_token": "never-probed",
+                        "status": "正常",
+                        "type": "free",
+                        "session_token": "sess",
+                    },
+                ]
+            )
+            self.assertFalse(
+                AccountService._should_skip_periodic_refresh(service.get_account("stale-session"))
+            )
+            self.assertFalse(
+                AccountService._should_skip_periodic_refresh(service.get_account("never-probed"))
+            )
 
     def test_session_only_near_expiry_stays_on_watcher(self) -> None:
         import base64
@@ -879,6 +917,8 @@ class AccountCapabilityTests(unittest.TestCase):
                         "type": "free",
                         "session_token": "sess",
                         "quota": 0,
+                        # fresh probe → watcher still skips healthy session_only
+                        "last_probed_at": datetime.now(timezone.utc).isoformat(),
                     },
                     {
                         "access_token": "dead-free",
@@ -1016,6 +1056,32 @@ class AccountCapabilityTests(unittest.TestCase):
             msg = str(ctx.exception)
             self.assertIn("no available image quota", msg)
             self.assertIn("revoked", msg)
+
+    def test_codex_quota_message_points_at_web_model(self) -> None:
+        """codex-gpt-image-2 with a register-only pool must not suggest
+        re-registering free accounts (they can never fill the codex scope)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "alive-web",
+                        "status": "正常",
+                        "type": "free",
+                        "quota": 25,
+                        "session_token": "sess",
+                        "source_type": "register",
+                    }
+                ]
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                service.get_available_access_token(
+                    source_type="codex", plan_types=("plus", "team", "pro")
+                )
+            msg = str(ctx.exception)
+            self.assertIn("no available codex image quota", msg)
+            self.assertIn("gpt-image-2.5", msg)
+            self.assertNotIn("re-register a live free account", msg)
 
     def test_validate_access_token_alive_returns_none_on_network_error(self) -> None:
         # Bugfix A2: network errors must return None (inconclusive), not False

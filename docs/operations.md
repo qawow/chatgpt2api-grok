@@ -182,7 +182,9 @@ docker logs -f chatgpt2api
 | 注册号无生图额度 / 秒死 | 入库后**后台** `fetch_remote_info`；free 上游 `image_gen.remaining` 常为 0，看号池本地 `quota`。`session_only` **可生图**。约 5 分钟被标异常：以前是入库后自动 Codex / 巡检 `/me`+密码重登二次登录；现已关掉。手动「Codex 补 refresh」仍会踢 session |
 | session_only 要补 refresh | 号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」。**不会**入库后自动补。手动补是二次登录，可能踢掉当前 web session。见 [gpt-register.md](gpt-register.md) §6.7.1 |
 | 生图报模型追问 / `content_policy_violation` 但其实出过图 | 旧版取下载地址撞 OPENSSL 后把「你更喜欢…？」当成违规。1.8.1 会重试同出口，不再把追问当政策拦截 |
-| `upstream session expired, please retry` | `chat_requirements_prepare` 401：不当废号、同请求换号。不是额度用尽 |
+| `upstream session expired, please retry` | `chat_requirements_prepare` 401：不当废号、同请求换号。不是额度用尽。1.8.6 起轮询超时也会换号续传，且结果已到手后的断流不再判死 |
+| `no available image quota ... none are image-selectable, tried=0` | 池子全部被判吊销/异常，选号器无可发。1.8.6 起过期探活（30 分钟）会发现死号并触发自动补号；老版本需手动「检测」全部账号把僵尸号标掉 |
+| `no available codex image quota ... only 0 are codex-source` | `codex-gpt-image-2` 只接受导入的 Codex OAuth 号（Plus/Team/Pro）。免费注册号走 web 链路，客户端改用 `gpt-image-2.5`（以 `/v1/models` 目录为准） |
 | `upstream image connection failed` | OPENSSL / curl 35 / 代理失败：同出口短重试后再换号。SOCKS 上不要切直连（本机直连 chatgpt.com 会超时） |
 | OTP / OAuth 超时 | 换代理出口；CFD1 本身不走 OpenAI 代理 |
 

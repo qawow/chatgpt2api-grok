@@ -275,7 +275,8 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `executor` | `protocol` | `protocol` / `headless` / `headed`；推荐 protocol |
 | `mail_provider` | `cloudflare_d1_api` | 邮箱 provider |
 | `cfd1_domain` | 空 | 覆盖 `CFD1_DOMAIN` |
-| `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*` |
+| `cfd1_domains` | 空 | 域名池：多条按行/逗号分隔，每次注册随机取一个（优先于 `cfd1_domain`），对抗上游按邮箱域名的批量封禁波。所有域名须配置 Cloudflare Email Routing catch-all 到同一个 Worker/D1 |
+| `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*`。多条按行/逗号分隔成池，并发注册时 round-robin 分给各号（配合 `bind_register_proxy` 实现按号隔离出口） |
 | `bind_register_proxy` | true | 入库时把代理绑到账号；绑了代理的号不再回落到全局/直连（按号隔离出口） |
 | `plan_type` | `free` | 写入号池的 type |
 | `source_type` | 空 | 空则自动（register / codex） |

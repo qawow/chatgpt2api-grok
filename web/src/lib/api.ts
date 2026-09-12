@@ -902,6 +902,8 @@ export type GptRegisterSettings = {
   plan_type: string;
   source_type: string;
   cfd1_domain: string;
+  /** 域名池：多条按行/逗号分隔，每次注册随机取一个（对抗按域名的批量封禁） */
+  cfd1_domains: string;
   push_enabled: boolean;
   push_mode: string;
   chatgpt2api_base_url: string;

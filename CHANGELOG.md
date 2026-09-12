@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.8.6 - 2026-09-12
+
+### chatgpt2api-grok（本分支）
+
++ [发布] 版本 1.8.6：生图请求内「换号续传」补强 + 死号探活/补号闭环修复 + 注册域名池 + codex 报错指引。
++ [新增] 生图请求内续传增强（`_generate_single_image`）：
+  - 轮询超时不再扎同一个号：超时号即时排除出候选集，下一棒**必然换号续传**（原逻辑可能反复选中同一个已挂死的号直到重试耗尽）。
+  - 断流保结果：图片结果已到手后流再报错（如 curl(56) 连接重置），直接返回已生成的图片，不再把成功结果判死成 `upstream session expired`。
+  - 轮询超时会写入 `last_connection_error`，多次超时耗尽候选池时报错指向真实原因而非笼统的空池文案。
++ [分析] 账号死亡模式定性：重建 29 个号的完整生死时间线，确认死亡呈**上游批量封禁波**特征而非自然过期——09-09 注册的号活了 45 小时、09-10 的 17~19 小时，全部死于 09-11 12:49 UTC 同一分钟内的单一波次；1.8.5 时代注册的号躲过该波但也在 13~24 小时内死亡。当前注册路径（单域名 + 单数据中心出口 IP 45.192.199.151，实测代理无会话语法、无轮换）关联度过强，是波次团灭的主因。
++ [新增] 注册邮箱域名池 `cfd1_domains`：多条按行/逗号分隔，每次注册随机取一个作为 `cfd1_domain`（不能用 per-job 索引轮询——自动补号任务恒为 count=1/index=1，会永远钉死在第一个域名），对抗上游按邮箱域名的批量封禁。所有域名须配置 Cloudflare Email Routing catch-all 到同一个 Worker/D1（`wait_for_code` 按完整地址过滤，天然支持多域）。设置页加「域名池（随机轮换）」输入框，任务日志记录每次选中的域名。
++ [修复] `auto_replenish_target_available` / `auto_replenish_spacing_secs` 昨天漏加进 `api/gpt_register.py` 的 Pydantic 模型——设置页这两项的保存被 FastAPI 静默丢弃（模型注释里早有此坑的警告）。已补上并加回归测试。
++ [修复] 健康 session_only 号的巡检跳过逻辑导致死号装死：1.8.1 为避免探活踢 session，JWT 不到期就不探活，但免费号 JWT 有效期约 9 天而封禁波几小时就把号打死——死号挂着「正常」状态最长 8 天，自动补号误判池子已满（stocked）不再补号。现改为：`last_probed_at` 超过 30 分钟（`_SESSION_ONLY_PROBE_STALE_SECONDS`）的健康 session_only 号重新纳入巡检，探活只是带现有 token 的 GET /me（普通页面加载级行为），session 续期只会在 /me 已 401 后才触发。实测重启后 26 个死号当周期全部正确标记，补号闭环恢复。
++ [说明] 出站代理池轮询注册早已支持（`parse_proxy_pool` + `bind_register_proxy`），本次实测当前代理为固定单出口不支持会话语法；如需按号隔离出口 IP 只需在注册配置里填多条代理。
++ [观察] 个别死号的 /me 返回 Cloudflare challenge 页（403 HTML）而非 401——服务按设计只在 401 确认时标记，此类「僵尸号」会暂时占住 1 个可用额度位。补号按 target 水位运行会自动补偿，暂不改动（CF 抖动期误标的代价更大）。
++ [修复] `codex-gpt-image-2` 空池报错文案误导：原消息建议「re-register a live free account」，但 codex 链路（`_ensure_codex_source_account`）只接受 source_type=codex 的 OAuth 号，自动注册的免费 web 号永远填不进 codex 池。现按 scope 给出可行指引：codex 模型需要导入 Codex OAuth 号（Plus/Team/Pro），否则改用 `gpt-image-2.5`（web 链路）。注意 `/v1/models` 目录只在池内有 codex 号时才列出 codex 模型——客户端应从目录取模型而不是写死。
+
 ## 1.8.5 - 2026-09-11
 
 ### chatgpt2api-grok（本分支）

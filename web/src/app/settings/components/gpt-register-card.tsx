@@ -43,6 +43,7 @@ const DEFAULT_FORM: GptRegisterSettings = {
   plan_type: "free",
   source_type: "",
   cfd1_domain: "",
+  cfd1_domains: "",
   push_enabled: true,
   push_mode: "local",
   chatgpt2api_base_url: "",
@@ -352,6 +353,18 @@ export function GptRegisterCard() {
                   onChange={(e) => setField("cfd1_domain", e.target.value)}
                   placeholder="mail.example.com"
                   className="h-10 rounded-xl border-stone-200 bg-white"
+                  disabled={running}
+                />
+              </Field>
+              <Field
+                label="域名池（随机轮换）"
+                hint="多条按行或逗号分隔，每次注册随机取一个，对抗按邮箱域名的批量封禁。所有域名须配好 Cloudflare Email Routing catch-all 到同一个 Worker/D1；设置后优先于上面的单域名覆盖"
+              >
+                <Textarea
+                  value={form.cfd1_domains}
+                  onChange={(e) => setField("cfd1_domains", e.target.value)}
+                  placeholder={"mail1.example.com\nmail2.example.com"}
+                  className="min-h-20 rounded-xl border-stone-200 bg-white"
                   disabled={running}
                 />
               </Field>

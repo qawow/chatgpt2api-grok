@@ -455,3 +455,101 @@ class ImageConnectionFailoverTests(unittest.TestCase):
                 ))
         self.assertIn("download url unresolved", str(ctx.exception))
         self.assertTrue(is_upstream_connection_error(str(ctx.exception)))
+
+    def test_poll_timeout_switches_account_and_continues(self) -> None:
+        """续传：轮询超时后排除超时号，下一棒换号继续并拿到结果。"""
+        from services.openai_backend_api import ImagePollTimeoutError
+
+        created: list[str] = []
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+                created.append(access_token)
+
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            if backend.access_token == "token-a":
+                yield ImageOutput(kind="progress", model=request.model, index=index, total=total, text="working")
+                raise ImagePollTimeoutError("poll timed out")
+            yield ImageOutput(
+                kind="result",
+                model=request.model,
+                index=index,
+                total=total,
+                data=[{"url": "http://example.test/ok.png"}],
+            )
+
+        def get_token(**kwargs):
+            excluded = kwargs.get("excluded_tokens") or set()
+            if "token-a" in excluded:
+                return "token-b"
+            return "token-a"
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://live.example:1080")],
+            ),
+        ):
+            accounts.get_available_access_token.side_effect = get_token
+            accounts.get_account.side_effect = lambda token: {"email": f"{token}@example.com"}
+            outputs = _generate_single_image(
+                ConversationRequest(model="gpt-image-2", prompt="cat"),
+                1,
+                1,
+            )
+
+        self.assertEqual(created, ["token-a", "token-b"])
+        self.assertEqual(outputs[-1].kind, "result")
+        self.assertEqual(outputs[-1].data[0]["url"], "http://example.test/ok.png")
+
+    def test_trailing_stream_error_keeps_collected_result(self) -> None:
+        """断流保结果：结果已到手后流报错，直接返回结果而不是对外报错。"""
+        created: list[str] = []
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+                created.append(access_token)
+
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            yield ImageOutput(
+                kind="result",
+                model=request.model,
+                index=index,
+                total=total,
+                data=[{"url": "http://example.test/ok.png"}],
+            )
+            raise RuntimeError("curl: (56) Recv failure: Connection reset by peer")
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://live.example:1080")],
+            ),
+        ):
+            accounts.get_available_access_token.return_value = "token-a"
+            accounts.get_account.return_value = {"email": "a@example.com"}
+            outputs = _generate_single_image(
+                ConversationRequest(model="gpt-image-2", prompt="cat"),
+                1,
+                1,
+            )
+
+        self.assertEqual(created, ["token-a"])
+        self.assertEqual(outputs[-1].kind, "result")
+        self.assertEqual(outputs[-1].data[0]["url"], "http://example.test/ok.png")

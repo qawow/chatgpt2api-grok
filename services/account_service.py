@@ -27,6 +27,11 @@ class AccountService:
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
+    # Healthy session_only accounts: re-probe (plain /me) when last_probed_at
+    # is older than this. Free accounts die in ban waves hours-to-days before
+    # their ~9-day JWT nears the 24h refresh skew; without a stale probe the
+    # pool shows 正常 for days and auto-replenish sees a stocked pool of corpses.
+    _SESSION_ONLY_PROBE_STALE_SECONDS = 30 * 60
     _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
@@ -288,7 +293,9 @@ class AccountService:
         Upstream probes every selected token on refresh. We only skip accounts
         the watcher cannot usefully recover this cycle:
         禁用, confirmed-revoke cooldown, and 异常 session-only with no password/refresh.
-        正常 / 限流 session_only stay in the probe set so quota and liveness update.
+        正常 / 限流 session_only are probed when the JWT nears expiry or the
+        last successful probe is older than _SESSION_ONLY_PROBE_STALE_SECONDS
+        (ban-wave death discovery); freshly-probed healthy ones are skipped.
         """
         if not isinstance(account, dict):
             return True
@@ -307,10 +314,21 @@ class AccountService:
         # Healthy session_only: a 5-minute /me (+ password fallback) is a
         # second client and often revokes the NextAuth session. Image pick
         # already skips /me when quota>0. Probe only when JWT is near expiry
-        # (session cookie can mint a new accessToken). Manual 检测 still /me.
+        # (session cookie can mint a new accessToken) or when the account has
+        # not been probed recently — ban waves revoke consumable free accounts
+        # hours before their ~9-day JWT expires, and a stale 正常 mark both
+        # hides the death and blocks auto-replenish (which counts status).
+        # The stale probe is a plain /me; session refresh only runs after /me
+        # already said 401. Manual 检测 still /me.
         if cls._is_session_only_account(account) and account.get("status") in {"正常", "限流"}:
             token = str(account.get("access_token") or "").strip()
             if token and cls._token_needs_refresh(token):
+                return False
+            probed_at = cls._parse_time(account.get("last_probed_at"))
+            if probed_at is None:
+                return False
+            stale_after = cls._SESSION_ONLY_PROBE_STALE_SECONDS
+            if (datetime.now(timezone.utc) - probed_at).total_seconds() >= stale_after:
                 return False
             return True
         return False
@@ -1582,6 +1600,18 @@ class AccountService:
         scope_prefix = f"{scope} " if scope else ""
         if total_accounts == 0:
             return f"no available {scope_prefix}image quota: account pool is empty".replace("  ", " ").strip()
+        if str(source_type or "").strip().lower() == "codex":
+            codex_n = sum(
+                1 for i in accounts
+                if self._normalize_source_type(i.get("source_type")) == "codex"
+            )
+            return (
+                f"no available codex image quota: pool has {total_accounts} account(s) "
+                f"but only {codex_n} are codex-source. codex-gpt-image-2 requires imported "
+                f"Codex OAuth accounts (Plus/Team/Pro with refresh_token); auto-registered "
+                f"free web accounts only serve gpt-image-2.5 — switch the model or import "
+                f"codex accounts. tried={tried}"
+            )
         if revoked_n or abnormal_n:
             return (
                 f"no available {scope_prefix}image quota: pool has {total_accounts} account(s) "
