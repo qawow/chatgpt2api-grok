@@ -58,6 +58,9 @@ class FakeImageTaskService:
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
         }
 
+    def resume_poll(self, identity, task_id, extra_timeout_secs):
+        return {"id": task_id, "status": "running", "timeout": extra_timeout_secs}
+
 
 class ImageTasksApiTests(unittest.TestCase):
     def setUp(self):
@@ -125,6 +128,17 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_resume_task_endpoint_and_timeout_validation(self):
+        response = self.client.post("/api/image-tasks/failed-task/resume-poll", headers=AUTH_HEADERS,
+                                    json={"extra_timeout_secs": 30})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["id"], "failed-task")
+        self.assertEqual(response.json()["status"], "running")
+        for timeout in (0, 121):
+            response = self.client.post("/api/image-tasks/failed-task/resume-poll", headers=AUTH_HEADERS,
+                                        json={"extra_timeout_secs": timeout})
+            self.assertEqual(response.status_code, 422)
 
 
 if __name__ == "__main__":

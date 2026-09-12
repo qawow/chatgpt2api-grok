@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import threading
 import time
@@ -12,9 +14,14 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import grok_v1_image_generations, openai_v1_image_edit, openai_v1_image_generations
+from services.protocol.conversation import is_token_invalid_error, is_upstream_connection_error
+from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError
+from services.image_task_control import ImageTaskControl
+from services.image_task_inputs import ImageTaskInputs
 from utils.atomic import atomic_write_json
 from utils.grok_models import is_grok_image_model, resolve_grok_image_model
 from utils.helper import WEB_IMAGE_MODEL
+from utils.log import logger
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -76,7 +83,8 @@ def route_image_generation(body: dict[str, Any]) -> dict[str, Any]:
         payload = dict(body)
         payload["model"] = resolve_grok_image_model(model)
         # Grok free path is synchronous; progress callback is ChatGPT-SSE only.
-        payload.pop("progress_callback", None)
+        for key in ("progress_callback", "checkpoint_callback", "_is_cancelled", "_task_control"):
+            payload.pop(key, None)
         result = grok_v1_image_generations.handle(payload)
         if not isinstance(result, dict):
             raise RuntimeError("grok image generation returned unexpected streaming result")
@@ -120,6 +128,9 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 class ImageTaskService:
+    _ACCOUNT_FAILURE_COOLDOWN_SECS = 60.0
+    _PROGRESS_SAVE_INTERVAL_SECS = 1.0
+
     def __init__(
         self,
         path: Path,
@@ -134,10 +145,24 @@ class ImageTaskService:
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self._lock = threading.RLock()
         self._tasks: dict[str, dict[str, Any]] = {}
+        self.inputs = ImageTaskInputs(path.with_name(f"{path.stem}_inputs"))
+        self._pending_input_cleanup: list[dict[str, Any]] = []
+        self._last_progress_save = 0.0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
             changed = self._recover_unfinished_locked()
+            for key, task in self._tasks.items():
+                if isinstance(task.get("payload"), dict):
+                    try:
+                        payload = self.inputs.migrate(key, task["payload"])
+                        if payload is not task["payload"]:
+                            task["payload"] = payload
+                            changed = True
+                    except (OSError, ValueError):
+                        # Keep the original recoverable record if migration
+                        # fails; never replace it with an incomplete reference.
+                        logger.warning({"event": "image_task_input_migration_failed", "task_id": task["id"]})
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
@@ -247,9 +272,15 @@ class ImageTaskService:
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
+                "payload": self.inputs.encode(key, payload),
+                "attempt": 0,
             }
             self._tasks[key] = task
-            self._save_locked()
+            try:
+                self._save_locked()
+            except Exception:
+                self._tasks.pop(key, None)
+                raise
             should_start = True
 
         if should_start:
@@ -269,17 +300,62 @@ class ImageTaskService:
         payload: dict[str, Any],
         identity: dict[str, object],
         model: str,
+        attempt: int = 0,
+        control: ImageTaskControl | None = None,
     ) -> None:
         started = time.time()
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        control = control or ImageTaskControl(float(config.image_task_timeout_secs))
+
+        def update(**updates: Any) -> None:
+            self._update_task(key, expected_attempt=attempt, **updates)
+
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
-                self._update_task(key, started_ts=time.time())
-            self._update_task(key, progress=step)
+                update(started_ts=time.time())
+            update(progress=step)
+
+        def checkpoint_callback(checkpoint: dict[str, Any]) -> None:
+            with self._lock:
+                task = self._tasks.get(key) or {}
+                updates = {
+                    k: v for k, v in checkpoint.items()
+                    if k in {"account_email", "conversation_id", "account_token_hash", "generation_id"}
+                }
+                failed_email = checkpoint.get("failed_account_email")
+                if failed_email:
+                    updates["failed_account_emails"] = list(dict.fromkeys([
+                        *task.get("failed_account_emails", []), failed_email,
+                    ]))
+                failed_hash = checkpoint.get("failed_token_hash")
+                if failed_hash:
+                    updates["failed_token_hashes"] = list(dict.fromkeys([
+                        *task.get("failed_token_hashes", []), failed_hash,
+                    ]))
+                    failures = dict(task.get("account_failures") or {})
+                    failures[failed_hash] = {
+                        "kind": checkpoint.get("failure_kind", "transient"),
+                        "retry_at": time.time() + self._ACCOUNT_FAILURE_COOLDOWN_SECS,
+                        "attempt": attempt,
+                    }
+                    updates["account_failures"] = failures
+                update(**updates)
+
+        def is_cancelled() -> bool:
+            with self._lock:
+                task = self._tasks.get(key)
+                return (
+                    control.is_cancelled() or task is None or task.get("status") in TERMINAL_STATUSES
+                    or int(task.get("attempt") or 0) != attempt
+                )
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**payload, "progress_callback": progress_callback}
+        payload_with_progress = {
+            **payload, "progress_callback": progress_callback,
+            "checkpoint_callback": checkpoint_callback, "_is_cancelled": is_cancelled,
+            "_task_control": control,
+        }
         try:
+            update(status=TASK_STATUS_RUNNING, error="")
             try:
                 task_timeout = float(config.image_task_timeout_secs)
             except Exception:
@@ -314,12 +390,14 @@ class ImageTaskService:
                 daemon=True,
             )
             worker.start()
-            if not done.wait(timeout=task_timeout):
+            if not done.wait(timeout=control.remaining()):
+                control.cancelled.set()
                 raise TimeoutError(
                     f"图片任务超时（已等待 {int(task_timeout)} 秒仍未完成；"
                     f"常见于上游 SSE 经代理半开卡住）。可在 config 中调大 "
                     f"image_task_timeout_secs / image_sse_idle_timeout_secs。"
                 )
+            control.remaining()
             if "error" in error_box:
                 raise error_box["error"]
             result = result_box.get("result")
@@ -339,8 +417,7 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(
-                key,
+            update(
                 status=TASK_STATUS_SUCCESS,
                 data=data,
                 usage=usage,
@@ -359,17 +436,18 @@ class ImageTaskService:
                 account_email=account_email,
             )
         except Exception as exc:
+            control.cancelled.set()
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(
-                key,
+            update(
                 status=TASK_STATUS_ERROR,
                 error=error_message,
                 data=[],
                 duration_ms=duration_ms,
-                account_email=account_email,
+                error_code=_clean(getattr(exc, "code", "")),
+                **({"account_email": account_email} if account_email else {}),
                 **({"conversation_id": conversation_id} if conversation_id else {}),
             )
             self._log_call(
@@ -424,10 +502,15 @@ class ImageTaskService:
         except Exception:
             pass
 
-    def _update_task(self, key: str, **updates: Any) -> None:
+    def _update_task(self, key: str, *, expected_attempt: int | None = None, **updates: Any) -> None:
         with self._lock:
             task = self._tasks.get(key)
             if task is None:
+                return
+            if expected_attempt is not None and (
+                int(task.get("attempt") or 0) != expected_attempt
+                or task.get("status") in TERMINAL_STATUSES
+            ):
                 return
             # Prevent a late-arriving worker from overwriting an ERROR status
             # (e.g. set by a timeout) with SUCCESS. Once a task is marked
@@ -442,8 +525,21 @@ class ImageTaskService:
             ):
                 return
             task.update(updates)
+            if new_status == TASK_STATUS_ERROR:
+                task["last_failure_at"] = time.time()
+                fingerprint = _clean(task.get("account_token_hash"))
+                failures = dict(task.get("account_failures") or {})
+                if fingerprint and failures.get(fingerprint, {}).get("attempt") != task.get("attempt", 0):
+                    failures[fingerprint] = {
+                        "kind": "transient", "attempt": task.get("attempt", 0),
+                        "retry_at": time.time() + self._ACCOUNT_FAILURE_COOLDOWN_SECS,
+                    }
+                    task["account_failures"] = failures
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
+            if set(updates) <= {"progress", "started_ts"}:
+                if time.monotonic() - self._last_progress_save < self._PROGRESS_SAVE_INTERVAL_SECS:
+                    return
             self._save_locked()
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
@@ -481,7 +577,18 @@ class ImageTaskService:
                 "updated_ts": item.get("updated_ts"),
                 "started_ts": item.get("started_ts"),
                 "duration_ms": item.get("duration_ms"),
+                "attempt": int(item.get("attempt") or 0),
+                "account_email": _clean(item.get("account_email")),
+                "failed_account_emails": item.get("failed_account_emails") or [],
+                "account_token_hash": _clean(item.get("account_token_hash")),
+                "failed_token_hashes": item.get("failed_token_hashes") or [],
+                "error_code": _clean(item.get("error_code")),
+                "generation_id": _clean(item.get("generation_id")),
+                "account_failures": item.get("account_failures") or {},
+                "last_failure_at": item.get("last_failure_at") or item.get("updated_ts") or _timestamp(item.get("updated_at")),
             }
+            if isinstance(item.get("payload"), dict):
+                task["payload"] = item["payload"]
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
@@ -503,6 +610,21 @@ class ImageTaskService:
     def _save_locked(self) -> None:
         items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         atomic_write_json(self.path, {"tasks": items})
+        self._last_progress_save = time.monotonic()
+        # Remove expired attachments only AFTER the metadata deletion commits.
+        pending, self._pending_input_cleanup = self._pending_input_cleanup, []
+        live_blobs = {
+            entry["blob"] for task in self._tasks.values()
+            for field in ("images", "mask")
+            for entry in (task.get("payload") or {}).get(field, [])
+            if isinstance(entry, dict) and "blob" in entry
+        }
+        for payload in pending:
+            try:
+                self.inputs.delete(payload, keep=live_blobs)
+            except (OSError, ValueError):
+                self._pending_input_cleanup.append(payload)
+                logger.warning({"event": "image_task_input_cleanup_failed"})
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False
@@ -526,7 +648,8 @@ class ImageTaskService:
             if task.get("status") in TERMINAL_STATUSES and _timestamp(task.get("updated_at")) < cutoff
         ]
         for key in removed_keys:
-            self._tasks.pop(key, None)
+            task = self._tasks.pop(key)
+            self._pending_input_cleanup.append(task.get("payload") or {})
         return bool(removed_keys)
 
     def resume_poll(
@@ -535,7 +658,7 @@ class ImageTaskService:
         task_id: str,
         extra_timeout_secs: float = 30.0,
     ) -> dict[str, Any]:
-        """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
+        """Resume the same task: poll its conversation, or replay saved inputs on another account."""
         owner = _owner_id(identity)
         key = _task_key(owner, _clean(task_id))
         with self._lock:
@@ -545,25 +668,107 @@ class ImageTaskService:
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
             error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
-                raise ValueError("task error is not a timeout error")
+            if task.get("error_code") == "content_policy_violation":
+                raise ValueError("内容策略拒绝不支持换号续传，请修改提示词")
             conversation_id = _clean(task.get("conversation_id"))
-            if not conversation_id:
-                raise ValueError("task has no conversation_id")
+            # An expired account cannot read its old conversation, and another
+            # account never owns that conversation. Replay the original inputs.
+            if is_token_invalid_error(error_msg):
+                conversation_id = ""
+            if not conversation_id and not task.get("payload"):
+                raise ValueError("旧任务没有保存原始请求，无法换号续传，请重新生成")
             mode = task.get("mode", "generate")
             model = task.get("model", WEB_IMAGE_MODEL)
+            task["last_failure_at"] = task.get("last_failure_at") or task.get("updated_ts") or _timestamp(task.get("updated_at")) or time.time()
             # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            attempt = int(task.get("attempt") or 0) + 1
+            self._update_task(key, status=TASK_STATUS_RUNNING, error="", attempt=attempt,
+                              started_ts=time.time(), progress="resuming", duration_ms=None)
+            public = _public_task(task)
 
         # 启动新线程继续轮询
         thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            target=self._run_resume_task,
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, attempt),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
         thread.start()
-        return _public_task(task)
+        return public
+
+    def _replay_task(self, key: str, identity: dict[str, object], mode: str, model: str, attempt: int,
+                     control: ImageTaskControl | None = None) -> None:
+        from services.account_service import account_service
+        from services.content_filter import check_request
+
+        with self._lock:
+            task = self._tasks[key]
+            if not task.get("payload"):
+                raise ValueError("旧任务没有保存原始请求，无法换号续传，请重新生成")
+            saved_payload = dict(task["payload"])
+            emails = set(task.get("failed_account_emails") or [])
+            if task.get("account_email"):
+                emails.add(task["account_email"])
+            hashes = set(task.get("failed_token_hashes") or [])
+            if task.get("account_token_hash"):
+                hashes.add(task["account_token_hash"])
+            failures = dict(task.get("account_failures") or {})
+            legacy_retry_at = float(task.get("last_failure_at") or time.time()) + self._ACCOUNT_FAILURE_COOLDOWN_SECS
+            for fingerprint in hashes:
+                failures.setdefault(fingerprint, {"kind": "transient", "retry_at": legacy_retry_at})
+            hashes = {
+                fingerprint for fingerprint in hashes | failures.keys()
+                if failures.get(fingerprint, {}).get("kind") == "revoked"
+                or float(failures.get(fingerprint, {}).get("retry_at", legacy_retry_at)) > time.time()
+            }
+        # Blob reads can be large; do not block status updates or the timeout
+        # watchdog on the global task lock while loading reference images.
+        payload = self.inputs.decode(saved_payload)
+        check_request(request_text(payload.get("prompt")))
+        if hashes:
+            # Match failed credentials, not the email identity. After re-login a
+            # new token for the same account is eligible again (even without email).
+            payload["_excluded_tokens"] = [
+                token for account in account_service.list_accounts()
+                if (token := str(account.get("access_token") or ""))
+                and hashlib.sha256(token.encode()).hexdigest() in hashes
+            ]
+        elif not failures and legacy_retry_at > time.time():
+            # Compatibility for older tasks that only recorded account email.
+            payload["_excluded_tokens"] = [
+                token for email in emails if (token := account_service.find_access_token_by_email(email))
+            ]
+        else:
+            payload["_excluded_tokens"] = []
+        self._update_task(
+            key, expected_attempt=attempt, conversation_id="", progress="switching_account",
+            account_failures=failures, account_email="", account_token_hash="", generation_id="",
+        )
+        self._run_task(key, mode, payload, identity, model, attempt, control)
+
+    def _run_resume_task(self, key: str, conversation_id: str, extra_timeout_secs: float,
+                         identity: dict[str, object], mode: str, model: str, attempt: int) -> None:
+        """Keep one wall-clock budget across poll, download and replay."""
+        control = ImageTaskControl(float(config.image_task_timeout_secs))
+        done = threading.Event()
+
+        def worker() -> None:
+            try:
+                self._run_resume_poll(key, conversation_id, extra_timeout_secs, identity, mode, model, attempt, control)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=worker, name=f"image-resume-worker-{key[-16:]}", daemon=True)
+        thread.start()
+        try:
+            if done.wait(timeout=control.remaining()):
+                return
+        except TimeoutError:
+            pass
+        if not done.is_set():
+            control.cancelled.set()
+            self._update_task(key, expected_attempt=attempt, status=TASK_STATUS_ERROR,
+                              error="图片续传任务超时，请稍后重试", error_code="task_timeout")
 
     def _run_resume_poll(
         self,
@@ -573,72 +778,105 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        attempt: int = 0,
+        control: ImageTaskControl | None = None,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
+        control = control or ImageTaskControl(float(config.image_task_timeout_secs))
         backend = None
+        token = ""
         try:
+            if not conversation_id:
+                self._replay_task(key, identity, mode, model, attempt, control)
+                return
             from services.account_service import account_service
             from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result, is_upstream_connection_error
+            from services.protocol.conversation import format_image_result
             from services.proxy_service import proxy_settings
 
             with self._lock:
-                email = _clean((self._tasks.get(key) or {}).get("account_email"))
+                task = self._tasks.get(key) or {}
+                email = _clean(task.get("account_email"))
+                fingerprint = _clean(task.get("account_token_hash"))
             token = account_service.find_access_token_by_email(email) if email else ""
+            if not token and fingerprint:
+                token = next((
+                    value for item in account_service.list_accounts()
+                    if (value := str(item.get("access_token") or ""))
+                    and hashlib.sha256(value.encode()).hexdigest() == fingerprint
+                ), "")
             if not token:
-                raise RuntimeError("续轮询失败：任务没有可用账号，无法读取上游对话")
+                self._replay_task(key, identity, mode, model, attempt, control)
+                return
 
             account = account_service.get_account(token) or {}
+            if account_service._token_looks_revoked(account) is True:
+                self._replay_task(key, identity, mode, model, attempt, control)
+                return
             last_error: BaseException | None = None
             file_ids: list[str] = []
             sediment_ids: list[str] = []
             image_urls: list[str] = []
+            poll_deadline = time.monotonic() + extra_timeout_secs
             for _source, proxy_url in proxy_settings.list_egress_candidates(account=account, upstream=True):
-                attempt = OpenAIBackendAPI(access_token=token, force_proxy=proxy_url)
+                control.remaining()
+                poll_remaining = poll_deadline - time.monotonic()
+                if poll_remaining <= 0:
+                    raise ImagePollTimeoutError("图片续轮询超时")
+                candidate = OpenAIBackendAPI(access_token=token, force_proxy=proxy_url)
+                candidate.task_control = control
                 try:
-                    file_ids, sediment_ids = attempt._poll_image_results(
+                    file_ids, sediment_ids = candidate._poll_image_results(
                         conversation_id,
-                        extra_timeout_secs,
+                        control.remaining(poll_remaining),
                     )
+                    control.remaining()
                     if not file_ids and not sediment_ids:
-                        raise RuntimeError(
+                        raise ImagePollTimeoutError(
                             f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
                         )
-                    image_urls = attempt.resolve_conversation_image_urls(
+                    image_urls = candidate.resolve_conversation_image_urls(
                         conversation_id, file_ids, sediment_ids, poll=False,
                     )
                     if not image_urls:
                         raise RuntimeError("图片 URL 解析失败")
-                    backend = attempt
+                    backend = candidate
                     last_error = None
                     break
                 except Exception as exc:
                     last_error = exc
                     if not is_upstream_connection_error(str(exc)):
-                        attempt.close()
+                        candidate.close()
                         raise
-                    attempt.close()
+                    candidate.close()
             if backend is None:
                 raise last_error or RuntimeError("续轮询失败：无法连接上游")
 
+            control.remaining()
             image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                {"b64_json": base64.b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
+            control.remaining()
             with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
+                task = self._tasks.get(key) or {}
+                payload = task.get("payload") or {}
+                generation_id = _clean(task.get("generation_id")) or f"conversation:{conversation_id}"
             data = format_image_result(
                 image_items,
-                "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
+                _clean(payload.get("prompt")),
+                _clean(payload.get("response_format"), "url"),
+                _clean(payload.get("base_url")),
                 int(time.time()),
             )["data"]
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
+            if not data:
+                raise RuntimeError("续传没有返回图片数据")
+            control.remaining()
+            # This poll owns no image slot. Use the original generation ID to
+            # settle exactly once, even if the original worker already did so.
+            account_service.mark_image_result(token, True, release_slot=False, result_id=generation_id)
+            self._update_task(key, expected_attempt=attempt, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,
                 mode,
@@ -649,9 +887,26 @@ class ImageTaskService:
                 urls=_collect_image_urls(data),
             )
         except Exception as exc:
+            # A dead session/transport cannot be continued across accounts.
+            # Replay only when original inputs exist; never replay policy errors.
+            with self._lock:
+                can_replay = bool((self._tasks.get(key) or {}).get("payload"))
+            if not control.is_cancelled() and conversation_id and can_replay and (
+                is_token_invalid_error(str(exc)) or is_upstream_connection_error(str(exc))
+                or isinstance(exc, ImagePollTimeoutError)
+            ):
+                try:
+                    self._replay_task(key, identity, mode, model, attempt, control)
+                    return
+                except Exception as replay_exc:
+                    exc = replay_exc
             error_message = str(exc) or "resume poll failed"
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
+            self._update_task(
+                key, expected_attempt=attempt, status=TASK_STATUS_ERROR,
+                error=error_message, data=[], duration_ms=duration_ms,
+                error_code="content_policy_violation" if isinstance(exc, ImageContentPolicyError) else _clean(getattr(exc, "code", "")),
+            )
             self._log_call(
                 identity,
                 mode,

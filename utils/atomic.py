@@ -54,3 +54,20 @@ def atomic_write_json(path: Path, data: Any, *, indent: int = 2, ensure_ascii: b
     """Atomically write JSON data to ``path``."""
     content = json.dumps(data, ensure_ascii=ensure_ascii, indent=indent) + "\n"
     atomic_write_text(path, content)
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Store an attachment atomically with private temporary-file permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass

@@ -312,7 +312,7 @@ export function ImageResults({
                       }
 
                       if (image.status === "error") {
-                        const isTimeoutError = image.error?.includes("超时") && image.taskId;
+                        const canResume = Boolean(image.taskId);
                         return (
                           <div key={image.id} className="break-inside-avoid">
                             <div
@@ -330,13 +330,13 @@ export function ImageResults({
                               <p className="font-medium">图片 {index + 1}/{turn.images.length}</p>
                               <span className="line-clamp-2 sm:line-clamp-none">{image.error || "生成失败"}</span>
                               <div className="flex items-center gap-2">
-                                {isTimeoutError && (
+                                {canResume && (
                                   <button
                                     type="button"
                                     onClick={() => void onTimeoutRetryContinue(image.taskId!)}
                                     className="rounded-full bg-emerald-100 px-2 py-1 text-[10px] font-medium text-emerald-600 shadow-sm transition hover:bg-emerald-200 sm:px-3 sm:text-xs"
                                   >
-                                    继续等待
+                                    续传 / 换号继续
                                   </button>
                                 )}
                                 <button
@@ -463,6 +463,8 @@ function getTurnStatusLabel(status: ImageTurnStatus) {
 
 const PROGRESS_LABELS: Record<string, string> = {
   getting_account: "确认可用账号",
+  switching_account: "切换可用账号继续",
+  resuming: "恢复图片任务",
   uploading: "上传图片",
   bootstrapping: "预热首页",
   getting_token: "获取 token",

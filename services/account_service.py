@@ -2316,18 +2316,28 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def mark_image_result(
+        self, access_token: str, success: bool, *,
+        release_slot: bool = True, result_id: str = "",
+    ) -> dict | None:
         if not access_token:
             return None
-        self.release_image_slot(access_token)
+        if release_slot:
+            self.release_image_slot(access_token)
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return None
+            settled = dict(current.get("image_result_ids") or {})
+            if success and result_id and result_id in settled:
+                return dict(current)
             next_item = dict(current)
             next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if success:
+                if result_id:
+                    settled[result_id] = datetime.now(timezone.utc).isoformat()
+                    next_item["image_result_ids"] = settled
                 next_item["success"] = int(next_item.get("success") or 0) + 1
                 next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
                 if next_item["quota"] == 0:
@@ -2341,12 +2351,26 @@ class AccountService:
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
+                previous_aliases = dict(self._token_aliases)
+                previous_inflight = dict(self._image_inflight)
                 self._remove_account_locked(access_token)
-                self._save_accounts()
+                try:
+                    self._save_accounts()
+                except Exception:
+                    self._accounts[access_token] = current
+                    self._token_aliases = previous_aliases
+                    self._image_inflight = previous_inflight
+                    raise
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            try:
+                # Result ID and quota are committed together in the account
+                # snapshot, so restart/repeated polling cannot charge twice.
+                self._save_accounts()
+            except Exception:
+                self._accounts[access_token] = current
+                raise
             return dict(account)
         return None
 

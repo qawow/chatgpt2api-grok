@@ -196,6 +196,24 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
+    def _request_timeout(self, maximum: float) -> float:
+        control = getattr(self, "task_control", None)
+        timeout = control.remaining(maximum) if control is not None else maximum
+        poll_deadline = getattr(self, "_poll_deadline", None)
+        if poll_deadline is not None:
+            remaining = poll_deadline - time.monotonic()
+            if remaining <= 0:
+                raise ImagePollTimeoutError("图片轮询超时")
+            timeout = min(timeout, remaining)
+        return timeout
+
+    def _poll_sleep(self, seconds: float) -> None:
+        control = getattr(self, "task_control", None)
+        if control is not None:
+            control.wait(seconds)
+        else:
+            time.sleep(seconds)
+
     def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
         """初始化后端客户端。
 
@@ -1384,7 +1402,7 @@ class OpenAIBackendAPI:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._request_timeout(60))
         ensure_ok(response, path)
         return response.json()
 
@@ -1601,6 +1619,23 @@ class OpenAIBackendAPI:
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
     ) -> tuple[list[str], list[str]]:
+        previous = getattr(self, "_poll_deadline", None)
+        self._poll_deadline = time.monotonic() + max(0.0, timeout_secs)
+        try:
+            return self._poll_image_results_impl(conversation_id, timeout_secs, initial_file_ids, initial_sediment_ids)
+        except ImagePollTimeoutError as exc:
+            exc.conversation_id = conversation_id
+            raise
+        finally:
+            self._poll_deadline = previous
+
+    def _poll_image_results_impl(
+            self,
+            conversation_id: str,
+            timeout_secs: float = 120.0,
+            initial_file_ids: list[str] | None = None,
+            initial_sediment_ids: list[str] | None = None,
+    ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
         - Sleeps image_poll_initial_wait_secs first (default 4s, +jitter) only when
@@ -1644,12 +1679,12 @@ class OpenAIBackendAPI:
             if config.image_settle_enabled:
                 settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
                 if settle_for > 0:
-                    time.sleep(settle_for)
+                    self._poll_sleep(settle_for)
         elif initial_wait > 0:
             jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
             sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
             if sleep_for > 0:
-                time.sleep(sleep_for)
+                self._poll_sleep(sleep_for)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -1671,7 +1706,7 @@ class OpenAIBackendAPI:
             if error is not None:
                 log_payload["error"] = error
             logger.warning(log_payload)
-            time.sleep(sleep_for)
+            self._poll_sleep(sleep_for)
             return True
 
         last_task_error = ""
@@ -1761,7 +1796,7 @@ class OpenAIBackendAPI:
                              "settle_secs": config.image_settle_secs})
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
                 if wait > 0:
-                    time.sleep(wait)
+                    self._poll_sleep(wait)
                     continue
                 return file_ids, sediment_ids
             elapsed = time.time() - start
@@ -1773,7 +1808,7 @@ class OpenAIBackendAPI:
                 "sleep_secs": round(wait, 2),
             })
             if wait > 0:
-                time.sleep(wait)
+                self._poll_sleep(wait)
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
@@ -1797,7 +1832,7 @@ class OpenAIBackendAPI:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._request_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -1806,7 +1841,7 @@ class OpenAIBackendAPI:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._request_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -1831,7 +1866,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "application/json"}),
-            timeout=timeout_secs,
+            timeout=self._request_timeout(timeout_secs),
         )
         ensure_ok(response, path)
         data = response.json()
@@ -2028,7 +2063,7 @@ class OpenAIBackendAPI:
         )
 
     def _download_authenticated_file(self, url: str) -> bytes:
-        response = self.session.get(url, headers=self._file_download_headers(url), timeout=120)
+        response = self.session.get(url, headers=self._file_download_headers(url), timeout=self._request_timeout(120))
         ensure_ok(response, "image_download")
         return response.content
 
@@ -2048,7 +2083,7 @@ class OpenAIBackendAPI:
                 images.append(self._download_authenticated_file(url))
                 continue
             try:
-                response = self._resource_session().get(url, timeout=120)
+                response = self._resource_session().get(url, timeout=self._request_timeout(120))
                 ensure_ok(response, "image_download")
                 images.append(response.content)
                 continue
@@ -2070,7 +2105,7 @@ class OpenAIBackendAPI:
                     resource=True,
                     upstream=True,
                     impersonate=self.fp["impersonate"],
-                    timeout=120,
+                    timeout=self._request_timeout(120),
                     headers=headers,
                     skip_proxy_urls={used_proxy} if used_proxy else set(),
                 )

@@ -494,11 +494,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     | { type: "all" }
     | null
   >(null);
-  const [timeoutRetry, setTimeoutRetry] = useState<{
-    conversationId: string;
-    taskId: string;
-    taskError: string;
-  } | null>(null);
 
   const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
   const selectedConversation = useMemo(
@@ -1259,27 +1254,32 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       };
 
       try {
-
-        const referenceFiles = activeTurn.referenceImages.map((image, index) =>
-          dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
-        );
-        if (activeTurn.mode === "edit" && referenceFiles.length === 0) {
-          throw new Error("未找到可用于继续编辑的参考图");
-        }
-
-        const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
-        const submitted = await Promise.all(
-          pendingImages.map((image) => {
+        const submitMissingImages = async (images: StoredImage[]) => {
+          if (images.length === 0) return [];
+          const referenceFiles = activeTurn.referenceImages.map((image, index) =>
+            dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
+          );
+          if (activeTurn.mode === "edit" && referenceFiles.length === 0) {
+            throw new Error("未找到可用于继续编辑的参考图");
+          }
+          return Promise.all(images.map((image) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
               ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
               : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
-          }),
-        );
-        await applyTasks(submitted);
+          }));
+        };
+
+        // Resumed tasks already have their original inputs on the server. Poll
+        // them without uploading again or requiring local reference images.
+        const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
+        const existing = await fetchImageTasks(pendingImages.map((image) => image.taskId || image.id));
+        await applyTasks(existing.items);
+        const missingImages = pendingImages.filter((image) => existing.missing_ids.includes(image.taskId || image.id));
+        const submitted = await submitMissingImages(missingImages);
+        if (submitted.length > 0) await applyTasks(submitted);
 
         let consecutiveErrors = 0;
-        const retryingTaskIdsRef = new Set<string>();
         while (true) {
           const latestConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
           const latestTurn = latestConversation?.turns.find((turn) => turn.id === activeTurn.id);
@@ -1296,38 +1296,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             const taskList = await fetchImageTasks(loadingTaskIds);
             consecutiveErrors = 0;
             if (taskList.items.length > 0) {
-              // 检测是否有超时错误且需要显示重试按钮
-              const timeoutTask = taskList.items.find(
-                (task) =>
-                  task.status === "error" &&
-                  task.error?.includes("超时") &&
-                  task.conversation_id &&
-                  !retryingTaskIdsRef.has(task.id),
-              );
-              if (timeoutTask && timeoutTask.conversation_id) {
-                retryingTaskIdsRef.add(timeoutTask.id);
-                setTimeoutRetry({
-                  conversationId: timeoutTask.conversation_id,
-                  taskId: timeoutTask.id,
-                  taskError: timeoutTask.error || "生图超时",
-                });
-                // 应用超时错误到对应图片，显示继续等待按钮
-                await applyTasks([timeoutTask]);
-              } else {
-                await applyTasks(taskList.items);
-              }
+              await applyTasks(taskList.items);
             }
             if (taskList.missing_ids.length > 0 && latestTurn) {
               const missingImages = latestTurn.images.filter(
                 (image) => image.status === "loading" && image.taskId && taskList.missing_ids.includes(image.taskId),
               );
-              const resubmitted = await Promise.all(
-                missingImages.map((image) =>
-                  activeTurn.mode === "edit"
-                    ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
-                    : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality),
-                ),
-              );
+              const resubmitted = await submitMissingImages(missingImages);
               if (resubmitted.length > 0) {
                 await applyTasks(resubmitted);
               }
@@ -1468,13 +1443,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     [runConversationQueue],
   );
 
-  const handleTimeoutRetryContinue = useCallback(async () => {
-    if (!timeoutRetry) return;
-    const { conversationId, taskId } = timeoutRetry;
+  const handleTimeoutRetryContinue = useCallback(async (taskId: string) => {
+    // UI conversation IDs and upstream conversation IDs are unrelated.
+    const conversationId = conversationsRef.current.find((conversation) =>
+      conversation.turns.some((turn) => turn.images.some((image) => image.taskId === taskId)),
+    )?.id;
+    if (!conversationId) return;
     try {
-      await resumeImagePoll(taskId, imageTimeoutRetrySecs);
+      const task = await resumeImagePoll(taskId, imageTimeoutRetrySecs);
       // 将对应图片的状态重置为 loading，并清除错误
-      void updateConversation(conversationId, (current) => {
+      await updateConversation(conversationId, (current) => {
         const conversation = current ?? conversationsRef.current.find((c) => c.id === conversationId);
         if (!conversation) return current!;
         return {
@@ -1489,51 +1467,19 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               error: undefined,
               images: turn.images.map((image) =>
                 image.taskId === taskId
-                  ? { ...image, status: "loading" as const, error: undefined, taskStatus: "running" as const, startTime: image.startTime || Date.now() }
+                  ? taskDataToStoredImage({ ...image, startTime: Date.now() }, task)
                   : image
               ),
             };
           }),
         };
       });
-      // 清除重试状态
-      setTimeoutRetry(null);
-      toast.info(`已继续等待 ${imageTimeoutRetrySecs} 秒`);
+      toast.info("已续传：优先获取已有结果，失败后换可用账号继续");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "续轮询失败";
       toast.error(msg);
-      setTimeoutRetry(null);
     }
-  }, [timeoutRetry, updateConversation, imageTimeoutRetrySecs]);
-
-  const handleTimeoutRetryCancel = useCallback(() => {
-    if (!timeoutRetry) return;
-    const { conversationId: convId, taskId, taskError } = timeoutRetry;
-    // 将超时错误应用到对应图片
-    void updateConversation(convId, (current) => {
-      const conversation = current ?? conversationsRef.current.find((c) => c.id === convId);
-      if (!conversation) return current!;
-      return {
-        ...conversation,
-        updatedAt: new Date().toISOString(),
-        turns: conversation.turns.map((turn) => {
-          const hasLoading = turn.images.some((image) => image.status === "loading" && image.taskId === taskId);
-          if (!hasLoading) return turn;
-          const images = turn.images.map((image) =>
-            image.taskId === taskId ? { ...image, status: "error" as const, error: taskError } : image,
-          );
-          const derived = deriveTurnStatus({ ...turn, images });
-          return {
-            ...turn,
-            ...derived,
-            images,
-          };
-        }),
-      };
-    });
-    setTimeoutRetry(null);
-    toast.error(taskError);
-  }, [timeoutRetry, updateConversation]);
+  }, [updateConversation, imageTimeoutRetrySecs]);
 
   const handleDismissErrors = useCallback(
     async (conversationId: string, turnId: string) => {

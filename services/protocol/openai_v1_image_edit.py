@@ -75,6 +75,10 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        checkpoint_callback=body.get("checkpoint_callback"),
+        excluded_tokens=set(body.get("_excluded_tokens") or ()),
+        is_cancelled=body.get("_is_cancelled"),
+        task_control=body.get("_task_control"),
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

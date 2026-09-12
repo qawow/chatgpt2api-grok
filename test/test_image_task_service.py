@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -289,6 +290,143 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(created, [("token-a", "socks5h://dead.example:1080"), ("token-a", "")])
             self.assertTrue(task.get("data"))
+
+    def test_failed_edit_resumes_after_restart_with_original_inputs(self):
+        from services.protocol.conversation import ImageGenerationError
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "tasks.json"
+
+            def fail(payload):
+                payload["checkpoint_callback"]({"account_email": "failed@example.test", "conversation_id": "old-conv"})
+                raise ImageGenerationError("upstream session expired, please retry")
+
+            service = self.make_service(path, fail)
+            images = [(b"original-image", "ref.png", "image/png")]
+            masks = [(b"original-mask", "mask.png", "image/png")]
+            service.submit_edit(OWNER, client_task_id="edit", prompt="make blue", model="gpt-image-2",
+                                size="1024x1024", quality="high", images=images, masks=masks)
+            failed = wait_for_task(service, OWNER, "edit", "error")
+            self.assertNotIn("payload", failed)
+            received = []
+            service = self.make_service(path, lambda payload: received.append(payload) or {"data": [{"url": "done"}]})
+            with mock.patch("services.account_service.account_service.find_access_token_by_email", return_value="failed-token"):
+                service.resume_poll(OWNER, "edit")
+                done = wait_for_task(service, OWNER, "edit", "success")
+            self.assertEqual(done["id"], "edit")
+            self.assertEqual(received[0]["prompt"], "make blue")
+            self.assertEqual(received[0]["images"], images)
+            self.assertEqual(received[0]["mask"], masks)
+            self.assertEqual(received[0]["quality"], "high")
+            self.assertEqual(received[0]["_excluded_tokens"], ["failed-token"])
+            self.assertNotIn("conversation_id", done)
+
+    def test_resume_enforces_owner_and_rejects_duplicate_running_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            release = threading.Event()
+            entered = threading.Event()
+            self.addCleanup(release.set)
+
+            def handler(payload):
+                entered.set()
+                release.wait(timeout=2)
+                return {"data": [{"url": "done"}]}
+
+            service = self.make_service(Path(tmp_dir) / "tasks.json", handler)
+            service._tasks["owner-1:task"] = {
+                "id": "task", "owner_id": "owner-1", "status": "error", "mode": "generate",
+                "payload": {"prompt": "cat", "model": "gpt-image-2"},
+            }
+            with self.assertRaisesRegex(ValueError, "not found"):
+                service.resume_poll(OTHER_OWNER, "task")
+            service.resume_poll(OWNER, "task")
+            self.assertTrue(entered.wait(timeout=1))
+            with self.assertRaisesRegex(ValueError, "not in error"):
+                service.resume_poll(OWNER, "task")
+            service._update_task("owner-1:task", expected_attempt=0, status="error", error="old error")
+            self.assertEqual(service._tasks["owner-1:task"]["status"], "running")
+            release.set()
+            wait_for_task(service, OWNER, "task", "success")
+
+    def test_resume_poll_auth_failure_replays_instead_of_reading_with_another_account(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            received = []
+            service = self.make_service(Path(tmp_dir) / "tasks.json", lambda payload: received.append(payload) or {"data": [{"url": "new"}]})
+            service._tasks["owner-1:task"] = {
+                "id": "task", "owner_id": "owner-1", "status": "error", "mode": "generate",
+                "account_email": "a@example.test", "conversation_id": "old-conv", "error": "poll timeout",
+                "payload": {"prompt": "cat", "model": "gpt-image-2"},
+            }
+            with mock.patch("services.account_service.account_service") as accounts, mock.patch(
+                "services.openai_backend_api.OpenAIBackendAPI"
+            ) as backend, mock.patch(
+                "services.proxy_service.proxy_settings.list_egress_candidates", return_value=[("direct", "")]
+            ):
+                accounts.find_access_token_by_email.return_value = "a"
+                accounts._token_looks_revoked.return_value = False
+                backend.return_value._poll_image_results.side_effect = RuntimeError("token_revoked")
+                service.resume_poll(OWNER, "task")
+                wait_for_task(service, OWNER, "task", "success")
+            backend.assert_called_once_with(access_token="a", force_proxy="")
+            self.assertEqual(received[0]["_excluded_tokens"], ["a"])
+            self.assertEqual(received[0]["prompt"], "cat")
+            backend.return_value.close.assert_called_once()
+
+    def test_old_task_without_inputs_and_policy_rejections_do_not_replay(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "tasks.json")
+            task = {"id": "task", "owner_id": "owner-1", "status": "error", "error": "session expired"}
+            service._tasks["owner-1:task"] = task
+            with self.assertRaisesRegex(ValueError, "原始请求"):
+                service.resume_poll(OWNER, "task")
+            task.update(payload={"prompt": "cat"}, error_code="content_policy_violation")
+            with self.assertRaisesRegex(ValueError, "内容策略"):
+                service.resume_poll(OWNER, "task")
+
+    def test_checkpoints_survive_restart_but_stale_updates_are_ignored(self):
+        from services.protocol.conversation import ImageGenerationError
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            callbacks = {}
+
+            def fail(payload):
+                callbacks.update(payload)
+                payload["checkpoint_callback"]({"account_email": "a@example.test", "conversation_id": "conv"})
+                raise ImageGenerationError("upstream disconnected")
+
+            path = Path(tmp_dir) / "tasks.json"
+            service = self.make_service(path, fail)
+            service.submit_generation(OWNER, client_task_id="task", prompt="cat", model="gpt-image-2", size=None)
+            wait_for_task(service, OWNER, "task", "error")
+            callbacks["checkpoint_callback"]({"conversation_id": "stale-conv"})
+            callbacks["progress_callback"]("stale-progress")
+            self.assertTrue(callbacks["_is_cancelled"]())
+            reloaded = self.make_service(path)
+            task = reloaded._tasks["owner-1:task"]
+            self.assertEqual(task["account_email"], "a@example.test")
+            self.assertEqual(task["conversation_id"], "conv")
+            self.assertNotEqual(task.get("progress"), "stale-progress")
+
+    def test_relogin_new_token_not_excluded_by_failed_email(self):
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            received = []
+            service = self.make_service(Path(tmp_dir) / "tasks.json", lambda payload: received.append(payload) or {"data": [{"url": "ok"}]})
+            service._tasks["owner-1:task"] = {
+                "id": "task", "owner_id": "owner-1", "status": "error", "mode": "generate",
+                "account_email": "a@example.test", "error": "upstream session expired",
+                "account_token_hash": hashlib.sha256(b"old-token").hexdigest(),
+                "failed_token_hashes": [hashlib.sha256(b"no-email-token").hexdigest()],
+                "payload": {"prompt": "cat", "model": "gpt-image-2"},
+            }
+            with mock.patch("services.account_service.account_service.list_accounts", return_value=[
+                {"email": "a@example.test", "access_token": "new-token"},
+                {"access_token": "no-email-token"},
+            ]):
+                service.resume_poll(OWNER, "task")
+                wait_for_task(service, OWNER, "task", "success")
+            self.assertEqual(received[0]["_excluded_tokens"], ["no-email-token"])
 
 
 if __name__ == "__main__":

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
-from services.account_service import account_service
+from services.account_service import AccountService, account_service
+from services.image_task_control import ImageTaskControl
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
@@ -79,6 +82,7 @@ def is_token_invalid_error(message: str) -> bool:
         or "invalid_access_token" in text
         or "invalidated oauth token" in text
         or "status=401" in text
+        or "upstream session expired" in text
     )
 
 
@@ -378,6 +382,10 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    checkpoint_callback: Any = None  # Internal task recovery metadata; never includes credentials.
+    excluded_tokens: set[str] = field(default_factory=set)
+    is_cancelled: Any = None
+    task_control: ImageTaskControl | None = None
 
 
 @dataclass
@@ -894,6 +902,7 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
+    checkpoint_conversation_id = ""
     for event in conversation_events(
             backend,
             prompt=request.prompt,
@@ -903,6 +912,11 @@ def stream_image_outputs(
             quality=request.quality,
     ):
         last = event
+        event_conversation_id = str(event.get("conversation_id") or "")
+        if event_conversation_id and event_conversation_id != checkpoint_conversation_id:
+            checkpoint_conversation_id = event_conversation_id
+            if request.checkpoint_callback:
+                request.checkpoint_callback({"conversation_id": event_conversation_id})
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
                 kind="progress",
@@ -1361,10 +1375,50 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
-def _generate_single_image(
+class ImageResultSettlementError(RuntimeError):
+    pass
+
+
+class _ImageAccountLease:
+    """Own exactly one reservation across sticky retries and token rotation."""
+    def __init__(self) -> None:
+        self.token = ""
+        self.result_id = ""
+
+    def release(self) -> None:
+        token, self.token = self.token, ""
+        if token:
+            account_service.release_image_slot(token)
+
+    def finish(self, success: bool) -> None:
+        if not self.token:
+            return
+        try:
+            kwargs: dict[str, Any] = {"release_slot": False}
+            if success:
+                kwargs["result_id"] = self.result_id
+            account_service.mark_image_result(self.token, success, **kwargs)
+        except Exception as exc:
+            raise ImageResultSettlementError("图片账号结算保存失败，请稍后续传") from exc
+        finally:
+            self.release()
+
+
+def _generate_single_image(request: ConversationRequest, index: int, total: int) -> list[ImageOutput]:
+    lease = _ImageAccountLease()
+    try:
+        return _generate_single_image_impl(request, index, total, lease)
+    finally:
+        # Includes checkpoints, proxy setup, backend construction/close, and
+        # exceptions raised inside retry handlers, not just stream failures.
+        lease.release()
+
+
+def _generate_single_image_impl(
         request: ConversationRequest,
         index: int,
         total: int,
+        lease: _ImageAccountLease,
 ) -> list[ImageOutput]:
     """为单张图片执行生成逻辑（含重试），返回结果列表。
 
@@ -1390,9 +1444,50 @@ def _generate_single_image(
         "current_proxy_url": "",
         "current_proxy_source": "",
         "failed_proxy_urls": set(),
-        "failed_connection_tokens": set(),
+        "failed_connection_tokens": set(request.excluded_tokens),
         "last_connection_error": "",
     }
+    refreshed_tokens: set[str] = set()
+
+    def exclude_account(active_token: str, error: str, *, revoked: bool = False) -> None:
+        state["failed_connection_tokens"].add(active_token)
+        state["last_connection_error"] = error
+        state["sticky_token"] = ""
+        state["tls_retry_count"] = 0
+        state["conn_timeout_retry_count"] = 0
+        if request.checkpoint_callback:
+            request.checkpoint_callback({
+                "failed_account_email": account_email,
+                "failed_token_hash": hashlib.sha256(active_token.encode()).hexdigest(),
+                "failure_kind": "revoked" if revoked else "transient",
+            })
+        if request.progress_callback:
+            request.progress_callback("switching_account")
+
+    def recover_auth(active_token: str, error: str) -> None:
+        # Keep the reserved slot while refreshing: token rotation migrates it.
+        refreshed = None
+        if active_token not in refreshed_tokens:
+            refreshed_tokens.add(active_token)
+            refreshed = account_service.refresh_access_token(active_token, force=True, event="image_stream")
+        if refreshed and refreshed != active_token and refreshed not in refreshed_tokens:
+            refreshed_tokens.add(refreshed)
+            lease.token = refreshed
+            state["sticky_token"] = refreshed
+            return
+        lease.finish(False)
+        revoked = False
+        if not is_soft_prepare_auth_error(error):
+            # Persist hard invalidation evidence before remove_invalid_token:
+            # session-only rows may be retained and must not become selectable
+            # again on the next request just because local quota is positive.
+            account_service._record_invalid_token_seen(active_token, "image_stream", error)
+            account_service.remove_invalid_token(active_token, "image_stream:auth_failed")
+            revoked = AccountService._token_looks_revoked({"last_refresh_error": error})
+        elif account_service.confirm_token_revoked(active_token):
+            revoked = True
+            account_service.remove_invalid_token(active_token, "image_stream:auth_failed")
+        exclude_account(active_token, error, revoked=revoked)
 
     def recover_connection(active_token: str, last_error: str) -> bool:
         """同一账号换出口，或换号。返回 True 表示外层应 continue。"""
@@ -1463,9 +1558,8 @@ def _generate_single_image(
             return True
 
         failed_tokens: set[str] = state["failed_connection_tokens"]
-        failed_tokens.add(active_token)
-        account_service.mark_image_result(active_token, False)
-        state["sticky_token"] = ""
+        lease.finish(False)
+        exclude_account(active_token, last_error)
         if len(failed_tokens) >= MAX_CONNECTION_ACCOUNT_RETRIES:
             return False
         logger.warning({
@@ -1479,6 +1573,10 @@ def _generate_single_image(
         return True
 
     while True:
+        if request.is_cancelled and request.is_cancelled():
+            if state["sticky_token"]:
+                lease.release()
+            raise ImageGenerationError("image task attempt cancelled", code="task_cancelled")
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1493,24 +1591,43 @@ def _generate_single_image(
                     plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                     excluded_tokens=state["failed_connection_tokens"],
                 )
+                lease.token = token
             if token in state["failed_connection_tokens"]:
                 raise ImageGenerationError(
                     image_stream_error_message(str(state["last_connection_error"] or "image generation failed")),
                     account_email=account_email,
                 )
         except RuntimeError as exc:
+            unavailable = "no available" in str(exc).lower()
+            message = str(exc) or "image generation failed"
             if state["failed_connection_tokens"] and state["last_connection_error"]:
-                raise ImageGenerationError(
-                    image_stream_error_message(str(state["last_connection_error"])),
-                    account_email=account_email,
-                ) from exc
-            raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+                last_message = image_stream_error_message(str(state["last_connection_error"]))
+                message = f"{message}; last attempt: {last_message}" if unavailable else last_message
+            raise ImageGenerationError(
+                message, account_email=account_email,
+                status_code=429 if unavailable else 502,
+                error_type="insufficient_quota" if unavailable else "server_error",
+                code="insufficient_quota" if unavailable else "upstream_error",
+            ) from exc
+
+        # The slot picker may have waited behind another request while the
+        # enclosing task timed out. Do not launch a new upstream request now.
+        if request.is_cancelled and request.is_cancelled():
+            lease.release()
+            raise ImageGenerationError("image task attempt cancelled", code="task_cancelled")
 
         emitted_for_token = False
         returned_message = False
         returned_result = False
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        lease.result_id = uuid.uuid4().hex
+        if request.checkpoint_callback:
+            request.checkpoint_callback({
+                "account_email": account_email, "conversation_id": "",
+                "account_token_hash": hashlib.sha256(token.encode()).hexdigest(),
+                "generation_id": lease.result_id,
+            })
         logger.debug({
             "event": "image_account_lookup",
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
@@ -1526,7 +1643,7 @@ def _generate_single_image(
                 state["egress_queue"] = [("direct", "")]
             if not state["egress_queue"]:
                 state["failed_connection_tokens"].add(token)
-                account_service.mark_image_result(token, False)
+                lease.finish(False)
                 state["sticky_token"] = ""
                 if state["last_connection_error"] and len(state["failed_connection_tokens"]) >= MAX_CONNECTION_ACCOUNT_RETRIES:
                     raise ImageGenerationError(
@@ -1538,15 +1655,20 @@ def _generate_single_image(
         state["current_proxy_source"] = proxy_source
         state["current_proxy_url"] = proxy_url
         backend = None
+        outputs: list[ImageOutput] = []
         try:
             if request.progress_callback:
                 request.progress_callback("preparing_conversation")
             backend = OpenAIBackendAPI(access_token=token, force_proxy=proxy_url)
+            backend.task_control = request.task_control
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
-            outputs: list[ImageOutput] = []
             for output in stream_fn(backend, request, index, total):
+                if request.is_cancelled and request.is_cancelled():
+                    raise ImageGenerationError("image task attempt cancelled", code="task_cancelled")
+                if output.conversation_id and request.checkpoint_callback:
+                    request.checkpoint_callback({"conversation_id": output.conversation_id})
                 if account_email and not output.account_email:
                     output.account_email = account_email
                 if output.kind == "progress":
@@ -1576,10 +1698,9 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
-                account_service.mark_image_result(token, False)
+                lease.finish(False)
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1590,21 +1711,24 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=conv_id,
                     )
-                return outputs
-            account_service.mark_image_result(token, True)
+                raise ImageGenerationError("upstream completed without generating images", code="upstream_text_reply")
+            lease.finish(True)
             return outputs
+        except ImageResultSettlementError:
+            raise
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 结果已到手：收尾阶段的流错误不能把已生成的图片判死。
             if returned_result and outputs:
+                lease.finish(True)
                 return outputs
+            lease.finish(False)
             # 轮询超时：把超时号排除出候选，下一次选号必然换号续传，
             # 而不是反复扎进同一个可能已挂死的账号。
-            state["failed_connection_tokens"].add(token)
-            state["last_connection_error"] = str(exc)
-            state["sticky_token"] = ""
+            exclude_account(token, str(exc))
+            if request.checkpoint_callback and getattr(exc, "conversation_id", ""):
+                request.checkpoint_callback({"conversation_id": exc.conversation_id})
             poll_timeout_retry_count += 1
             if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                 logger.warning({
@@ -1625,7 +1749,10 @@ def _generate_single_image(
             })
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            if returned_result and outputs:
+                lease.finish(True)
+                return outputs
+            lease.finish(False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1647,7 +1774,11 @@ def _generate_single_image(
             error_text = str(exc)
             # 结果已到手：收尾阶段的错误不能把已生成的图片判死，直接返回。
             if returned_result and outputs:
+                lease.finish(True)
                 return outputs
+            if not emitted_for_token and is_token_invalid_error(error_text):
+                recover_auth(token, error_text)
+                continue
             # 如果是模型返回文本而非图片，尝试换账号重试
             if (
                 not emitted_for_token
@@ -1657,7 +1788,8 @@ def _generate_single_image(
                     or getattr(exc, "code", "") == "upstream_text_reply"
                 )
             ):
-                account_service.mark_image_result(token, False)
+                lease.finish(False)
+                exclude_account(token, error_text)
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
@@ -1699,7 +1831,7 @@ def _generate_single_image(
                     image_stream_error_message(error_text),
                     account_email=account_email,
                 ) from exc
-            account_service.mark_image_result(token, False)
+            lease.finish(False)
             logger.warning({
                 "event": "image_stream_generation_error",
                 "request_token": token,
@@ -1719,6 +1851,7 @@ def _generate_single_image(
             })
             # 结果已到手：收尾阶段的流错误不能把已生成的图片判死，直接返回。
             if returned_result and outputs:
+                lease.finish(True)
                 return outputs
             if not emitted_for_token and is_upstream_connection_error(last_error):
                 if recover_connection(token, last_error):
@@ -1728,52 +1861,10 @@ def _generate_single_image(
                     account_email=account_email,
                 ) from exc
             state["sticky_token"] = ""
-            account_service.mark_image_result(token, False)
             if not emitted_for_token and is_token_invalid_error(last_error):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                if refreshed_token and refreshed_token != token:
-                    state["sticky_token"] = refreshed_token
-                    continue
-                if is_soft_prepare_auth_error(last_error):
-                    # Prepare 401 is only "soft" until /me disagrees. Without this
-                    # confirmation a server-revoked token keeps its 正常 status and
-                    # unexpired JWT, so the picker skips the probe and hands it out
-                    # again on every request — the pool silently serves dead rows.
-                    if account_service.confirm_token_revoked(token):
-                        state["failed_connection_tokens"].add(token)
-                        state["sticky_token"] = ""
-                        logger.warning({
-                            "event": "image_stream_prepare_auth_revoke_confirmed",
-                            "request_token": token,
-                            "account_email": account_email,
-                            "index": index,
-                            "error": last_error[:200],
-                        })
-                        account_service.remove_invalid_token(
-                            token, "image_stream:prepare_401_confirmed_on_me"
-                        )
-                        continue
-                    state["last_connection_error"] = last_error
-                    state["failed_connection_tokens"].add(token)
-                    state["sticky_token"] = ""
-                    account_service.mark_image_result(token, False)
-                    logger.warning({
-                        "event": "image_stream_soft_prepare_auth_failover",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "failed_accounts": len(state["failed_connection_tokens"]),
-                        "index": index,
-                        "error": last_error[:200],
-                    })
-                    if len(state["failed_connection_tokens"]) >= MAX_CONNECTION_ACCOUNT_RETRIES:
-                        raise ImageGenerationError(
-                            image_stream_error_message(last_error),
-                            account_email=account_email,
-                            conversation_id="",
-                        ) from exc
-                    continue
-                account_service.remove_invalid_token(token, "image_stream")
+                recover_auth(token, last_error)
                 continue
+            lease.finish(False)
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
             if backend is not None:
@@ -1854,6 +1945,10 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             })
         return
 
+    if errors:
+        # Preserve structured quota/policy errors (and timeout conversation IDs).
+        # Rewrapping them as generic 502 discards the client's recovery context.
+        raise errors[max(errors)]
     if not last_error:
         last_error = "no account in the pool could generate images — check account quota and rate-limit status"
     raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")

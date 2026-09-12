@@ -653,7 +653,7 @@ export async function fetchImageTasks(ids: string[]) {
 export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
   return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`, {
     method: "POST",
-    body: { extra_timeout_secs: extraTimeoutSecs },
+    body: { extra_timeout_secs: Number.isFinite(extraTimeoutSecs) ? Math.max(5, Math.min(120, extraTimeoutSecs)) : 30 },
   });
 }
 

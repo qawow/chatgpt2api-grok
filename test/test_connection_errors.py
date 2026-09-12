@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, call, patch
 
 from services.protocol.conversation import (
     ConversationRequest,
@@ -139,7 +139,7 @@ class ImageConnectionFailoverTests(unittest.TestCase):
 
         self.assertEqual(created, [("token-a", "socks5h://dead.example:1080"), ("token-a", "")])
         self.assertEqual(outputs[0].data[0]["url"], "http://example.test/ok.png")
-        accounts.mark_image_result.assert_called_with("token-a", True)
+        accounts.mark_image_result.assert_called_with("token-a", True, release_slot=False, result_id=ANY)
 
     def test_wrapped_connection_error_also_failovers_proxy(self) -> None:
         created: list[str | None] = []
@@ -278,7 +278,7 @@ class ImageConnectionFailoverTests(unittest.TestCase):
 
         self.assertIn("session expired", str(ctx.exception).lower())
         accounts.remove_invalid_token.assert_not_called()
-        accounts.mark_image_result.assert_called_with("token-a", False)
+        accounts.mark_image_result.assert_called_with("token-a", False, release_slot=False)
 
     def test_prepare_401_removes_account_when_me_confirms_revoke(self) -> None:
         """prepare 401 且 /me 也 401 → 确认吊销，必须清掉这行，否则下次还会选中它。"""
@@ -509,6 +509,165 @@ class ImageConnectionFailoverTests(unittest.TestCase):
         self.assertEqual(created, ["token-a", "token-b"])
         self.assertEqual(outputs[-1].kind, "result")
         self.assertEqual(outputs[-1].data[0]["url"], "http://example.test/ok.png")
+
+
+class ImageFailoverRegressionTests(unittest.TestCase):
+    def run_generation(self, stream, *, request=None):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        accounts = stack.enter_context(patch("services.protocol.conversation.account_service"))
+        backend = stack.enter_context(patch("services.protocol.conversation.OpenAIBackendAPI"))
+        backend.side_effect = lambda access_token, **_kw: type("Backend", (), {
+            "access_token": access_token, "close": lambda self: None,
+        })()
+        stack.enter_context(patch("services.protocol.conversation.stream_image_outputs", stream))
+        stack.enter_context(patch("services.protocol.conversation.time.sleep"))
+        stack.enter_context(patch("services.protocol.conversation.proxy_settings.list_egress_candidates", return_value=[("direct", "")]))
+
+        def pick(**kwargs):
+            for token in ("a", "b"):
+                if token not in kwargs["excluded_tokens"]:
+                    return token
+            raise RuntimeError("no available image quota")
+
+        accounts.get_available_access_token.side_effect = pick
+        accounts.get_account.side_effect = lambda token: {"email": token + "@test.invalid"}
+        accounts.refresh_access_token.return_value = None
+        accounts.confirm_token_revoked.return_value = False
+        return accounts, lambda: _generate_single_image(request or ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+
+    def test_hard_auth_retained_account_is_excluded(self):
+        visited = []
+
+        def stream(backend, request, index, total):
+            visited.append(backend.access_token)
+            if backend.access_token == "a":
+                raise RuntimeError("token_revoked")
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+
+        accounts, run = self.run_generation(stream)
+        self.assertEqual(run()[-1].data, [{"url": "ok"}])
+        self.assertEqual(visited, ["a", "b"])
+        self.assertEqual(accounts.mark_image_result.call_args_list, [call("a", False, release_slot=False), call("b", True, release_slot=False, result_id=ANY)])
+        accounts._record_invalid_token_seen.assert_called_once_with("a", "image_stream", "token_revoked")
+
+    def test_soft_auth_is_counted_once_and_typed_auth_also_transfers(self):
+        def stream(backend, request, index, total):
+            if backend.access_token == "a":
+                raise ImageGenerationError("token invalidated (chat_requirements_prepare)")
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+
+        accounts, run = self.run_generation(stream)
+        run()
+        self.assertEqual(accounts.mark_image_result.call_args_list, [call("a", False, release_slot=False), call("b", True, release_slot=False, result_id=ANY)])
+        accounts.remove_invalid_token.assert_not_called()
+        accounts._record_invalid_token_seen.assert_not_called()
+
+    def test_text_after_sticky_tls_retry_switches_account(self):
+        visited = []
+
+        def stream(backend, request, index, total):
+            visited.append(backend.access_token)
+            if len(visited) == 1:
+                raise RuntimeError("curl: (35) TLS connect error")
+            if backend.access_token == "a":
+                raise ImageGenerationError("Which style do you prefer?", code="upstream_text_reply")
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+
+        accounts, run = self.run_generation(stream)
+        run()
+        self.assertEqual(visited, ["a", "a", "b"])
+        self.assertEqual(accounts.mark_image_result.call_args_list, [call("a", False, release_slot=False), call("b", True, release_slot=False, result_id=ANY)])
+
+    def test_refresh_keeps_slot_until_result(self):
+        def stream(backend, request, index, total):
+            if backend.access_token == "a":
+                raise RuntimeError("token_revoked")
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+
+        accounts, run = self.run_generation(stream)
+        accounts.refresh_access_token.return_value = "refreshed"
+        run()
+        accounts.mark_image_result.assert_called_once_with("refreshed", True, release_slot=False, result_id=ANY)
+        accounts.get_available_access_token.assert_called_once()
+
+    def test_all_trailing_errors_account_for_success_once(self):
+        from services.openai_backend_api import ImagePollTimeoutError
+
+        for error in (RuntimeError("curl: (56)"), ImagePollTimeoutError("timeout"), ImageGenerationError("stream failed")):
+            with self.subTest(error=type(error).__name__):
+                def stream(backend, request, index, total):
+                    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+                    raise error
+
+                accounts, run = self.run_generation(stream)
+                self.assertEqual(run()[-1].data, [{"url": "ok"}])
+                accounts.mark_image_result.assert_called_once_with("a", True, release_slot=False, result_id=ANY)
+
+    def test_empty_pool_is_quota_error(self):
+        accounts, run = self.run_generation(iter(()))
+        accounts.get_available_access_token.side_effect = RuntimeError("no available image quota: revoked=10")
+        with self.assertRaises(ImageGenerationError) as caught:
+            run()
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(caught.exception.code, "insufficient_quota")
+        accounts.mark_image_result.assert_not_called()
+
+    def test_cancelled_while_waiting_for_slot_does_not_start_generation(self):
+        cancelled = iter((False, True))
+        request = ConversationRequest(model="gpt-image-2", prompt="cat", is_cancelled=lambda: next(cancelled))
+        accounts, run = self.run_generation(None, request=request)
+        with self.assertRaises(ImageGenerationError) as caught:
+            run()
+        self.assertEqual(caught.exception.code, "task_cancelled")
+        accounts.release_image_slot.assert_called_once_with("a")
+        accounts.mark_image_result.assert_not_called()
+
+    def test_checkpoint_write_failure_releases_slot(self):
+        from unittest.mock import Mock
+        request = ConversationRequest(model="gpt-image-2", prompt="cat", checkpoint_callback=Mock(side_effect=OSError("disk full")))
+        accounts, run = self.run_generation(None, request=request)
+        with self.assertRaises(OSError):
+            run()
+        accounts.release_image_slot.assert_called_once_with("a")
+        accounts.mark_image_result.assert_not_called()
+
+    def test_proxy_setup_failure_releases_slot(self):
+        accounts, run = self.run_generation(None)
+        with patch("services.protocol.conversation.proxy_settings.list_egress_candidates", side_effect=RuntimeError("setup failed")):
+            with self.assertRaises(RuntimeError):
+                run()
+        accounts.release_image_slot.assert_called_once_with("a")
+
+    def test_settlement_write_failure_does_not_report_success_or_release_twice(self):
+        from services.protocol.conversation import ImageResultSettlementError
+
+        def stream(backend, request, index, total):
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+
+        accounts, run = self.run_generation(stream)
+        accounts.mark_image_result.side_effect = OSError("disk full")
+        with self.assertRaises(ImageResultSettlementError):
+            run()
+        accounts.mark_image_result.assert_called_once()
+        accounts.release_image_slot.assert_called_once_with("a")
+
+    def test_success_uses_persisted_generation_id(self):
+        from unittest.mock import Mock
+        checkpoint = Mock()
+        request = ConversationRequest(model="gpt-image-2", prompt="cat", checkpoint_callback=checkpoint)
+
+        def stream(backend, request, index, total):
+            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=[{"url": "ok"}])
+
+        accounts, run = self.run_generation(stream, request=request)
+        run()
+        generation_id = checkpoint.call_args_list[0].args[0]["generation_id"]
+        self.assertTrue(generation_id)
+        accounts.mark_image_result.assert_called_once_with("a", True, release_slot=False, result_id=generation_id)
+        accounts.release_image_slot.assert_called_once_with("a")
 
     def test_trailing_stream_error_keeps_collected_result(self) -> None:
         """断流保结果：结果已到手后流报错，直接返回结果而不是对外报错。"""
