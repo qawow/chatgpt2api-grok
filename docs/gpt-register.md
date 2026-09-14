@@ -294,9 +294,17 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `so_collect_ms` | 空 | create_account 前 SO 采集等待毫秒；空=默认 0；需要旧行为时设 `5000` |
 | `auto_replenish_enabled` | **true** | 可生图账号低于阈值时，用当前注册配置自动开任务 |
 | `auto_replenish_min_available` | 1 | 号池最少可用（`_is_image_account_available`）账号数 |
+| `auto_replenish_target_available` | 4 | 主动维持的水位：低于 target 就小步补，不等跌破 min 才抢救 |
+| `auto_replenish_min_total_quota` | 0 | 按额度补号：**可用账号剩余生图额度总和**低于此值即补号；`0`=关闭（默认）。与数量水位是 **OR** 关系，任一不足即触发 |
 | `auto_replenish_batch` | 1 | 每次自动任务注册几个（1–5） |
 | `auto_replenish_interval_secs` | 90 | 检查间隔；已有任务时跳过 |
+| `auto_replenish_spacing_secs` | 600 | 两次**成功**自动补号的最小间隔，把注册/死亡时间摊开；跌破 min 的紧急情况不受此限 |
 | `auto_replenish_fail_cooldown_secs` | 600 | 自动任务入库 0 后的冷却，避免空转烧代理/邮箱 |
+| `circuit_break` | 3 | 连续网络错误后停止当前自动补号任务；0=关闭（仍受 `timeout_secs` 保护） |
+
+自动补号容灾建议：`min_available=2`、`target_available=4`、`batch=1`、`spacing_secs=600`、`fail_cooldown_secs=600`、`circuit_break=3`。网络连续失败时任务会停止，等待代理/邮箱恢复后下一轮检查再补；业务失败（例如 OTP 错误）不会误触发网络熔断。所有参数都可在设置页修改，下一轮调度生效。
+
+**按额度补号**（`auto_replenish_min_total_quota`，默认关闭）：按数量补水只在「可用账号数」少时触发，但「4 个号各剩 1 张」这种情形数量充足、额度已快耗尽。设为如 `20` 后，可用账号剩余额度总和低于 20 就补号——额度口径与生图请求完全一致（`total_image_available_quota`，只算选号器当前可用的账号，异常/吊销账号的残余额度不算）。与数量水位是 OR：任一不足即触发，spacing / 失败冷却 / 批次大小 / 熔断全部共用。免费号上游 `image_gen.remaining` 常为 0，所以默认 `0`=关闭；按每号约 25 张设阈值。
 
 ### 号池侧相关 API（补 refresh）
 

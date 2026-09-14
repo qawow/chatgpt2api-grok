@@ -169,6 +169,18 @@ docker logs -f chatgpt2api
 # 系统日志：data/logs.jsonl（type=account，摘要「GPT注册任务结束」）
 ```
 
+日志保留：`logs.jsonl` 只追加、且列表/删除接口每次读全文件，不清理会无限膨胀。`log_retention_days`（默认 30，`0` 不清理）在启动时与每 6 小时流式裁剪——内存不随文件体积增长，坏行保留不误删。日志页变慢时先看这个。
+
+### 出口（代理）熔断
+
+连接类错误（代理拒连 / 超时 / TLS）会按出口记失败：
+
+- `egress_blacklist_failure_threshold`（默认 3）：窗口内达到该次数才把出口拉黑 10 分钟。单次瞬断不再拉黑唯一出口，避免「一次抖动 → 10 分钟全量回落直连」。
+- `egress_blacklist_window_secs`（默认 60）：失败计数窗口。
+- `OPENSSL_internal:invalid library` 是本地 curl_cffi/HTTP2 问题，不计失败、也不拉黑（见 1.8.0 说明）。
+
+排障：代理偶发不通时先看是否命中熔断（`POST /api/proxy/test` 直连测一次），而不是反复换号。
+
 | 症状 | 方向 |
 | --- | --- |
 | 无 Grok / 注册 API | 是否拉了上游官方镜像 → 改用 `ghcr.io/qawow/chatgpt2api` 或 local compose 重建 |
@@ -204,6 +216,10 @@ docker logs -f chatgpt2api
 - 重启后未完成任务仍标为中断，可手动续传；成功图片不会被重新提交。没有保存原始输入的历史任务仅能续轮询，无法换号重放时需点「重新生成这一张」。内容策略拒绝不自动换号重试。
 - `revoked=10`、`tried=0` 表示没有 token 能进入选号器，`local_quota_sum` 不代表上游真实可用。续传不能复活已吊销 token：先导入/重新登录有效账号，再续传失败任务。账号池为空时不会无限重试。
 
+### 自动补号容灾
+
+设置 → GPT 注册中可调：最少/目标可用账号、每批数量、检查间隔、成功补号间隔、失败冷却和网络熔断阈值。`circuit_break=0` 关闭连续网络故障熔断，但单任务仍受注册 `timeout_secs` 限制；建议保留默认值 3。自动补号只统计当前真正可生图的账号，异常/吊销账号不会因为本地残余额度被当作库存。补号任务完成后会等待下一次调度，避免失败时持续消耗代理和邮箱额度。除「按数量」外还可开**按额度补号**（`auto_replenish_min_total_quota`，默认 `0` 关闭）：可用账号剩余生图额度总和低于阈值即补号，与数量阈值是 OR 关系，适合「号够多但额度将耗尽」的场景；详见 [gpt-register.md](gpt-register.md) §自动补号。
+
 ## 7. 开发
 
 ```bash
@@ -220,7 +236,9 @@ uv run python -m unittest \
   test.test_account_image_capabilities \
   test.test_curl_tls \
   test.test_image_download_auth \
-  test.test_web_fallback -v
+  test.test_web_fallback \
+  test.test_ssrf \
+  test.test_body_limit -v
 ```
 
 ## 8. 安全
@@ -228,6 +246,8 @@ uv run python -m unittest \
 - 强随机 `auth-key` / `CHATGPT2API_AUTH_KEY`  
 - `data/*.env`、号池 token 勿提交 git  
 - 管理端口勿裸奔公网；需要时反代 + HTTPS + 访问控制  
+- **SSRF**：所有用户提供的图片 URL（`/v1/images/edits` 的 `image_url`、`/v1/chat/completions` 与 `/v1/responses` 消息内的 `image_url`）都经 `utils/ssrf.py` 校验——只允许 `http/https`，拒绝私网 / 回环 / 链路本地 / 云元数据地址（含 IPv6 与 IPv4-mapped），无法证明为公网的域名 fail-closed 拒绝；重定向逐跳校验，不安全目标不会回落到其他出口。
+- **请求体上限**：`max_request_body_mb`（默认 256 MB，`0` 不限制）拦截超大 JSON / multipart 上传，超限返回 413；`CHATGPT2API_LIMIT_CONCURRENCY`（默认 256）限制并发连接数。
 - 本项目仅供学习研究，遵守各平台服务条款与法律  
 
 运行时密钥文件：`data/grok_accounts.json`、`data/accounts.json`。详见 [grok-pool.md](./grok-pool.md)。  

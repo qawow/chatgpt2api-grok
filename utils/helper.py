@@ -13,6 +13,7 @@ from curl_cffi import requests
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
+from utils.ssrf import UnsafeUrlError, assert_safe_url
 
 # 官网生图链路自 2026-09-08 起出的就是 ChatGPT Images 2.5，故对外正名为
 # gpt-image-2.5。画图档位由服务端决定，改名不改上游请求（仍发 gpt-5-3 +
@@ -434,6 +435,15 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
 
+    # SSRF protection: message-supplied image URLs must not reach internal
+    # addresses, and redirect hops are re-validated before being followed.
+    try:
+        assert_safe_url(source)
+    except UnsafeUrlError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "image_url must not point to a private or local network address"},
+        ) from exc
     try:
         response = proxy_settings.get_with_egress_fallback(
             source,
@@ -441,7 +451,13 @@ def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
             upstream=True,
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
             timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
+            ssrf_guard=True,
         )
+    except UnsafeUrlError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "image_url must not point to a private or local network address"},
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
     if not 200 <= response.status_code < 300:

@@ -62,4 +62,7 @@ COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+# --limit-concurrency: cap simultaneous connections so slow / oversized clients
+# cannot exhaust the event loop or the image thread pool (see also
+# RequestBodyLimitMiddleware and max_request_body_mb in config.json).
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log", "--limit-concurrency", "256"]

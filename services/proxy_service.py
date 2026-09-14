@@ -14,27 +14,48 @@ from urllib.parse import quote, urlparse
 from services.config import config
 from utils.curl_tls import (
     create_cffi_session,
+    is_openssl_invalid_library,
     resolve_session_impersonate,
     sanitize_curl_ssl_env,
 )
+from utils.ssrf import UnsafeUrlError, assert_safe_url, fetch_following_redirects
 
 _UNUSABLE_EGRESS_TTL_SECS = 10 * 60
 _unusable_egress_until: dict[str, float] = {}
+_egress_failures: dict[str, list[float]] = {}
 _unusable_egress_lock = threading.Lock()
 
 
 def mark_egress_unusable(url: str, reason: str = "") -> None:
-    """Remember a dead proxy so the next account does not wait on it again."""
-    from utils.curl_tls import is_openssl_invalid_library
+    """Remember a dead proxy so the next account does not wait on it again.
 
+    Blacklisting is circuit-breaker style: a single transient blip (one proxy
+    timeout) only counts toward a windowed failure counter. Once
+    ``egress_blacklist_failure_threshold`` connection errors land inside
+    ``egress_blacklist_window_secs`` the egress is blacklisted for the TTL — a
+    genuinely dead proxy still trips fast, but one flaky packet no longer
+    blacklists the only egress for 10 minutes. ``OPENSSL_internal`` is a local
+    curl_cffi/HTTP2 bug, not a dead proxy, and never counts.
+    """
     # OPENSSL_internal is a local curl_cffi/HTTP2 bug, not a dead proxy.
     if is_openssl_invalid_library(reason):
         return
     key = normalize_proxy_url(url)
     if not key:
         return
+    threshold = max(1, config.egress_blacklist_failure_threshold)
+    window = max(1, config.egress_blacklist_window_secs)
+    now = time.time()
     with _unusable_egress_lock:
-        _unusable_egress_until[key] = time.time() + _UNUSABLE_EGRESS_TTL_SECS
+        recent = [stamp for stamp in _egress_failures.get(key, []) if now - stamp < window]
+        recent.append(now)
+        if len(recent) < threshold:
+            _egress_failures[key] = recent
+            return
+        # Threshold reached: blacklist and reset the counter so the penalty is
+        # one TTL per burst, not an ever-growing count.
+        _egress_failures.pop(key, None)
+        _unusable_egress_until[key] = now + _UNUSABLE_EGRESS_TTL_SECS
 
 
 def is_egress_unusable(url: str) -> bool:
@@ -55,6 +76,7 @@ def is_egress_unusable(url: str) -> bool:
 def reset_unusable_egress() -> None:
     with _unusable_egress_lock:
         _unusable_egress_until.clear()
+        _egress_failures.clear()
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
@@ -394,8 +416,18 @@ class ProxySettingsStore:
         impersonate: str = "chrome",
         verify: bool = True,
         skip_proxy_urls: set[str] | frozenset[str] | None = None,
+        ssrf_guard: bool = False,
     ) -> FetchedResponse:
-        """GET ``url``, walking remaining egress after a dead proxy."""
+        """GET ``url``, walking remaining egress after a dead proxy.
+
+        ``ssrf_guard=True`` validates the URL and every redirect hop against the
+        SSRF rules in ``utils.ssrf`` instead of blindly following redirects. An
+        unsafe URL never falls through to another egress candidate — trying
+        direct egress to reach an internal address is exactly what we must not
+        do — so :class:`~utils.ssrf.UnsafeUrlError` propagates immediately.
+        """
+        if ssrf_guard:
+            assert_safe_url(url)
         skipped = {normalize_proxy_url(item) for item in (skip_proxy_urls or set())}
         last_error: Exception | None = None
         request_headers = dict(headers or {})
@@ -415,17 +447,30 @@ class ProxySettingsStore:
                 )
             )
             try:
-                response = session.get(
-                    url,
-                    headers=request_headers,
-                    timeout=timeout,
-                    allow_redirects=True,
-                )
+                if ssrf_guard:
+                    response = fetch_following_redirects(
+                        lambda target: session.get(
+                            target,
+                            headers=request_headers,
+                            timeout=timeout,
+                            allow_redirects=False,
+                        ),
+                        url,
+                    )
+                else:
+                    response = session.get(
+                        url,
+                        headers=request_headers,
+                        timeout=timeout,
+                        allow_redirects=True,
+                    )
                 return FetchedResponse(
                     content=response.content or b"",
                     status_code=int(response.status_code),
                     headers={str(key): str(value) for key, value in response.headers.items()},
                 )
+            except UnsafeUrlError:
+                raise
             except Exception as exc:
                 last_error = exc
                 if not _is_egress_connect_error(str(exc)):

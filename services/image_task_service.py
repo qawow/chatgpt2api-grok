@@ -128,8 +128,11 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 class ImageTaskService:
-    _ACCOUNT_FAILURE_COOLDOWN_SECS = 60.0
     _PROGRESS_SAVE_INTERVAL_SECS = 1.0
+
+    @staticmethod
+    def _account_failure_cooldown_secs() -> float:
+        return max(0.0, float(config.image_transient_failure_cooldown_secs))
 
     def __init__(
         self,
@@ -335,7 +338,7 @@ class ImageTaskService:
                     failures = dict(task.get("account_failures") or {})
                     failures[failed_hash] = {
                         "kind": checkpoint.get("failure_kind", "transient"),
-                        "retry_at": time.time() + self._ACCOUNT_FAILURE_COOLDOWN_SECS,
+                        "retry_at": time.time() + self._account_failure_cooldown_secs(),
                         "attempt": attempt,
                     }
                     updates["account_failures"] = failures
@@ -532,7 +535,7 @@ class ImageTaskService:
                 if fingerprint and failures.get(fingerprint, {}).get("attempt") != task.get("attempt", 0):
                     failures[fingerprint] = {
                         "kind": "transient", "attempt": task.get("attempt", 0),
-                        "retry_at": time.time() + self._ACCOUNT_FAILURE_COOLDOWN_SECS,
+                    "retry_at": time.time() + self._account_failure_cooldown_secs(),
                     }
                     task["account_failures"] = failures
             task["updated_at"] = _now_iso()
@@ -713,7 +716,7 @@ class ImageTaskService:
             if task.get("account_token_hash"):
                 hashes.add(task["account_token_hash"])
             failures = dict(task.get("account_failures") or {})
-            legacy_retry_at = float(task.get("last_failure_at") or time.time()) + self._ACCOUNT_FAILURE_COOLDOWN_SECS
+            legacy_retry_at = float(task.get("last_failure_at") or time.time()) + self._account_failure_cooldown_secs()
             for fingerprint in hashes:
                 failures.setdefault(fingerprint, {"kind": "transient", "retry_at": legacy_retry_at})
             hashes = {

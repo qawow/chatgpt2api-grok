@@ -456,6 +456,36 @@ class ConfigStore:
             return 3
 
     @property
+    def image_account_failover_retries(self) -> int:
+        """Maximum account changes for one image before returning an error."""
+        try:
+            return max(1, min(20, int(self.data.get("image_account_failover_retries", 4))))
+        except (TypeError, ValueError):
+            return 4
+
+    @property
+    def image_poll_failover_retries(self) -> int:
+        try:
+            return max(0, min(20, int(self.data.get("image_poll_failover_retries", 4))))
+        except (TypeError, ValueError):
+            return 4
+
+    @property
+    def image_text_failover_retries(self) -> int:
+        try:
+            return max(0, min(20, int(self.data.get("image_text_failover_retries", 3))))
+        except (TypeError, ValueError):
+            return 3
+
+    @property
+    def image_transient_failure_cooldown_secs(self) -> int:
+        """Task-local cooldown for a transiently failed credential; 0 disables it."""
+        try:
+            return max(0, min(3600, int(self.data.get("image_transient_failure_cooldown_secs", 60))))
+        except (TypeError, ValueError):
+            return 60
+
+    @property
     def image_parallel_generation(self) -> bool:
         value = self.data.get("image_parallel_generation", True)
         if isinstance(value, str):
@@ -493,6 +523,38 @@ class ConfigStore:
             return max(0.5, float(self.data.get("image_settle_secs", 2.0)))
         except (TypeError, ValueError):
             return 2.0
+
+    @property
+    def egress_blacklist_failure_threshold(self) -> int:
+        """连接错误熔断阈值：窗口内达到该次数才把出口拉黑（0/1 = 旧的一次即拉黑）。"""
+        try:
+            return max(1, int(self.data.get("egress_blacklist_failure_threshold", 3)))
+        except (TypeError, ValueError):
+            return 3
+
+    @property
+    def egress_blacklist_window_secs(self) -> int:
+        """失败计数窗口（秒）。"""
+        try:
+            return max(1, int(self.data.get("egress_blacklist_window_secs", 60)))
+        except (TypeError, ValueError):
+            return 60
+
+    @property
+    def max_request_body_mb(self) -> int:
+        """单个请求体上限（MB）：含 multipart 上传与 JSON body，0 表示不限制。"""
+        try:
+            return max(0, int(self.data.get("max_request_body_mb", 256)))
+        except (TypeError, ValueError):
+            return 256
+
+    @property
+    def log_retention_days(self) -> int:
+        """logs.jsonl 保留天数；0 表示不清理。list()/delete() 会读全文件，不清理会无限膨胀。"""
+        try:
+            return max(0, int(self.data.get("log_retention_days", 30)))
+        except (TypeError, ValueError):
+            return 30
 
     @property
     def auto_remove_invalid_accounts(self) -> bool:
@@ -590,11 +652,19 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_account_failover_retries"] = self.image_account_failover_retries
+        data["image_poll_failover_retries"] = self.image_poll_failover_retries
+        data["image_text_failover_retries"] = self.image_text_failover_retries
+        data["image_transient_failure_cooldown_secs"] = self.image_transient_failure_cooldown_secs
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
+        data["egress_blacklist_failure_threshold"] = self.egress_blacklist_failure_threshold
+        data["egress_blacklist_window_secs"] = self.egress_blacklist_window_secs
+        data["max_request_body_mb"] = self.max_request_body_mb
+        data["log_retention_days"] = self.log_retention_days
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review

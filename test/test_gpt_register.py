@@ -72,6 +72,15 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertEqual(s["auto_replenish_batch"], 1)
         self.assertEqual(s["auto_replenish_interval_secs"], 30)
 
+    def test_auto_replenish_disaster_controls_are_persisted_and_clamped(self):
+        s = normalize_settings({
+            "auto_replenish_fail_cooldown_secs": 1,
+            "circuit_break": 99,
+        })
+        self.assertEqual(s["auto_replenish_fail_cooldown_secs"], 60)
+        self.assertEqual(s["circuit_break"], 20)
+        self.assertEqual(normalize_settings({"circuit_break": 0})["circuit_break"], 0)
+
     def test_api_model_accepts_latency_fields(self):
         """Regression: undeclared fields were dropped by Pydantic → UI could not uncheck skip_codex."""
         from api.gpt_register import GptRegisterSettingsUpdate
@@ -107,6 +116,18 @@ class NormalizeSettingsTest(unittest.TestCase):
         self.assertEqual(patch["auto_replenish_target_available"], 5)
         self.assertEqual(patch["auto_replenish_spacing_secs"], 300)
         self.assertIn("b.example.com", patch["cfd1_domains"])
+
+    def test_api_model_accepts_circuit_break_zero(self):
+        from api.gpt_register import GptRegisterSettingsUpdate
+
+        body = GptRegisterSettingsUpdate(
+            auto_replenish_fail_cooldown_secs=120,
+            circuit_break=0,
+        )
+        self.assertEqual(body.model_dump(exclude_none=True), {
+            "auto_replenish_fail_cooldown_secs": 120,
+            "circuit_break": 0,
+        })
 
 
 class ConfigStoreTest(unittest.TestCase):

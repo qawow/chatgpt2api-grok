@@ -1,7 +1,18 @@
 # Changelog
 
-## Unreleased
+## 1.8.7 - 2026-09-15
 
++ [安全] 网络层加固（SSRF / 熔断 / 请求体上限 / 探测兜底）：
+  - [修复] `/v1/chat/completions` 与 `/v1/responses` 消息内 `image_url` 此前**完全没有** SSRF 防护（`utils/helper._decode_message_image_url` 直连抓取），与 `/v1/images/edits` 的校验标准不一致。新增共享守卫 `utils/ssrf.py`，两条路径统一拦截私网 / 回环 / 链路本地 / 云元数据地址。
+  - [修复] 重定向跟随导致 SSRF 绕过：`get_with_egress_fallback` 原先 `allow_redirects=True`，公网 URL 可 `302 → 169.254.169.254`。新增 `ssrf_guard=True` 逐跳校验（含相对 Location 解析、重定向环与跳数上限），且不安全 URL **绝不**回落到其他出口（不会试着用直连去够内网地址）。
+  - [修复] 代理出口下的 DNS 语义不一致：原校验用本机 `getaddrinfo` 解析，但请求走 `socks5h`（远端 DNS），本地解析失败的域名会被放行。现改为 fail-closed——无法证明为公网的域名一律拒绝。
+  - [修复] 出口熔断过激：`mark_egress_unusable` 原先任何一次连接错误（含单次 `timed out`）即拉黑 10 分钟，单代理部署下一次抖动等于 10 分钟全损。改为窗口内失败计数（`egress_blacklist_failure_threshold` 默认 3 / `egress_blacklist_window_secs` 默认 60）达标才拉黑；`OPENSSL_internal` 仍不计入。
+  - [新增] 请求体上限：`max_request_body_mb`（默认 256，`0` 不限制）+ 纯 ASGI `RequestBodyLimitMiddleware`，同时拦 `Content-Length` 与分块 / multipart 流式 body（超限返回 413）；uvicorn 与 `main.py` 统一 `--limit-concurrency 256`（`CHATGPT2API_LIMIT_CONCURRENCY` 可覆盖）。
+  - [优化] 出口地理探测（`utils/egress_locale`）加 User-Agent 与备用 provider（ipwho.is，HTTPS 免费档），主 provider（ip-api 明文免费档）失败时兜底，降低单点失败导致时区画像回退东京的概率。
+  - [优化] WebDAV 上传超时不再固定 30s：按 body 大小缩放（30s 起 + 每 MB 10s，上限 300s），慢链路大图不再误超时。
+  - [修复] `main.py` 的 `access_log=False` 与 Dockerfile 的 `--access-log` 不一致：本地 `uv run main.py` 现在也记录访问日志（`CHATGPT2API_ACCESS_LOG=false` 可关）。
+  - [测试] 新增 `test/test_ssrf.py`（14）与 `test/test_body_limit.py`（4），`test_proxy_service` 补熔断计数与 SSRF 不回落直连的回归；顺带修复 1.8.3 改名后未同步的 `gpt-image-2` 旧断言。
++ [新增] 自动补号和生图换号容灾参数可配置：补号网络熔断阈值、失败冷却，以及生图账号/轮询/文字回复换号次数和临时失败冷却；`0` 的关闭语义不会被前端默认值覆盖。
 + [修复] 临时网络/轮询失败不再永久排除账号：按任务记录 60 秒冷却；确认吊销的凭证继续排除，同账号更新凭证后可用。
 + [修复] 图片账号槽使用统一租约释放，覆盖检查点写盘、出口初始化及异常处理失败；结算写盘失败不伪装为成功。
 + [修复] 原生成和续轮询共用持久化 generation_id，额度与结算 ID 一次提交；重复/并发续轮询与重启恢复不重复扣减，续轮询不释放其他请求的并发槽。
@@ -11,6 +22,9 @@
 + [新增] 图片失败任务支持「续传 / 换号继续」：持久化提示词、尺寸、质量、参考图/蒙版和上游会话检查点。可访问旧会话则续轮询；会话失效或续轮询超时/连接失败时，用原始输入换可用账号重新生成，保留任务 ID。
 + [修复] 续传按任务所有者隔离，重复提交受状态保护，旧执行进度不能覆盖新执行；失败凭证使用哈希识别，同邮箱重新登录得到的新 token 不被永久排除。
 + [修复] 前端续传按 task ID 定位本地会话，不再混用上游 conversation ID；空池返回结构化 429 insufficient_quota，不把本地剩余额度当作已吊销账号可用的依据。
++ [修复] 数据库后端（postgres/mysql）`accounts.access_token` 原为 `varchar(2048)`：实测 token 约 1.9k 字符、余量仅约 100，超长 JWT 会触发 `value too long` 使**整次保存失败**（SQLite 不校验长度所以本地无感）。改为不限长的 `TEXT`，并对已有库在启动时幂等 `ALTER` 升级（DDL 失败不阻断启动）。新增 `test/test_database_storage.py`。
++ [新增] `logs.jsonl` 日志保留：`log_retention_days`（默认 30，`0` 不清理）。日志只追加不清理、且 `list()`/`delete()` 每次读全文件，长期运行后管理端日志页会变慢占内存；现启动时与每 6 小时流式裁剪（内存不随文件体积增长，坏行保留不误删）。新增 `test/test_log_retention.py`。
++ [新增] 注册补号支持**按额度触发**：`auto_replenish_min_total_quota`（默认 `0`=关闭）。原补号只按可用账号数量（min/target available），「号够多但额度将耗尽」无法自动补；开启后可用账号剩余生图额度总和低于阈值即开任务，与数量阈值是 OR 关系，spacing/失败冷却/批次/熔断全部共用。额度口径与生图请求一致（`account_service.total_image_available_quota`，只算选号器当前可用账号）。新增 `test/test_replenish_quota.py`（8）。
 
 ## 1.8.6 - 2026-09-12
 

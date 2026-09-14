@@ -60,6 +60,9 @@ const DEFAULT_FORM: GptRegisterSettings = {
   auto_replenish_batch: 1,
   auto_replenish_interval_secs: 90,
   auto_replenish_spacing_secs: 600,
+  auto_replenish_fail_cooldown_secs: 600,
+  auto_replenish_min_total_quota: 0,
+  circuit_break: 3,
 };
 
 function isActiveJob(job?: GptRegisterJob | null) {
@@ -163,7 +166,10 @@ export function GptRegisterCard() {
         auto_replenish_target_available: Number(form.auto_replenish_target_available) || 4,
         auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
         auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
-        auto_replenish_spacing_secs: Number(form.auto_replenish_spacing_secs) || 600,
+        auto_replenish_spacing_secs: Math.max(0, Number(form.auto_replenish_spacing_secs ?? 600)),
+        auto_replenish_fail_cooldown_secs: Math.max(60, Number(form.auto_replenish_fail_cooldown_secs ?? 600)),
+        auto_replenish_min_total_quota: Math.max(0, Number(form.auto_replenish_min_total_quota ?? 0)),
+        circuit_break: Math.max(0, Math.min(20, Number(form.circuit_break ?? 3))),
         executor: "protocol",
         mail_provider: "cloudflare_d1_api",
         captcha: "",
@@ -199,7 +205,10 @@ export function GptRegisterCard() {
         auto_replenish_target_available: Number(form.auto_replenish_target_available) || 4,
         auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
         auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
-        auto_replenish_spacing_secs: Number(form.auto_replenish_spacing_secs) || 600,
+        auto_replenish_spacing_secs: Math.max(0, Number(form.auto_replenish_spacing_secs ?? 600)),
+        auto_replenish_fail_cooldown_secs: Math.max(60, Number(form.auto_replenish_fail_cooldown_secs ?? 600)),
+        auto_replenish_min_total_quota: Math.max(0, Number(form.auto_replenish_min_total_quota ?? 0)),
+        circuit_break: Math.max(0, Math.min(20, Number(form.circuit_break ?? 3))),
         executor: "protocol",
         mail_provider: "cloudflare_d1_api",
         captcha: "",
@@ -513,11 +522,26 @@ export function GptRegisterCard() {
                     max={7200}
                     value={form.auto_replenish_spacing_secs ?? 600}
                     onChange={(e) =>
-                      setField("auto_replenish_spacing_secs", Number(e.target.value) || 600)
+                      setField("auto_replenish_spacing_secs", Math.max(0, Number(e.target.value) || 0))
                     }
                     className="h-10 rounded-xl border-stone-200 bg-white"
                     disabled={running || form.auto_replenish_enabled === false}
                   />
+                </Field>
+                <Field label="失败冷却(秒)" hint="补号无新增账号后的等待时间">
+                  <Input type="number" min={60} max={7200} value={form.auto_replenish_fail_cooldown_secs ?? 600}
+                    onChange={(e) => setField("auto_replenish_fail_cooldown_secs", Number(e.target.value) || 60)}
+                    className="h-10 rounded-xl border-stone-200 bg-white" disabled={running || form.auto_replenish_enabled === false} />
+                </Field>
+                <Field label="按额度补号阈值" hint="可用账号剩余生图额度总和低于此值即补号；0=关闭，与数量阈值并存（OR）">
+                  <Input type="number" min={0} max={10000} value={form.auto_replenish_min_total_quota ?? 0}
+                    onChange={(e) => setField("auto_replenish_min_total_quota", Math.max(0, Number(e.target.value) || 0))}
+                    className="h-10 rounded-xl border-stone-200 bg-white" disabled={running || form.auto_replenish_enabled === false} />
+                </Field>
+                <Field label="网络熔断阈值" hint="连续网络失败次数；0=关闭">
+                  <Input type="number" min={0} max={20} value={form.circuit_break ?? 3}
+                    onChange={(e) => setField("circuit_break", Math.max(0, Number(e.target.value) || 0))}
+                    className="h-10 rounded-xl border-stone-200 bg-white" disabled={running || form.auto_replenish_enabled === false} />
                 </Field>
               </div>
             </div>

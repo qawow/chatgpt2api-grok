@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import base64
 import binascii
-import ipaddress
 import json
 import mimetypes
 import re
-import socket
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import unquote, unquote_to_bytes, urlparse
@@ -18,6 +16,7 @@ from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
 from utils.helper import WEB_IMAGE_MODEL
+from utils.ssrf import UnsafeUrlError, assert_safe_url
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -258,33 +257,6 @@ def _filename_from_url(parsed_path: str, mime_type: str) -> str:
     return _safe_filename(raw_name, mime_type, "image_url")
 
 
-def _is_private_ip(host: str) -> bool:
-    """Check if a hostname resolves to a private/loopback/link-local IP.
-
-    Prevents SSRF attacks where an attacker provides a URL pointing to
-    internal services (e.g. 169.254.169.254 AWS metadata, 127.0.0.1).
-    """
-    # Already an IP literal?
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        # Hostname — resolve it
-        try:
-            addr_info = socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            return False  # Let the actual request fail naturally
-        for family, _, _, _, sockaddr in addr_info:
-            ip_str = sockaddr[0]
-            try:
-                ip = ipaddress.ip_address(ip_str)
-            except ValueError:
-                continue
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-                return True
-        return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
-
-
 def _download_image_url(url: str) -> ImageInput:
     """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
     source = _clean(url)
@@ -293,13 +265,15 @@ def _download_image_url(url: str) -> ImageInput:
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    # SSRF protection: reject URLs pointing to private/loopback/link-local IPs.
-    hostname = parsed.hostname or ""
-    if _is_private_ip(hostname):
+    # SSRF protection: reject URLs pointing to private/loopback/link-local IPs
+    # (and follow redirect hops only after re-validating each target).
+    try:
+        assert_safe_url(source)
+    except UnsafeUrlError as exc:
         raise HTTPException(
             status_code=400,
             detail={"error": "image_url must not point to a private or local network address"},
-        )
+        ) from exc
     try:
         response = proxy_settings.get_with_egress_fallback(
             source,
@@ -307,7 +281,13 @@ def _download_image_url(url: str) -> ImageInput:
             upstream=True,
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
             timeout=60,
+            ssrf_guard=True,
         )
+    except UnsafeUrlError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "image_url must not point to a private or local network address"},
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
     if not 200 <= response.status_code < 300:

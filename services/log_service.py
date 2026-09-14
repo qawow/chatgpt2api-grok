@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import os
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -119,8 +120,67 @@ class LogService:
             atomic_write_text(self.path, content)
         return {"removed": removed}
 
+    def trim(self, retention_days: int) -> dict[str, int]:
+        """Drop log entries older than ``retention_days``.
+
+        ``logs.jsonl`` is append-only and nothing else caps its growth; without
+        this it grows forever and every ``list()`` / ``delete()`` pays the full
+        file in memory. The trim streams line by line (memory stays O(1) in the
+        file size — only kept lines are buffered) and swaps the file in place
+        atomically. ``retention_days <= 0`` disables trimming.
+        """
+        if retention_days <= 0 or not self.path.exists():
+            return {"removed": 0, "kept": 0}
+        cutoff = datetime.now() - timedelta(days=int(retention_days))
+        cutoff_key = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        removed = 0
+        kept = 0
+        tmp_path = self.path.with_name(self.path.name + ".trim")
+        with self._lock:
+            try:
+                with self.path.open("r", encoding="utf-8") as src, \
+                        tmp_path.open("w", encoding="utf-8") as dst:
+                    for raw_line in src:
+                        if _line_within_retention(raw_line, cutoff_key):
+                            dst.write(raw_line)
+                            kept += 1
+                        else:
+                            removed += 1
+                if removed:
+                    os.replace(tmp_path, self.path)
+                else:
+                    tmp_path.unlink(missing_ok=True)
+            except OSError:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return {"removed": 0, "kept": kept}
+        return {"removed": removed, "kept": kept}
+
 
 log_service = LogService(DATA_DIR / "logs.jsonl")
+
+
+_TIME_FIELD = '"time":"'
+
+
+def _line_within_retention(raw_line: str, cutoff_key: str) -> bool:
+    """Keep lines whose ``time`` is at/after the cutoff.
+
+    Timestamps are written as fixed-width ``YYYY-MM-DD HH:MM:SS``, so a string
+    comparison is exact. Unparseable lines are kept so a malformed entry can
+    never wipe the log; the top-level ``time`` key is serialized before any
+    nested detail, so the first match is the right one.
+    """
+    at = raw_line.find(_TIME_FIELD)
+    if at < 0:
+        return True
+    start = at + len(_TIME_FIELD)
+    end = raw_line.find('"', start)
+    if end <= start:
+        return True
+    return raw_line[start:end] >= cutoff_key
 
 
 def _collect_urls(value: object) -> list[str]:

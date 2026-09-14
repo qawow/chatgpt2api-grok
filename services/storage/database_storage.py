@@ -17,7 +17,10 @@ class AccountModel(Base):
     __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    access_token = Column(String(2048), unique=True, nullable=False, index=True)
+    # ChatGPT access tokens are ~1.9k-char JWTs; a bounded varchar(2048) has
+    # almost no headroom and PostgreSQL/MySQL reject over-long values with
+    # ``value too long for type`` (failing the whole save). TEXT is unbounded.
+    access_token = Column(Text, unique=True, nullable=False, index=True)
     data = Column(Text, nullable=False)  # JSON 格式存储完整账号数据
 
 
@@ -41,7 +44,36 @@ class DatabaseStorageBackend(StorageBackend):
             pool_recycle=3600,   # 1小时回收连接
         )
         Base.metadata.create_all(self.engine)
+        # Existing deployments created access_token as varchar(2048); promote
+        # it to TEXT so long JWTs no longer fail the save. create_all cannot
+        # alter an existing table, so do it explicitly and idempotently.
+        self._promote_token_column_to_text()
         self.Session = sessionmaker(bind=self.engine)
+
+    def _promote_token_column_to_text(self) -> None:
+        """varchar(2048) → TEXT for pre-existing tables (SQLite skips: it does
+        not enforce column lengths, and its ALTER syntax differs)."""
+        dialect = str(getattr(self.engine.dialect, "name", "") or "").lower()
+        if dialect in {"sqlite", ""}:
+            return
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_name = 'accounts' AND column_name = 'access_token'"
+                    )
+                ).fetchone()
+                if not row or str(row[0]).lower() not in {"character varying", "varchar"}:
+                    return
+                if dialect == "mysql":
+                    stmt = "ALTER TABLE accounts MODIFY COLUMN access_token TEXT"
+                else:
+                    stmt = "ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT"
+                conn.execute(text(stmt))
+                conn.commit()
+        except Exception as exc:  # best-effort: do not block startup over DDL
+            print(f"[storage] access_token column promotion skipped: {exc}", flush=True)
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从数据库加载账号数据"""

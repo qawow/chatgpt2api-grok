@@ -27,6 +27,10 @@ export function ConfigCard() {
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImagePollIntervalSecs = useSettingsStore((state) => state.setImagePollIntervalSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setImageAccountFailoverRetries = useSettingsStore((state) => state.setImageAccountFailoverRetries);
+  const setImagePollFailoverRetries = useSettingsStore((state) => state.setImagePollFailoverRetries);
+  const setImageTextFailoverRetries = useSettingsStore((state) => state.setImageTextFailoverRetries);
+  const setImageTransientFailureCooldownSecs = useSettingsStore((state) => state.setImageTransientFailureCooldownSecs);
   const setImageParallelGeneration = useSettingsStore((state) => state.setImageParallelGeneration);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageCheckBeforeHitEnabled = useSettingsStore((state) => state.setImageCheckBeforeHitEnabled);
@@ -188,6 +192,26 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">账号换号重试次数</label>
+            <Input value={String(config?.image_account_failover_retries ?? 4)} onChange={(event) => setImageAccountFailoverRetries(event.target.value)} placeholder="4" />
+            <p className="text-xs text-stone-500">一次生图最多尝试多少个失败账号，范围 1–20。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">轮询失败换号次数</label>
+            <Input value={String(config?.image_poll_failover_retries ?? 4)} onChange={(event) => setImagePollFailoverRetries(event.target.value)} placeholder="4" />
+            <p className="text-xs text-stone-500">上游轮询超时后换账号次数，0 表示不换号。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">文字回复换号次数</label>
+            <Input value={String(config?.image_text_failover_retries ?? 3)} onChange={(event) => setImageTextFailoverRetries(event.target.value)} placeholder="3" />
+            <p className="text-xs text-stone-500">上游只返回文字而未出图时的换号次数，0 表示不重试。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">临时失败冷却秒数</label>
+            <Input value={String(config?.image_transient_failure_cooldown_secs ?? 60)} onChange={(event) => setImageTransientFailureCooldownSecs(event.target.value)} placeholder="60" />
+            <p className="text-xs text-stone-500">同一任务内临时失败账号的冷却时间，0 表示立即允许再次尝试。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">

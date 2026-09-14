@@ -193,6 +193,10 @@ export type SettingsConfig = {
   image_poll_timeout_secs?: number | string;
   image_poll_interval_secs?: number | string;
   image_account_concurrency?: number | string;
+  image_account_failover_retries?: number | string;
+  image_poll_failover_retries?: number | string;
+  image_text_failover_retries?: number | string;
+  image_transient_failure_cooldown_secs?: number | string;
   image_parallel_generation?: boolean;
   image_settle_enabled?: boolean;
   image_check_before_hit_enabled?: boolean;
@@ -928,6 +932,10 @@ export type GptRegisterSettings = {
   /** 两次成功补号的最小间隔，拉开各号注册/死亡时间 */
   auto_replenish_spacing_secs?: number;
   auto_replenish_fail_cooldown_secs?: number;
+  /** 可用账号剩余生图额度总和低于此值即补号；0=关闭，与数量阈值是 OR 关系 */
+  auto_replenish_min_total_quota?: number;
+  /** 连续网络错误后停止当前补号任务；0=关闭，仍受 timeout_secs 保护 */
+  circuit_break?: number;
 };
 
 export type GptRegisterPoolSnapshot = {

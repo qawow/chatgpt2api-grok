@@ -58,6 +58,19 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_image_failover_controls_have_safe_bounds(self) -> None:
+        config = self.config_module.ConfigStore.__new__(self.config_module.ConfigStore)
+        config.data = {
+            "image_account_failover_retries": 99,
+            "image_poll_failover_retries": -1,
+            "image_text_failover_retries": "bad",
+            "image_transient_failure_cooldown_secs": 99999,
+        }
+        self.assertEqual(config.image_account_failover_retries, 20)
+        self.assertEqual(config.image_poll_failover_retries, 0)
+        self.assertEqual(config.image_text_failover_retries, 3)
+        self.assertEqual(config.image_transient_failure_cooldown_secs, 3600)
+
 
 if __name__ == "__main__":
     unittest.main()

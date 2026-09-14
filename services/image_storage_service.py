@@ -94,6 +94,15 @@ def _write_json_object(path: Path, data: dict[str, object]) -> None:
     atomic_write_json(path, data)
 
 
+def _upload_timeout(payload: bytes, *, base: float = 30.0, per_mb: float = 10.0, maximum: float = 300.0) -> float:
+    """上传超时随 body 大小缩放：30s 起 + 每 MB 10s，上限 300s。"""
+    try:
+        size = len(payload or b"")
+    except TypeError:
+        size = 0
+    return max(base, min(maximum, base + size / (1024 * 1024) * per_mb))
+
+
 class WebDAVClient:
     def __init__(self, settings: dict[str, object]):
         self.url = _clean(settings.get("webdav_url")).rstrip("/")
@@ -110,8 +119,8 @@ class WebDAVClient:
     def _auth_kwargs(self) -> dict[str, object]:
         return {"auth": (self.username, self.password)} if self.username or self.password else {}
 
-    def _request(self, method: str, url: str, **kwargs):
-        response = self.session.request(method, url, timeout=30, **self._auth_kwargs(), **kwargs)
+    def _request(self, method: str, url: str, timeout: float = 30.0, **kwargs):
+        response = self.session.request(method, url, timeout=timeout, **self._auth_kwargs(), **kwargs)
         if response.status_code >= 400 and not (method == "MKCOL" and response.status_code in {405}):
             raise ImageStorageError(f"WebDAV {method} failed: HTTP {response.status_code}")
         return response
@@ -137,7 +146,10 @@ class WebDAVClient:
     def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
         self.ensure_dirs(rel)
         url = self.remote_url(rel)
-        self._request("PUT", url, data=payload, headers={"Content-Type": content_type})
+        # Scale the timeout with payload size: a few-MB image over a slow link
+        # needs far more than a flat 30s ceiling.
+        self._request("PUT", url, data=payload, headers={"Content-Type": content_type},
+                      timeout=_upload_timeout(payload))
         return url
 
     def get(self, rel: str) -> bytes:

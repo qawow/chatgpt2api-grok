@@ -114,6 +114,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 号池各号年龄错开，不会同一时刻集体被吊销。跌破 min 的紧急情况不受此限。
     "auto_replenish_spacing_secs": 600,
     "auto_replenish_fail_cooldown_secs": 600,
+    # 按额度补号：可用账号剩余生图额度总和低于此值就补号（0=不启用）。
+    # 与数量水位是 OR 关系：任一不足即触发，spacing/失败冷却/批次共用。
+    # 免费号 quota 常为 0，故默认关闭；想用时按每号约 25 张设阈值。
+    "auto_replenish_min_total_quota": 0,
+    # 连续网络故障熔断；0=关闭熔断（仍受任务 timeout 保护）。
+    "circuit_break": 3,
 }
 
 
@@ -382,7 +388,7 @@ def _mask_proxy_url(proxy: object) -> str:
 
 def _circuit_break_threshold(settings: dict[str, Any] | None = None) -> int:
     raw = ""
-    if settings:
+    if settings and "circuit_break" in settings:
         raw = str(settings.get("circuit_break") or "").strip()
     if not raw:
         raw = str(os.environ.get("GPT_REGISTER_CIRCUIT_BREAK") or "3").strip()
@@ -514,6 +520,10 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["auto_replenish_fail_cooldown_secs"] = _clamp_int(
         out.get("auto_replenish_fail_cooldown_secs"), 600, 60, 7200
     )
+    out["auto_replenish_min_total_quota"] = _clamp_int(
+        out.get("auto_replenish_min_total_quota"), 0, 0, 10000
+    )
+    out["circuit_break"] = _clamp_int(out.get("circuit_break"), 3, 0, 20)
     return out
 
 
@@ -672,6 +682,8 @@ class GptRegisterService:
             "available": 0,
             "min_available": int(settings["auto_replenish_min_available"]),
             "target_available": int(settings["auto_replenish_target_available"]),
+            "total_quota": 0,
+            "min_total_quota": int(settings["auto_replenish_min_total_quota"]),
             "wait_secs": interval,
         }
         if not settings.get("auto_replenish_enabled"):
@@ -692,10 +704,15 @@ class GptRegisterService:
         available = int(account_service.count_image_available_accounts())
         min_available = int(settings["auto_replenish_min_available"])
         target = max(int(settings["auto_replenish_target_available"]), min_available)
+        # 额度触发：可用账号剩余额度总和低于阈值（0=关闭）。与数量水位是 OR。
+        min_quota = int(settings["auto_replenish_min_total_quota"])
+        total_quota = int(account_service.total_image_available_quota())
+        quota_short = min_quota > 0 and total_quota < min_quota
         result["available"] = available
         result["min_available"] = min_available
         result["target_available"] = target
-        if available >= target:
+        result["total_quota"] = total_quota
+        if available >= target and not quota_short:
             result["reason"] = "stocked"
             return result
 
@@ -726,7 +743,12 @@ class GptRegisterService:
             return result
 
         result["action"] = "started"
-        result["reason"] = "below_min" if available < min_available else "below_target"
+        if available < min_available:
+            result["reason"] = "below_min"
+        elif quota_short:
+            result["reason"] = "low_quota"
+        else:
+            result["reason"] = "below_target"
         result["count"] = need
         result["job_id"] = job.get("job_id")
         try:
@@ -739,6 +761,8 @@ class GptRegisterService:
                     "available": available,
                     "min_available": min_available,
                     "target_available": target,
+                    "total_quota": total_quota,
+                    "min_total_quota": min_quota,
                     "count": need,
                     "job_id": job.get("job_id"),
                 },
@@ -747,7 +771,8 @@ class GptRegisterService:
             pass
         print(
             f"[account-replenish] start count={need} available={available} "
-            f"min={min_available} target={target} job={str(job.get('job_id') or '')[:8]}"
+            f"min={min_available} target={target} quota={total_quota}/{min_quota} "
+            f"reason={result['reason']} job={str(job.get('job_id') or '')[:8]}"
         )
         return result
 

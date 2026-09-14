@@ -156,6 +156,10 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
     image_poll_interval_secs: Number(config.image_poll_interval_secs || 5),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
+    image_account_failover_retries: Number(config.image_account_failover_retries ?? 4),
+    image_poll_failover_retries: Number(config.image_poll_failover_retries ?? 4),
+    image_text_failover_retries: Number(config.image_text_failover_retries ?? 3),
+    image_transient_failure_cooldown_secs: Number(config.image_transient_failure_cooldown_secs ?? 60),
     image_parallel_generation: Boolean(config.image_parallel_generation !== false),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -237,6 +241,10 @@ type SettingsStore = {
   setImagePollTimeoutSecs: (value: string) => void;
   setImagePollIntervalSecs: (value: string) => void;
   setImageAccountConcurrency: (value: string) => void;
+  setImageAccountFailoverRetries: (value: string) => void;
+  setImagePollFailoverRetries: (value: string) => void;
+  setImageTextFailoverRetries: (value: string) => void;
+  setImageTransientFailureCooldownSecs: (value: string) => void;
   setImageParallelGeneration: (value: boolean) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
@@ -322,6 +330,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
         image_poll_interval_secs: Math.max(0.5, Number(config.image_poll_interval_secs) || 5),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
+        image_account_failover_retries: Math.max(1, Math.min(20, Number(config.image_account_failover_retries ?? 4))),
+        image_poll_failover_retries: Math.max(0, Math.min(20, Number(config.image_poll_failover_retries ?? 4))),
+        image_text_failover_retries: Math.max(0, Math.min(20, Number(config.image_text_failover_retries ?? 3))),
+        image_transient_failure_cooldown_secs: Math.max(0, Math.min(3600, Number(config.image_transient_failure_cooldown_secs ?? 60))),
         image_parallel_generation: Boolean(config.image_parallel_generation !== false),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -431,6 +443,22 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageAccountConcurrency: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_account_concurrency: value } } : {});
+  },
+
+  setImageAccountFailoverRetries: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_account_failover_retries: value } } : {});
+  },
+
+  setImagePollFailoverRetries: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_poll_failover_retries: value } } : {});
+  },
+
+  setImageTextFailoverRetries: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_text_failover_retries: value } } : {});
+  },
+
+  setImageTransientFailureCooldownSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_transient_failure_cooldown_secs: value } } : {});
   },
 
   setImageParallelGeneration: (value) => {

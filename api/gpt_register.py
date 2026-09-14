@@ -53,6 +53,7 @@ class GptRegisterSettingsUpdate(BaseModel):
     auto_replenish_interval_secs: int | None = Field(default=None, ge=30, le=3600)
     auto_replenish_spacing_secs: int | None = Field(default=None, ge=0, le=7200)
     auto_replenish_fail_cooldown_secs: int | None = Field(default=None, ge=60, le=7200)
+    circuit_break: int | None = Field(default=None, ge=0, le=20)
 
 
 class GptRegisterStartRequest(GptRegisterSettingsUpdate):

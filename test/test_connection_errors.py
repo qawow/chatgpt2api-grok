@@ -7,6 +7,7 @@ from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
     ImageOutput,
+    ImagePollTimeoutError,
     _generate_single_image,
     image_stream_error_message,
     is_clarifying_image_followup,
@@ -87,6 +88,43 @@ class ConnectionErrorClassifierTests(unittest.TestCase):
         self.assertTrue(is_clarifying_image_followup("Which do you prefer, A or B?"))
         self.assertFalse(is_clarifying_image_followup("This violates our content policy."))
         self.assertFalse(is_clarifying_image_followup('{"size":"1920x1088","n":1}'))
+
+    def test_image_failover_settings_control_retry_budget(self) -> None:
+        from services.config import config
+
+        old = dict(config.data)
+        try:
+            config.data.update({
+                "image_account_failover_retries": 1,
+                "image_poll_failover_retries": 0,
+                "image_text_failover_retries": 0,
+            })
+            visited = []
+
+            class Backend:
+                def __init__(self, access_token="", **_kwargs):
+                    self.access_token = access_token
+                def close(self):
+                    return None
+
+            def stream(backend, request, index, total):
+                visited.append(backend.access_token)
+                raise ImagePollTimeoutError("poll timed out")
+                yield  # pragma: no cover
+
+            with patch("services.protocol.conversation.account_service") as accounts, patch(
+                "services.protocol.conversation.OpenAIBackendAPI", Backend
+            ), patch("services.protocol.conversation.stream_image_outputs", stream), patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates", return_value=[("direct", "")]
+            ):
+                accounts.get_available_access_token.return_value = "token-a"
+                accounts.get_account.return_value = {"email": "a@example.com"}
+                with self.assertRaises(ImagePollTimeoutError):
+                    _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+            self.assertEqual(visited, ["token-a"])
+        finally:
+            config.data.clear()
+            config.data.update(old)
 
     def test_non_connection_errors_pass_through(self) -> None:
         self.assertFalse(is_upstream_connection_error("content policy violation"))

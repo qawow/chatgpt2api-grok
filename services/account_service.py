@@ -1527,6 +1527,20 @@ class AccountService:
         with self._lock:
             return sum(1 for item in self._accounts.values() if self._is_image_account_available(item))
 
+    def total_image_available_quota(self) -> int:
+        """Sum of remaining image quota across accounts the picker can use now.
+
+        Same口径 as generation requests: local cached quota over
+        image-available accounts (quota=0 bootstrap-eligible fresh accounts
+        count as 0). Used by the quota-based auto-replenish trigger.
+        """
+        with self._lock:
+            return sum(
+                int(item.get("quota") or 0)
+                for item in self._accounts.values()
+                if self._is_image_account_available(item)
+            )
+
     def image_pool_snapshot(self) -> dict[str, int]:
         with self._lock:
             items = list(self._accounts.values())

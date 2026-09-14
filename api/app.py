@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from threading import Event, Thread
 
@@ -14,11 +15,79 @@ from api.support import (
     should_skip_spa_fallback,
     start_account_replenish_watcher,
     start_grok_account_watcher,
+    start_log_retention_watcher,
     start_limited_account_watcher,
 )
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
+
+
+class _BodyTooLarge(Exception):
+    """Internal signal: an in-flight request body exceeded the limit."""
+
+
+class RequestBodyLimitMiddleware:
+    """Pure-ASGI guard capping request body size (``max_request_body_mb``).
+
+    Covers both ``Content-Length`` (rejected before a byte is read) and
+    chunked/streamed bodies — multipart uploads carry no content-length — by
+    counting bytes as the app receives them. 0 disables the limit.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        from services.config import config as _config
+
+        max_bytes = int(_config.max_request_body_mb) * 1024 * 1024
+        if scope.get("type") != "http" or max_bytes <= 0:
+            return await self.app(scope, receive, send)
+
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"content-length":
+                try:
+                    if int(value.strip()) > max_bytes:
+                        return await self._reject(send, max_bytes)
+                except ValueError:
+                    pass
+                break
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b"") or b"")
+                if received > max_bytes:
+                    raise _BodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _BodyTooLarge:
+            # Endpoints read the full body before responding, so nothing has
+            # been sent yet and we can still answer with a clean 413.
+            return await self._reject(send, max_bytes)
+
+    @staticmethod
+    async def _reject(send, max_bytes: int) -> None:
+        payload = json.dumps(
+            {"error": f"request body exceeds {max_bytes // (1024 * 1024)} MB limit"}
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
 
 
 def create_app() -> FastAPI:
@@ -34,6 +103,7 @@ def create_app() -> FastAPI:
         grok_thread = start_grok_account_watcher(stop_event)
         replenish_thread = start_account_replenish_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
+        log_trim_thread = start_log_retention_watcher(stop_event)
         backup_service.start()
         config.cleanup_old_images()
         def _warmup_tiktoken() -> None:
@@ -53,10 +123,12 @@ def create_app() -> FastAPI:
             grok_thread.join(timeout=1)
             replenish_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
+            log_trim_thread.join(timeout=1)
             backup_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
+    app.add_middleware(RequestBodyLimitMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

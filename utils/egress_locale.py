@@ -107,22 +107,56 @@ def default_locale() -> EgressLocale:
     return _build(_DEFAULT_TIMEZONE, "JP", "default")
 
 
-def _detect(proxy_url: str | None) -> EgressLocale | None:
-    """经指定代理出口探测地理（无代理则探直连出口）。"""
-    try:
-        from curl_cffi import requests as curl_requests
-        kwargs: dict = {"timeout": 8}
-        if proxy_url:
-            kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-        r = curl_requests.get(
-            "http://ip-api.com/json/?fields=status,countryCode,timezone",
-            **kwargs,
-        )
-        data = r.json()
-        if data.get("status") == "success" and data.get("timezone"):
-            return _build(str(data["timezone"]), str(data.get("countryCode") or ""), "detected")
-    except Exception:
+_DETECT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+)
+
+
+def _detect_once(proxy_url: str | None) -> EgressLocale | None:
+    """主探测：ip-api 明文免费档（HTTPS 仅付费档，实测 403）。"""
+    from curl_cffi import requests as curl_requests
+
+    kwargs: dict = {"timeout": 8, "headers": {"User-Agent": _DETECT_USER_AGENT}}
+    if proxy_url:
+        kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+    r = curl_requests.get(
+        "http://ip-api.com/json/?fields=status,countryCode,timezone",
+        **kwargs,
+    )
+    data = r.json()
+    if data.get("status") == "success" and data.get("timezone"):
+        return _build(str(data["timezone"]), str(data.get("countryCode") or ""), "detected")
+    return None
+
+
+def _detect_once_fallback(proxy_url: str | None) -> EgressLocale | None:
+    """备用探测：ipwho.is（HTTPS 免费档），解析 timezone.id。"""
+    from curl_cffi import requests as curl_requests
+
+    kwargs: dict = {"timeout": 8, "headers": {"User-Agent": _DETECT_USER_AGENT}}
+    if proxy_url:
+        kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+    r = curl_requests.get("https://ipwho.is/?fields=success,country_code,timezone", **kwargs)
+    data = r.json()
+    if not isinstance(data, dict) or not data.get("success"):
         return None
+    tz = data.get("timezone")
+    tz_id = str(tz.get("id") or "").strip() if isinstance(tz, dict) else str(tz or "").strip()
+    if not tz_id:
+        return None
+    return _build(tz_id, str(data.get("country_code") or ""), "detected")
+
+
+def _detect(proxy_url: str | None) -> EgressLocale | None:
+    """经指定代理出口探测地理（无代理则探直连出口），主 provider 失败走备用。"""
+    for probe in (_detect_once, _detect_once_fallback):
+        try:
+            locale = probe(proxy_url)
+        except Exception:
+            locale = None
+        if locale is not None:
+            return locale
     return None
 
 

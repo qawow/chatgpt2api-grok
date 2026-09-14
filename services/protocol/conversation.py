@@ -1425,13 +1425,12 @@ def _generate_single_image_impl(
     该函数在独立线程中运行，每个线程使用不同的账号，
     实现并行生图，避免串行超时阻塞。
     """
-    # 模型返回文本而非图片的最大重试次数
-    MAX_TEXT_REPLY_RETRIES = 3
     # TLS/超时：同出口短重试；代理拒连则立刻换下一条出口
     MAX_TLS_RETRIES = 3
-    MAX_CONNECTION_ACCOUNT_RETRIES = 4
+    MAX_CONNECTION_ACCOUNT_RETRIES = max(1, int(config.image_account_failover_retries))
     MAX_CONN_TIMEOUT_RETRIES = 3
-    MAX_POLL_TIMEOUT_RETRIES = 4
+    MAX_POLL_TIMEOUT_RETRIES = max(0, int(config.image_poll_failover_retries))
+    MAX_TEXT_REPLY_RETRIES = max(0, int(config.image_text_failover_retries))
 
     text_reply_retry_count = 0
     poll_timeout_retry_count = 0

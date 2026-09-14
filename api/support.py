@@ -153,11 +153,17 @@ def start_account_replenish_watcher(stop_event: Event) -> Thread:
                 action = str((result or {}).get("action") or "skip")
                 reason = str((result or {}).get("reason") or "")
                 if action == "started" or reason not in {"stocked", "disabled"}:
+                    quota_line = ""
+                    min_quota = int((result or {}).get("min_total_quota") or 0)
+                    if min_quota > 0:
+                        quota_line = (
+                            f" quota={(result or {}).get('total_quota')}/{min_quota}"
+                        )
                     print(
                         "[account-replenish] "
                         f"{action} reason={reason} "
                         f"available={(result or {}).get('available')} "
-                        f"min={(result or {}).get('min_available')}"
+                        f"min={(result or {}).get('min_available')}{quota_line}"
                     )
             except Exception as exc:
                 print(f"[account-replenish] fail {exc}")
@@ -165,6 +171,44 @@ def start_account_replenish_watcher(stop_event: Event) -> Thread:
             stop_event.wait(wait_secs)
 
     thread = Thread(target=worker, name="account-replenish", daemon=True)
+    thread.start()
+    return thread
+
+
+_LOG_TRIM_INTERVAL_SECONDS = 6 * 3600
+
+
+def start_log_retention_watcher(stop_event: Event) -> Thread:
+    """Trim logs.jsonl to ``log_retention_days`` on startup and every 6h.
+
+    The log is append-only and list()/delete() read the whole file each call,
+    so unbounded growth slowly cripples the admin log page.
+    """
+
+    def worker() -> None:
+        from services.log_service import log_service
+
+        def _trim_once() -> None:
+            try:
+                retention = config.log_retention_days
+                if retention <= 0:
+                    return
+                result = log_service.trim(retention)
+                if result.get("removed"):
+                    print(
+                        f"[log-retention] trimmed {result['removed']} entries "
+                        f"older than {retention}d, kept {result['kept']}"
+                    )
+            except Exception as exc:
+                print(f"[log-retention] fail {exc}")
+
+        _trim_once()
+        while not stop_event.is_set():
+            if stop_event.wait(_LOG_TRIM_INTERVAL_SECONDS):
+                return
+            _trim_once()
+
+    thread = Thread(target=worker, name="log-retention", daemon=True)
     thread.start()
     return thread
 

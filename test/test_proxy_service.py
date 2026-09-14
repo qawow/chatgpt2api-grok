@@ -1,5 +1,6 @@
 import copy
 import json
+import socket
 import threading
 import time
 import unittest
@@ -7,8 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from urllib.parse import urlparse
 
-from services.config import DEFAULT_PROXY_RUNTIME
+from services.config import DEFAULT_PROXY_RUNTIME, config
 from services.proxy_service import (
+    UnsafeUrlError,
     ClearanceBundle,
     FlareSolverrClearanceProvider,
     ProxySettingsStore,
@@ -166,8 +168,12 @@ class ProxyServiceTests(unittest.TestCase):
             "socks5h://dead.example:1080",
             "curl: (35) TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0)",
         )
+        # OPENSSL_internal never counts (local curl_cffi/HTTP2 bug, not a dead
+        # proxy) and a single transient error must not blacklist the only
+        # egress — the blacklist is circuit-breaker style.
         self.assertFalse(is_egress_unusable("socks5h://dead.example:1080"))
-        mark_egress_unusable("socks5h://dead.example:1080", "curl: (28) Connection timed out")
+        for _ in range(config.egress_blacklist_failure_threshold):
+            mark_egress_unusable("socks5h://dead.example:1080", "curl: (28) Connection timed out")
         self.assertTrue(is_egress_unusable("socks5h://dead.example:1080"))
         candidates = store.list_egress_candidates(
             account={"proxy": "socks5h://dead.example:1080"},
@@ -181,6 +187,17 @@ class ProxyServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["proxy"], "socks5h://dead.example:1080")
         unbound = store.list_egress_candidates(upstream=True)
         self.assertEqual(unbound, [("direct", "")])
+
+    def test_single_transient_failure_does_not_blacklist_egress(self) -> None:
+        """One flaky packet must not poison the only egress for the whole TTL."""
+        reset_unusable_egress()
+        proxy = "socks5h://flaky.example:1080"
+        for reason in (
+            "curl: (28) Connection timed out",
+            "curl: (56) Recv failure: Connection reset by peer",
+        ):
+            mark_egress_unusable(proxy, reason)
+            self.assertFalse(is_egress_unusable(proxy), f"{reason} should not blacklist alone")
 
     def test_unbound_account_still_falls_back_across_egress(self) -> None:
         runtime = make_runtime(enabled=True, egress_mode="single_proxy", proxy_url="http://runtime.example:8080")
@@ -231,6 +248,71 @@ class ProxyServiceTests(unittest.TestCase):
         self.assertEqual(fetched.content, b"ok")
         self.assertEqual(fetched.status_code, 200)
         self.assertEqual(calls, ["socks5h://dead.example:1080", ""])
+
+    def test_ssrf_guard_never_falls_back_to_direct_egress(self) -> None:
+        """A private URL must be refused, not retried over direct egress."""
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://dead.example:1080"))
+        created: list[str] = []
+
+        class TrapSession:
+            def __init__(self, **kwargs: object) -> None:
+                created.append(str(kwargs.get("proxy") or ""))
+
+            def get(self, *args, **kwargs):  # pragma: no cover - must never run
+                raise AssertionError("SSRF-guarded fetch must not reach the network")
+
+            def close(self) -> None:
+                return None
+
+        with patch("services.proxy_service.create_cffi_session", TrapSession):
+            with self.assertRaises(UnsafeUrlError):
+                store.get_with_egress_fallback(
+                    "http://169.254.169.254/latest/meta-data/",
+                    upstream=True,
+                    ssrf_guard=True,
+                )
+        # No session was created at all — the URL is rejected before egress walk.
+        self.assertEqual(created, [])
+
+    def test_ssrf_guard_validates_each_redirect_hop(self) -> None:
+        store = ProxySettingsStore(FakeConfig())
+        fetched_urls: list[str] = []
+
+        class Response:
+            def __init__(self, status_code: int, headers: dict, content: bytes = b""):
+                self.status_code = status_code
+                self.headers = headers
+                self.content = content
+
+            def close(self) -> None:
+                return None
+
+        class RedirectSession:
+            def get(self, url: str, **kwargs: object):
+                fetched_urls.append(url)
+                if url.endswith("/start.png"):
+                    return Response(302, {"location": "http://169.254.169.254/latest/meta-data/"})
+                return Response(200, {"content-type": "image/png"}, b"ok")
+
+            def close(self) -> None:
+                return None
+
+        def fake_getaddrinfo(host, *args, **kwargs):
+            # public.example is public; everything else fails closed.
+            if host == "public.example":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+            raise socket.gaierror("no DNS in tests")
+
+        with patch("utils.ssrf.socket.getaddrinfo", side_effect=fake_getaddrinfo), \
+                patch("services.proxy_service.create_cffi_session", lambda **kw: RedirectSession()):
+            with self.assertRaises(UnsafeUrlError):
+                store.get_with_egress_fallback(
+                    "https://public.example/start.png",
+                    upstream=True,
+                    ssrf_guard=True,
+                )
+        # The initial public URL was fetched; the internal redirect target was not.
+        self.assertEqual(fetched_urls, ["https://public.example/start.png"])
 
     def test_upstream_chat_session_uses_runtime_proxy(self) -> None:
         runtime = make_runtime(
