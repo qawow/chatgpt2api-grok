@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.8.8 - 2026-09-20
+
++ [新增] 非官方 [www.waifu2x.net](https://www.waifu2x.net/) 超分 API：`POST /v1/waifu2x`（别名 `POST /v1/images/upscale`）、`GET /v1/waifu2x/status`。协议对齐公开网页表单（`style` / `noise` / `scale` / `format` + Turnstile）。Turnstile 支持请求透传 token、Capsolver / 2Captcha / YesCaptcha、以及 Patreon `ses_id` 跳过。设置项密钥在 `/api/settings` 中掩码。文档见 `docs/waifu2x.md`，CLI：`python scripts/waifu2x_upscale.py`。新增 `test/test_waifu2x_api.py`。
+
 ## 1.8.7 - 2026-09-15
 
 + [安全] 网络层加固（SSRF / 熔断 / 请求体上限 / 探测兜底）：

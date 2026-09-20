@@ -7,9 +7,10 @@
 
 <p align="center">
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
-  <a href="./CHANGELOG.md">v1.8.2</a> ·
+  <a href="./CHANGELOG.md">v1.8.8</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
+  <a href="./docs/waifu2x.md">waifu2x</a> ·
   <a href="./docs/operations.md">运维与调用</a> ·
   <a href="./docs/deployment.md">部署说明</a>
 </p>
@@ -31,6 +32,7 @@
 | GPT Free 批量注册 | 设置页「GPT注册」：内置 `gpt_free_register` 纯协议注册 free 号并入库 ChatGPT 号池；入库后自动刷新额度；无 refresh 的号标 `session_only`（**可生图**） |
 | 账号出口隔离 | 绑定了 `proxy` 的号只走该出口，不回落 runtime / 全局 / 直连；注册浏览器指纹写入号池。一号一 IP 需要注册代理池 |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
+| waifu2x 超分 | 非官方封装 [www.waifu2x.net](https://www.waifu2x.net/)：`POST /v1/waifu2x` / `/v1/images/upscale`，见 [docs/waifu2x.md](./docs/waifu2x.md) |
 
 隔离原则：ChatGPT 与 Grok **不同存储、不同管理 API、不同选号**，禁止混池。ChatGPT 号池内，账号若绑定了 `proxy`，出站只走该代理；多个号绑同一 SOCKS 仍共享出口 IP。
 
