@@ -1,6 +1,6 @@
 # 运维与维护（chatgpt2api-grok）
 
-面向本二开仓库的日常使用、升级、备份与排障。当前版本 **1.8.2**（仓库根目录 `VERSION`，说明见 [CHANGELOG.md](../CHANGELOG.md)）。上游官方文档见原项目。部署机优先拉本仓库 GitHub Actions 构建的镜像，不要用上游官方 `ghcr.io/basketikun/chatgpt2api`。`docker-compose.yml` 默认 `:latest`，只在打 `v*` tag 时更新；分支 push 只出 `:sha-<commit>`。
+面向本二开仓库的日常使用、升级、备份与排障。当前版本 **1.8.9**（仓库根目录 `VERSION`，说明见 [CHANGELOG.md](../CHANGELOG.md)）。上游官方文档见原项目。部署机优先拉本仓库 GitHub Actions 构建的镜像，不要用上游官方 `ghcr.io/basketikun/chatgpt2api`。`docker-compose.yml` 默认 `:latest`，只在打 `v*` tag 时更新；分支 push 只出 `:sha-<commit>`。
 
 ## 1. 正确部署方式
 
@@ -104,7 +104,33 @@ curl -s "$BASE/v1/images/generations" \
 curl -s "$BASE/v1/grok/images/generations" \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"prompt":"a red cube","n":1}'
+
+# waifu2x.net 超分（非官方网页协议，需 Turnstile / 打码密钥 / Patreon ses_id）
+curl -s "$BASE/v1/waifu2x/status" -H "Authorization: Bearer $KEY"
+curl -s "$BASE/v1/waifu2x" \
+  -H "Authorization: Bearer $KEY" \
+  -F "file=@input.png;type=image/png" \
+  -F "style=art" -F "noise=medium" -F "scale=2x" \
+  --output out.png
 ```
+
+完整参数与验证码说明：[waifu2x.md](./waifu2x.md)。
+
+```bash
+# 豆包网页生图（登录 Cookie；打码外接 captcha / CAPTCHA_SOLVE_URL）
+curl -s "$BASE/v1/doubao/status" -H "Authorization: Bearer $KEY"
+curl -s "$BASE/v1/doubao" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt":"一只橘猫","cookies":"sessionid=..."}'
+
+# 360智图文生图（QHPass Cookie；未登录 401，欠费 402）
+curl -s "$BASE/v1/zhitu360/status" -H "Authorization: Bearer $KEY"
+curl -s "$BASE/v1/zhitu360" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt":"一只橘猫","model":"jimeng","ratio":"1:1"}'
+```
+
+文档：[doubao.md](./doubao.md)、[zhitu360.md](./zhitu360.md)。
 
 ### 3.4 GPT Free 批量注册
 
@@ -238,7 +264,9 @@ uv run python -m unittest \
   test.test_image_download_auth \
   test.test_web_fallback \
   test.test_ssrf \
-  test.test_body_limit -v
+  test.test_body_limit \
+  test.test_waifu2x_api \
+  test.test_cn_images_api -v
 ```
 
 ## 8. 安全
@@ -246,7 +274,7 @@ uv run python -m unittest \
 - 强随机 `auth-key` / `CHATGPT2API_AUTH_KEY`  
 - `data/*.env`、号池 token 勿提交 git  
 - 管理端口勿裸奔公网；需要时反代 + HTTPS + 访问控制  
-- **SSRF**：所有用户提供的图片 URL（`/v1/images/edits` 的 `image_url`、`/v1/chat/completions` 与 `/v1/responses` 消息内的 `image_url`）都经 `utils/ssrf.py` 校验——只允许 `http/https`，拒绝私网 / 回环 / 链路本地 / 云元数据地址（含 IPv6 与 IPv4-mapped），无法证明为公网的域名 fail-closed 拒绝；重定向逐跳校验，不安全目标不会回落到其他出口。
+- **SSRF**：所有用户提供的图片 URL（`/v1/images/edits` 的 `image_url`、`/v1/chat/completions` 与 `/v1/responses` 消息内的 `image_url`、`/v1/waifu2x` 的 `url`）都经 `utils/ssrf.py` 校验——只允许 `http/https`，拒绝私网 / 回环 / 链路本地 / 云元数据地址（含 IPv6 与 IPv4-mapped），无法证明为公网的域名 fail-closed 拒绝；重定向逐跳校验，不安全目标不会回落到其他出口。
 - **请求体上限**：`max_request_body_mb`（默认 256 MB，`0` 不限制）拦截超大 JSON / multipart 上传，超限返回 413；`CHATGPT2API_LIMIT_CONCURRENCY`（默认 256）限制并发连接数。
 - 本项目仅供学习研究，遵守各平台服务条款与法律  
 

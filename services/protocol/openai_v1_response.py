@@ -15,7 +15,13 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.grok_models import is_grok_image_model, resolve_grok_image_model
-from utils.helper import WEB_IMAGE_MODEL, extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from utils.image_models import WEB_IMAGE_MODEL
+from utils.helper import (
+    extract_image_from_message_content,
+    extract_response_prompt,
+    has_response_image_generation_tool,
+    image_result_urls,
+)
 from utils.image_tokens import (
     count_image_content_tokens,
     count_image_output_items_tokens,
@@ -387,7 +393,13 @@ def stream_image_response(
             )
             for output_index, item in enumerate(items):
                 yield {"type": "response.output_item.done", "output_index": output_index, "item": item}
-            yield response_completed(response_id, model, created, items, usage)
+            completed = response_completed(response_id, model, created, items, usage)
+            # image_generation_call carries base64 only; log the stored URLs via the
+            # internal field (collect_response keeps the nested response dict, and
+            # LoggedCall strips _image_urls recursively on both paths).
+            if isinstance(completed.get("response"), dict):
+                completed["response"]["_image_urls"] = image_result_urls({"data": output.data})
+            yield completed
             return
     raise RuntimeError("image generation failed")
 
@@ -402,10 +414,7 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return completed
 
 
-TEXT_MODELS_DISABLED = (
-    "this backend only serves image models "
-    "(gpt-image-2 / codex-gpt-image-2 / grok-2-image); text models are disabled"
-)
+from utils.image_models import TEXT_MODELS_DISABLED  # noqa: E402  (single source for model names)
 
 
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:

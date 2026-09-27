@@ -8,14 +8,31 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
-os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
-
 from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
 from services.openai_backend_api import InvalidAccessTokenError
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
+
+# Scoped to this module only. Setting CHATGPT2API_AUTH_KEY at import time leaked
+# into every later test module (services.config.ConfigStore.auth_key reads the
+# env var first and falls back to config.json), which 401'd every API test that
+# authenticates with the config.json key.
+_AUTH_KEY_PATCHER: mock._patch_dict | None = None
+
+
+def setUpModule() -> None:
+    global _AUTH_KEY_PATCHER
+    _AUTH_KEY_PATCHER = mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "test-auth"})
+    _AUTH_KEY_PATCHER.start()
+
+
+def tearDownModule() -> None:
+    global _AUTH_KEY_PATCHER
+    if _AUTH_KEY_PATCHER is not None:
+        _AUTH_KEY_PATCHER.stop()
+        _AUTH_KEY_PATCHER = None
 
 
 class AccountCapabilityTests(unittest.TestCase):

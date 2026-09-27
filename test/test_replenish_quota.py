@@ -7,8 +7,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
-
 from services.account_service import AccountService
 from services.gpt_register_service import (
     DEFAULT_SETTINGS,
@@ -16,6 +14,24 @@ from services.gpt_register_service import (
     normalize_settings,
 )
 from services.storage.json_storage import JSONStorageBackend
+
+# Scoped to this module only — see the same note in
+# test/test_account_image_capabilities.py. A module-level setdefault() here
+# leaked "test-auth" into every later test module and 401'd the API tests.
+_AUTH_KEY_PATCHER: mock._patch_dict | None = None
+
+
+def setUpModule() -> None:
+    global _AUTH_KEY_PATCHER
+    _AUTH_KEY_PATCHER = mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "test-auth"})
+    _AUTH_KEY_PATCHER.start()
+
+
+def tearDownModule() -> None:
+    global _AUTH_KEY_PATCHER
+    if _AUTH_KEY_PATCHER is not None:
+        _AUTH_KEY_PATCHER.stop()
+        _AUTH_KEY_PATCHER = None
 
 
 class _FakeConfig:

@@ -124,7 +124,9 @@ def cmd_register(args):
     mailbox = None
     mail_provider = str(extra.get("mail_provider") or "").strip()
     if mail_provider and (extra.get("identity_provider") or "mailbox") in ("", "mailbox", "email", "mail"):
-        mailbox = create_mailbox(mail_provider, extra=extra, proxy=proxy)
+        # 自建 tempmail 直连（factory 认 TEMPMAIL_PROXY），不绕注册代理
+        mailbox_proxy = None if mail_provider == "tempmail" else proxy
+        mailbox = create_mailbox(mail_provider, extra=extra, proxy=mailbox_proxy)
 
     platform = platform_cls(config=config, mailbox=mailbox)
     platform.set_logger(print)

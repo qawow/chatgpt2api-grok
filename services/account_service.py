@@ -2218,7 +2218,22 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
+    def update_account(
+        self,
+        access_token: str,
+        updates: dict,
+        quiet: bool = False,
+        *,
+        allow_status_override: bool = False,
+    ) -> dict | None:
+        """Apply ``updates`` to an account.
+
+        ``禁用`` is an operator decision, so by default it survives everything
+        written here. Refresh and probe paths derive ``status`` from upstream
+        (``正常`` whenever quota > 0), which would otherwise silently return a
+        manually disabled account to the pool on the next 检测. Only the admin
+        edit endpoint passes ``allow_status_override=True``.
+        """
         if not access_token:
             return None
         with self._lock:
@@ -2226,6 +2241,13 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
+            if (
+                not allow_status_override
+                and current.get("status") == "禁用"
+                and "status" in updates
+                and updates.get("status") != "禁用"
+            ):
+                updates = {key: value for key, value in updates.items() if key != "status"}
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None

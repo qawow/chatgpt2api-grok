@@ -135,6 +135,43 @@ CFD1_DOMAIN=mail.example.com
 
 > SOCKS 代理必须安装 **PySocks**（镜像 `uv sync` 已带；缺依赖会在启动任务时预检失败）。
 
+### 3.2.1 改用自建 tempmail 收信（比 CF D1 快）
+
+[123nhh/tempmail](https://github.com/123nhh/tempmail) 是 Go + PostgreSQL + Postfix 的自建临时邮箱。
+Postfix 收信后 ≤100ms 落库，注册机直接走它的 REST API，不用绕 Email Routing → Worker → D1 → Cloudflare API。
+
+1. 在 tempmail 控制台拿到 `tm_` 开头的 API Key，确认至少有一个**已激活**域名（MX 指向 tempmail）。
+2. 管理后台 → 设置 → GPT 注册：**收信渠道**选 `tempmail`，填站点根地址（如 `https://mail.example.com`，带不带 `/api` 都行）和 API Key，点「测试」。
+   测试成功会列出可用域名，点一下加入域名池；域名池留空则由 tempmail 在已激活域名里随机挑。
+3. **域名模式**：`single` = `abc@example.com`；`multi` = 多级子域名，每个号一个独立主机名，用来分散按域名的批量封禁。
+   `multi` 需要域名配了通配 MX（`*.example.com`，任意层级都会命中）；只支持通配 MX 的域名只能用 `multi`。
+   - **子域名层数**（`tempmail_subdomain_depth`，默认 2）：注册机自己生成几级 4~8 位随机标签，如 `abc@k3x9q.m2a8.example.com`。
+     设为 `0` 则交给 tempmail 生成——它会拼 10~14 级 `gmail`/`yahoo`/`proton`… 单词（实测 73 字符的地址），又长又夹带邮箱品牌名。
+   - **域名池写法**：`example.com`（主域，按上面的模式建号）、`*.example.com`（在其下随机子域名，强制 multi）、
+     `a.example.com`（固定子域名，所有号共用这个主机名）、`*.a.example.com`（在 `a.` 下再随机）。
+     主域靠 `/api/domains` 反查（缓存 10 分钟，查不到会立即刷新一次），不属于该实例的域名在建号前就报错。
+
+也可以只写环境变量（`data/gpt_register.env` / 进程环境，subprocess 模式同样生效）：
+
+```bash
+TEMPMAIL_BASE_URL=https://mail.example.com
+TEMPMAIL_API_KEY=tm_xxx
+# 可选
+# TEMPMAIL_DOMAIN=example.com     # 固定域名（后台域名池优先）
+# TEMPMAIL_MODE=single            # single | multi | 空=服务端随机
+# TEMPMAIL_SUBDOMAIN_DEPTH=2      # multi 时自己生成的随机子域名层数；0=交给 tempmail
+# TEMPMAIL_PROXY=socks5h://...    # 默认直连，不走注册代理
+```
+
+注意事项：
+
+- **邮箱有 TTL**（tempmail 默认 30 分钟，过期即删）。之后对旧号做 Codex 补 OTP 时，会按原地址自动重建邮箱再收信。
+  切换收信渠道后，旧号按邮箱域名自动走原渠道（`cfd1_domain(s)` / `CFD1_DOMAIN` 里的域名走 CF D1，其余走 tempmail）。
+- **限流**：tempmail 默认每个 API Key `RATE_LIMIT=500` 次 / 60s，而且**每个请求（包括被 429 拒掉的）都会续期这个 60s 窗口**，
+  只要持续有请求计数就不会归零。注册机已尽量省请求（验证码直接从邮件主题取、新邮箱不查基线），
+  撞到 429 时本进程所有 tempmail 请求会静默一整个窗口让计数过期。批量并发注册建议在 tempmail 的 `.env` 里调大
+  `RATE_LIMIT`（如 `5000`），或把它 `middleware/ratelimit.go` 里的 `pipe.Expire` 改成 `pipe.ExpireNX`（只在窗口开始时设过期）。
+
 ### 3.3 Web 操作
 
 1. 登录管理后台（admin `auth-key`）  
@@ -273,9 +310,14 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `interval_secs` | 3 | 每号间隔秒 |
 | `timeout_secs` | 600 | 单号超时（subprocess 严格生效） |
 | `executor` | `protocol` | `protocol` / `headless` / `headed`；推荐 protocol |
-| `mail_provider` | `cloudflare_d1_api` | 邮箱 provider |
+| `mail_provider` | `cloudflare_d1_api` | 收信渠道：`cloudflare_d1_api` / `tempmail`（自建 123nhh/tempmail，见 3.2.1） |
 | `cfd1_domain` | 空 | 覆盖 `CFD1_DOMAIN` |
 | `cfd1_domains` | 空 | 域名池：多条按行/逗号分隔，每次注册随机取一个（优先于 `cfd1_domain`），对抗上游按邮箱域名的批量封禁波。所有域名须配置 Cloudflare Email Routing catch-all 到同一个 Worker/D1 |
+| `tempmail_base_url` | 空 | tempmail 站点根地址（自动去掉结尾 `/api`，没写协议补 `https://`） |
+| `tempmail_api_key` | 空 | `tm_` 开头；读配置时返回空串 + `has_tempmail_api_key`，写入空串表示不修改 |
+| `tempmail_domains` | 空 | tempmail 域名池（分隔规则同 `cfd1_domains`）；空 = 服务端随机挑已激活域名 |
+| `tempmail_mode` | `single` | `single` 普通域名 / `multi` 多级子域名 / 空 = 服务端随机 |
+| `tempmail_subdomain_depth` | 2 | `multi` 时注册机自己生成的随机子域名层数（0–5）；0 = 交给 tempmail 生成（10~14 级单词） |
 | `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*`。多条按行/逗号分隔成池，并发注册时 round-robin 分给各号（配合 `bind_register_proxy` 实现按号隔离出口） |
 | `bind_register_proxy` | true | 入库时把代理绑到账号；绑了代理的号不再回落到全局/直连（按号隔离出口） |
 | `plan_type` | `free` | 写入号池的 type |
@@ -336,6 +378,7 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | GET | `/api/gpt-register/settings` | 读配置（密钥脱敏）+ `pool` 快照（`total` / `available` / `normal` / `abnormal`） |
 | POST | `/api/gpt-register/settings` | 写配置（含 `skip_codex` / `auto_replenish_*`；`auto_codex_upgrade` 仍可写但不再自动调度） |
 | POST | `/api/gpt-register/start` | 启动任务（可带覆盖） |
+| POST | `/api/gpt-register/tempmail/test` | 测 tempmail 连通性：`{tempmail_base_url?, tempmail_api_key?}`（空字段用已保存的值），返回 `username` / `latency_ms` / `domains[{domain, single, multi}]` |
 | GET | `/api/gpt-register/jobs` | 任务列表 |
 | GET | `/api/gpt-register/jobs/{id}` | 任务详情 |
 | POST | `/api/gpt-register/jobs/{id}/cancel` | 取消 |

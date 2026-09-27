@@ -109,7 +109,9 @@ def encoding_for_model(model: str):
 
 def warmup() -> None:
     """Best-effort preload so the first image request does not wait on Azure Blob."""
+    from utils.image_models import WEB_IMAGE_MODEL
+
     try:
-        encoding_for_model("gpt-image-2")
+        encoding_for_model(WEB_IMAGE_MODEL)
     except Exception:
         return

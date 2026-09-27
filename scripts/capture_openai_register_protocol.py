@@ -238,7 +238,8 @@ def _event_index(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def capture_prefix(*, proxy: str, email: str | None) -> tuple[Path, dict[str, Any]]:
     from platforms.chatgpt.register import RegistrationEngine
 
-    probe_email = email or f"protocol-probe-{uuid.uuid4().hex[:10]}@cyt233.dpdns.org"
+    probe_domain = str(os.environ.get("CFD1_DOMAIN") or "").strip().lstrip("@") or "example.com"
+    probe_email = email or f"protocol-probe-{uuid.uuid4().hex[:10]}@{probe_domain}"
     engine = RegistrationEngine(
         email_service=DummyMailbox(probe_email),
         proxy_url=proxy,

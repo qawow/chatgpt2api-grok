@@ -4,10 +4,8 @@ export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = string;
 
-export function isGrokImageModel(model?: string | null) {
-  const id = String(model || "").trim().toLowerCase();
-  return id.includes("grok") && (id.includes("image") || id.includes("imagine"));
-}
+// Model ids and capability checks live in ./models (mirrors utils/image_models.py).
+export { isGrokImageModel, supportsImageEdits } from "./models";
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
 
@@ -908,6 +906,17 @@ export type GptRegisterSettings = {
   cfd1_domain: string;
   /** 域名池：多条按行/逗号分隔，每次注册随机取一个（对抗按域名的批量封禁） */
   cfd1_domains: string;
+  tempmail_base_url: string;
+  /** Write-only: always "" from the server; send "" to keep the stored key. */
+  tempmail_api_key: string;
+  has_tempmail_api_key?: boolean;
+  tempmail_domains: string;
+  /** Set per registration from tempmail_domains; empty means the server picks. */
+  tempmail_domain: string;
+  /** single | multi | "" (tempmail picks at random) */
+  tempmail_mode: string;
+  /** multi only: random subdomain labels we generate; 0 = tempmail's own (10–14 word labels). */
+  tempmail_subdomain_depth: number;
   push_enabled: boolean;
   push_mode: string;
   chatgpt2api_base_url: string;
@@ -1014,6 +1023,21 @@ export async function saveGptRegisterSettings(settings: Partial<GptRegisterSetti
   return httpRequest<{ settings: GptRegisterSettings }>("/api/gpt-register/settings", {
     method: "POST",
     body: settings,
+  });
+}
+
+export type TempmailProbeResult = {
+  ok: boolean;
+  base_url: string;
+  username: string;
+  latency_ms: number;
+  domains: { domain: string; single: boolean; multi: boolean }[];
+};
+
+export async function testTempmailConnection(values: { tempmail_base_url?: string; tempmail_api_key?: string }) {
+  return httpRequest<TempmailProbeResult>("/api/gpt-register/tempmail/test", {
+    method: "POST",
+    body: values,
   });
 }
 

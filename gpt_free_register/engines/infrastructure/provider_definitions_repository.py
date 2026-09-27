@@ -15,8 +15,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ``enabled`` gates both the settings page and create_*() in the core modules,
+# and ensure_seeded() re-applies it on every boot. A definition must therefore
+# only be enabled when an adapter is actually shipped in this tree:
+#
+#   mailbox  -> core.base_mailbox.MAILBOX_FACTORY_REGISTRY (cloudflare_d1, tempmail)
+#   captcha  -> providers/captcha/**            (EMPTY — nothing implemented)
+#   sms      -> core.base_sms.create_sms_provider (all three implemented)
+#   proxy    -> providers/proxy/**              (EMPTY — nothing implemented)
+#
+# Entries marked "无适配器实现" below are disabled on purpose: leaving them on
+# let users configure credentials for a provider that could only ever raise
+# ModuleNotFoundError / "不支持的邮箱 provider" at registration time.
 _BUILTIN_DEFINITIONS: list[dict] = [
     # ── mailbox ──────────────────────────────────────────────────────
+    # Only cloudflare_d1_api and tempmail are implemented (core/base_mailbox.py,
+    # core/tempmail_mailbox.py). The other 12 definitions are kept for their
+    # field schema but stay disabled until an adapter is added to
+    # MAILBOX_FACTORY_REGISTRY.
     {
         "provider_type": "mailbox",
         "provider_key": "cfworker_admin_api",
@@ -24,7 +40,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "基于 Cloudflare Worker 的自定义域名邮箱，需自行部署 Worker 后端",
         "driver_type": "cfworker_admin_api",
         "default_auth_mode": "token",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "selfhost",
         "auth_modes": [{"value": "token", "label": "Token 认证"}],
         "fields": [
@@ -48,7 +64,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {"key": "cfd1_api_token", "label": "CF API Token", "secret": True, "category": "auth", "placeholder": "Bearer token with D1 read"},
             {"key": "cfd1_account_id", "label": "Account ID", "category": "connection"},
             {"key": "cfd1_database_id", "label": "D1 Database ID", "category": "connection"},
-            {"key": "cfd1_domain", "label": "邮箱域名", "placeholder": "lg.zc.233159.xyz", "category": "connection"},
+            {"key": "cfd1_domain", "label": "邮箱域名", "placeholder": "mail.example.com", "category": "connection"},
             {"key": "cfd1_api_base", "label": "API Base（可选）", "placeholder": "https://api.cloudflare.com/client/v4", "category": "connection"},
             {"key": "cfd1_table", "label": "表名（可选）", "placeholder": "raw_mails", "category": "connection"},
             {"key": "cfd1_address_column", "label": "地址列（可选）", "placeholder": "address", "category": "connection"},
@@ -60,12 +76,29 @@ _BUILTIN_DEFINITIONS: list[dict] = [
     },
     {
         "provider_type": "mailbox",
+        "provider_key": "tempmail",
+        "label": "tempmail 自建邮箱",
+        "description": "自建 123nhh/tempmail（Go + PostgreSQL + Postfix）：服务端建号，REST API 读信",
+        "driver_type": "tempmail",
+        "default_auth_mode": "token",
+        "enabled": True,
+        "category": "selfhost",
+        "auth_modes": [{"value": "token", "label": "API Key"}],
+        "fields": [
+            {"key": "tempmail_base_url", "label": "站点地址", "placeholder": "https://mail.example.com", "category": "connection"},
+            {"key": "tempmail_api_key", "label": "API Key", "secret": True, "category": "auth", "placeholder": "tm_xxx"},
+            {"key": "tempmail_domain", "label": "邮箱域名（可选）", "placeholder": "空 = 服务端随机", "category": "connection"},
+            {"key": "tempmail_mode", "label": "域名模式（可选）", "placeholder": "single | multi", "category": "connection"},
+        ],
+    },
+    {
+        "provider_type": "mailbox",
         "provider_key": "moemail_api",
         "label": "MoeMail（sall.cc）",
         "description": "自部署临时邮箱，支持自动注册账号或手动登录已有账号",
         "driver_type": "moemail_api",
         "default_auth_mode": "password",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "selfhost",
         "auth_modes": [
             {"value": "password", "label": "账号密码"},
@@ -85,7 +118,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "免费临时邮箱，开箱即用，无需任何配置",
         "driver_type": "tempmail_lol_api",
         "default_auth_mode": "",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "free",
         "auth_modes": [],
         "fields": [],
@@ -97,7 +130,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "免费临时邮箱，需要浏览器环境（Camoufox）",
         "driver_type": "tempmail_web_api",
         "default_auth_mode": "",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "free",
         "auth_modes": [],
         "fields": [
@@ -111,7 +144,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "自部署邮箱服务，通过 API 自动生成临时邮箱",
         "driver_type": "duckmail_api",
         "default_auth_mode": "bearer",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "selfhost",
         "auth_modes": [{"value": "bearer", "label": "Bearer Token"}],
         "fields": [
@@ -127,7 +160,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "自部署邮箱服务，支持账号密码或 Admin Token 认证",
         "driver_type": "freemail_api",
         "default_auth_mode": "password",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "selfhost",
         "auth_modes": [{"value": "password", "label": "账号密码"}, {"value": "token", "label": "Admin Token"}],
         "fields": [
@@ -144,7 +177,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "Testmail.app 第三方服务，通过 API Key 和 Namespace 自动拼接邮箱",
         "driver_type": "testmail_api",
         "default_auth_mode": "apikey",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "thirdparty",
         "auth_modes": [{"value": "apikey", "label": "API Key"}],
         "fields": [
@@ -161,7 +194,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "laoudo.com 固定域名邮箱，使用已有邮箱地址接收验证码",
         "driver_type": "laoudo_api",
         "default_auth_mode": "token",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "thirdparty",
         "auth_modes": [{"value": "token", "label": "JWT Token"}],
         "fields": [
@@ -177,7 +210,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "mail.aitre.cc 免费临时邮箱，需指定一个固定邮箱地址",
         "driver_type": "aitre_api",
         "default_auth_mode": "",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "free",
         "auth_modes": [],
         "fields": [
@@ -192,7 +225,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "DuckDuckGo Email Protection，生成 @duck.com 别名，通过 IMAP 从转发邮箱读取验证码",
         "driver_type": "ddg_email",
         "default_auth_mode": "bearer",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "thirdparty",
         "auth_modes": [{"value": "bearer", "label": "Bearer Token"}],
         "fields": [
@@ -209,7 +242,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "导入心蓝邮箱助手通用格式账号池，优先使用 Client Id + 刷新令牌通过 Microsoft Graph 收验证码",
         "driver_type": "local_ms_pool",
         "default_auth_mode": "pool",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "custom",
         "auth_modes": [{"value": "pool", "label": "账号池"}],
         "fields": [
@@ -256,12 +289,17 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "通过配置 HTTP 端点和认证方式对接任意邮箱 API，适合高级用户",
         "driver_type": "generic_http_mailbox",
         "default_auth_mode": "",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "custom",
         "auth_modes": [],
         "fields": [],
     },
     # ── captcha ──────────────────────────────────────────────────────
+    # providers/captcha/ contains only __init__.py, so create_captcha_solver()
+    # cannot build any of these. All four stay disabled. Note the built-in
+    # ChatGPT protocol flow never asks for a solver
+    # (ProtocolMailboxAdapter.use_captcha_for_mailbox is False), so nothing in
+    # the default registration path regresses from this.
     {
         "provider_type": "captcha",
         "provider_key": "yescaptcha_api",
@@ -269,7 +307,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "YesCaptcha 云端验证码识别服务，支持 Turnstile 等类型",
         "driver_type": "yescaptcha_api",
         "default_auth_mode": "apikey",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "thirdparty",
         "auth_modes": [{"value": "apikey", "label": "API Key"}],
         "fields": [
@@ -283,7 +321,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "2Captcha 云端验证码识别服务，支持 Turnstile 等类型",
         "driver_type": "twocaptcha_api",
         "default_auth_mode": "apikey",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "thirdparty",
         "auth_modes": [{"value": "apikey", "label": "API Key"}],
         "fields": [
@@ -297,7 +335,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "调用本地 api_solver 服务（Camoufox/patchright）解 Turnstile 验证码",
         "driver_type": "local_solver",
         "default_auth_mode": "",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "thirdparty",
         "auth_modes": [],
         "fields": [
@@ -311,12 +349,17 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "description": "阻塞等待用户手动输入验证码，适用于调试场景",
         "driver_type": "manual",
         "default_auth_mode": "",
-        "enabled": True,
+        "enabled": False,  # 无适配器实现
         "category": "thirdparty",
         "auth_modes": [],
         "fields": [],
     },
     # ── sms ──────────────────────────────────────────────────────────
+    # These stay enabled: unlike captcha/proxy, the SMS adapters are NOT in
+    # providers/sms/ (that dir is empty) — they live inline in core/base_sms.py
+    # (SmsActivateProvider / HeroSmsProvider / SmsBowerProvider) and are reached
+    # through core.base_sms.create_sms_provider, wired up by
+    # core/registration/helpers.build_phone_callbacks.
     {
         "provider_type": "sms",
         "provider_key": "herosms_api",
@@ -375,6 +418,9 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         ],
     },
     # ── proxy ────────────────────────────────────────────────────────
+    # providers/proxy/ contains only __init__.py, so core.proxy_providers cannot
+    # build either of these. Both stay disabled; the static proxy pool is the
+    # only working path.
     {
         "provider_type": "proxy",
         "provider_key": "api_extract",

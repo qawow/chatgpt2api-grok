@@ -165,6 +165,37 @@ def _create_cfd1_mailbox(extra: dict[str, Any], proxy: str | None):
     return factory(extra, proxy)
 
 
+CFD1_MAIL_PROVIDERS = frozenset({"cloudflare_d1_api", "cloudflare_d1", "cfd1"})
+TEMPMAIL_MAIL_PROVIDER = "tempmail"
+
+_CFD1_EXTRA_KEYS = (
+    "cfd1_api_token",
+    "cfd1_account_id",
+    "cfd1_database_id",
+    "cfd1_domain",
+    "cfd1_local_part_prefix",
+    "cfd1_local_part_length",
+    "cfd1_api_base",
+    "cfd1_table",
+)
+_TEMPMAIL_EXTRA_KEYS = (
+    "tempmail_base_url",
+    "tempmail_api_key",
+    "tempmail_domain",
+    "tempmail_mode",
+    "tempmail_subdomain_depth",
+)
+
+
+def mailbox_extra(cfg: dict[str, Any], mail_provider: str) -> dict[str, Any]:
+    """Per-job mailbox overrides forwarded to the factory (it falls back to env)."""
+    keys = _TEMPMAIL_EXTRA_KEYS if mail_provider == TEMPMAIL_MAIL_PROVIDER else _CFD1_EXTRA_KEYS
+    # str(), not _clean(): 0 is a real value (tempmail_subdomain_depth=0), and
+    # _clean(0) would turn it into "" and let the factory default win.
+    values = {key: "" if cfg.get(key) is None else str(cfg.get(key)).strip() for key in keys}
+    return {key: value for key, value in values.items() if value}
+
+
 def _create_mailbox(provider: str, extra: dict[str, Any], proxy: str | None):
     key = _clean(provider) or "cloudflare_d1_api"
     # Prefer direct registry to avoid needing seeded register_engines.db.
@@ -256,7 +287,7 @@ def register_chatgpt_once(
     else:
         log_fn("[proxy] (none)")
 
-    mail_provider = "cloudflare_d1_api"
+    mail_provider = _clean(cfg.get("mail_provider")) or "cloudflare_d1_api"
     captcha = "auto"
     executor = "protocol"
 
@@ -265,19 +296,8 @@ def register_chatgpt_once(
         "identity_provider": "mailbox",
         "captcha_solver": captcha,
     }
-    # pass through optional CFD1 overrides into mailbox factory extra
-    for key in (
-        "cfd1_api_token",
-        "cfd1_account_id",
-        "cfd1_database_id",
-        "cfd1_domain",
-        "cfd1_local_part_prefix",
-        "cfd1_local_part_length",
-        "cfd1_api_base",
-        "cfd1_table",
-    ):
-        if _clean(cfg.get(key)):
-            extra[key] = _clean(cfg.get(key))
+    # pass through optional mailbox overrides into the factory extra
+    extra.update(mailbox_extra(cfg, mail_provider))
 
     config = RegisterConfig(
         executor_type=executor,
@@ -290,10 +310,13 @@ def register_chatgpt_once(
     # SOCKS for D1 as well; CFD1_PROXY overrides. Factory must not fall back to
     # REGISTER_PROXY_DEFAULT (a dead SOCKS eats the whole OTP window).
     mailbox_proxy = proxy
-    if mail_provider in {"cloudflare_d1_api", "cloudflare_d1", "cfd1"}:
+    if mail_provider in CFD1_MAIL_PROVIDERS:
         override = str(os.environ.get("CFD1_PROXY") or "").strip()
         if override:
             mailbox_proxy = override
+    elif mail_provider == TEMPMAIL_MAIL_PROVIDER:
+        # Self-hosted tempmail: direct is fastest; the factory honors TEMPMAIL_PROXY.
+        mailbox_proxy = None
     mailbox = _create_mailbox(mail_provider, extra, mailbox_proxy)
     platform_cls = get_platform("chatgpt")
     platform = platform_cls(config=config, mailbox=mailbox)
@@ -314,6 +337,11 @@ def register_chatgpt_once(
         }
     finally:
         # Close curl_cffi sessions so batch register doesn't leak fds.
+        if hasattr(mailbox, "close"):
+            try:
+                mailbox.close()
+            except Exception:
+                pass
         for obj in (platform, getattr(platform, "engine", None)):
             client = getattr(obj, "http_client", None) if obj is not None else None
             if client is not None and hasattr(client, "close"):

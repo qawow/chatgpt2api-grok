@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   LoaderCircle,
   Play,
+  PlugZap,
   Save,
   Square,
   UserPlus,
@@ -23,9 +24,11 @@ import {
   fetchGptRegisterSettings,
   saveGptRegisterSettings,
   startGptRegisterJob,
+  testTempmailConnection,
   type GptRegisterJob,
   type GptRegisterPoolSnapshot,
   type GptRegisterSettings,
+  type TempmailProbeResult,
 } from "@/lib/api";
 
 const DEFAULT_FORM: GptRegisterSettings = {
@@ -44,6 +47,13 @@ const DEFAULT_FORM: GptRegisterSettings = {
   source_type: "",
   cfd1_domain: "",
   cfd1_domains: "",
+  tempmail_base_url: "",
+  tempmail_api_key: "",
+  has_tempmail_api_key: false,
+  tempmail_domains: "",
+  tempmail_domain: "",
+  tempmail_mode: "single",
+  tempmail_subdomain_depth: 2,
   push_enabled: true,
   push_mode: "local",
   chatgpt2api_base_url: "",
@@ -64,6 +74,13 @@ const DEFAULT_FORM: GptRegisterSettings = {
   auto_replenish_min_total_quota: 0,
   circuit_break: 3,
 };
+
+function splitDomains(text: string) {
+  return String(text || "")
+    .split(/[\s,]+/)
+    .map((item) => item.trim().replace(/^@/, "").toLowerCase())
+    .filter(Boolean);
+}
 
 function isActiveJob(job?: GptRegisterJob | null) {
   return job?.status === "pending" || job?.status === "running";
@@ -96,6 +113,8 @@ export function GptRegisterCard() {
   const [isCancelling, setIsCancelling] = useState(false);
   const [job, setJob] = useState<GptRegisterJob | null>(null);
   const [pool, setPool] = useState<GptRegisterPoolSnapshot | null>(null);
+  const [isTestingMail, setIsTestingMail] = useState(false);
+  const [mailProbe, setMailProbe] = useState<TempmailProbeResult | null>(null);
 
   const setField = <K extends keyof GptRegisterSettings>(key: K, value: GptRegisterSettings[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -112,6 +131,7 @@ export function GptRegisterCard() {
         ...DEFAULT_FORM,
         ...settingsRes.settings,
         chatgpt2api_auth_key: "",
+        tempmail_api_key: "",
       });
       setPool(settingsRes.pool || null);
       const jobs = jobsRes.jobs || [];
@@ -153,35 +173,71 @@ export function GptRegisterCard() {
     return Math.min(100, Math.round((job.completed / job.total) * 100));
   }, [job?.completed, job?.total]);
 
+  const buildPayload = (): Partial<GptRegisterSettings> => {
+    const payload: Partial<GptRegisterSettings> = {
+      ...form,
+      count: Number(form.count) || 1,
+      concurrency: Number(form.concurrency) || 1,
+      interval_secs: Number(form.interval_secs) || 0,
+      timeout_secs: Number(form.timeout_secs) || 600,
+      auto_replenish_min_available: Number(form.auto_replenish_min_available) || 1,
+      auto_replenish_target_available: Number(form.auto_replenish_target_available) || 4,
+      auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
+      auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
+      auto_replenish_spacing_secs: Math.max(0, Number(form.auto_replenish_spacing_secs ?? 600)),
+      auto_replenish_fail_cooldown_secs: Math.max(60, Number(form.auto_replenish_fail_cooldown_secs ?? 600)),
+      auto_replenish_min_total_quota: Math.max(0, Number(form.auto_replenish_min_total_quota ?? 0)),
+      circuit_break: Math.max(0, Math.min(20, Number(form.circuit_break ?? 3))),
+      tempmail_subdomain_depth: Math.max(0, Math.min(5, Number(form.tempmail_subdomain_depth ?? 2))),
+      executor: "protocol",
+      mail_provider: form.mail_provider === "tempmail" ? "tempmail" : "cloudflare_d1_api",
+      captcha: "",
+    };
+    // Secrets are write-only; an empty value means "keep the stored one".
+    if (!String(payload.chatgpt2api_auth_key || "").trim()) {
+      delete payload.chatgpt2api_auth_key;
+    }
+    if (!String(payload.tempmail_api_key || "").trim()) {
+      delete payload.tempmail_api_key;
+    }
+    delete payload.has_chatgpt2api_auth_key;
+    delete payload.has_tempmail_api_key;
+    return payload;
+  };
+
+  const addTempmailDomain = (domain: string) => {
+    const current = splitDomains(form.tempmail_domains);
+    if (current.includes(domain)) return;
+    setField("tempmail_domains", [...current, domain].join("\n"));
+  };
+
+  const testMail = async () => {
+    setIsTestingMail(true);
+    try {
+      const result = await testTempmailConnection({
+        tempmail_base_url: form.tempmail_base_url,
+        tempmail_api_key: form.tempmail_api_key,
+      });
+      setMailProbe(result);
+      toast.success(`tempmail 连接正常（${result.username || "ok"}，${result.latency_ms}ms）`);
+    } catch (error) {
+      setMailProbe(null);
+      toast.error(error instanceof Error ? error.message : "tempmail 连接失败");
+    } finally {
+      setIsTestingMail(false);
+    }
+  };
+
   const saveSettings = async () => {
     setIsSaving(true);
     try {
-      const payload: Partial<GptRegisterSettings> = {
-        ...form,
-        count: Number(form.count) || 1,
-        concurrency: Number(form.concurrency) || 1,
-        interval_secs: Number(form.interval_secs) || 0,
-        timeout_secs: Number(form.timeout_secs) || 600,
-        auto_replenish_min_available: Number(form.auto_replenish_min_available) || 1,
-        auto_replenish_target_available: Number(form.auto_replenish_target_available) || 4,
-        auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
-        auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
-        auto_replenish_spacing_secs: Math.max(0, Number(form.auto_replenish_spacing_secs ?? 600)),
-        auto_replenish_fail_cooldown_secs: Math.max(60, Number(form.auto_replenish_fail_cooldown_secs ?? 600)),
-        auto_replenish_min_total_quota: Math.max(0, Number(form.auto_replenish_min_total_quota ?? 0)),
-        circuit_break: Math.max(0, Math.min(20, Number(form.circuit_break ?? 3))),
-        executor: "protocol",
-        mail_provider: "cloudflare_d1_api",
-        captcha: "",
-      };
-      if (!String(payload.chatgpt2api_auth_key || "").trim()) {
-        delete payload.chatgpt2api_auth_key;
-      }
+      const payload = buildPayload();
       const data = await saveGptRegisterSettings(payload);
       setForm({
         ...DEFAULT_FORM,
         ...data.settings,
         chatgpt2api_auth_key: "",
+        tempmail_api_key: "",
       });
       toast.success("注册配置已保存");
     } catch (error) {
@@ -195,27 +251,7 @@ export function GptRegisterCard() {
     setIsStarting(true);
     try {
       // save first so defaults stick
-      const payload: Partial<GptRegisterSettings> = {
-        ...form,
-        count: Number(form.count) || 1,
-        concurrency: Number(form.concurrency) || 1,
-        interval_secs: Number(form.interval_secs) || 0,
-        timeout_secs: Number(form.timeout_secs) || 600,
-        auto_replenish_min_available: Number(form.auto_replenish_min_available) || 1,
-        auto_replenish_target_available: Number(form.auto_replenish_target_available) || 4,
-        auto_replenish_batch: Number(form.auto_replenish_batch) || 1,
-        auto_replenish_interval_secs: Number(form.auto_replenish_interval_secs) || 90,
-        auto_replenish_spacing_secs: Math.max(0, Number(form.auto_replenish_spacing_secs ?? 600)),
-        auto_replenish_fail_cooldown_secs: Math.max(60, Number(form.auto_replenish_fail_cooldown_secs ?? 600)),
-        auto_replenish_min_total_quota: Math.max(0, Number(form.auto_replenish_min_total_quota ?? 0)),
-        circuit_break: Math.max(0, Math.min(20, Number(form.circuit_break ?? 3))),
-        executor: "protocol",
-        mail_provider: "cloudflare_d1_api",
-        captcha: "",
-      };
-      if (!String(payload.chatgpt2api_auth_key || "").trim()) {
-        delete payload.chatgpt2api_auth_key;
-      }
+      const payload = buildPayload();
       await saveGptRegisterSettings(payload);
       const data = await startGptRegisterJob(payload);
       setJob(data.job);
@@ -353,30 +389,150 @@ export function GptRegisterCard() {
                   disabled={running}
                 />
               </Field>
-              <Field label="注册路径" hint="浏览器 / Playwright 执行器已移除，固定纯协议。">
-                <Input value="protocol + Cloudflare D1" readOnly className="h-10 rounded-xl border-stone-200 bg-stone-50 text-stone-600" />
-              </Field>
-              <Field label="CFD1 域名覆盖" hint="留空用 data/gpt_register.env 或环境变量 CFD1_DOMAIN">
-                <Input
-                  value={form.cfd1_domain}
-                  onChange={(e) => setField("cfd1_domain", e.target.value)}
-                  placeholder="mail.example.com"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
+              <Field label="收信渠道" hint="注册固定纯协议。tempmail = 自建 123nhh/tempmail，REST 直连，收信比 CF D1 快">
+                <select
+                  value={form.mail_provider === "tempmail" ? "tempmail" : "cloudflare_d1_api"}
+                  onChange={(e) => setField("mail_provider", e.target.value)}
                   disabled={running}
-                />
+                  className="h-10 w-full rounded-xl border border-stone-200 bg-white px-3 text-sm"
+                >
+                  <option value="cloudflare_d1_api">Cloudflare D1（Email Routing → Worker → D1）</option>
+                  <option value="tempmail">tempmail（自建 123nhh/tempmail）</option>
+                </select>
               </Field>
-              <Field
-                label="域名池（随机轮换）"
-                hint="多条按行或逗号分隔，每次注册随机取一个，对抗按邮箱域名的批量封禁。所有域名须配好 Cloudflare Email Routing catch-all 到同一个 Worker/D1；设置后优先于上面的单域名覆盖"
-              >
-                <Textarea
-                  value={form.cfd1_domains}
-                  onChange={(e) => setField("cfd1_domains", e.target.value)}
-                  placeholder={"mail1.example.com\nmail2.example.com"}
-                  className="min-h-20 rounded-xl border-stone-200 bg-white"
-                  disabled={running}
-                />
-              </Field>
+              {form.mail_provider === "tempmail" ? (
+                <>
+                  <Field label="tempmail 地址" hint="站点根地址，带不带 /api 都行">
+                    <Input
+                      value={form.tempmail_base_url}
+                      onChange={(e) => setField("tempmail_base_url", e.target.value)}
+                      placeholder="https://mail.example.com"
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={running}
+                    />
+                  </Field>
+                  <Field
+                    label="tempmail API Key"
+                    hint={form.has_tempmail_api_key ? "已保存，留空不修改" : "tm_ 开头，在 tempmail 控制台获取"}
+                  >
+                    <div className="flex gap-2">
+                      <Input
+                        type="password"
+                        autoComplete="off"
+                        value={form.tempmail_api_key || ""}
+                        onChange={(e) => setField("tempmail_api_key", e.target.value)}
+                        placeholder={form.has_tempmail_api_key ? "••••••••" : "tm_xxx"}
+                        className="h-10 rounded-xl border-stone-200 bg-white"
+                        disabled={running}
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="h-10 shrink-0 rounded-xl border-stone-200 bg-white px-3 text-stone-700"
+                        onClick={() => void testMail()}
+                        disabled={isTestingMail || running}
+                      >
+                        {isTestingMail ? <LoaderCircle className="size-4 animate-spin" /> : <PlugZap className="size-4" />}
+                        测试
+                      </Button>
+                    </div>
+                  </Field>
+                  <Field
+                    label="域名模式"
+                    hint="multi 需要域名配了通配 MX（*.example.com），每个号一个独立主机名，分散按域名的封禁"
+                  >
+                    <select
+                      value={form.tempmail_mode}
+                      onChange={(e) => setField("tempmail_mode", e.target.value)}
+                      disabled={running}
+                      className="h-10 w-full rounded-xl border border-stone-200 bg-white px-3 text-sm"
+                    >
+                      <option value="single">single（abc@example.com）</option>
+                      <option value="multi">multi（abc@随机子域名.example.com）</option>
+                      <option value="">随机（由 tempmail 决定）</option>
+                    </select>
+                  </Field>
+                  {form.tempmail_mode === "multi" ? (
+                    <Field
+                      label="子域名层数"
+                      hint="注册机自己生成几级随机子域名，2 = abc@k3x9q.m2a8.example.com。0 = 交给 tempmail 生成（10~14 级 gmail/yahoo 等单词拼接，地址很长）"
+                    >
+                      <Input
+                        type="number"
+                        min={0}
+                        max={5}
+                        value={String(form.tempmail_subdomain_depth ?? 2)}
+                        onChange={(e) => {
+                          const n = parseInt(e.target.value, 10);
+                          setField("tempmail_subdomain_depth", Number.isNaN(n) ? 2 : Math.max(0, Math.min(5, n)));
+                        }}
+                        className="h-10 rounded-xl border-stone-200 bg-white"
+                        disabled={running}
+                      />
+                    </Field>
+                  ) : null}
+                  <Field
+                    label="域名池（随机轮换）"
+                    hint="留空由 tempmail 在已激活域名里随机挑；多条按行或逗号分隔，每次注册随机取一个。可写 example.com、*.example.com（其下随机子域名）或 a.example.com（固定子域名）。点「测试」后可点下方域名加入"
+                  >
+                    <Textarea
+                      value={form.tempmail_domains}
+                      onChange={(e) => setField("tempmail_domains", e.target.value)}
+                      placeholder={"example.com\n*.example.net"}
+                      className="min-h-20 rounded-xl border-stone-200 bg-white"
+                      disabled={running}
+                    />
+                    {mailProbe ? (
+                      <div className="flex flex-wrap gap-1.5">
+                        {mailProbe.domains.length ? (
+                          mailProbe.domains.map((item) => (
+                            <button
+                              key={item.domain}
+                              type="button"
+                              onClick={() => addTempmailDomain(item.domain)}
+                              disabled={running}
+                              title={item.single ? "点击加入域名池" : "该域名只支持 multi 模式"}
+                            >
+                              <Badge variant={splitDomains(form.tempmail_domains).includes(item.domain) ? "success" : "outline"}>
+                                {item.domain}
+                                <span className="ml-1 text-[10px] opacity-70">
+                                  {[item.single ? "single" : "", item.multi ? "multi" : ""].filter(Boolean).join("/")}
+                                </span>
+                              </Badge>
+                            </button>
+                          ))
+                        ) : (
+                          <span className="text-xs text-amber-600">tempmail 里还没有已激活的域名</span>
+                        )}
+                      </div>
+                    ) : null}
+                  </Field>
+                </>
+              ) : (
+                <>
+                  <Field label="CFD1 域名覆盖" hint="留空用 data/gpt_register.env 或环境变量 CFD1_DOMAIN">
+                    <Input
+                      value={form.cfd1_domain}
+                      onChange={(e) => setField("cfd1_domain", e.target.value)}
+                      placeholder="mail.example.com"
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={running}
+                    />
+                  </Field>
+                  <Field
+                    label="域名池（随机轮换）"
+                    hint="多条按行或逗号分隔，每次注册随机取一个，对抗按邮箱域名的批量封禁。所有域名须配好 Cloudflare Email Routing catch-all 到同一个 Worker/D1；设置后优先于上面的单域名覆盖"
+                  >
+                    <Textarea
+                      value={form.cfd1_domains}
+                      onChange={(e) => setField("cfd1_domains", e.target.value)}
+                      placeholder={"mail1.example.com\nmail2.example.com"}
+                      className="min-h-20 rounded-xl border-stone-200 bg-white"
+                      disabled={running}
+                    />
+                  </Field>
+                </>
+              )}
               <Field
                 label="出站代理"
                 hint="留空读 REGISTER_PROXY_DEFAULT。多条按行或逗号分隔，并发时 round-robin 分给各号"

@@ -4,20 +4,29 @@ Token 刷新模块
 """
 
 import logging
-import json
-import time
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Protocol, Tuple, runtime_checkable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from curl_cffi import requests as cffi_requests
 
-# from ..config.settings import get_settings  # removed: external dep
-# from ..database.session import get_db  # removed: external dep
-# from ..database import crud  # removed: external dep
-# from ..database.models import Account  # removed: external dep
-
 logger = logging.getLogger(__name__)
+
+
+# The original ORM model (``..database.models.Account``) was an external dep and
+# is gone. ``plugin.py._handle_refresh_token`` passes a plain duck-typed shim, so
+# the contract is structural: declare it explicitly instead of importing a model.
+# NOTE: this must stay a real module-level name — the annotation on
+# ``refresh_account`` is evaluated at def time (no ``from __future__ import
+# annotations`` here).
+@runtime_checkable
+class RefreshableAccount(Protocol):
+    """Minimal shape required by :meth:`TokenRefreshManager.refresh_account`."""
+
+    email: str
+    session_token: str
+    refresh_token: str
+    client_id: str
 
 
 def _utcnow() -> datetime:
@@ -205,7 +214,7 @@ class TokenRefreshManager:
             logger.error(result.error_message)
             return result
 
-    def refresh_account(self, account: Account) -> TokenRefreshResult:
+    def refresh_account(self, account: RefreshableAccount) -> TokenRefreshResult:
         """
         刷新账号的 Token
 
@@ -278,61 +287,8 @@ class TokenRefreshManager:
             return False, f"验证异常: {str(e)}"
 
 
-def refresh_account_token(account_id: int, proxy_url: Optional[str] = None) -> TokenRefreshResult:
-    """
-    刷新指定账号的 Token 并更新数据库
-
-    Args:
-        account_id: 账号 ID
-        proxy_url: 代理 URL
-
-    Returns:
-        TokenRefreshResult: 刷新结果
-    """
-    with get_db() as db:
-        account = crud.get_account_by_id(db, account_id)
-        if not account:
-            return TokenRefreshResult(success=False, error_message="账号不存在")
-
-        manager = TokenRefreshManager(proxy_url=proxy_url)
-        result = manager.refresh_account(account)
-
-        if result.success:
-            # 更新数据库
-            update_data = {
-                "access_token": result.access_token,
-                "last_refresh": _utcnow()
-            }
-
-            if result.refresh_token:
-                update_data["refresh_token"] = result.refresh_token
-
-            if result.expires_at:
-                update_data["expires_at"] = result.expires_at
-
-            crud.update_account(db, account_id, **update_data)
-
-        return result
-
-
-def validate_account_token(account_id: int, proxy_url: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-    """
-    验证指定账号的 Token 是否有效
-
-    Args:
-        account_id: 账号 ID
-        proxy_url: 代理 URL
-
-    Returns:
-        Tuple[bool, Optional[str]]: (是否有效, 错误信息)
-    """
-    with get_db() as db:
-        account = crud.get_account_by_id(db, account_id)
-        if not account:
-            return False, "账号不存在"
-
-        if not account.access_token:
-            return False, "账号没有 access_token"
-
-        manager = TokenRefreshManager(proxy_url=proxy_url)
-        return manager.validate_token(account.access_token)
+# NOTE: refresh_account_token() / validate_account_token() used to live here.
+# They looked up accounts through the removed ``..database`` package (get_db /
+# crud) and could only ever raise NameError, so they were dropped. Callers
+# should build a shim account and use TokenRefreshManager directly — see
+# ``plugin.ChatGPTPlatform._handle_refresh_token``.

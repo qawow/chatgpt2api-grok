@@ -3,9 +3,22 @@ from __future__ import annotations
 from typing import Any
 
 from services.account_service import account_service
+from services.config import config
 from services.grok_account_service import grok_account_service
-from utils.grok_models import GROK_IMAGE_MODELS
-from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODEL
+from utils.image_models import (
+    CODEX_IMAGE_MODEL,
+    DOUBAO_IMAGE_MODEL,
+    GROK_CANONICAL_IMAGE_MODELS,
+    OWNED_BY,
+    PROVIDER_CHATGPT,
+    PROVIDER_DOUBAO,
+    PROVIDER_GROK,
+    PROVIDER_ZHITU360,
+    WEB_IMAGE_MODEL,
+    ZHITU360_IMAGE_MODELS,
+)
+
+_CODEX_PLANS = {"Plus": "plus", "Team": "team", "Pro": "pro"}
 
 
 def reset_models_cache() -> None:
@@ -13,52 +26,76 @@ def reset_models_cache() -> None:
     return
 
 
-def _model_entry(model_id: str, owned_by: str = "chatgpt2api") -> dict[str, Any]:
+def _model_entry(model_id: str, provider: str) -> dict[str, Any]:
     return {
         "id": model_id,
         "object": "model",
         "created": 0,
-        "owned_by": owned_by,
+        "owned_by": OWNED_BY[provider],
         "permission": [],
         "root": model_id,
         "parent": None,
     }
 
 
-def list_models() -> dict[str, Any]:
-    """Public catalog is image-only. Text models (gpt-5*, grok-4.5, auto) are not exposed."""
-    data: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    dynamic_models: set[str] = set()
-    accounts = account_service.list_accounts()
-    web_image_accounts = [account for account in accounts if isinstance(account, dict)]
+def chatgpt_image_models() -> list[str]:
+    accounts = [account for account in account_service.list_accounts() if isinstance(account, dict)]
+    if not accounts:
+        return []
+    models = [WEB_IMAGE_MODEL]
     codex_types = {
         normalized
         for account in accounts
-        if isinstance(account, dict)
-           and account_service._normalize_source_type(account.get("source_type")) == "codex"
-           and (normalized := account_service._normalize_account_type(account.get("type")))
+        if account_service._normalize_source_type(account.get("source_type")) == "codex"
+        and (normalized := account_service._normalize_account_type(account.get("type")))
     }
+    paid_plans = [plan for plan in _CODEX_PLANS if plan in codex_types]
+    if paid_plans:
+        models.append(CODEX_IMAGE_MODEL)
+        models.extend(f"{_CODEX_PLANS[plan]}-{CODEX_IMAGE_MODEL}" for plan in paid_plans)
+    return models
 
-    if web_image_accounts:
-        dynamic_models.add(WEB_IMAGE_MODEL)
-    if codex_types & {"Plus", "Team", "Pro"}:
-        dynamic_models.add(CODEX_IMAGE_MODEL)
-    if "Plus" in codex_types:
-        dynamic_models.add(f"plus-{CODEX_IMAGE_MODEL}")
-    if "Team" in codex_types:
-        dynamic_models.add(f"team-{CODEX_IMAGE_MODEL}")
-    if "Pro" in codex_types:
-        dynamic_models.add(f"pro-{CODEX_IMAGE_MODEL}")
 
-    for model in sorted(dynamic_models):
-        if model not in seen:
-            data.append(_model_entry(model))
-            seen.add(model)
+def grok_image_models() -> list[str]:
+    return list(GROK_CANONICAL_IMAGE_MODELS) if grok_account_service.count() > 0 else []
 
-    if grok_account_service.count() > 0:
-        for model in sorted(GROK_IMAGE_MODELS):
+
+def _has_cookies(settings: dict[str, Any]) -> bool:
+    return bool(str(settings.get("cookies") or "").strip())
+
+
+def doubao_image_models() -> list[str]:
+    return [DOUBAO_IMAGE_MODEL] if _has_cookies(config.get_doubao_settings()) else []
+
+
+def zhitu360_image_models() -> list[str]:
+    return list(ZHITU360_IMAGE_MODELS) if _has_cookies(config.get_zhitu360_settings()) else []
+
+
+def list_models() -> dict[str, Any]:
+    """Image-generation models only, canonical ids only.
+
+    Text/chat models (gpt-5*, grok-4.5, auto) are never listed, and neither are
+    aliases or legacy names (gpt-image-2, grok-imagine, grok-2-image-1212,
+    即梦…) — those are still accepted on requests. A provider's models appear
+    only when it can serve them: a non-empty pool, or configured cookies for the
+    cookie-based backends (which also accept per-request cookies, so an unlisted
+    id can still work when the client supplies them).
+    """
+    data: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for provider, models in (
+        (PROVIDER_CHATGPT, chatgpt_image_models()),
+        (PROVIDER_GROK, grok_image_models()),
+        (PROVIDER_DOUBAO, doubao_image_models()),
+        (PROVIDER_ZHITU360, zhitu360_image_models()),
+    ):
+        for model in models:
             if model not in seen:
-                data.append(_model_entry(model, owned_by="grok"))
                 seen.add(model)
+                data.append(_model_entry(model, provider))
     return {"object": "list", "data": data}
+
+
+def list_grok_models() -> dict[str, Any]:
+    return {"object": "list", "data": [_model_entry(model, PROVIDER_GROK) for model in grok_image_models()]}

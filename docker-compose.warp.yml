@@ -1,9 +1,33 @@
+# 容器日志上限：默认 json-file driver 不轮转，而 app 入口开着 --access-log、
+# flaresolverr 本身也很啰嗦，长跑几周就能把宿主机磁盘写满。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# /health 不需要鉴权，号池为空时只是 status=degraded 而非 5xx，适合做存活探针。
+x-app-healthcheck: &app-healthcheck
+  test:
+    - CMD
+    - python
+    - -c
+    - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/health?format=json', timeout=5).status == 200 else 1)"
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 40s
+
 services:
   init-config:
     image: python:3.13-alpine
     container_name: chatgpt2api-warp-init
     working_dir: /app
     volumes:
+      # ⚠️ 首次启动前必须先 `cp config.example.json config.json`：
+      # 宿主机上不存在该文件时，Docker 会把挂载源自动建成【目录】，
+      # init 脚本读不到配置会直接退出，下面 app 的
+      # depends_on: service_completed_successfully 就永远等不到。
       - ./config.json:/app/config.json
       - ./scripts:/app/scripts:ro
     environment:
@@ -24,6 +48,7 @@ services:
       CHATGPT2API_FLARESOLVERR_URL: ${CHATGPT2API_FLARESOLVERR_URL:-http://flaresolverr:8191}
     command: ["python3", "/app/scripts/init_proxy_config.py"]
     restart: "no"
+    logging: *default-logging
 
   warp-proxy:
     image: caomingjun/warp:latest
@@ -47,6 +72,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    logging: *default-logging
 
   privoxy:
     image: vimagick/privoxy:latest
@@ -65,6 +91,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    logging: *default-logging
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -81,6 +108,7 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    logging: *default-logging
 
   app:
     build:
@@ -100,11 +128,30 @@ services:
       - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
       - ./data:/app/data
+      # ⚠️ 首次启动前必须先 `cp config.example.json config.json`，见 init-config 注释。
       - ./config.json:/app/config.json
       # 不要默认挂载 ./gpt_free_register，避免空目录盖掉镜像内 builtin engines
+    # 默认 root 运行。改为非 root（推荐）：先在宿主机执行
+    #   sudo chown -R 10001:10001 ./data && sudo chown 10001:10001 config.json
+    # 再放开下面这行：
+    # user: "10001:10001"
+    env_file:
+      # 读取 .env（README / docs/deployment.md 让用户 `cp .env.example .env`）。
+      # 没有 env_file 时 WAIFU2X_* / DOUBAO_* / ZHITU360_* / CAPSOLVER_KEY /
+      # OAI_CLIENT_* 等变量会静默失效。
+      # required: false 需要 Docker Compose >= 2.24，保证 .env 不存在时也能启动。
+      - path: .env
+        required: false
     environment:
+      # 认证密钥：优先读这里，留空时回落到 config.json 的 auth-key。两处都没有时
+      # services/config.py 在导入阶段抛 ValueError（配合 restart 会变成崩溃重启循环）。
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}
       REGISTER_ENGINES_DATABASE_URL: ${REGISTER_ENGINES_DATABASE_URL:-sqlite:////app/data/register_engines.db}
-      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      # ⚠️ 容器内监听端口固定为 80（入口读 PORT，默认 80）；
+      # CHATGPT2API_PORT 只用于上面的宿主机端口映射，不要注入容器。
+      PORT: "80"
+    healthcheck: *app-healthcheck
+    logging: *default-logging

@@ -10,7 +10,25 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_output_items_tokens, image_usage
-from utils.helper import WEB_IMAGE_MODEL
+from utils.image_models import WEB_IMAGE_MODEL
+
+# Orchestration hooks the task layer injects into the payload. They are callables
+# and token sets, never client input — an HTTP entrypoint must strip them before
+# handing a request body to handle(), or a caller can pass e.g. a string
+# progress_callback (TypeError mid-generation) or steer pool selection through
+# _excluded_tokens.
+INTERNAL_PAYLOAD_KEYS = (
+    "progress_callback",
+    "checkpoint_callback",
+    "_excluded_tokens",
+    "_is_cancelled",
+    "_task_control",
+)
+
+
+def strip_internal_keys(body: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``body`` with the orchestration hooks removed."""
+    return {key: value for key, value in body.items() if key not in INTERNAL_PAYLOAD_KEYS}
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

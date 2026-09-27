@@ -1,17 +1,43 @@
 import base64
 import json
+import socket
 import sys
 import time
+import unittest
 import urllib.request
+from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT_DIR / "data" / "output"
 BASE_URL = "http://127.0.0.1:8000"
+LIVE_SERVICE_TIMEOUT = 0.2
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+
+@lru_cache(maxsize=None)
+def service_is_live(base_url: str = BASE_URL, timeout: float = LIVE_SERVICE_TIMEOUT) -> bool:
+    """本地服务是否在监听（只做 TCP 连通性探测，不发 HTTP 请求）。"""
+    parts = urlsplit(base_url)
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def requires_live_service(base_url: str = BASE_URL):
+    """给需要真实起服务的 HTTP 用例加守卫：没起服务就 skip，而不是 error。"""
+    return unittest.skipUnless(
+        service_is_live(base_url),
+        f"本地服务未监听 {base_url}，跳过 HTTP 用例",
+    )
 
 
 def load_auth_key() -> str:

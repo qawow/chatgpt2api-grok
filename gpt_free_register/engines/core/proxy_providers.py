@@ -30,6 +30,12 @@ class BaseProxyProvider(ABC):
 # ---------------------------------------------------------------------------
 # Lazy re-exports for backward compatibility
 # (concrete classes now live under providers/proxy/)
+#
+# WARNING: neither module below exists in this tree — providers/proxy/ only ships
+# an __init__.py. Every dynamic-proxy provider therefore raises ModuleNotFoundError
+# at creation time. The matching provider definitions are seeded with
+# enabled=False (see infrastructure/provider_definitions_repository.py) so the
+# settings page cannot offer a provider that is guaranteed to fail.
 # ---------------------------------------------------------------------------
 _LAZY_IMPORTS = {
     "ApiExtractProvider": "providers.proxy.api_extract",
@@ -41,7 +47,13 @@ def __getattr__(name: str):
     module_path = _LAZY_IMPORTS.get(name)
     if module_path is not None:
         import importlib
-        mod = importlib.import_module(module_path)
+        try:
+            mod = importlib.import_module(module_path)
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                f"代理适配器缺失: {module_path} 未实现（providers/proxy/ 为空），"
+                f"无法创建 {name}。请改用静态代理池。"
+            ) from exc
         return getattr(mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -95,8 +107,11 @@ def get_dynamic_proxy(extra: dict | None = None) -> Optional[str]:
                 if proxy:
                     return proxy
             except Exception as exc:
-                logger.debug(f"[ProxyProvider] {setting.provider_key} 获取失败: {exc}")
+                # warning, not debug: a user who enabled a dynamic proxy on the
+                # settings page must see why it silently fell back to the static
+                # pool (most often: the adapter module does not exist at all).
+                logger.warning("[ProxyProvider] %s 获取代理失败，回退静态池: %s", setting.provider_key, exc)
                 continue
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[ProxyProvider] 读取动态代理配置失败，回退静态池: %s", exc)
     return None

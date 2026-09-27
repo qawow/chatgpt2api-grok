@@ -1,7 +1,27 @@
+# 容器日志上限：默认 json-file driver 不轮转，而入口开着 --access-log，
+# 长跑几周就能把宿主机磁盘写满。三个 compose 保持同一套配置。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# /health 不需要鉴权，号池为空时只是 status=degraded 而非 5xx，适合做存活探针。
+x-app-healthcheck: &app-healthcheck
+  test:
+    - CMD
+    - python
+    - -c
+    - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/health?format=json', timeout=5).status == 200 else 1)"
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 40s
+
 services:
   app:
     # 二开镜像（GitHub Actions 构建并推送）。
-    # - push 到 publish-root/main 分支 → 推 :sha 标签（滚动部署可固定 sha）
+    # - push 到 main / publish-root / fork/** 分支 → 推 :sha 标签（滚动部署可固定 sha）
     # - 打 v* tag → 推 :latest + 版本号
     # 部署：docker compose up -d（自动拉取镜像，无需本地构建）
     # 本地开发/改源码构建：docker compose -f docker-compose.local.yml up -d --build
@@ -12,10 +32,33 @@ services:
       - "8000:80"
     volumes:
       - ./data:/app/data
+      # ⚠️ 首次部署前必须先 `cp config.example.json config.json`：
+      # 宿主机上不存在该文件时，Docker 会把挂载源自动建成【目录】，配置随即全部失效。
       - ./config.json:/app/config.json
+    # 默认 root 运行。改为非 root（推荐）：先在宿主机执行
+    #   sudo chown -R 10001:10001 ./data && sudo chown 10001:10001 config.json
+    # 再放开下面这行：
+    # user: "10001:10001"
+    env_file:
+      # 读取 .env（README / docs/deployment.md 让用户 `cp .env.example .env`）。
+      # 没有 env_file 时 WAIFU2X_* / DOUBAO_* / ZHITU360_* / CAPSOLVER_KEY /
+      # OAI_CLIENT_* 等变量会静默失效。
+      # required: false 需要 Docker Compose >= 2.24，保证 .env 不存在时也能启动。
+      - path: .env
+        required: false
     environment:
+      # 认证密钥（必填）。缺失时 services/config.py 在模块导入阶段就抛 ValueError，
+      # 配合 restart: unless-stopped 会变成看不出原因的崩溃重启循环，
+      # 留空时回落到 config.json 的 auth-key（两者都没有才会启动失败）。
+      - CHATGPT2API_AUTH_KEY=${CHATGPT2API_AUTH_KEY:-}
+
+      # 容器内监听端口固定 80（入口脚本读 PORT，默认 80），由上面的 8000:80 映射到宿主机。
+      # 显式写死是为了盖掉 .env 里可能存在的 PORT（env_file 的值会被 environment 覆盖）。
+      - PORT=80
+
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
-       - STORAGE_BACKEND=json
+      # 三个 compose 统一默认 json；换 compose 文件不应该静默换后端把号池"弄丢"。
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-json}
 
       # 数据库配置 (当 STORAGE_BACKEND=sqlite/postgres 时使用)
       # - DATABASE_URL=postgresql://user:password@host:5432/dbname
@@ -27,8 +70,7 @@ services:
       # - GIT_BRANCH=main
       # - GIT_FILE_PATH=accounts.json
 
-      # 认证密钥 (可选，覆盖 config.json)
-      # - CHATGPT2API_AUTH_KEY=your_secret_key
-
       # 基础 URL (可选)
       # - CHATGPT2API_BASE_URL=https://your-domain.com
+    healthcheck: *app-healthcheck
+    logging: *default-logging

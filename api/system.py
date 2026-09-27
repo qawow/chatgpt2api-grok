@@ -294,21 +294,38 @@ def create_router(app_version: str) -> APIRouter:
         return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
 
     @router.get("/health", response_model=None)
-    async def health_dashboard(format: str = Query(default="html")):
+    async def health_dashboard(
+        format: str = Query(default="html"),
+        authorization: str | None = Header(default=None),
+    ):
         from services.account_service import account_service as acct_svc
         stats = acct_svc.get_stats()
-        storage = config.get_storage_backend()
-        storage_health = storage.health_check()
         healthy = stats["active"] > 0
 
-        stats_json = {
+        # This endpoint is deliberately unauthenticated so load balancers and
+        # the container HEALTHCHECK can reach it, which means the storage and
+        # proxy sections — absolute file paths, the (masked) DB connection
+        # string, egress mode, cached clearance hostnames — are only safe to
+        # include for an admin caller. The HTML dashboard never rendered them.
+        try:
+            require_admin(authorization)
+            authorized = True
+        except HTTPException:
+            authorized = False
+
+        stats_json: dict[str, object] = {
             "status": "ok" if healthy else "degraded",
             "healthy": healthy,
             "version": app_version,
-            "storage": {"backend": storage.get_backend_info(), "health": storage_health},
-            "proxy_runtime": proxy_settings.get_runtime_status(),
             "accounts": stats,
         }
+        if authorized:
+            storage = config.get_storage_backend()
+            stats_json["storage"] = {
+                "backend": storage.get_backend_info(),
+                "health": storage.health_check(),
+            }
+            stats_json["proxy_runtime"] = proxy_settings.get_runtime_status()
         if format == "json":
             return stats_json
         return HTMLResponse(f"""<!DOCTYPE html>

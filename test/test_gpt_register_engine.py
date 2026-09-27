@@ -2,12 +2,25 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from gpt_free_register.engines.core.base_mailbox import CloudflareD1Mailbox
+# The vendored engines tree (``gpt_free_register/engines``) is imported with
+# top-level absolute names (``core.*`` / ``platforms.*``) by its own modules,
+# exactly like ``gpt_free_register.runner._ensure_engines_on_path`` does at
+# runtime. Importing it as ``gpt_free_register.engines.platforms...`` blows up
+# on those internal imports, so put the engines dir on sys.path instead and use
+# the same module identities the engine itself uses (otherwise mock.patch
+# targets below would patch a second, unused copy of each module).
+_ENGINES_DIR = str(Path(__file__).resolve().parents[1] / "gpt_free_register" / "engines")
+if _ENGINES_DIR not in sys.path:
+    sys.path.append(_ENGINES_DIR)
+
+from core.base_mailbox import CloudflareD1Mailbox
 from platforms.chatgpt.protocol_mailbox import _MailboxEmailService
 from platforms.chatgpt.register import RegistrationEngine, _SentinelTokenGenerator
 

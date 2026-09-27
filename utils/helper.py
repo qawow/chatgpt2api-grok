@@ -15,18 +15,18 @@ from services.proxy_service import proxy_settings
 from utils.log import logger
 from utils.ssrf import UnsafeUrlError, assert_safe_url
 
+# 模型 id 统一定义在 utils/image_models.py；这里仅为兼容旧 import 而再导出。
 # 官网生图链路自 2026-09-08 起出的就是 ChatGPT Images 2.5，故对外正名为
 # gpt-image-2.5。画图档位由服务端决定，改名不改上游请求（仍发 gpt-5-3 +
 # picture_v2）。老 id 继续接受，避免打挂在用的客户端，但不再对外列出。
-WEB_IMAGE_MODEL = "gpt-image-2.5"
-LEGACY_WEB_IMAGE_MODELS = {"gpt-image-2"}
-IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
-# Codex 链路的 tools[0].model 是上游显式的画图模型 id，与本次改名无关，保持不动。
-CODEX_IMAGE_MODEL = "codex-gpt-image-2"
-PREFIXED_CODEX_IMAGE_MODELS = {
-    f"{plan_type}-{CODEX_IMAGE_MODEL}"
-    for plan_type in IMAGE_MODEL_PLAN_TYPES
-}
+from utils.image_models import (  # noqa: E402
+    CODEX_IMAGE_MODEL,
+    CODEX_PLAN_PREFIXES as IMAGE_MODEL_PLAN_TYPES,
+    LEGACY_WEB_IMAGE_MODELS,
+    PREFIXED_CODEX_IMAGE_MODELS,
+    WEB_IMAGE_MODEL,
+)
+
 BASE_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL} | LEGACY_WEB_IMAGE_MODELS
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL} | PREFIXED_CODEX_IMAGE_MODELS
@@ -567,6 +567,25 @@ def parse_image_count(raw_value: object) -> int:
     if value < 1 or value > 4:
         raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
     return value
+
+
+def image_result_urls(image_result: dict[str, object]) -> list[str]:
+    """Stored (http/relative) URLs of an image result, for call logs.
+
+    Chat completions / responses embed images inline as base64, so the public
+    payload has no ``url`` for the log collector to find even though every image
+    was already saved by format_image_result. Handlers attach this list as the
+    internal ``_image_urls`` field (stripped before the client sees it).
+    """
+    items = image_result.get("data") if isinstance(image_result.get("data"), list) else []
+    urls: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if url and not url.startswith("data:") and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:

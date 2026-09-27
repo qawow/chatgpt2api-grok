@@ -1,0 +1,110 @@
+{
+  "_comment": "配置模板。首次部署请执行 `cp config.example.json config.json` 后再改；config.json 已被 .gitignore 忽略，请勿提交。若不先创建该文件，docker compose 会把 ./config.json 当成不存在的挂载源并自动建成【目录】，导致配置全部失效。",
+  "_comment_auth_key": "【必填】auth-key 留空时服务会在启动阶段直接抛错退出（services/config.py 的 ConfigStore 模块级校验）。请填写一个强随机字符串，或改用环境变量 CHATGPT2API_AUTH_KEY（环境变量优先级更高）。",
+  "auth-key": "",
+  "refresh_account_interval_minute": 5,
+  "image_retention_days": 15,
+  "image_poll_timeout_secs": 120,
+  "auto_remove_rate_limited_accounts": false,
+  "auto_remove_invalid_accounts": true,
+  "log_levels": [
+    "debug",
+    "error",
+    "info",
+    "warning"
+  ],
+  "_comment_proxy": "出口代理，留空表示直连。示例：socks5h://user:password@host:1080 或 http://host:8118。切勿把真实凭据提交到 git。",
+  "proxy": "",
+  "proxy_runtime": {
+    "enabled": false,
+    "egress_mode": "direct",
+    "proxy_url": "",
+    "resource_proxy_url": "",
+    "skip_ssl_verify": false,
+    "reset_session_status_codes": [
+      403
+    ],
+    "clearance": {
+      "enabled": false,
+      "mode": "none",
+      "cf_cookies": "",
+      "cf_clearance": "",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "browser": "chrome",
+      "flaresolverr_url": "",
+      "timeout_sec": 60,
+      "refresh_interval": 3600,
+      "warm_up_on_start": false
+    }
+  },
+  "base_url": "",
+  "sensitive_words": [],
+  "global_system_prompt": "",
+  "ai_review": {
+    "enabled": false,
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "prompt": ""
+  },
+  "backup": {
+    "enabled": false,
+    "provider": "cloudflare_r2",
+    "account_id": "",
+    "access_key_id": "",
+    "secret_access_key": "",
+    "bucket": "",
+    "prefix": "backups",
+    "interval_minutes": 1440,
+    "rotation_keep": 10,
+    "encrypt": false,
+    "passphrase": "",
+    "include": {
+      "config": true,
+      "logs": true,
+      "image_tasks": true,
+      "accounts_snapshot": true,
+      "auth_keys_snapshot": true,
+      "images": false
+    }
+  },
+  "image_account_concurrency": 3,
+  "image_parallel_generation": true,
+  "image_poll_interval_secs": 5,
+  "image_poll_initial_wait_secs": 3,
+  "image_storage": {
+    "enabled": false,
+    "mode": "local",
+    "webdav_url": "",
+    "webdav_username": "",
+    "webdav_password": "",
+    "webdav_root_path": "chatgpt2api/images",
+    "public_base_url": ""
+  },
+  "image_min_free_mb": 500,
+  "chat_completion_cache": {
+    "enabled": true,
+    "ttl_seconds": 60,
+    "max_entries": 256,
+    "dedupe_inflight": true,
+    "stream_cache": true,
+    "normalize_messages": true,
+    "drop_adjacent_duplicates": true,
+    "drop_assistant_history": false
+  },
+  "image_settle_enabled": false,
+  "image_check_before_hit_enabled": false,
+  "image_settle_secs": 2,
+  "auto_relogin_after_refresh": false,
+  "image_timeout_retry_secs": 30,
+  "third_party_apps": {
+    "infinite_canvas": {
+      "enabled": true,
+      "url": "https://canvas.best"
+    }
+  },
+  "image_remove_conversation_after_result": true,
+  "image_sse_idle_timeout_secs": 90,
+  "image_sse_total_timeout_secs": 420,
+  "image_task_timeout_secs": 600
+}

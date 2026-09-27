@@ -1,11 +1,14 @@
 .git
 .gitignore
+.github
 .idea
 .venv
 __pycache__
+**/__pycache__
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache
 .env
 .env.*
 **/.env
@@ -15,8 +18,33 @@ __pycache__
 *.sqlite3
 data
 
+# 含 auth-key / 代理密码，且镜像本来就不 COPY 它（运行时由 compose 挂载）。
+# 留在 build context 里等于把密钥送进 builder 与构建缓存。
+config.json
+
+# 前端构建产物：镜像里的 web_dist 由 web-build stage 现编，宿主机这两份只是白占 context
 web/.next
 web/node_modules
+web/out
+web/tsconfig.tsbuildinfo
+web_dist
+
+# 研究用克隆 / 本地账本 / 备份 / 笔记，合计约 40MB，且可能含密钥
+.ref
+.jspace
+backups
+issues
+.cursor
+.codex
+.claude
+.tmp-research
+
+# 测试与本地调试输出：镜像不需要
+test
+test_batch_output
+utils/output
+loginwithpassword_*
+logwithemailverifycode_*
 
 assets
 README.md

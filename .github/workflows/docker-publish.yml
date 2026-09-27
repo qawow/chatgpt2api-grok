@@ -3,18 +3,55 @@ name: Publish Docker Image
 on:
   push:
     branches:
-      - "publish-root"
+      # 精确/glob 匹配：fork/** 覆盖 fork/publish-root 这类二开工作分支，
+      # 否则该分支上的提交不会产出任何镜像。
       - "main"
+      - "publish-root"
+      - "fork/**"
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
+
+# 同一分支/PR 的新推送取消仍在跑的旧任务，避免排队浪费 runner。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   IMAGE_NAME: chatgpt2api
 
 jobs:
-  docker:
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # config.json 被 gitignore，CI 里不存在；services/config.py 在模块导入时
+      # 就会因 auth-key 缺失抛 ValueError（不设置 → 只能收集到 418/478 个用例，
+      # 还带 2 个 import 错误）。值必须是 chatgpt2api：多个用例用
+      # os.environ.setdefault("CHATGPT2API_AUTH_KEY", "chatgpt2api") 并按这个值发
+      # Authorization 头，换成别的字符串会直接 401。
+      CHATGPT2API_AUTH_KEY: chatgpt2api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        # 不复用仓库里的 .venv（未提交），uv 会按 .python-version 拉 3.13 并新建干净环境
+        run: uv sync
+
+      - name: Run unit tests
+        run: uv run python -m unittest discover -s test -t .
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -32,6 +69,8 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        # PR（尤其是 fork 发来的）拿不到可写的 GITHUB_TOKEN，跳过登录、只做构建验证
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -48,6 +87,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=ref,event=tag
+            type=ref,event=pr
             type=sha,enable=${{ github.ref_type == 'branch' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -58,7 +98,7 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

@@ -22,7 +22,11 @@ from utils.helper import anthropic_sse_stream, sse_json_stream
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
-INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+# Fields handlers attach for logging only; stripped before anything reaches the
+# client. _image_urls carries the stored image URLs for endpoints whose public
+# payload embeds images inline (chat/completions and responses return base64
+# markdown / image_generation_call results, which have no "url" key to collect).
+INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id", "_image_urls"}
 
 
 class LogService:
@@ -138,8 +142,13 @@ class LogService:
         tmp_path = self.path.with_name(self.path.name + ".trim")
         with self._lock:
             try:
+                # Create the replacement owner-only: os.replace below hands its
+                # mode to logs.jsonl, and a default-umask 0644 here is what kept
+                # resetting the log (prompts, upstream error strings) to
+                # world-readable on every retention pass.
+                tmp_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with self.path.open("r", encoding="utf-8") as src, \
-                        tmp_path.open("w", encoding="utf-8") as dst:
+                        os.fdopen(tmp_fd, "w", encoding="utf-8") as dst:
                     for raw_line in src:
                         if _line_within_retention(raw_line, cutoff_key):
                             dst.write(raw_line)
@@ -189,7 +198,7 @@ def _collect_urls(value: object) -> list[str]:
         for key, item in value.items():
             if key == "url" and isinstance(item, str):
                 urls.append(item)
-            elif key == "urls" and isinstance(item, list):
+            elif key in {"urls", "_image_urls"} and isinstance(item, list):
                 urls.extend(str(url) for url in item if isinstance(url, str))
             else:
                 urls.extend(_collect_urls(item))
@@ -314,9 +323,7 @@ class LoggedCall:
 
         if isinstance(result, dict):
             self.log("调用完成", result)
-            response = dict(result)
-            response.pop("_account_email", None)
-            return response
+            return _strip_internal_response_fields(result)
 
         sender = anthropic_sse_stream if sse == "anthropic" else sse_json_stream
         try:

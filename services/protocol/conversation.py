@@ -895,6 +895,41 @@ def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id:
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
+# Conversations owned by an in-flight generation in this process. The SSE
+# conversation_id is registered as soon as it is seen; the "recover a lost
+# conversation_id from the recent-conversations list" fallback must never pick
+# one of these, or two generations sharing an account end up returning the same
+# upstream image (and one request can receive another's result).
+_CLAIMED_CONVERSATION_TTL_SECS = 30 * 60
+_claimed_conversations: dict[str, float] = {}
+_claimed_conversations_lock = threading.Lock()
+
+
+def _prune_claimed_locked(now: float) -> None:
+    for conversation_id, claimed_at in list(_claimed_conversations.items()):
+        if now - claimed_at > _CLAIMED_CONVERSATION_TTL_SECS:
+            _claimed_conversations.pop(conversation_id, None)
+
+
+def claim_conversation(conversation_id: str) -> bool:
+    """Mark a conversation as owned. Returns False if another generation holds it."""
+    if not conversation_id:
+        return False
+    now = time.time()
+    with _claimed_conversations_lock:
+        _prune_claimed_locked(now)
+        if conversation_id in _claimed_conversations:
+            return False
+        _claimed_conversations[conversation_id] = now
+        return True
+
+
+def claimed_conversation_ids() -> set[str]:
+    with _claimed_conversations_lock:
+        _prune_claimed_locked(time.time())
+        return set(_claimed_conversations)
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -903,6 +938,7 @@ def stream_image_outputs(
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
     checkpoint_conversation_id = ""
+    started_at = time.time()
     for event in conversation_events(
             backend,
             prompt=request.prompt,
@@ -915,6 +951,7 @@ def stream_image_outputs(
         event_conversation_id = str(event.get("conversation_id") or "")
         if event_conversation_id and event_conversation_id != checkpoint_conversation_id:
             checkpoint_conversation_id = event_conversation_id
+            claim_conversation(event_conversation_id)
             if request.checkpoint_callback:
                 request.checkpoint_callback({"conversation_id": event_conversation_id})
         if event.get("type") == "conversation.delta":
@@ -958,7 +995,19 @@ def stream_image_outputs(
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    # This used to compare turn_use_case against the literal "image gen", which
+    # upstream never emits (observed values are text/multimodal; the tool form is
+    # image_gen). It was therefore always False for text-to-image, which short
+    # circuited below and made the whole retry/poll block unreachable — a turn
+    # whose SSE dropped before the tool finished came back as a bare text reply
+    # and got reported as a policy violation. Match on normalized upstream values
+    # plus the "model is still generating" heuristic instead.
+    turn_use_case = str(last.get("turn_use_case") or "").replace(" ", "_").lower()
+    should_poll_for_image = (
+        bool(request.images)
+        or "image" in turn_use_case
+        or (is_supported_image_model(request.model) and is_model_text_reply_instead_of_image(message))
+    )
     if message and not file_ids and not sediment_ids and not should_poll_for_image:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -979,10 +1028,16 @@ def stream_image_outputs(
     # 但图片已在上游异步生成。通过列出最近对话来恢复 conversation_id。
     if is_text_reply and not conversation_id:
         try:
-            import time as _time
+            # started_at used to be time.time() at *recovery* time, which widened
+            # the window to conversations that began before this request.
             recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
+                request.prompt, started_at, timeout_secs=5.0,
+                exclude_ids=claimed_conversation_ids(),
             )
+            if recovered_id and not claim_conversation(recovered_id):
+                # Lost the race to another generation between list and claim.
+                logger.info({"event": "image_conversation_recovery_claimed_elsewhere", "conversation_id": recovered_id})
+                recovered_id = ""
             if recovered_id:
                 conversation_id = recovered_id
                 logger.info({

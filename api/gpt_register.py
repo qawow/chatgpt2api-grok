@@ -11,6 +11,7 @@ from api.support import require_admin
 from services.gpt_register_service import (
     gpt_register_config,
     gpt_register_service,
+    probe_tempmail,
     public_settings,
 )
 
@@ -34,6 +35,12 @@ class GptRegisterSettingsUpdate(BaseModel):
     source_type: str | None = None
     cfd1_domain: str | None = None
     cfd1_domains: str | None = None
+    tempmail_base_url: str | None = None
+    tempmail_api_key: str | None = None
+    tempmail_domains: str | None = None
+    tempmail_domain: str | None = None
+    tempmail_mode: str | None = None
+    tempmail_subdomain_depth: int | None = Field(default=None, ge=0, le=5)
     push_enabled: bool | None = None
     push_mode: str | None = None
     chatgpt2api_base_url: str | None = None
@@ -53,7 +60,17 @@ class GptRegisterSettingsUpdate(BaseModel):
     auto_replenish_interval_secs: int | None = Field(default=None, ge=30, le=3600)
     auto_replenish_spacing_secs: int | None = Field(default=None, ge=0, le=7200)
     auto_replenish_fail_cooldown_secs: int | None = Field(default=None, ge=60, le=7200)
+    # OR'd with the count watermark; 0 disables. Bounds match _clamp_int in
+    # gpt_register_service._normalize_settings.
+    auto_replenish_min_total_quota: int | None = Field(default=None, ge=0, le=10000)
     circuit_break: int | None = Field(default=None, ge=0, le=20)
+
+
+class TempmailProbeRequest(BaseModel):
+    """Unsaved form values; empty fields fall back to the stored settings."""
+
+    tempmail_base_url: str | None = None
+    tempmail_api_key: str | None = None
 
 
 class GptRegisterStartRequest(GptRegisterSettingsUpdate):
@@ -86,6 +103,20 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "no settings provided"})
         settings = gpt_register_config.update(patch)
         return {"settings": public_settings(settings)}
+
+    @router.post("/api/gpt-register/tempmail/test")
+    async def test_tempmail(
+        body: TempmailProbeRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        stored = gpt_register_config.get()
+        base_url = (body.tempmail_base_url or "").strip() or stored.get("tempmail_base_url")
+        api_key = (body.tempmail_api_key or "").strip() or stored.get("tempmail_api_key")
+        try:
+            return await run_in_threadpool(probe_tempmail, base_url, api_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/gpt-register/jobs")
     async def list_jobs(authorization: str | None = Header(default=None)):

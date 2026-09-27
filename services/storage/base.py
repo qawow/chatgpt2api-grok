@@ -1,7 +1,30 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from typing import Any
+
+_URL_CREDENTIALS_RE = re.compile(r"(?<=://)[^/\s@]+(?=@)")
+
+
+class StorageLoadError(RuntimeError):
+    """Raised when existing stored data is present but unreadable.
+
+    Deliberately distinct from "no data yet": callers treat an empty list as
+    authoritative and will happily save over it, so a parse failure that
+    degrades to ``[]`` destroys the file on the next write.
+    """
+
+
+def redact_url_credentials(value: Any) -> str:
+    """Strip ``scheme://credentials@host`` secrets out of arbitrary text.
+
+    health_check() error branches surface raw driver/GitPython exceptions, and
+    those carry the full command line or DSN — including the token we spliced
+    into the remote URL. /health is unauthenticated, so anything returned from
+    here is world-readable.
+    """
+    return _URL_CREDENTIALS_RE.sub("****", str(value))
 
 
 class StorageBackend(ABC):

@@ -24,6 +24,39 @@ def _assert_complete_oauth_callback(result) -> None:
         )
 
 
+class _AccountShim:
+    """Duck-typed stand-in for the ORM ``Account`` the helper modules expect.
+
+    ``payment.PaymentAccount`` / ``token_refresh.RefreshableAccount`` document the
+    structural contract; building the shim in one place keeps every capability
+    handler from shipping a partially-populated object (``generate_link`` used to
+    omit ``access_token``, which made the payment helpers raise AttributeError).
+    """
+
+    __slots__ = (
+        "email", "password", "user_id", "account_id", "access_token",
+        "refresh_token", "id_token", "session_token", "client_id", "cookies",
+        "region", "extra",
+    )
+
+    def __init__(self, account: Account):
+        from .constants import OAUTH_CLIENT_ID
+
+        extra = dict(account.extra or {})
+        self.email = account.email or ""
+        self.password = account.password or ""
+        self.user_id = account.user_id or ""
+        self.account_id = account.user_id or ""
+        self.access_token = extra.get("access_token") or account.token or ""
+        self.refresh_token = extra.get("refresh_token", "")
+        self.id_token = extra.get("id_token", "")
+        self.session_token = extra.get("session_token", "")
+        self.client_id = extra.get("client_id", OAUTH_CLIENT_ID)
+        self.cookies = extra.get("cookies", "")
+        self.region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
+        self.extra = extra
+
+
 def _generate_chatgpt_registration_password(length: int = 16) -> str:
     """生成更稳定通过 OpenAI 注册页校验的密码。
 
@@ -72,15 +105,10 @@ class ChatGPTPlatform(BasePlatform):
         try:
             from platforms.chatgpt.payment import fetch_subscription_status_details
             from core.proxy_pool import proxy_pool
-            class _A: pass
-            a = _A()
-            extra = account.extra or {}
-            a.access_token = extra.get("access_token") or account.token
-            a.id_token = extra.get("id_token", "")
-            a.cookies = extra.get("cookies", "")
-            a.extra = extra
 
-            region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
+            a = _AccountShim(account)
+            region = a.region
+            last_error: Exception | None = None
             configured_proxy = self.config.proxy if self.config else None
             proxy_candidates: list[tuple[str | None, bool]] = []
             if configured_proxy:
@@ -106,11 +134,17 @@ class ChatGPTPlatform(BasePlatform):
                         overview["chatgpt_usage"] = details["usage"]
                     self._last_check_overview = overview
                     return status not in ("expired", "invalid", "banned", None)
-                except Exception:
+                except Exception as exc:
                     if should_report and proxy:
                         proxy_pool.report_fail(proxy)
+                    last_error = exc
                     continue
-        except Exception:
+            if last_error is not None:
+                self.log(f"[check_valid] 所有代理候选都失败: {last_error}")
+        except Exception as exc:
+            # Do not swallow silently: an ImportError here used to pin
+            # check_valid() to False for every account without a trace.
+            self.log(f"[check_valid] 探活异常: {type(exc).__name__}: {exc}")
             return False
         return False
 
@@ -222,104 +256,80 @@ class ChatGPTPlatform(BasePlatform):
             ),
         )
 
-    def get_platform_actions(self) -> list:
-        return [
-            {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
-            {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
-            {"id": "refresh_token", "label": "刷新 Token", "params": []},
-            {"id": "payment_link", "label": "生成支付链接",
-             "params": [
-                 {"key": "country", "label": "地区", "type": "select",
-                  "options": ["US","SG","TR","HK","JP","GB","AU","CA"]},
-                 {"key": "plan", "label": "套餐", "type": "select",
-                  "options": ["plus", "team"]},
-             ]},
-        ]
+    # NOTE: get_platform_actions() is intentionally NOT overridden here. The old
+    # override advertised ids (switch_account / get_account_state / payment_link)
+    # that no handler dispatches on, so 3 of the 4 buttons ended in
+    # NotImplementedError. BasePlatform.get_platform_actions() derives the ids
+    # from `capabilities` via CapabilityRegistry, which matches execute_action().
+    # Use `capability_overrides` if the labels/params need tweaking.
 
     def get_desktop_state(self) -> dict:
         from platforms.chatgpt.switch import get_codex_desktop_state
 
         return get_codex_desktop_state()
 
-    def _execute_platform_action(self, action_id: str, account: Account, params: dict) -> dict:
-        """Handle ChatGPT-specific actions."""
+    # Override specific capability handlers.
+    # IMPORTANT: capability ids declared in `capabilities` are dispatched by
+    # BasePlatform._handle_capability() to `_handle_<capability>` BEFORE
+    # _execute_platform_action() is consulted, so every declared capability needs
+    # a `_handle_*` method here — otherwise the base class's NotImplementedError
+    # stub wins and the action silently degrades to {"ok": False, ...}.
+    def _handle_switch_desktop(self, account: Account, params: dict) -> dict:
+        """Handle switch_desktop capability: push credentials into Codex desktop."""
         proxy = self.config.proxy if self.config else None
-        extra = account.extra or {}
+        a = _AccountShim(account)
 
-        class _A: pass
-        a = _A()
-        a.email = account.email
-        a.access_token = extra.get("access_token") or account.token
-        a.refresh_token = extra.get("refresh_token", "")
-        a.id_token = extra.get("id_token", "")
-        a.session_token = extra.get("session_token", "")
-        from .constants import OAUTH_CLIENT_ID
-        a.client_id = extra.get("client_id", OAUTH_CLIENT_ID)
-        a.cookies = extra.get("cookies", "")
-        a.user_id = account.user_id or ""
-        a.account_id = account.user_id or ""
+        from platforms.chatgpt.switch import (
+            close_codex_app,
+            extract_session_token,
+            fetch_chatgpt_account_state,
+            get_codex_desktop_state,
+            read_current_codex_account,
+            restart_codex_app,
+            switch_codex_account,
+        )
 
-        if action_id == "switch_desktop":
-            from platforms.chatgpt.switch import (
-                close_codex_app,
-                extract_session_token,
-                fetch_chatgpt_account_state,
-                get_codex_desktop_state,
-                read_current_codex_account,
-                restart_codex_app,
-                switch_codex_account,
-            )
+        session_token = extract_session_token(a.session_token, a.cookies)
+        if not session_token:
+            return {"ok": False, "error": "Switch to Codex desktop requires session_token"}
 
-            session_token = extract_session_token(a.session_token, a.cookies)
-            if not session_token:
-                return {"ok": False, "error": "Switch to Codex desktop requires session_token"}
+        close_ok, close_msg = close_codex_app()
+        switch_ok, switch_data = switch_codex_account(session_token=session_token, cookies=a.cookies)
+        if not switch_ok:
+            return {"ok": False, "error": switch_data.get("error", "Switch failed")}
 
-            close_ok, close_msg = close_codex_app()
-            switch_ok, switch_data = switch_codex_account(session_token=session_token, cookies=a.cookies)
-            if not switch_ok:
-                return {"ok": False, "error": switch_data.get("error", "Switch failed")}
+        remote_state = fetch_chatgpt_account_state(
+            access_token=a.access_token,
+            session_token=session_token,
+            cookies=a.cookies,
+            proxy=proxy,
+        )
+        local_state = read_current_codex_account()
+        restart_ok, restart_msg = restart_codex_app()
+        message_parts = [switch_data.get("message", "Codex credentials written")]
+        if close_msg:
+            message_parts.append(close_msg)
+        if restart_msg:
+            message_parts.append(restart_msg)
+        data = {
+            "message": ".".join(part for part in message_parts if part),
+            "close": {"ok": close_ok, "message": close_msg},
+            "restart": {"ok": restart_ok, "message": restart_msg},
+            "local_app_account": local_state,
+            "desktop_app_state": get_codex_desktop_state(),
+            "remote_state": remote_state,
+            "switch_details": switch_data,
+        }
+        if remote_state.get("access_token"):
+            data["access_token"] = remote_state["access_token"]
+        if remote_state.get("refresh_token"):
+            data["refresh_token"] = remote_state["refresh_token"]
+        return {"ok": True, "data": data}
 
-            remote_state = fetch_chatgpt_account_state(
-                access_token=a.access_token,
-                session_token=session_token,
-                cookies=a.cookies,
-                proxy=proxy,
-            )
-            local_state = read_current_codex_account()
-            restart_ok, restart_msg = restart_codex_app()
-            message_parts = [switch_data.get("message", "Codex credentials written")]
-            if close_msg:
-                message_parts.append(close_msg)
-            if restart_msg:
-                message_parts.append(restart_msg)
-            data = {
-                "message": ".".join(part for part in message_parts if part),
-                "close": {"ok": close_ok, "message": close_msg},
-                "restart": {"ok": restart_ok, "message": restart_msg},
-                "local_app_account": local_state,
-                "desktop_app_state": get_codex_desktop_state(),
-                "remote_state": remote_state,
-                "switch_details": switch_data,
-            }
-            if remote_state.get("access_token"):
-                data["access_token"] = remote_state["access_token"]
-            if remote_state.get("refresh_token"):
-                data["refresh_token"] = remote_state["refresh_token"]
-            return {"ok": True, "data": data}
-
-        raise NotImplementedError(f"Unknown action: {action_id}")
-
-    # Override specific capability handlers
     def _handle_query_state(self, account: Account, params: dict) -> dict:
         """Handle query_state capability for ChatGPT."""
         proxy = self.config.proxy if self.config else None
-        extra = account.extra or {}
-
-        class _A: pass
-        a = _A()
-        a.access_token = extra.get("access_token") or account.token
-        a.session_token = extra.get("session_token", "")
-        a.cookies = extra.get("cookies", "")
+        a = _AccountShim(account)
 
         from platforms.chatgpt.switch import fetch_chatgpt_account_state, get_codex_desktop_state, read_current_codex_account
 
@@ -336,14 +346,9 @@ class ChatGPTPlatform(BasePlatform):
     def _handle_refresh_token(self, account: Account, params: dict) -> dict:
         """Handle refresh_token capability for ChatGPT."""
         proxy = self.config.proxy if self.config else None
-        extra = account.extra or {}
-
-        class _A: pass
-        a = _A()
-        a.access_token = extra.get("access_token") or account.token
-        a.refresh_token = extra.get("refresh_token", "")
-        a.session_token = extra.get("session_token", "")
-        a.cookies = extra.get("cookies", "")
+        # refresh_account() reads .email / .session_token / .refresh_token /
+        # .client_id — the shim must carry all of them.
+        a = _AccountShim(account)
 
         from platforms.chatgpt.token_refresh import TokenRefreshManager
         manager = TokenRefreshManager(proxy_url=proxy)
@@ -366,14 +371,9 @@ class ChatGPTPlatform(BasePlatform):
     def _handle_generate_link(self, account: Account, params: dict) -> dict:
         """Handle generate_link capability for ChatGPT."""
         proxy = self.config.proxy if self.config else None
-        extra = account.extra or {}
-
-        class _A: pass
-        a = _A()
-        a.email = account.email
-        a.password = account.password
-        a.session_token = extra.get("session_token", "")
-        a.cookies = extra.get("cookies", "")
+        # generate_plus_link()/generate_team_link() require .access_token — the
+        # old inline shim omitted it and raised AttributeError on every call.
+        a = _AccountShim(account)
 
         from platforms.chatgpt.payment import generate_plus_link, generate_team_link, open_url_incognito
         plan = params.get("plan", "plus")

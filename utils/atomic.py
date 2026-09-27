@@ -4,9 +4,30 @@ from __future__ import annotations
 import errno
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
+
+# mkstemp already creates temp files with these permissions, so anything written
+# through atomic_write_* inherits them via os.replace. This constant is for the
+# files that predate those writers, or that a plain write_text() left readable.
+PRIVATE_FILE_MODE = 0o600
+
+
+def secure_file_mode(path: Path) -> bool:
+    """Tighten an existing file to owner-only. Returns True if it changed."""
+    try:
+        current = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return False
+    if current == PRIVATE_FILE_MODE:
+        return False
+    try:
+        os.chmod(path, PRIVATE_FILE_MODE)
+    except OSError:
+        return False
+    return True
 
 
 def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:

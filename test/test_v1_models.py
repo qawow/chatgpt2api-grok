@@ -7,6 +7,7 @@ from unittest import mock
 import requests
 
 from services.protocol import openai_v1_models
+from test.utils import requires_live_service
 
 
 AUTH_KEY = "chatgpt2api"
@@ -75,9 +76,11 @@ class ModelListTests(unittest.TestCase):
             result = openai_v1_models.list_models()
         ids = {item["id"] for item in result["data"]}
         self.assertIn("grok-2-image", ids)
-        self.assertIn("grok-imagine", ids)
         self.assertIn("grok-imagine-image", ids)
         self.assertNotIn("grok-4.5", ids)
+        # Aliases are accepted on requests but not advertised.
+        self.assertNotIn("grok-imagine", ids)
+        self.assertNotIn("grok-2-image-1212", ids)
 
     def test_list_models_does_not_hit_upstream(self):
         with (
@@ -97,6 +100,7 @@ class ModelListTests(unittest.TestCase):
         print("function result:")
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
+    @requires_live_service(BASE_URL)
     def test_list_models_http(self):
         """测试通过 HTTP 接口获取模型列表。"""
         response = requests.get(

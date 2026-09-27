@@ -9,7 +9,7 @@ from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
-from utils.helper import WEB_IMAGE_MODEL
+from utils.image_models import WEB_IMAGE_MODEL
 
 
 class ImageGenerationTaskRequest(BaseModel):

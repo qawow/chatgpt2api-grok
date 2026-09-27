@@ -7,10 +7,12 @@
 
 <p align="center">
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
-  <a href="./CHANGELOG.md">v1.8.8</a> ·
+  <a href="./CHANGELOG.md">v1.8.9</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/waifu2x.md">waifu2x</a> ·
+  <a href="./docs/doubao.md">豆包</a> ·
+  <a href="./docs/zhitu360.md">360智图</a> ·
   <a href="./docs/operations.md">运维与调用</a> ·
   <a href="./docs/deployment.md">部署说明</a>
 </p>
@@ -33,6 +35,8 @@
 | 账号出口隔离 | 绑定了 `proxy` 的号只走该出口，不回落 runtime / 全局 / 直连；注册浏览器指纹写入号池。一号一 IP 需要注册代理池 |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
 | waifu2x 超分 | 非官方封装 [www.waifu2x.net](https://www.waifu2x.net/)：`POST /v1/waifu2x` / `/v1/images/upscale`，见 [docs/waifu2x.md](./docs/waifu2x.md) |
+| 豆包网页生图 | 非官方封装 www.doubao.com `/chat/completion`（ImageGeneration）：`POST /v1/doubao`，见 [docs/doubao.md](./docs/doubao.md) |
+| 360智图 | 非官方封装 image.360.com `/api/v1/zhitu` 文生图：`POST /v1/zhitu360`，见 [docs/zhitu360.md](./docs/zhitu360.md) |
 
 隔离原则：ChatGPT 与 Grok **不同存储、不同管理 API、不同选号**，禁止混池。ChatGPT 号池内，账号若绑定了 `proxy`，出站只走该代理；多个号绑同一 SOCKS 仍共享出口 IP。
 
@@ -213,7 +217,7 @@ environment:
 - 兼容 `POST /v1/images/edits` 图片编辑接口
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
-- `GET /v1/models` 只返回生图模型：`gpt-image-2.5`、`codex-gpt-image-2`（及 plus/team/pro 前缀）；本地 Grok 号池非空时注入 `grok-2-image` / `grok-imagine-image` / `grok-imagine`。**不暴露对话模型**（gpt-5* / auto / grok-4.5）
+- `GET /v1/models` 只返回生图模型的规范 id：`gpt-image-2.5`、`codex-gpt-image-2`（及 plus/team/pro 前缀，按号池里的 Codex 账号类型）；本地 Grok 号池非空时加 `grok-imagine-image` / `grok-2-image`；配置了 cookies 时加豆包 `doubao-image` 与 360智图 `jimeng` / `jimeng40` / `jimeng45` / `hunyuan` / `tongyi` / `wanx21plus`。**不暴露对话模型**（gpt-5* / auto / grok-4.5），也不列别名 / 旧名（`gpt-image-2`、`grok-imagine`、`grok-2-image-1212`、`即梦`…，这些仍可直接调用）。模型 id 统一定义在 `utils/image_models.py`
 - 支持通过 `n` 返回多张生成结果
 - 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
   `gpt-image-2.5`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度

@@ -62,7 +62,7 @@ def _create_cfd1(extra: dict, proxy: str | None) -> 'BaseMailbox':
         api_token=_pick("cfd1_api_token", "cf_api_token", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN"),
         account_id=_pick("cfd1_account_id", "cf_account_id", "CLOUDFLARE_ACCOUNT_ID"),
         database_id=_pick("cfd1_database_id", "cf_d1_id", "d1_database_id", "CLOUDFLARE_D1_DB_ID", "CLOUDFLARE_D1_DATABASE_ID"),
-        domain=_pick("cfd1_domain", "cf_mail_domain", "CLOUDFLARE_EMAIL_DOMAIN", "MAIL_DOMAIN", default="lg.zc.233159.xyz"),
+        domain=_pick("cfd1_domain", "cf_mail_domain", "CLOUDFLARE_EMAIL_DOMAIN", "MAIL_DOMAIN"),
         api_base=_pick("cfd1_api_base"),
         table=_pick("cfd1_table", default="raw_mails"),
         address_column=_pick("cfd1_address_column", default="address"),
@@ -74,10 +74,48 @@ def _create_cfd1(extra: dict, proxy: str | None) -> 'BaseMailbox':
     )
 
 
+def _create_tempmail(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    import os
+    from core.proxy_env import load_dotenv
+    from core.tempmail_mailbox import TempMailMailbox
+
+    load_dotenv()
+    cfg = dict(extra or {})
+
+    def _pick(*keys: str, default: str = "") -> str:
+        for key in keys:
+            value = str(cfg.get(key, "") or "").strip()
+            if value:
+                return value
+            value = str(os.getenv(key, "") or os.getenv(key.upper(), "") or "").strip()
+            if value:
+                return value
+        return default
+
+    # 自建 tempmail 一般直连最快；caller 传 None 时只认 TEMPMAIL_PROXY，
+    # 不回落到注册 SOCKS（死代理会吞掉整个 OTP 等待窗口）。
+    if not proxy:
+        proxy = str(os.getenv("TEMPMAIL_PROXY") or "").strip() or None
+
+    return TempMailMailbox(
+        base_url=_pick("tempmail_base_url", "TEMPMAIL_BASE_URL"),
+        api_key=_pick("tempmail_api_key", "TEMPMAIL_API_KEY"),
+        domain=_pick("tempmail_domain", "TEMPMAIL_DOMAIN"),
+        mode=_pick("tempmail_mode", "TEMPMAIL_MODE"),
+        subdomain_depth=_pick("tempmail_subdomain_depth", "TEMPMAIL_SUBDOMAIN_DEPTH",
+                              default=str(TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH)),
+        local_part_length=int(_pick("tempmail_local_part_length", "TEMPMAIL_LOCAL_PART_LENGTH", default="12") or 12),
+        local_part_prefix=_pick("tempmail_local_part_prefix", "TEMPMAIL_LOCAL_PART_PREFIX"),
+        proxy=proxy,
+    )
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "cloudflare_d1_api": _create_cfd1,
     "cloudflare_d1": _create_cfd1,
     "cfd1": _create_cfd1,
+    # 123nhh/tempmail 自建临时邮箱
+    "tempmail": _create_tempmail,
 }
 
 
@@ -85,7 +123,7 @@ def create_mailbox(provider: str, extra: dict = None, proxy: str = None) -> "Bas
     key = str(provider or "").strip() or "cloudflare_d1_api"
     factory = MAILBOX_FACTORY_REGISTRY.get(key)
     if not factory:
-        raise RuntimeError(f"不支持的邮箱 provider: {key}（仅 cloudflare_d1）")
+        raise RuntimeError(f"不支持的邮箱 provider: {key}（可选 cloudflare_d1_api / tempmail）")
     return factory(extra or {}, proxy)
 
 

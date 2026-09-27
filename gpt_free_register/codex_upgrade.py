@@ -10,6 +10,8 @@ the session_only row.
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import traceback
 import urllib.parse
@@ -17,16 +19,45 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpt_free_register.runner import (
+    CFD1_MAIL_PROVIDERS,
+    TEMPMAIL_MAIL_PROVIDER,
     _bootstrap,
     _clean,
     _create_mailbox,
     _ensure_runtime_deps,
     default_engines_dir,
+    mailbox_extra,
 )
+
+# Env keys the CFD1 factory reads its domain from (see core.base_mailbox._create_cfd1).
+_CFD1_DOMAIN_ENV_KEYS = ("CFD1_DOMAIN", "CF_MAIL_DOMAIN", "CLOUDFLARE_EMAIL_DOMAIN", "MAIL_DOMAIN")
 
 
 def _log(log: Callable[[str], None] | None, msg: str) -> None:
     (log or print)(msg)
+
+
+def _cfd1_domains(cfg: dict[str, Any]) -> set[str]:
+    values = [cfg.get("cfd1_domain"), *(os.environ.get(key) for key in _CFD1_DOMAIN_ENV_KEYS)]
+    values.extend(re.split(r"[\s,;]+", _clean(cfg.get("cfd1_domains"))))
+    return {_clean(v).lstrip("@").lower() for v in values if _clean(v)}
+
+
+def _mail_provider_for(cfg: dict[str, Any], email: str) -> str:
+    """Read the second OTP from the provider that minted this address.
+
+    Switching the register mailbox (CFD1 ↔ tempmail) must not strand accounts
+    registered under the other one: the CFD1 domain list tells them apart.
+    """
+    configured = _clean(cfg.get("mail_provider")) or "cloudflare_d1_api"
+    domain = _clean(email).lower().rsplit("@", 1)[-1]
+    cf_domains = _cfd1_domains(cfg)
+    if configured == TEMPMAIL_MAIL_PROVIDER and domain in cf_domains:
+        return "cloudflare_d1_api"
+    tempmail_ready = _clean(cfg.get("tempmail_base_url")) and _clean(cfg.get("tempmail_api_key"))
+    if configured in CFD1_MAIL_PROVIDERS and cf_domains and domain not in cf_domains and tempmail_ready:
+        return TEMPMAIL_MAIL_PROVIDER
+    return configured
 
 
 def _bind_existing_mailbox_account(mailbox: Any, email: str):
@@ -36,6 +67,12 @@ def _bind_existing_mailbox_account(mailbox: Any, email: str):
     addr = _clean(email).lower()
     if not addr or "@" not in addr:
         raise ValueError("email is required for Codex upgrade")
+    if hasattr(mailbox, "bind_existing"):
+        # Server-side mailboxes (tempmail) need their mailbox id, and an expired
+        # one is recreated under the same address before the OTP is sent.
+        account = mailbox.bind_existing(addr)
+        account.extra["fixed_email"] = True
+        return account
     domain = addr.split("@", 1)[-1]
     return MailboxAccount(
         email=addr,
@@ -137,6 +174,7 @@ def obtain_codex_tokens_for_email(
 
     engine = None
     login_client = None
+    mailbox = None
     try:
         _bootstrap(engines_dir)
         _apply_env_overrides(cfg)
@@ -147,27 +185,17 @@ def obtain_codex_tokens_for_email(
         _ensure_runtime_deps(proxy)
         _append(f"[codex-upgrade] email={addr} proxy={mask_proxy(proxy) if proxy else '(none)'}")
 
-        mail_provider = _clean(cfg.get("mail_provider")) or "cloudflare_d1_api"
+        mail_provider = _mail_provider_for(cfg, addr)
         extra: dict[str, Any] = {
             "mail_provider": mail_provider,
             "identity_provider": "mailbox",
+            **mailbox_extra(cfg, mail_provider),
         }
-        for key in (
-            "cfd1_api_token",
-            "cfd1_account_id",
-            "cfd1_database_id",
-            "cfd1_domain",
-            "cfd1_local_part_prefix",
-            "cfd1_local_part_length",
-            "cfd1_api_base",
-            "cfd1_table",
-        ):
-            if _clean(cfg.get(key)):
-                extra[key] = _clean(cfg.get(key))
 
-        # CFD1 reads are independent of OpenAI egress; avoid SOCKS timeouts on mail poll.
+        # CFD1 / tempmail reads are independent of OpenAI egress; avoid SOCKS
+        # timeouts on mail poll.
         mailbox_proxy = None
-        if mail_provider not in {"cloudflare_d1_api", "cloudflare_d1", "cfd1"}:
+        if mail_provider not in CFD1_MAIL_PROVIDERS and mail_provider != TEMPMAIL_MAIL_PROVIDER:
             mailbox_proxy = proxy
         mailbox = _create_mailbox(mail_provider, extra, mailbox_proxy)
         mailbox_account = _bind_existing_mailbox_account(mailbox, addr)
@@ -488,6 +516,11 @@ def obtain_codex_tokens_for_email(
             "logs": logs[-80:] + [traceback.format_exc()[-600:]],
         }
     finally:
+        if mailbox is not None and hasattr(mailbox, "close"):
+            try:
+                mailbox.close()
+            except Exception:
+                pass
         for client in (
             login_client,
             getattr(engine, "http_client", None) if engine is not None else None,

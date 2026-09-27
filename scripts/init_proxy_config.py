@@ -124,16 +124,38 @@ def _mask_url(value: str) -> str:
     return re.sub(r"(https?://)([^\s/@:]+):([^\s/@]+)@", r"\1[REDACTED]@", value or "", flags=re.I)
 
 
+_DIRECTORY_HINT = (
+    "宿主机上的 ./config.json 不存在时，Docker 会把 bind mount 源自动创建成【目录】。\n"
+    "修复：先停掉 compose（docker compose down），在宿主机执行\n"
+    "  rmdir config.json && cp config.example.json config.json\n"
+    "填好 auth-key 后再重新启动。"
+)
+
+
 def main() -> int:
     config_path = Path(os.getenv("CHATGPT2API_CONFIG_FILE", "/app/config.json"))
     if not config_path.exists():
         print(f"Config file not found, creating {config_path}")
         data: dict[str, Any] = {}
+    elif config_path.is_dir():
+        # 目录挂载无法当配置文件读写，提前给出可操作的报错，
+        # 而不是让 read_text() 抛未捕获的 IsADirectoryError。
+        print(f"Config path is a directory, not a file: {config_path}", file=sys.stderr)
+        print(_DIRECTORY_HINT, file=sys.stderr)
+        return 1
     else:
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             print(f"Invalid JSON in {config_path}: {exc}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            # IsADirectoryError / PermissionError 等都是 OSError 子类。此前只捕获
+            # JSONDecodeError，init 容器会带着 traceback 非 0 退出，而
+            # docker-compose.warp.yml 的 depends_on: service_completed_successfully
+            # 会让 app 永远起不来且看不出原因。
+            print(f"Cannot read {config_path}: {exc}", file=sys.stderr)
+            print(_DIRECTORY_HINT, file=sys.stderr)
             return 1
         if not isinstance(data, dict):
             print(f"Config root must be an object: {config_path}", file=sys.stderr)

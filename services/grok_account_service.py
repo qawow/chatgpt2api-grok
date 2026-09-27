@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -26,6 +27,34 @@ def _now_iso() -> str:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+_AUTH_ERROR_RE = re.compile(
+    r"\bauth_40[13]\b|\brefresh_40[13]\b|\bhttp 40[13]\b|\bunauthorized\b|\bforbidden\b|\binvalid_token\b",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_ERROR_RE = re.compile(r"\bhttp 429\b|\brate[_ ]limit(?:ed)?\b", re.IGNORECASE)
+
+
+def _classify_failure(status: int | None, error: str) -> str:
+    """Map an upstream failure to "auth" | "rate_limited" | "other".
+
+    A known HTTP status wins. The text fallback only matches explicit markers:
+    a bare "401"/"403" substring appeared in attempt logs, IDs and body excerpts
+    of perfectly healthy responses.
+    """
+    if status in {401, 403}:
+        return "auth"
+    if status == 429:
+        return "rate_limited"
+    if status is not None:
+        return "other"
+    text = str(error or "")
+    if _AUTH_ERROR_RE.search(text):
+        return "auth"
+    if _RATE_LIMIT_ERROR_RE.search(text):
+        return "rate_limited"
+    return "other"
 
 
 class GrokAccountService:
@@ -234,14 +263,24 @@ class GrokAccountService:
     # Cool down after recent auth/refresh failure so get_next_account stops
     # hammering a known-dead token until the next watcher probe or manual refresh.
     _ERROR_COOLDOWN_SECONDS = 5 * 60
+    _RATE_LIMIT_COOLDOWN_SECONDS = 15 * 60
 
     def _is_available(self, account: dict[str, Any]) -> bool:
         if bool(account.get("disabled")):
             return False
         status = _clean(account.get("status")) or "正常"
-        # 限流/异常/禁用 均不可选（限流是 429 标记，异常是 401/403 标记）
-        if status in {"禁用", "异常", "限流"}:
+        # 异常/禁用 不可选（异常是 401/403 标记）。
+        if status in {"禁用", "异常"}:
             return False
+        if status == "限流":
+            # 429 is temporary. Without an expiry a rate-limited account with no
+            # refresh_token could never return: live traffic skipped it and the
+            # watcher only visits accounts it can refresh.
+            limited_at = self._parse_expired_like(account.get("last_error_at"))
+            if limited_at is None:
+                return False
+            elapsed = (datetime.now(timezone.utc) - limited_at).total_seconds()
+            return elapsed >= self._RATE_LIMIT_COOLDOWN_SECONDS
         return True
 
     def _recent_error_cooldown_active(self, account: dict[str, Any], now: datetime | None = None) -> bool:
@@ -327,7 +366,7 @@ class GrokAccountService:
             # this silently returned the old account, causing every subsequent
             # request to fail with 401 without any status change.
             if getattr(exc, "status", None) in {401, 403}:
-                self.mark_result(token, False, error=f"refresh_{exc.status}")
+                self.mark_result(token, False, error=f"refresh_{exc.status}", status=exc.status)
             return dict(account)
         except Exception as exc:
             # Non-auth errors (network, JSON parse) — record but don't mark 异常
@@ -395,7 +434,21 @@ class GrokAccountService:
             fresh["last_used_at"] = candidate.get("last_used_at") or _now_iso()
         return fresh
 
-    def mark_result(self, access_token: str, success: bool, *, error: str | None = None) -> None:
+    def mark_result(
+        self,
+        access_token: str,
+        success: bool,
+        *,
+        error: str | None = None,
+        status: int | None = None,
+    ) -> None:
+        """Record a request outcome.
+
+        Pass the upstream HTTP ``status`` when known. Classifying by substring
+        of the error text alone mis-fired: generate_image errors embed the full
+        attempts log (other paths' statuses, 160-char upstream body prefixes), so
+        any stray "403" in there marked a healthy account 异常.
+        """
         token = _clean(access_token)
         if not token:
             return
@@ -406,7 +459,7 @@ class GrokAccountService:
             next_item = dict(account)
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
-                if next_item.get("status") == "异常":
+                if next_item.get("status") in {"异常", "限流"}:
                     next_item["status"] = "正常"
                 next_item["last_error"] = None
             else:
@@ -416,19 +469,11 @@ class GrokAccountService:
                 next_item["last_error_at"] = _now_iso()
                 # Auth failures (401/403) imply the token is dead → mark 异常
                 # so _is_available excludes it. Watcher can still recover later.
-                err_l = err_text.lower()
-                if (
-                    "auth_401" in err_l
-                    or "auth_403" in err_l
-                    or "401" in err_l
-                    or "403" in err_l
-                    or "unauthorized" in err_l
-                    or "forbidden" in err_l
-                    or "invalid_token" in err_l
-                ):
+                verdict = _classify_failure(status, err_text)
+                if verdict == "auth":
                     next_item["status"] = "异常"
-                # 429 rate-limit → mark 限流 (already handled in refresh_accounts)
-                elif "429" in err_l or "rate_limit" in err_l or "rate limited" in err_l:
+                elif verdict == "rate_limited":
+                    # _is_available lets it back in after _RATE_LIMIT_COOLDOWN_SECONDS.
                     next_item["status"] = "限流"
             self._accounts[token] = next_item
             self._save()

@@ -6,13 +6,24 @@ import json
 import logging
 import subprocess
 import sys
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 from curl_cffi import requests as cffi_requests
 
-# from ..database.models import Account  # removed: external dep
-
 logger = logging.getLogger(__name__)
+
+
+# The original ORM model (``..database.models.Account``) was an external dep and
+# is gone. Callers (see ``plugin.py``) hand us a plain duck-typed shim, so the
+# contract is structural: declare it explicitly instead of importing a model.
+# NOTE: this must stay a real module-level name — the annotations below are
+# evaluated at def time (no ``from __future__ import annotations`` here).
+@runtime_checkable
+class PaymentAccount(Protocol):
+    """Minimal shape required by the payment helpers."""
+
+    access_token: str
+    cookies: str
 
 PAYMENT_CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 TEAM_CHECKOUT_BASE_URL = "https://chatgpt.com/checkout/openai_llc/"
@@ -197,7 +208,7 @@ def _open_url_system_browser(url: str) -> bool:
 
 
 def generate_plus_link(
-    account: Account,
+    account: PaymentAccount,
     proxy: Optional[str] = None,
     country: str = "SG",
 ) -> str:
@@ -243,7 +254,7 @@ def generate_plus_link(
 
 
 def generate_team_link(
-    account: Account,
+    account: PaymentAccount,
     workspace_name: str = "MyTeam",
     price_interval: str = "month",
     seat_quantity: int = 5,
@@ -324,7 +335,7 @@ def open_url_incognito(url: str, cookies_str: Optional[str] = None) -> bool:
     return True
 
 
-def check_subscription_status(account: Account, proxy: Optional[str] = None) -> str:
+def check_subscription_status(account: PaymentAccount, proxy: Optional[str] = None) -> str:
     """
     检测账号当前订阅状态。
 
@@ -334,7 +345,7 @@ def check_subscription_status(account: Account, proxy: Optional[str] = None) -> 
     return fetch_subscription_status_details(account, proxy=proxy)["status"]
 
 
-def fetch_subscription_status_details(account: Account, proxy: Optional[str] = None) -> dict:
+def fetch_subscription_status_details(account: PaymentAccount, proxy: Optional[str] = None) -> dict:
     """Return normalized subscription status plus raw usage data when available."""
     if not account.access_token:
         raise ValueError("账号缺少 access_token")

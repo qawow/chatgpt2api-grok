@@ -13,8 +13,13 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
-from services.account_service import account_service
+# 添加项目根目录到 Python 路径（直接 `python scripts/verify_oauth_refresh.py`
+# 时 sys.path[0] 是 scripts/，否则 import services 会 ModuleNotFoundError）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from services.account_service import account_service  # noqa: E402
 
 
 def _fmt_remaining(seconds: int | None) -> str:

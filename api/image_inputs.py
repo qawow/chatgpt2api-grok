@@ -15,7 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
-from utils.helper import WEB_IMAGE_MODEL
+from utils.image_models import WEB_IMAGE_MODEL
 from utils.ssrf import UnsafeUrlError, assert_safe_url
 
 ImageInput = tuple[bytes, str, str]

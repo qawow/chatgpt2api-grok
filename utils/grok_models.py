@@ -12,26 +12,21 @@ NOT an image model:
 """
 from __future__ import annotations
 
-GROK_IMAGE_MODELS: set[str] = {
-    "grok-2-image",
-    "grok-2-image-1212",
-    "grok-imagine-image",
-    "grok-imagine",
-}
+# Ids live in utils/image_models.py; re-exported here for existing imports.
+from utils.image_models import (
+    DEFAULT_GROK_IMAGE_MODEL,
+    DEFAULT_GROK_TEXT_MODEL,
+    GROK_CANONICAL_IMAGE_MODELS,
+    GROK_IMAGE_ALIASES,
+    is_grok_image_model,
+)
 
-# Client aliases → canonical image catalog id.
-GROK_IMAGE_ALIASES: dict[str, str] = {
-    "grok-imagine": "grok-imagine-image",
-}
-
-DEFAULT_GROK_IMAGE_MODEL = "grok-2-image"
-
-# Internal only: Build probe + free /responses chat agent. Never a public image id.
-DEFAULT_GROK_TEXT_MODEL = "grok-4.5"
+# Every id the Grok image route accepts: canonical ids plus aliases.
+GROK_IMAGE_MODELS: frozenset[str] = frozenset(GROK_CANONICAL_IMAGE_MODELS) | frozenset(GROK_IMAGE_ALIASES)
 
 GROK_TEXT_MODELS_DISABLED = (
-    "grok-4.5 is a chat model, not an image model; "
-    "use grok-imagine-image or grok-2-image"
+    f"{DEFAULT_GROK_TEXT_MODEL} is a chat model, not an image model; "
+    f"use {' or '.join(GROK_CANONICAL_IMAGE_MODELS)}"
 )
 
 GROK_TEXT_MODEL_PREFIXES = (
@@ -42,18 +37,6 @@ GROK_TEXT_MODEL_PREFIXES = (
 
 def _norm(model: object) -> str:
     return str(model or "").strip().lower()
-
-
-def is_grok_image_model(model: object) -> bool:
-    name = _norm(model)
-    if not name:
-        return False
-    if name in GROK_IMAGE_MODELS:
-        return True
-    # Accept any grok-* containing "image" or exact imagine alias
-    if name.startswith("grok") and ("image" in name or name.endswith("imagine") or "imagine" in name):
-        return True
-    return False
 
 
 def is_grok_text_model(model: object) -> bool:
@@ -76,5 +59,5 @@ def resolve_grok_image_model(model: object | None) -> str:
     if alias:
         return alias
     if is_grok_image_model(name):
-        return raw if raw in GROK_IMAGE_MODELS else name
+        return name
     return DEFAULT_GROK_IMAGE_MODEL

@@ -461,13 +461,10 @@ class RegistrationEngine:
         if self.callback_logger:
             self.callback_logger(message)
 
-        # 记录到数据库（如果有关联任务）
-        if self.task_uuid:
-            try:
-                with get_db() as db:
-                    crud.append_task_log(db, self.task_uuid, message)
-            except Exception as e:
-                logger.warning(f"记录任务日志失败: {e}")
+        # NOTE: task logs used to be appended to the removed ``..database``
+        # package here (get_db / crud.append_task_log) — undefined names, so the
+        # block could only raise NameError. self.task_uuid is kept because it is
+        # part of the constructor signature, but it is now purely informational.
 
         # 根据级别记录到日志系统
         if level == "error":
@@ -1550,7 +1547,6 @@ class RegistrationEngine:
 
                     if "already" in error_msg.lower() or "exists" in error_msg.lower() or error_code == "user_exists":
                         self._log(f"邮箱 {self.email} 可能已在 OpenAI 注册过", "error")
-                        self._mark_email_as_registered()
                         # Surface to caller so step 8 routes to login OTP instead of aborting.
                         self._is_existing_account = True
                         return False, None
@@ -1563,26 +1559,12 @@ class RegistrationEngine:
             self._log(f"密码注册失败: {e}", "error")
             return False, None
 
-    def _mark_email_as_registered(self):
-        """标记邮箱为已注册状态（用于防止重复尝试）"""
-        try:
-            with get_db() as db:
-                # 检查是否已存在该邮箱的记录
-                existing = crud.get_account_by_email(db, self.email)
-                if not existing:
-                    # 创建一个失败记录，标记该邮箱已注册过
-                    crud.create_account(
-                        db,
-                        email=self.email,
-                        password="",  # 空密码表示未成功注册
-                        email_service=self.email_service.service_type.value,
-                        email_service_id=self.email_info.get("service_id") if self.email_info else None,
-                        status="failed",
-                        extra_data={"register_failed_reason": "email_already_registered_on_openai"}
-                    )
-                    self._log(f"已在数据库中标记邮箱 {self.email} 为已注册状态")
-        except Exception as e:
-            logger.warning(f"标记邮箱状态失败: {e}")
+    # NOTE: _mark_email_as_registered() used to live here. It wrote a "failed"
+    # placeholder row through the removed ``..database`` package (get_db / crud),
+    # so every call raised NameError and was swallowed by its own except. There
+    # is no local account DB in this engine, and CFD1 mailboxes use a random
+    # local-part (collision odds are negligible), so the de-dupe guard was
+    # dropped rather than faked.
 
     def _cookie_value(self, name: str) -> str:
         """Read a cookie by name without requiring a specific domain."""
@@ -3023,12 +3005,28 @@ class RegistrationEngine:
             self._log("=" * 60)
 
             result.success = True
-            result.metadata = {
+            # MUST be update(), not assignment: metadata["profile"] was written
+            # above and is the only carrier of the registration fingerprint
+            # (impersonate/UA/client-hints) down to the account pool
+            # (plugin._map_result -> RegistrationResult.extra["profile"] ->
+            # gpt_register_service._merge_register_fp). Overwriting it here made
+            # every account fall back to the hardcoded chrome142/Windows FP.
+            result.metadata = dict(result.metadata or {})
+            result.metadata.update({
                 "email_service": self.email_service.service_type.value,
                 "proxy_used": self.proxy_url,
                 "registered_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "is_existing_account": self._is_existing_account,
-            }
+            })
+
+            saved_profile = result.metadata.get("profile") or {}
+            if saved_profile.get("impersonate"):
+                self._log(
+                    "注册指纹已写入 metadata.profile: "
+                    f"{saved_profile.get('impersonate')} / {saved_profile.get('platform')}"
+                )
+            else:
+                self._log("注册指纹缺失，账号入库后 TLS/UA 将回落默认值", "warning")
 
             return result
 

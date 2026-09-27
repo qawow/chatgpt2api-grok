@@ -9,7 +9,7 @@ from threading import Lock
 from typing import Literal
 
 from services.config import config
-from services.storage.base import StorageBackend
+from services.storage.base import StorageBackend, StorageLoadError
 
 AuthRole = Literal["admin", "user"]
 
@@ -61,12 +61,12 @@ class AuthService:
         }
 
     def _load(self) -> list[dict[str, object]]:
-        try:
-            items = self.storage.load_auth_keys()
-        except Exception:
-            return []
+        # Deliberately not guarded. create_key() reloads and then saves, so
+        # degrading a read failure to [] here would overwrite every stored key
+        # with the one being created. A loud failure is recoverable; that isn't.
+        items = self.storage.load_auth_keys()
         if not isinstance(items, list):
-            return []
+            raise StorageLoadError("鉴权密钥存储返回了非列表结构，拒绝以空列表覆盖")
         return [normalized for item in items if (normalized := self._normalize_item(item)) is not None]
 
     def _save(self) -> None:

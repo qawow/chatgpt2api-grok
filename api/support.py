@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 from pathlib import Path
 from threading import Event, Thread
 
 from fastapi import HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.content_filter import check_request
 from services.grok_account_service import grok_account_service
+from services.log_service import LoggedCall
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -23,9 +28,18 @@ def extract_bearer_token(authorization: str | None) -> str:
 
 def _legacy_admin_identity(token: str) -> dict[str, object] | None:
     auth_key = str(config.auth_key or "").strip()
-    if auth_key and token == auth_key:
-        return {"id": "admin", "name": "管理员", "role": "admin"}
-    return None
+    if not auth_key or not token:
+        return None
+    # Hash both sides before comparing: compare_digest on the raw values would
+    # still leak length, and it rejects non-ASCII keys outright. This is the
+    # admin credential on an unthrottled path, so it gets the same treatment
+    # auth_service already gives per-user keys.
+    if not hmac.compare_digest(
+        hashlib.sha256(token.encode("utf-8")).digest(),
+        hashlib.sha256(auth_key.encode("utf-8")).digest(),
+    ):
+        return None
+    return {"id": "admin", "name": "管理员", "role": "admin"}
 
 
 def require_identity(authorization: str | None) -> dict[str, object]:
@@ -45,6 +59,19 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
     return identity
+
+
+async def filter_or_log(call: LoggedCall, text: str) -> None:
+    """Run the sensitive-word / AI review gate, recording rejections on the call.
+
+    Lives here rather than in api.ai so every generation entrypoint can reuse it
+    without an import cycle (api.ai already imports from api.cn_images).
+    """
+    try:
+        await run_in_threadpool(check_request, text)
+    except HTTPException as exc:
+        call.log("调用失败", status="failed", error=str(exc.detail))
+        raise
 
 
 def resolve_image_base_url(request: Request) -> str:
@@ -213,16 +240,22 @@ def start_log_retention_watcher(stop_event: Event) -> Thread:
     return thread
 
 
-_SPA_FALLBACK_BLOCKLIST = ("_next/", "api/", "v1/", "auth/")
+_SPA_FALLBACK_BLOCKLIST = ("_next/", "api/", "v1/", "auth/", "images/", "image-thumbnails/")
+# Server-owned paths with no trailing slash. Kept separate so a page route that
+# merely starts with the same letters ("/versions") is not caught by accident.
+_SPA_FALLBACK_EXACT = frozenset({"health", "version", "docs", "redoc", "openapi.json"})
 
 
 def should_skip_spa_fallback(requested_path: str) -> bool:
     """Unknown API/auth/asset paths must 404, not the dashboard HTML.
 
     The July settings UI still GETs removed /api/cpa/pools. Serving index.html
-    as 200 made axios treat the page as JSON and crash the settings tab.
+    as 200 made axios treat the page as JSON and crash the settings tab. The
+    exact list matters for the same reason: with docs disabled, /openapi.json
+    would otherwise answer 200 text/html and look like it still exists.
     """
-    return requested_path.strip("/").startswith(_SPA_FALLBACK_BLOCKLIST)
+    clean_path = requested_path.strip("/")
+    return clean_path in _SPA_FALLBACK_EXACT or clean_path.startswith(_SPA_FALLBACK_BLOCKLIST)
 
 
 def resolve_web_asset(requested_path: str) -> Path | None:

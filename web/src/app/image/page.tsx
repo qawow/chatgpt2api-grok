@@ -23,13 +23,13 @@ import {
   fetchAccounts,
   fetchModels,
   fetchImageTasks,
-  isGrokImageModel,
   resumeImagePoll,
   type Account,
   type ImageModel,
   type Model,
   type ImageTask,
 } from "@/lib/api";
+import { DEFAULT_IMAGE_MODEL, imageEditsUnsupportedMessage, supportsImageEdits } from "@/lib/models";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { useSettingsStore } from "@/app/settings/store";
 import {
@@ -145,14 +145,12 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
   return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
 }
 
+// /v1/models lists image-generation models only, so trust it as-is. The old
+// "id contains image" filter hid valid ids such as jimeng / hunyuan.
 function filterImageModels(items: Model[]): ImageModel[] {
   return items
     .map((item) => String(item.id || "").trim())
-    .filter(
-      (id, index, list) =>
-        (id.toLowerCase().includes("image") || id.toLowerCase().includes("grok-imagine")) &&
-        list.indexOf(id) === index,
-    );
+    .filter((id, index, list) => Boolean(id) && list.indexOf(id) === index);
 }
 
 function normalizeStoredImageModel(value: string | null, availableModels: ImageModel[]): ImageModel {
@@ -160,7 +158,7 @@ function normalizeStoredImageModel(value: string | null, availableModels: ImageM
   if (normalized && availableModels.includes(normalized)) {
     return normalized;
   }
-  return availableModels[0] || "gpt-image-2.5";
+  return availableModels[0] || DEFAULT_IMAGE_MODEL;
 }
 
 function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
@@ -474,8 +472,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
-  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2.5");
-  const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2.5"]);
+  const [imageModel, setImageModel] = useState<ImageModel>(DEFAULT_IMAGE_MODEL);
+  const [imageModels, setImageModels] = useState<ImageModel[]>([DEFAULT_IMAGE_MODEL]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
@@ -705,7 +703,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         });
       } catch {
         if (!cancelled) {
-          setImageModels(["gpt-image-2.5"]);
+          setImageModels([DEFAULT_IMAGE_MODEL]);
         }
       }
     };
@@ -1060,8 +1058,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     if (files.length === 0) {
       return;
     }
-    if (isGrokImageModel(imageModel)) {
-      toast.error("Grok 本地池不支持图生图");
+    if (!supportsImageEdits(imageModel)) {
+      toast.error(imageEditsUnsupportedMessage(imageModel));
       return;
     }
 
@@ -1098,7 +1096,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleImageModelChange = useCallback((model: ImageModel) => {
     setImageModel(model);
-    if (!isGrokImageModel(model)) {
+    if (supportsImageEdits(model)) {
       return;
     }
     setReferenceImages((prev) => {
@@ -1127,8 +1125,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleContinueEdit = useCallback(
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
-      if (isGrokImageModel(imageModel)) {
-        toast.error("当前模型是 Grok，不支持图生图，请先切回 gpt-image-2.5");
+      if (!supportsImageEdits(imageModel)) {
+        toast.error(imageEditsUnsupportedMessage(imageModel));
         return;
       }
       try {
@@ -1175,7 +1173,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     setImageHeight(parsedSize.height);
     setImageQuality(turn.quality);
     setImageModel(turn.model);
-    const nextRefs = isGrokImageModel(turn.model) ? [] : turn.referenceImages;
+    const nextRefs = supportsImageEdits(turn.model) ? turn.referenceImages : [];
     setReferenceImages(nextRefs);
     setReferenceImageFiles(
       nextRefs.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
@@ -1529,8 +1527,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
-    if (isGrokImageModel(imageModel) && referenceImageFiles.length > 0) {
-      toast.error("Grok 本地池不支持图生图，请先移除参考图或换模型");
+    if (!supportsImageEdits(imageModel) && referenceImageFiles.length > 0) {
+      toast.error(imageEditsUnsupportedMessage(imageModel));
       return;
     }
 
@@ -1678,7 +1676,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
                 selectedConversation={selectedConversation}
                 onOpenLightbox={openLightbox}
                 onContinueEdit={handleContinueEdit}
-                canEditImages={!isGrokImageModel(imageModel)}
+                canEditImages={supportsImageEdits(imageModel)}
                 onDeletePrompt={openDeletePromptConfirm}
                 onDeleteResults={openDeleteResultsConfirm}
                 onReuseTurnConfig={handleReuseTurnConfig}

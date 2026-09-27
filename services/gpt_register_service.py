@@ -26,6 +26,14 @@ GPT_REGISTER_JOBS_FILE = DATA_DIR / "gpt_register_jobs.json"
 
 _JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}\s*$")
 
+_ACTIVE_JOB_STATUSES = frozenset({"pending", "running"})
+_TERMINAL_JOB_STATUSES = frozenset({"done", "failed", "cancelled"})
+# A job heartbeats via updated_at on every log line and after every completed
+# registration. Total silence for this long means the worker is wedged (an
+# inprocess run has no timeout of its own), and holding the "active" flag
+# forever would keep auto-replenish switched off for the whole process.
+_JOB_STALE_AFTER_SECS = 2 * 60 * 60
+
 _FP_KEY_ALIASES = {
     "user_agent": "user-agent",
     "user-agent": "user-agent",
@@ -75,6 +83,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "interval_secs": 3,
     "timeout_secs": 600,
     "executor": "protocol",
+    # 收信渠道：cloudflare_d1_api（CF Email Routing → Worker → D1）
+    #          tempmail（自建 123nhh/tempmail，REST 直连，收信快）
     "mail_provider": "cloudflare_d1_api",
     "captcha": "",
     "proxy": "",  # empty → engines .env REGISTER_PROXY_DEFAULT
@@ -86,6 +96,19 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 对抗上游按邮箱域名的批量封禁波（实测整池同域名号在同一分钟内集体被吊销）。
     # 所有域名必须已配置 Cloudflare Email Routing catch-all 到同一个 Worker/D1。
     "cfd1_domains": "",
+    # 123nhh/tempmail：站点根地址（带不带 /api 都行）+ tm_ 开头的 API Key
+    "tempmail_base_url": "",
+    "tempmail_api_key": "",
+    # 域名池（同 cfd1_domains 的分隔规则），每次注册随机取一个；空 = 服务端随机
+    "tempmail_domains": "",
+    # 每次注册实际使用的域名（由域名池随机写入）；
+    # 必须在 DEFAULT_SETTINGS 里，否则 normalize_settings 会把它丢掉。
+    "tempmail_domain": "",
+    # single = 普通域名 abc@example.com；multi = 多级子域名；空 = 服务端随机
+    "tempmail_mode": "single",
+    # multi 时自己生成几级随机子域名（abc@k3x9q.m2a8.example.com）；
+    # 0 = 交给 tempmail 生成（10~14 级 gmail/yahoo… 单词拼接，地址很长）
+    "tempmail_subdomain_depth": 2,
     "push_enabled": True,
     "push_mode": "local",  # local | http
     # empty → auto (local in-process import; http mode uses container-aware default)
@@ -220,6 +243,90 @@ def parse_domain_pool(text: object) -> list[str]:
             seen.add(domain)
             out.append(domain)
     return out
+
+
+MAIL_PROVIDER_CFD1 = "cloudflare_d1_api"
+MAIL_PROVIDER_TEMPMAIL = "tempmail"
+TEMPMAIL_MODES = frozenset({"single", "multi"})
+# Blanked by public_settings; an empty value in a patch keeps the stored one.
+SECRET_SETTING_KEYS = ("chatgpt2api_auth_key", "tempmail_api_key")
+
+
+def normalize_mail_provider(value: object) -> str:
+    key = _clean(value).lower()
+    if key in {MAIL_PROVIDER_TEMPMAIL, "tempmail_api", "123nhh_tempmail"}:
+        return MAIL_PROVIDER_TEMPMAIL
+    return MAIL_PROVIDER_CFD1
+
+
+def normalize_tempmail_base_url(value: object) -> str:
+    """https://mail.example.com[/api][/] → https://mail.example.com（API 在 /api 下）。"""
+    url = _clean(value).rstrip("/")
+    if url.lower().endswith("/api"):
+        url = url[:-4].rstrip("/")
+    if url and "://" not in url:
+        url = f"https://{url}"
+    return url
+
+
+def probe_tempmail(base_url: object, api_key: object, *, timeout: float = 10.0) -> dict[str, Any]:
+    """「测试连接」：校验 Key，并列出 tempmail 实例里可用的域名（GET /api/me + /api/domains）。"""
+    import requests
+
+    url = normalize_tempmail_base_url(base_url)
+    key = _clean(api_key)
+    if not url or not key:
+        raise ValueError("请先填写 tempmail 地址和 API Key")
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update({"Authorization": f"Bearer {key}", "Accept": "application/json"})
+
+    def get(path: str) -> dict[str, Any]:
+        try:
+            resp = session.get(f"{url}/api/{path}", timeout=timeout)
+        except requests.RequestException as exc:
+            raise ValueError(f"连不上 tempmail（{url}）：{exc}") from exc
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if resp.status_code == 401:
+            raise ValueError("tempmail API Key 无效")
+        if resp.status_code >= 400 or not isinstance(data, dict):
+            detail = data.get("error") if isinstance(data, dict) else (resp.text or "")[:120]
+            raise ValueError(f"tempmail /api/{path} 返回 {resp.status_code}：{detail}（地址应填站点根地址）")
+        return data
+
+    started = time.time()
+    try:
+        me = get("me")
+        latency_ms = int((time.time() - started) * 1000)
+        rows = get("domains").get("domains") or []
+    finally:
+        session.close()
+    domains = [
+        {
+            "domain": _clean(row.get("base_domain") or row.get("domain")).lower(),
+            "single": bool(row.get("supports_single")),
+            "multi": bool(row.get("supports_wildcard")),
+        }
+        for row in rows
+        if isinstance(row, dict) and row.get("is_active") and _clean(row.get("base_domain") or row.get("domain"))
+    ]
+    return {
+        "ok": True,
+        "base_url": url,
+        "username": _clean(me.get("username")),
+        "latency_ms": latency_ms,
+        "domains": domains,
+    }
+
+
+def mail_domain_setting_keys(settings: dict[str, Any]) -> tuple[str, str]:
+    """(domain pool field, per-registration domain key) for the active provider."""
+    if settings.get("mail_provider") == MAIL_PROVIDER_TEMPMAIL:
+        return "tempmail_domains", "tempmail_domain"
+    return "cfd1_domains", "cfd1_domain"
 
 
 _PROXY_SEMS: dict[str, threading.Semaphore] = {}
@@ -470,7 +577,7 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     if executor != "protocol":
         executor = "protocol"
     out["executor"] = executor
-    out["mail_provider"] = "cloudflare_d1_api"
+    out["mail_provider"] = normalize_mail_provider(out.get("mail_provider"))
     out["captcha"] = ""
     out["proxy"] = _clean(out.get("proxy"))
     out["bind_register_proxy"] = bool(out.get("bind_register_proxy"))
@@ -478,6 +585,13 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["source_type"] = _clean(out.get("source_type"))
     out["cfd1_domain"] = _clean(out.get("cfd1_domain"))
     out["cfd1_domains"] = _clean(out.get("cfd1_domains"))
+    out["tempmail_base_url"] = normalize_tempmail_base_url(out.get("tempmail_base_url"))
+    out["tempmail_api_key"] = _clean(out.get("tempmail_api_key"))
+    out["tempmail_domains"] = _clean(out.get("tempmail_domains"))
+    out["tempmail_domain"] = _clean(out.get("tempmail_domain")).lstrip("@").lower()
+    tempmail_mode = _clean(out.get("tempmail_mode")).lower()
+    out["tempmail_mode"] = tempmail_mode if tempmail_mode in TEMPMAIL_MODES else ""
+    out["tempmail_subdomain_depth"] = _clamp_int(out.get("tempmail_subdomain_depth"), 2, 0, 5)
     out["push_enabled"] = bool(out.get("push_enabled", True))
     push_mode = _clean(out.get("push_mode")).lower() or "local"
     if push_mode not in {"local", "http"}:
@@ -533,7 +647,17 @@ def public_settings(settings: dict[str, Any]) -> dict[str, Any]:
     key = _clean(item.get("chatgpt2api_auth_key"))
     item["chatgpt2api_auth_key"] = ""
     item["has_chatgpt2api_auth_key"] = bool(key) or bool(_clean(config.auth_key))
+    item["has_tempmail_api_key"] = bool(_clean(item.get("tempmail_api_key")))
+    item["tempmail_api_key"] = ""
     return item
+
+
+def keep_stored_secrets(merged: dict[str, Any], patch: dict[str, Any], stored: dict[str, Any]) -> dict[str, Any]:
+    """public_settings blanks secrets, so an empty secret in a patch means "unchanged"."""
+    for key in SECRET_SETTING_KEYS:
+        if key in (patch or {}) and not _clean(patch.get(key)):
+            merged[key] = stored.get(key) or ""
+    return merged
 
 
 class GptRegisterConfig:
@@ -552,11 +676,12 @@ class GptRegisterConfig:
         return normalize_settings(raw)
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(self._settings, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        from utils.atomic import atomic_write_json
+
+        # Holds the register proxy URL with its password. A plain write_text
+        # left it 0644 on a bind-mounted ./data; atomic_write_json inherits
+        # mkstemp's 0600.
+        atomic_write_json(self.path, self._settings)
 
     def get(self) -> dict[str, Any]:
         with self._lock:
@@ -564,10 +689,7 @@ class GptRegisterConfig:
 
     def update(self, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            merged = {**self._settings, **(patch or {})}
-            # empty auth key means keep previous
-            if "chatgpt2api_auth_key" in (patch or {}) and not _clean(patch.get("chatgpt2api_auth_key")):
-                merged["chatgpt2api_auth_key"] = self._settings.get("chatgpt2api_auth_key") or ""
+            merged = keep_stored_secrets({**self._settings, **(patch or {})}, patch, self._settings)
             self._settings = normalize_settings(merged)
             self._save()
             return dict(self._settings)
@@ -590,7 +712,7 @@ class GptRegisterService:
                 for item in raw:
                     if isinstance(item, dict) and item.get("job_id"):
                         # mark unfinished as failed on restart
-                        if item.get("status") in {"pending", "running"}:
+                        if item.get("status") in _ACTIVE_JOB_STATUSES:
                             item["status"] = "failed"
                             item["error"] = item.get("error") or "interrupted by restart"
                             item["finished_at"] = _now_iso()
@@ -616,7 +738,7 @@ class GptRegisterService:
         # need to keep them after the job is done).
         for jid, job in list(self._jobs.items()):
             status = str(job.get("status") or "")
-            if status in {"done", "failed", "cancelled"}:
+            if status in _TERMINAL_JOB_STATUSES:
                 self._cancel_flags.pop(jid, None)
         from utils.atomic import atomic_write_json
         atomic_write_json(GPT_REGISTER_JOBS_FILE, items)
@@ -644,7 +766,7 @@ class GptRegisterService:
             flag = self._cancel_flags.get(jid)
             if flag:
                 flag.set()
-            if job.get("status") in {"pending", "running"}:
+            if job.get("status") in _ACTIVE_JOB_STATUSES:
                 job = dict(job)
                 job["cancel_requested"] = True
                 self._jobs[jid] = job
@@ -653,7 +775,18 @@ class GptRegisterService:
 
     def has_active_job(self) -> bool:
         with self._lock:
-            return any(job.get("status") in {"pending", "running"} for job in self._jobs.values())
+            return any(
+                job.get("status") in _ACTIVE_JOB_STATUSES and not self._job_is_stale(job)
+                for job in self._jobs.values()
+            )
+
+    @staticmethod
+    def _job_is_stale(job: dict[str, Any]) -> bool:
+        """Has an "active" job gone silent long enough to be considered dead?"""
+        stamp = _parse_iso(job.get("updated_at") or job.get("started_at") or job.get("created_at"))
+        if stamp is None:
+            return False
+        return (datetime.now(timezone.utc) - stamp).total_seconds() > _JOB_STALE_AFTER_SECS
 
     def _last_finished_auto_job(self) -> dict[str, Any] | None:
         finished: list[dict[str, Any]] = []
@@ -661,7 +794,7 @@ class GptRegisterService:
             for job in self._jobs.values():
                 if job.get("trigger") != "auto_replenish":
                     continue
-                if job.get("status") not in {"done", "failed", "cancelled"}:
+                if job.get("status") not in _TERMINAL_JOB_STATUSES:
                     continue
                 finished.append(dict(job))
         if not finished:
@@ -779,10 +912,7 @@ class GptRegisterService:
     def start_job(self, overrides: dict[str, Any] | None = None, *, trigger: str = "manual") -> dict[str, Any]:
         base = self.config_store.get()
         if overrides:
-            # empty auth key keep stored
-            merged = {**base, **overrides}
-            if "chatgpt2api_auth_key" in overrides and not _clean(overrides.get("chatgpt2api_auth_key")):
-                merged["chatgpt2api_auth_key"] = base.get("chatgpt2api_auth_key") or ""
+            merged = keep_stored_secrets({**base, **overrides}, overrides, base)
             settings = normalize_settings(merged)
         else:
             settings = normalize_settings(base)
@@ -790,7 +920,7 @@ class GptRegisterService:
         # only one running job at a time
         with self._lock:
             for job in self._jobs.values():
-                if job.get("status") in {"pending", "running"}:
+                if job.get("status") in _ACTIVE_JOB_STATUSES:
                     raise RuntimeError("已有注册任务在运行，请等待结束或先取消")
 
             job_id = uuid.uuid4().hex
@@ -881,6 +1011,43 @@ class GptRegisterService:
             self._save_jobs()
 
     def _run_job(self, job_id: str, settings: dict[str, Any]) -> None:
+        """Run a job, guaranteeing it ends in a terminal status.
+
+        _run_job_impl does bookkeeping after its main loop (_append_log,
+        _patch_job, _save_jobs → atomic_write_json). Anything raising there used
+        to kill the worker thread with the job still marked "running", and since
+        has_active_job() reads that status, maybe_replenish_pool() would refuse
+        to start another job for the rest of the process lifetime. cancel_job()
+        only sets a flag, so there was no way back short of a restart.
+        """
+        try:
+            self._run_job_impl(job_id, settings)
+        except BaseException as exc:
+            try:
+                self._append_log(job_id, f"任务异常终止：{exc}", level="error", force_save=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            self._ensure_terminal_status(job_id)
+
+    def _ensure_terminal_status(self, job_id: str) -> None:
+        try:
+            job = self.get_job(job_id)
+            if not job or str(job.get("status") or "") in _TERMINAL_JOB_STATUSES:
+                return
+            self._patch_job(
+                job_id,
+                status="failed",
+                error=str(job.get("error") or "任务线程异常退出，未能正常收尾")[:300],
+                finished_at=_now_iso(),
+            )
+        except Exception:
+            # _patch_job already updated the in-memory job before attempting to
+            # persist, so has_active_job() is unblocked even if the write failed.
+            pass
+
+    def _run_job_impl(self, job_id: str, settings: dict[str, Any]) -> None:
         cancel = self._cancel_flags.get(job_id) or threading.Event()
         started_at = _now_iso()
         self._patch_job(job_id, status="running", started_at=started_at)
@@ -899,7 +1066,8 @@ class GptRegisterService:
         concurrency = int(settings["concurrency"])
         interval = float(settings["interval_secs"])
         proxy_pool = parse_proxy_pool(settings.get("proxy"))
-        domain_pool = parse_domain_pool(settings.get("cfd1_domains"))
+        pool_key, domain_key = mail_domain_setting_keys(settings)
+        domain_pool = parse_domain_pool(settings.get(pool_key))
         if domain_pool:
             self._append_log(job_id, f"邮箱域名池启用：{len(domain_pool)} 个域名随机轮换")
         if proxy_pool and concurrency > len(proxy_pool):
@@ -959,7 +1127,7 @@ class GptRegisterService:
             if domain_pool:
                 # random, not index round-robin: auto-replenish jobs are count=1
                 # (always index 1), which would pin every registration to pool[0].
-                per_settings["cfd1_domain"] = random.choice(domain_pool)
+                per_settings[domain_key] = random.choice(domain_pool)
             if concurrency > 1:
                 # gpt-auto-register: stagger workers so N accounts don't hit
                 # the same egress in the same second.
@@ -973,7 +1141,7 @@ class GptRegisterService:
                         f"pool={len(proxy_pool)}"
                     )
                 if domain_pool:
-                    prefix_logs.append(f"mail_domain={per_settings.get('cfd1_domain')}")
+                    prefix_logs.append(f"mail_domain={per_settings.get(domain_key)}")
                 if prefix_logs:
                     result.setdefault("logs", [])
                     if isinstance(result.get("logs"), list):
@@ -1210,7 +1378,10 @@ class GptRegisterService:
                     for it in (items or [])
                 ],
             }
-            path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            # record embeds settings.proxy (credentialed URL) — keep it 0600.
+            from utils.atomic import atomic_write_json
+
+            atomic_write_json(path, record)
             self._append_log(job_id, f"完成日志已写入 data/gpt_register_logs/{job_id}.json")
         except Exception as exc:
             self._append_log(job_id, f"写入完成日志文件失败: {exc}", level="warn")
@@ -1243,6 +1414,10 @@ class GptRegisterService:
         plugin = engines / "platforms" / "chatgpt" / "plugin.py"
         if not plugin.is_file():
             raise RuntimeError(f"注册机不完整，缺少 ChatGPT 插件: {plugin}")
+        if settings.get("mail_provider") == MAIL_PROVIDER_TEMPMAIL:
+            missing = [key for key in ("tempmail_base_url", "tempmail_api_key") if not _clean(settings.get(key))]
+            if missing:
+                raise RuntimeError("收信渠道 tempmail 缺少配置: " + ", ".join(missing))
         if str(settings.get("run_mode") or "inprocess") == "subprocess":
             cli = engines / "register_cli.py"
             if not cli.is_file():
@@ -1375,6 +1550,17 @@ class GptRegisterService:
         env["PYTHONUNBUFFERED"] = "1"
         if settings.get("cfd1_domain"):
             env["CFD1_DOMAIN"] = str(settings["cfd1_domain"])
+        if settings.get("mail_provider") == MAIL_PROVIDER_TEMPMAIL:
+            for env_key, cfg_key in (
+                ("TEMPMAIL_BASE_URL", "tempmail_base_url"),
+                ("TEMPMAIL_API_KEY", "tempmail_api_key"),
+                ("TEMPMAIL_DOMAIN", "tempmail_domain"),
+                ("TEMPMAIL_MODE", "tempmail_mode"),
+                ("TEMPMAIL_SUBDOMAIN_DEPTH", "tempmail_subdomain_depth"),
+            ):
+                value = settings.get(cfg_key)
+                if value is not None and str(value).strip():
+                    env[env_key] = str(value).strip()
         # latency knobs for subprocess path (inprocess goes through runner.py)
         env["OPENAI_SKIP_CODEX"] = "1" if settings.get("skip_codex", True) else "0"
         if settings.get("register_no_delay"):

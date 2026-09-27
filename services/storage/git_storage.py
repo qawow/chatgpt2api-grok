@@ -9,7 +9,7 @@ from typing import Any
 from git import Repo
 from git.exc import GitCommandError
 
-from services.storage.base import StorageBackend
+from services.storage.base import StorageBackend, redact_url_credentials
 
 
 class GitStorageBackend(StorageBackend):
@@ -158,7 +158,7 @@ class GitStorageBackend(StorageBackend):
             return {
                 "status": "unhealthy",
                 "backend": "git",
-                "error": str(e),
+                "error": self._redact(e),
             }
 
     def get_backend_info(self) -> dict[str, Any]:
@@ -171,6 +171,13 @@ class GitStorageBackend(StorageBackend):
             "file_path": self.file_path,
             "auth_keys_file_path": self.auth_keys_file_path,
         }
+
+    def _redact(self, value: Any) -> str:
+        """Scrub the PAT out of an exception before it reaches /health."""
+        out = redact_url_credentials(value)
+        if self.token:
+            out = out.replace(self.token, "****")
+        return out
 
     @staticmethod
     def _mask_token(url: str) -> str:

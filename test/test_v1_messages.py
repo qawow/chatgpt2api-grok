@@ -6,11 +6,14 @@ import unittest
 
 import requests
 
+from test.utils import requires_live_service
+
 AUTH_KEY = "chatgpt2api"
 BASE_URL = "http://localhost:8000"
 MODEL = "auto"
 
 
+@requires_live_service(BASE_URL)
 class AnthropicMessagesTests(unittest.TestCase):
     @staticmethod
     def _headers() -> dict[str, str]:
@@ -39,6 +42,7 @@ class AnthropicMessagesTests(unittest.TestCase):
             print(json.dumps(response.json(), ensure_ascii=False, indent=2))
         except Exception:
             print(response.text)
+        self.assertEqual(response.status_code, 200, response.text)
 
     def test_message_stream_http(self):
         """测试 Anthropic Messages 的流式 HTTP 调用。"""
@@ -63,9 +67,9 @@ class AnthropicMessagesTests(unittest.TestCase):
         print(response.headers.get("content-type", ""))
         print("messages stream response headers:")
         print(f"{headers_at - started_at:6.2f}s")
-        if response.status_code != 200:
-            print(response.text)
-            return
+        # 之前这里是 `if status != 200: print(...); return`，上游挂了用例照样「通过」。
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("text/event-stream", response.headers.get("content-type", ""))
         print("messages stream chunks:")
         for line in response.iter_lines(chunk_size=1):
             if not line:

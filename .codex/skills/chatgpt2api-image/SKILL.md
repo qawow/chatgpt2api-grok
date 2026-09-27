@@ -19,13 +19,13 @@ Content-Type: application/json
 Body:
 
 {
-  "model": "gpt-image-2",
+  "model": "gpt-image-2.5",
   "prompt": "<image prompt>",
   "n": 1,
   "response_format": "b64_json"
 }
 
-Models: `gpt-image-2`, `codex-gpt-image-2`, `grok-imagine-image`, `grok-2-image`.
+Models: `gpt-image-2.5`, `codex-gpt-image-2`, `grok-imagine-image`, `grok-2-image` (live list: `GET /v1/models`).
 
 For edits, POST http://127.0.0.1:8000/v1/images/edits with a reference image and prompt.
 

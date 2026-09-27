@@ -13,14 +13,19 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
-from services.protocol import grok_v1_image_generations, openai_v1_image_edit, openai_v1_image_generations
+from services.protocol import (
+    cn_image_generations,
+    grok_v1_image_generations,
+    openai_v1_image_edit,
+    openai_v1_image_generations,
+)
 from services.protocol.conversation import is_token_invalid_error, is_upstream_connection_error
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError
 from services.image_task_control import ImageTaskControl
 from services.image_task_inputs import ImageTaskInputs
 from utils.atomic import atomic_write_json
 from utils.grok_models import is_grok_image_model, resolve_grok_image_model
-from utils.helper import WEB_IMAGE_MODEL
+from utils.image_models import WEB_IMAGE_MODEL
 from utils.log import logger
 
 TASK_STATUS_QUEUED = "queued"
@@ -79,11 +84,16 @@ def route_image_generation(body: dict[str, Any]) -> dict[str, Any]:
     ``is_supported_image_model`` rejects ``grok-2-image`` with unsupported model.
     """
     model = str(body.get("model") or "").strip()
+    if cn_image_generations.is_cn_image_model(model):
+        # Same handler as /v1/images/generations, so the web UI can use every
+        # model /v1/models lists. Synchronous; drop the SSE-only hooks.
+        payload = openai_v1_image_generations.strip_internal_keys(body)
+        return cn_image_generations.handle(payload)
     if is_grok_image_model(model):
         payload = dict(body)
         payload["model"] = resolve_grok_image_model(model)
         # Grok free path is synchronous; progress callback is ChatGPT-SSE only.
-        for key in ("progress_callback", "checkpoint_callback", "_is_cancelled", "_task_control"):
+        for key in openai_v1_image_generations.INTERNAL_PAYLOAD_KEYS:
             payload.pop(key, None)
         result = grok_v1_image_generations.handle(payload)
         if not isinstance(result, dict):
@@ -367,10 +377,12 @@ class ImageTaskService:
 
             if mode == "edit" and is_grok_image_model(model):
                 raise RuntimeError("Grok 本地池不支持图生图")
+            if mode == "edit" and cn_image_generations.is_cn_image_model(model):
+                raise RuntimeError("豆包 / 360智图 暂不支持图生图")
             else:
                 handler = self.edit_handler if mode == "edit" else self.generation_handler
-            # Mark progress for Grok path (no SSE steps) so UI is not stuck blank.
-            if mode != "edit" and is_grok_image_model(model):
+            # Grok / CN backends emit no SSE steps; mark progress so the UI is not stuck blank.
+            if mode != "edit" and (is_grok_image_model(model) or cn_image_generations.is_cn_image_model(model)):
                 progress_callback("generating")
             # Run the handler in a nested worker so a hung SSE/proxy socket cannot
             # leave the task stuck at progress=generating forever. The outer
@@ -400,7 +412,9 @@ class ImageTaskService:
                     f"常见于上游 SSE 经代理半开卡住）。可在 config 中调大 "
                     f"image_task_timeout_secs / image_sse_idle_timeout_secs。"
                 )
-            control.remaining()
+            # No deadline check here: the wait above already enforced it, and the
+            # worker has handed back a finished result. Re-checking only loses a
+            # result we already paid the upstream quota for.
             if "error" in error_box:
                 raise error_box["error"]
             result = result_box.get("result")
@@ -861,7 +875,10 @@ class ImageTaskService:
                 {"b64_json": base64.b64encode(image_data).decode("ascii")}
                 for image_data in backend.download_image_bytes(image_urls)
             ]
-            control.remaining()
+            # Past this point the images are in hand and the upstream quota is
+            # already spent, so the deadline stops applying: aborting here would
+            # skip mark_image_result below and leave the local quota unreduced
+            # forever while the account really did consume a generation.
             with self._lock:
                 task = self._tasks.get(key) or {}
                 payload = task.get("payload") or {}
@@ -875,7 +892,6 @@ class ImageTaskService:
             )["data"]
             if not data:
                 raise RuntimeError("续传没有返回图片数据")
-            control.remaining()
             # This poll owns no image slot. Use the original generation ID to
             # settle exactly once, even if the original worker already did so.
             account_service.mark_image_result(token, True, release_slot=False, result_id=generation_id)

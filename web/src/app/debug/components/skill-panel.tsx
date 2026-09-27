@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import webConfig from "@/constants/common-env";
 import { fetchSettingsConfig } from "@/lib/api";
 import { getStoredAuthSession } from "@/store/auth";
+import { DEFAULT_IMAGE_MODEL, DOCUMENTED_IMAGE_MODELS } from "@/lib/models";
 
 export function SkillPanel() {
   const [browserBaseUrl, setBrowserBaseUrl] = useState("");
@@ -42,13 +43,13 @@ Content-Type: application/json
 Body:
 
 {
-  "model": "gpt-image-2.5",
+  "model": "${DEFAULT_IMAGE_MODEL}",
   "prompt": "<用户的生图提示词>",
   "n": 1,
   "response_format": "b64_json"
 }
 
-可用模型：\`gpt-image-2.5\`、\`codex-gpt-image-2\`、\`grok-imagine-image\`、\`grok-2-image\`。
+可用模型（以 GET /v1/models 为准）：${DOCUMENTED_IMAGE_MODELS.map((m) => `\`${m}\``).join("、")}。
 
 改图使用 \`POST ${apiBaseUrl}/v1/images/edits\`，上传参考图并附带 prompt。
 
@@ -78,13 +79,13 @@ Content-Type: application/json
 JSON body:
 
 {
-  "model": "gpt-image-2.5",
+  "model": "${DEFAULT_IMAGE_MODEL}",
   "prompt": "<image prompt>",
   "n": 1,
   "response_format": "b64_json"
 }
 
-Models: \`gpt-image-2.5\`, \`codex-gpt-image-2\`, \`grok-imagine-image\`, \`grok-2-image\`.
+Models (authoritative list: GET /v1/models): ${DOCUMENTED_IMAGE_MODELS.map((m) => `\`${m}\``).join(", ")}.
 
 For edits, POST ${apiBaseUrl}/v1/images/edits with a reference image and prompt.
 

@@ -15,7 +15,7 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
-from utils.helper import WEB_IMAGE_MODEL
+from utils.image_models import WEB_IMAGE_MODEL
 
 
 def _composite_mask(

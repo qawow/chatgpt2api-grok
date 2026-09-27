@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.8.9 - 2026-09-28
+
++ [新增] 非官方豆包网页生图：`POST /v1/doubao`、`GET /v1/doubao/status`。上游 `POST www.doubao.com/chat/completion`（`aid=497858`，`skill_type=4` ImageGeneration）。需要登录 Cookie；人机验证走请求 `captcha`、`solve_url` 或 Capsolver/2Captcha/YesCaptcha。可选透传 `a_bogus`。`POST /v1/images/generations` 且 `model=doubao*` 走同一后端。文档 `docs/doubao.md`。
++ [新增] 非官方 360智图文生图：`POST /v1/zhitu360`、`POST /v1/zhitu360/query`、`GET /v1/zhitu360/status|models`。上游 `image.360.com/api/v1/zhitu/text/to/image/{create,query,v2/config}`。模型 `jimeng` / `jimeng40` / `jimeng45` / `hunyuan` / `tongyi` / `wanx21plus`。未登录 20601→401，欠费 20603→402，风控 hit_risk→403。打码同样外接。`model=zhitu360|jimeng*|hunyuan|tongyi|wanx21plus` 可走 `/v1/images/generations`。文档 `docs/zhitu360.md`。
++ [新增] 共享 `services/captcha_solver.py`：显式 token、`CAPTCHA_SOLVE_URL` webhook、SaaS 打码。新增 `test/test_cn_images_api.py`。
++ [新增] GPT 注册收信渠道可选自建 [123nhh/tempmail](https://github.com/123nhh/tempmail)（设置 → GPT 注册 → 收信渠道）：REST 直连、Postfix 收信即落库，不再绕 Cloudflare Email Routing → Worker → D1 → Cloudflare API。验证码优先从邮件主题提取（每轮只一个列表请求）；带「测试」按钮列出实例可用域名；API Key 脱敏存储。tempmail 邮箱有 TTL，Codex 补 OTP 时按原地址自动重建；切换渠道后旧号按域名自动走原渠道。适配 tempmail 限流（窗口会被每个请求续期）：撞 429 后本进程全部 tempmail 请求静默一整个窗口。
++ [新增] tempmail 多级域名：`multi` 模式默认由注册机生成 2 级随机子域名（`abc@k3x9q.m2a8.example.com`，层数可配，0 = 交给 tempmail 生成 10~14 级单词），每个号一个独立主机名；域名池支持 `*.example.com`（其下随机子域名）与 `a.example.com`（固定子域名），主域经 `/api/domains` 反查并缓存。
++ [修复] 一个请求回传两张一样的图片：一个 `sediment://file_00000000…` 指针会同时进入 file / sediment 两个 id 列表，同一 id 分别走 `/files/{id}/download` 与 `/conversation/{cid}/attachment/{id}/download`，两个接口签出的 URL 不同，字符串去重挡不住。现按 id 去重，并在下载后按字节再去重一次。另修两个次要来源：丢失 `conversation_id` 后按 prompt 恢复会话时，并发生成会认领同一会话（新增进程内会话认领表，且改用真实请求开始时间）；豆包分流把每张图拆成 `url` 与 `b64_json` 两条。
++ [修复] 日志管理看不到 `/v1/chat/completions`、`/v1/responses`、`/v1/doubao` 生成的图片：前两者以 base64 内联返回、无 `url` 字段可收集，后者只记了张数。现附带内部字段 `_image_urls`（发给客户端前剥离）记录已落盘 URL。
++ [修复] Grok：免费路径 200 但模型没调图片工具时，付费路径的 403（无额度）被当成鉴权失败，账号被标异常——一个被拒的 prompt 能逐个打死整个 Grok 池。现返回 422「未生成图片」并附模型原话，且不记失败、不再换号重试。另修：`ensure_fresh_account` 抛错时 `new_token` UnboundLocalError；刷新后 token 未变仍整轮重试；失败分类改按 HTTP 状态（原先对错误文本做 "401/403/429" 子串匹配）；限流号 15 分钟后自动回池；免费路径不再静默丢弃 `size`；抽图以 `image_generation_call` 为准，url 副本不再算第二张。
++ [调整] `/v1/models` 只列规范的生图模型 id：别名与旧名（`gpt-image-2`、`grok-imagine`、`grok-2-image-1212`、`即梦`…）仍可调用但不再列出；豆包 / 360智图在配置了 cookies 时列出。网页端生图也能使用这些模型（任务接口此前只认 ChatGPT / Grok）。
++ [重构] 模型 id 统一到 `utils/image_models.py`（后端唯一定义处）与 `web/src/lib/models.ts`（前端镜像，有测试校验一致）；路由、`/v1/models`、报错文案、各后端不再各自写字符串。报错文案里残留的 `gpt-image-2` 随之更正。
++ [安全] `/health` 未鉴权时不再返回存储路径 / 数据库连接串 / 代理拓扑，存储健康检查的异常信息脱敏；`/docs`、`/openapi.json` 默认关闭（`CHATGPT2API_ENABLE_DOCS=1` 开启）；`GET /api/settings` 补齐顶层 `proxy` 与 `ai_review.api_key` 脱敏；保存设置不再把 `.env` 里的密钥写进 `config.json`；启动时把 `data/` 下凭据文件收紧为 0600；管理员密钥改为常量时间比较。
++ [修复] 存储文件损坏时不再当作空列表并在下次保存时覆盖（`auth_keys.json` 损坏后新建一把密钥会清空其余全部）；结算前的超时检查不再丢弃已付费的结果（本地额度与上游不同步）；补号任务收尾异常不再让任务永远卡在 running、导致自动补号停摆；`auto_replenish_min_total_quota` 此前被 API 静默丢弃；手动「禁用」的账号不会再被刷新 / 检测洗回「正常」。
++ [测试] 修复测试套件（此前 25 失败 / 18 错误，注册引擎 805 行测试因导入路径错误从未运行）；CI 增加测试任务，并覆盖 `fork/**` 分支。
+
 ## 1.8.8 - 2026-09-20
 
 + [新增] 非官方 [www.waifu2x.net](https://www.waifu2x.net/) 超分 API：`POST /v1/waifu2x`（别名 `POST /v1/images/upscale`）、`GET /v1/waifu2x/status`。协议对齐公开网页表单（`style` / `noise` / `scale` / `format` + Turnstile）。Turnstile 支持请求透传 token、Capsolver / 2Captcha / YesCaptcha、以及 Patreon `ses_id` 跳过。设置项密钥在 `/api/settings` 中掩码。文档见 `docs/waifu2x.md`，CLI：`python scripts/waifu2x_upscale.py`。新增 `test/test_waifu2x_api.py`。

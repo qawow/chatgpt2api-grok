@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -31,6 +32,7 @@ from utils.helper import (
     new_uuid,
     split_image_model,
 )
+from utils.image_models import CODEX_IMAGE_MODEL, CODEX_RESPONSES_MODEL, CODEX_UPSTREAM_TOOL_MODEL
 from utils.log import logger
 from utils.pow import (
     POW_CORES,
@@ -86,8 +88,6 @@ class ChatRequirements:
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
-CODEX_IMAGE_MODEL = "codex-gpt-image-2"
-CODEX_RESPONSES_MODEL = "gpt-5.5"
 FILE_SERVICE_ID_RE = re.compile(r"file-service://([A-Za-z0-9_-]+)")
 _AUTH_FILE_HOSTS = ("chatgpt.com", "chat.openai.com")
 _AUTH_FILE_PATH_PREFIXES = (
@@ -164,6 +164,29 @@ def _is_content_policy_error(error_msg: str) -> bool:
     msg_lower = error_msg.lower()
     return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
 
+
+
+def _dedupe_image_bytes(images: list[bytes]) -> list[bytes]:
+    """Drop byte-identical images from one download batch, keeping order.
+
+    Every image in a single result is generated separately, so identical bytes
+    only ever mean the same upstream asset was reached twice (two pointers or
+    two download endpoints for one id). Returning it twice is the "one request,
+    two identical images" symptom; this is the last line of defence after the
+    id-level dedupe in _resolve_image_urls.
+    """
+    seen: set[str] = set()
+    out: list[bytes] = []
+    for data in images:
+        if not data:
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in seen:
+            logger.info({"event": "image_duplicate_bytes_dropped", "sha256": digest[:16]})
+            continue
+        seen.add(digest)
+        out.append(data)
+    return out
 
 
 def image_poll_sleep_secs(elapsed: float, interval: float) -> float:
@@ -1152,7 +1175,7 @@ class OpenAIBackendAPI:
             "input": self._codex_image_input(prompt, images or []),
             "tools": [{
                 "type": "image_generation",
-                "model": "gpt-image-2",
+                "model": CODEX_UPSTREAM_TOOL_MODEL,
                 "action": "edit" if images else "generate",
                 "size": str(size or "1024x1024"),
                 "quality": str(quality or "auto"),
@@ -1444,7 +1467,13 @@ class OpenAIBackendAPI:
             logger.debug({"event": "list_conversations_failed", "error": str(exc)})
             return []
 
-    def find_conversation_by_prompt(self, prompt: str, started_at: float, timeout_secs: float = 10.0) -> str:
+    def find_conversation_by_prompt(
+            self,
+            prompt: str,
+            started_at: float,
+            timeout_secs: float = 10.0,
+            exclude_ids: set[str] | None = None,
+    ) -> str:
         """根据 prompt 和开始时间，从最近对话列表中查找匹配的 conversation_id。
 
         当 SSE 流太短导致 conversation_id 丢失时，使用此方法恢复。
@@ -1470,6 +1499,12 @@ class OpenAIBackendAPI:
             # item 可能是完整的 conversation 对象或摘要
             conv_id = str(item.get("id") or item.get("conversation_id") or "")
             if not conv_id:
+                continue
+            # Conversations another in-flight generation already owns. Without
+            # this, parallel n>1 (or concurrent requests on one account) that
+            # both lost their SSE conversation_id recover the *same* one and
+            # return the same image twice — or hand back another request's image.
+            if exclude_ids and conv_id in exclude_ids:
                 continue
             # 检查时间范围：对话的 updated_at 应该在请求开始时间之后（或附近）
             updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
@@ -1923,6 +1958,11 @@ class OpenAIBackendAPI:
         urls = []
         last_connect_exc: BaseException | None = None
         skip_patterns = {"file_upload"}
+        # 一张输出图常同时以 file-service://file_x 和 sediment://file_x 出现（两者 id
+        # 相同，见 docs/upstream-sse-conversation.md）。file 与 attachment 是两个下载
+        # 接口，会为同一张图签出两个不同 URL，字符串去重挡不住 → 客户端拿到两张一样的
+        # 图。这里按 id 去重：已通过 file 接口解析成功的 id，sediment 阶段直接跳过。
+        resolved_ids: set[str] = set()
 
         def _record_fetch_error(source: str, item_id: str, exc: BaseException) -> None:
             nonlocal last_connect_exc
@@ -1951,6 +1991,7 @@ class OpenAIBackendAPI:
                 _record_fetch_error("file", file_id, exc)
                 continue
             if url:
+                resolved_ids.add(file_id)
                 if url not in urls:
                     urls.append(url)
             else:
@@ -1962,12 +2003,21 @@ class OpenAIBackendAPI:
                 })
         if conversation_id and sediment_ids:
             for sediment_id in sediment_ids:
+                if sediment_id in resolved_ids:
+                    # 同一 id 已由 file 接口解析，跳过以免同图重复。
+                    logger.debug({
+                        "event": "image_sediment_id_deduped",
+                        "conversation_id": conversation_id,
+                        "id": sediment_id,
+                    })
+                    continue
                 try:
                     url = self._get_attachment_download_url(conversation_id, sediment_id)
                 except Exception as exc:
                     _record_fetch_error("sediment", sediment_id, exc)
                     continue
                 if url:
+                    resolved_ids.add(sediment_id)
                     if url not in urls:
                         urls.append(url)
                 else:
@@ -2112,7 +2162,7 @@ class OpenAIBackendAPI:
                 if not 200 <= response.status_code < 300:
                     raise RuntimeError(f"image_download failed: HTTP {response.status_code}") from exc
                 images.append(response.content)
-        return images
+        return _dedupe_image_bytes(images)
 
     def stream_conversation(
             self,

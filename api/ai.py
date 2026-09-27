@@ -5,10 +5,11 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
-from services.content_filter import check_request, request_shape, request_text
+from api.support import filter_or_log, require_identity, resolve_image_base_url
+from services.content_filter import request_shape, request_text
 from services.log_service import LoggedCall
 from services.protocol import (
+    cn_image_generations,
     grok_v1_image_generations,
     openai_v1_chat_complete,
     openai_v1_image_edit,
@@ -18,16 +19,16 @@ from services.protocol import (
 )
 from utils.grok_models import (
     DEFAULT_GROK_IMAGE_MODEL,
-    GROK_IMAGE_MODELS,
     GROK_TEXT_MODELS_DISABLED,
     is_grok_image_model,
     is_grok_text_model,
     resolve_grok_image_model,
 )
-from utils.helper import WEB_IMAGE_MODEL
+from utils.image_models import WEB_IMAGE_MODEL, is_doubao_model, is_zhitu_model
 
 
 class ImageGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     prompt: str = Field(..., min_length=1)
     model: str = WEB_IMAGE_MODEL
     n: int = Field(default=1, ge=1, le=4)
@@ -36,6 +37,11 @@ class ImageGenerationRequest(BaseModel):
     response_format: str = "b64_json"
     history_disabled: bool = True
     stream: bool | None = None
+    cookies: str | None = None
+    captcha: str | None = None
+    ratio: str | None = None
+    style: str | None = None
+    a_bogus: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -57,14 +63,6 @@ class ResponseCreateRequest(BaseModel):
     stream: bool | None = None
 
 
-async def filter_or_log(call: LoggedCall, text: str) -> None:
-    try:
-        await run_in_threadpool(check_request, text)
-    except HTTPException as exc:
-        call.log("调用失败", status="failed", error=str(exc.detail))
-        raise
-
-
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -83,8 +81,15 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        payload = body.model_dump(mode="python")
+        # ImageGenerationRequest is extra="allow", so anything the client sent
+        # survives model_dump — including the task layer's internal hooks.
+        payload = openai_v1_image_generations.strip_internal_keys(body.model_dump(mode="python"))
         payload["base_url"] = resolve_image_base_url(request)
+        if is_doubao_model(body.model) or is_zhitu_model(body.model):
+            label = "豆包文生图" if is_doubao_model(body.model) else "360智图文生图"
+            call = LoggedCall(identity, "/v1/images/generations", body.model, label, request_text=body.prompt)
+            await filter_or_log(call, body.prompt)
+            return await call.run(cn_image_generations.handle, payload)
         # grok-4.5 is chat, not image — never fall through to ChatGPT.
         if is_grok_text_model(body.model):
             raise HTTPException(status_code=400, detail={"error": GROK_TEXT_MODELS_DISABLED})
@@ -112,7 +117,7 @@ def create_router() -> APIRouter:
     ):
         """Force Grok pool (OpenAI Images shape). Default model grok-2-image."""
         identity = require_identity(authorization)
-        payload = body.model_dump(mode="python")
+        payload = openai_v1_image_generations.strip_internal_keys(body.model_dump(mode="python"))
         payload["model"] = resolve_grok_image_model(body.model or DEFAULT_GROK_IMAGE_MODEL)
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(
@@ -142,24 +147,10 @@ def create_router() -> APIRouter:
     @router.get("/v1/grok/models")
     async def list_grok_models(authorization: str | None = Header(default=None)):
         require_identity(authorization)
-        from services.grok_account_service import grok_account_service
-
-        has_accounts = grok_account_service.count() > 0
-        data = []
-        if has_accounts:
-            for model in sorted(GROK_IMAGE_MODELS):
-                data.append(
-                    {
-                        "id": model,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": "grok",
-                        "permission": [],
-                        "root": model,
-                        "parent": None,
-                    }
-                )
-        return {"object": "list", "data": data}
+        try:
+            return await run_in_threadpool(openai_v1_models.list_grok_models)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
     @router.post("/v1/images/edits")
     async def edit_images(

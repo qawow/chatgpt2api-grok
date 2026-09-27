@@ -7,7 +7,7 @@ from sqlalchemy import Column, String, Text, create_engine, Integer, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-from services.storage.base import StorageBackend
+from services.storage.base import StorageBackend, redact_url_credentials
 
 Base = declarative_base()
 
@@ -169,7 +169,7 @@ class DatabaseStorageBackend(StorageBackend):
             return {
                 "status": "unhealthy",
                 "backend": "database",
-                "error": str(e),
+                "error": self._redact(e),
             }
 
     def get_backend_info(self) -> dict[str, Any]:
@@ -188,6 +188,24 @@ class DatabaseStorageBackend(StorageBackend):
             "description": f"数据库存储 ({db_type})",
             "database_url": self._mask_password(self.database_url),
         }
+
+    def _redact(self, value: Any) -> str:
+        """Scrub the DSN password out of an exception before it reaches /health."""
+        out = redact_url_credentials(value)
+        password = self._password_of(self.database_url)
+        if password:
+            out = out.replace(password, "****")
+        return out
+
+    @staticmethod
+    def _password_of(url: str) -> str:
+        if "://" not in url:
+            return ""
+        _, _, rest = url.partition("://")
+        credentials, sep, _ = rest.partition("@")
+        if not sep or ":" not in credentials:
+            return ""
+        return credentials.split(":", 1)[1]
 
     @staticmethod
     def _mask_password(url: str) -> str:

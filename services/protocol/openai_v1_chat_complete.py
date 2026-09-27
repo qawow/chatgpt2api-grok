@@ -16,7 +16,15 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.grok_models import is_grok_image_model, resolve_grok_image_model
-from utils.helper import WEB_IMAGE_MODEL, build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import (
+    build_chat_image_markdown_content,
+    extract_chat_image,
+    extract_chat_prompt,
+    image_result_urls,
+    is_image_chat_request,
+    parse_image_count,
+)
+from utils.image_models import WEB_IMAGE_MODEL
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -156,6 +164,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         images=encode_images(images) or None,
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
+    response["_image_urls"] = image_result_urls(result)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),
@@ -195,9 +204,12 @@ def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: st
             continue
         if not sent_role:
             sent_role = True
-            yield completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
+            chunk = completion_chunk(model, {"role": "assistant", "content": content}, None, completion_id, created)
         else:
-            yield completion_chunk(model, {"content": content}, None, completion_id, created)
+            chunk = completion_chunk(model, {"content": content}, None, completion_id, created)
+        if output.kind == "result":
+            chunk["_image_urls"] = image_result_urls({"data": output.data})
+        yield chunk
     if not sent_role:
         yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
     yield completion_chunk(model, {}, "stop", completion_id, created)
@@ -229,6 +241,7 @@ def _grok_image_chat(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str
         ]
         return stream_image_chat_completion(outputs, model)
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
+    response["_image_urls"] = image_result_urls(result)
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         output_tokens=count_image_output_items_tokens(result.get("data")),
@@ -237,10 +250,7 @@ def _grok_image_chat(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str
     return response
 
 
-TEXT_MODELS_DISABLED = (
-    "this backend only serves image models "
-    "(gpt-image-2 / codex-gpt-image-2 / grok-2-image); text models are disabled"
-)
+from utils.image_models import TEXT_MODELS_DISABLED  # noqa: E402  (single source for model names)
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

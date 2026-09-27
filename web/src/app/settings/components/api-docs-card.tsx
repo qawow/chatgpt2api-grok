@@ -5,6 +5,7 @@ import { ChevronDown, FileArchive, FileText, KeyRound, ListChecks, type LucideIc
 
 import { Card, CardContent } from "@/components/ui/card";
 import webConfig from "@/constants/common-env";
+import { DEFAULT_IMAGE_MODEL, DOCUMENTED_IMAGE_MODELS, GROK_2_IMAGE_MODEL, GROK_IMAGINE_IMAGE_MODEL } from "@/lib/models";
 import { getStoredAuthSession } from "@/store/auth";
 
 type ParamRow = [string, string, string];
@@ -40,7 +41,7 @@ const docs: ApiDoc[] = [
     path: "/v1/chat/completions",
     icon: FileText,
     input: [
-      ["model", "string", "仅生图：gpt-image-2.5 / grok-imagine-image / grok-2-image。grok-4.5 是对话模型，已关闭。"],
+      ["model", "string", `仅生图：${DEFAULT_IMAGE_MODEL} / ${GROK_IMAGINE_IMAGE_MODEL} / ${GROK_2_IMAGE_MODEL}。grok-4.5 是对话模型，已关闭。`],
       ["messages", "array", "OpenAI 兼容消息数组。"],
       ["stream", "boolean", "可选，是否流式返回。"],
       ["n", "number", "可选，图片兼容场景会解析为生成数量。"],
@@ -53,7 +54,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/chat/completions \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-image-2.5","messages":[{"role":"user","content":"一只橘猫"}]}'`,
+  -d '{"model":"${DEFAULT_IMAGE_MODEL}","messages":[{"role":"user","content":"一只橘猫"}]}'`,
   },
   {
     title: "Responses",
@@ -74,7 +75,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/responses \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-image-2.5","input":"生成一张未来城市图片","tools":[{"type":"image_generation"}]}'`,
+  -d '{"model":"${DEFAULT_IMAGE_MODEL}","input":"生成一张未来城市图片","tools":[{"type":"image_generation"}]}'`,
   },
   {
     title: "图片生成",
@@ -83,7 +84,7 @@ const docs: ApiDoc[] = [
     icon: FileArchive,
     input: [
       ["prompt", "string", "图片生成提示词。"],
-      ["model", "string", "可选，默认 gpt-image-2.5。"],
+      ["model", "string", `可选，默认 ${DEFAULT_IMAGE_MODEL}。`],
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
@@ -97,7 +98,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/generations \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-image-2.5","prompt":"一张极简产品海报","n":1}'`,
+  -d '{"model":"${DEFAULT_IMAGE_MODEL}","prompt":"一张极简产品海报","n":1}'`,
   },
   {
     title: "图片编辑",
@@ -107,7 +108,7 @@ const docs: ApiDoc[] = [
     input: [
       ["image", "file | file[] | URL", "参考图，支持 multipart 上传，也支持 JSON 图片链接。"],
       ["prompt", "string", "编辑提示词。"],
-      ["model", "string", "可选，默认 gpt-image-2.5。"],
+      ["model", "string", `可选，默认 ${DEFAULT_IMAGE_MODEL}。`],
       ["n", "number", "可选，生成数量，当前限制 1-4。"],
       ["size", "string", "可选，图片尺寸。"],
       ["quality", "string", "可选，默认 auto。"],
@@ -119,13 +120,13 @@ const docs: ApiDoc[] = [
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/edits \\
   -H "Authorization: Bearer ${key}" \\
-  -F "model=gpt-image-2.5" \\
+  -F "model=${DEFAULT_IMAGE_MODEL}" \\
   -F "prompt=改成赛博朋克夜景" \\
   -F "image=@./input.png"`,
   },
 ];
 
-const usableModels = ["gpt-image-2.5", "codex-gpt-image-2", "grok-2-image", "grok-imagine-image"];
+const usableModels = DOCUMENTED_IMAGE_MODELS;
 
 function ParamTable({ rows }: { rows: ParamRow[] }) {
   return (

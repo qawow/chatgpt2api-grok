@@ -80,6 +80,47 @@ DEFAULT_THIRD_PARTY_APPS = {
     },
 }
 
+DEFAULT_WAIFU2X = {
+    "base_url": "https://www.waifu2x.net",
+    "timeout_sec": 180,
+    "capsolver_key": "",
+    "twocaptcha_key": "",
+    "yescaptcha_key": "",
+    "ses_id": "",
+    "user_agent": DEFAULT_PROXY_RUNTIME_USER_AGENT,
+}
+
+DEFAULT_DOUBAO = {
+    "base_url": "https://www.doubao.com",
+    "timeout_sec": 180,
+    "aid": "497858",
+    "cookies": "",
+    "a_bogus": "",
+    "captcha_site_key": "",
+    "captcha_task_type": "",
+    "capsolver_key": "",
+    "twocaptcha_key": "",
+    "yescaptcha_key": "",
+    "solve_url": "",
+    "user_agent": DEFAULT_PROXY_RUNTIME_USER_AGENT,
+}
+
+DEFAULT_ZHITU360 = {
+    "base_url": "https://image.360.com",
+    "timeout_sec": 180,
+    "poll_interval_sec": 2,
+    "cookies": "",
+    "api_user": "chacha",
+    "feature": "tools_text2image",
+    "srcg": "360_pic",
+    "captcha_site_key": "",
+    "capsolver_key": "",
+    "twocaptcha_key": "",
+    "yescaptcha_key": "",
+    "solve_url": "",
+    "user_agent": DEFAULT_PROXY_RUNTIME_USER_AGENT,
+}
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -285,6 +326,146 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     }
 
 
+def _env_or(
+    source: dict[str, object], key: str, env_name: str, default: str = "", *, use_env: bool = True
+) -> str:
+    """Resolve a setting, preferring the environment.
+
+    ``use_env=False`` is for the write path: these normalizers run both when
+    reading settings (where the env should win) and when persisting them (where
+    it must not, or a single "save settings" bakes every .env secret into
+    config.json — and from there into the backup archive).
+    """
+    if use_env:
+        env_value = str(os.getenv(env_name) or "").strip()
+        if env_value:
+            return env_value
+    if source.get(key) is not None and str(source.get(key) or "").strip():
+        return str(source.get(key) or "").strip()
+    return default
+
+
+def _env_int_source(env_name: str, source: dict[str, object], key: str, *, use_env: bool = True) -> object:
+    if use_env:
+        raw = os.getenv(env_name)
+        if str(raw or "").strip():
+            return raw
+    return source.get(key)
+
+
+# Single source of truth for which fields get masked on the way out and
+# restored on the way in. Keeping these apart is how waifu2x ended up with a
+# solve_url that GET never masked.
+_WAIFU2X_SECRET_KEYS = ("capsolver_key", "twocaptcha_key", "yescaptcha_key", "ses_id", "solve_url")
+_DOUBAO_SECRET_KEYS = (
+    "cookies",
+    "a_bogus",
+    "capsolver_key",
+    "twocaptcha_key",
+    "yescaptcha_key",
+    "solve_url",
+)
+_ZHITU360_SECRET_KEYS = ("cookies", "capsolver_key", "twocaptcha_key", "yescaptcha_key", "solve_url")
+
+
+def _normalize_waifu2x_settings(value: object, *, use_env: bool = True) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    base = _env_or(source, "base_url", "WAIFU2X_BASE_URL", str(DEFAULT_WAIFU2X["base_url"]), use_env=use_env)
+    timeout_source = _env_int_source("WAIFU2X_TIMEOUT_SEC", source, "timeout_sec", use_env=use_env)
+    return {
+        "base_url": (base or str(DEFAULT_WAIFU2X["base_url"])).rstrip("/"),
+        "timeout_sec": _normalize_positive_int(timeout_source, int(DEFAULT_WAIFU2X["timeout_sec"]), 10),
+        "capsolver_key": _env_or(source, "capsolver_key", "WAIFU2X_CAPSOLVER_KEY", use_env=use_env),
+        "twocaptcha_key": _env_or(source, "twocaptcha_key", "WAIFU2X_TWOCAPTCHA_KEY", use_env=use_env),
+        "yescaptcha_key": _env_or(source, "yescaptcha_key", "WAIFU2X_YESCAPTCHA_KEY", use_env=use_env),
+        "ses_id": _env_or(source, "ses_id", "WAIFU2X_SES_ID", use_env=use_env),
+        "solve_url": _env_or(
+            source, "solve_url", "WAIFU2X_SOLVE_URL", (os.getenv("CAPTCHA_SOLVE_URL") or "") if use_env else "",
+            use_env=use_env,
+        ),
+        "user_agent": _env_or(
+            source,
+            "user_agent",
+            "WAIFU2X_USER_AGENT",
+            str(DEFAULT_WAIFU2X["user_agent"]),
+            use_env=use_env,
+        ),
+    }
+
+
+def _captcha_keys(source: dict, prefix: str, *, use_env: bool = True) -> dict[str, str]:
+    def _fallback(name: str) -> str:
+        return (os.getenv(name) or "") if use_env else ""
+
+    return {
+        "capsolver_key": _env_or(
+            source, "capsolver_key", f"{prefix}_CAPSOLVER_KEY", _fallback("CAPSOLVER_KEY"), use_env=use_env
+        ),
+        "twocaptcha_key": _env_or(
+            source, "twocaptcha_key", f"{prefix}_TWOCAPTCHA_KEY", _fallback("TWOCAPTCHA_KEY"), use_env=use_env
+        ),
+        "yescaptcha_key": _env_or(
+            source, "yescaptcha_key", f"{prefix}_YESCAPTCHA_KEY", _fallback("YESCAPTCHA_KEY"), use_env=use_env
+        ),
+        "solve_url": _env_or(
+            source, "solve_url", f"{prefix}_SOLVE_URL", _fallback("CAPTCHA_SOLVE_URL"), use_env=use_env
+        ),
+    }
+
+
+def _normalize_doubao_settings(value: object, *, use_env: bool = True) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    timeout_source = _env_int_source("DOUBAO_TIMEOUT_SEC", source, "timeout_sec", use_env=use_env)
+    out: dict[str, object] = {
+        "base_url": (
+            _env_or(source, "base_url", "DOUBAO_BASE_URL", str(DEFAULT_DOUBAO["base_url"]), use_env=use_env)
+            or DEFAULT_DOUBAO["base_url"]
+        ).rstrip("/"),
+        "timeout_sec": _normalize_positive_int(timeout_source, int(DEFAULT_DOUBAO["timeout_sec"]), 10),
+        "aid": _env_or(source, "aid", "DOUBAO_AID", str(DEFAULT_DOUBAO["aid"]), use_env=use_env),
+        "cookies": _env_or(source, "cookies", "DOUBAO_COOKIES", use_env=use_env),
+        "a_bogus": _env_or(source, "a_bogus", "DOUBAO_A_BOGUS", use_env=use_env),
+        "captcha_site_key": _env_or(source, "captcha_site_key", "DOUBAO_CAPTCHA_SITE_KEY", use_env=use_env),
+        "captcha_task_type": _env_or(source, "captcha_task_type", "DOUBAO_CAPTCHA_TASK_TYPE", use_env=use_env),
+        "user_agent": _env_or(
+            source, "user_agent", "DOUBAO_USER_AGENT", str(DEFAULT_DOUBAO["user_agent"]), use_env=use_env
+        ),
+    }
+    out.update(_captcha_keys(source, "DOUBAO", use_env=use_env))
+    return out
+
+
+def _normalize_zhitu360_settings(value: object, *, use_env: bool = True) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    timeout_source = _env_int_source("ZHITU360_TIMEOUT_SEC", source, "timeout_sec", use_env=use_env)
+    poll_source = _env_int_source("ZHITU360_POLL_INTERVAL_SEC", source, "poll_interval_sec", use_env=use_env)
+    out: dict[str, object] = {
+        "base_url": (
+            _env_or(source, "base_url", "ZHITU360_BASE_URL", str(DEFAULT_ZHITU360["base_url"]), use_env=use_env)
+            or DEFAULT_ZHITU360["base_url"]
+        ).rstrip("/"),
+        "timeout_sec": _normalize_positive_int(timeout_source, int(DEFAULT_ZHITU360["timeout_sec"]), 10),
+        "poll_interval_sec": _normalize_positive_int(poll_source, int(DEFAULT_ZHITU360["poll_interval_sec"]), 1),
+        "cookies": _env_or(source, "cookies", "ZHITU360_COOKIES", use_env=use_env),
+        "api_user": _env_or(
+            source, "api_user", "ZHITU360_API_USER", str(DEFAULT_ZHITU360["api_user"]), use_env=use_env
+        ),
+        "feature": _env_or(source, "feature", "ZHITU360_FEATURE", str(DEFAULT_ZHITU360["feature"]), use_env=use_env),
+        "srcg": _env_or(source, "srcg", "ZHITU360_SRCG", str(DEFAULT_ZHITU360["srcg"]), use_env=use_env),
+        "captcha_site_key": _env_or(source, "captcha_site_key", "ZHITU360_CAPTCHA_SITE_KEY", use_env=use_env),
+        # 360 does not use Turnstile; without this the solver falls back to the
+        # per-provider default and hands the platform the wrong task type.
+        "captcha_task_type": _env_or(
+            source, "captcha_task_type", "ZHITU360_CAPTCHA_TASK_TYPE", use_env=use_env
+        ),
+        "user_agent": _env_or(
+            source, "user_agent", "ZHITU360_USER_AGENT", str(DEFAULT_ZHITU360["user_agent"]), use_env=use_env
+        ),
+    }
+    out.update(_captcha_keys(source, "ZHITU360", use_env=use_env))
+    return out
+
+
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
     if not _normalize_bool(settings.get("enabled"), False):
         return
@@ -385,6 +566,15 @@ class ConfigStore:
     def get_grok_settings(self) -> dict[str, object]:
         raw = self.data.get("grok")
         return dict(raw) if isinstance(raw, dict) else {}
+
+    def get_waifu2x_settings(self) -> dict[str, object]:
+        return _normalize_waifu2x_settings(self.data.get("waifu2x"))
+
+    def get_doubao_settings(self) -> dict[str, object]:
+        return _normalize_doubao_settings(self.data.get("doubao"))
+
+    def get_zhitu360_settings(self) -> dict[str, object]:
+        return _normalize_zhitu360_settings(self.data.get("zhitu360"))
 
     @property
     def refresh_account_interval_minute(self) -> int:
@@ -667,13 +857,26 @@ class ConfigStore:
         data["log_retention_days"] = self.log_retention_days
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
-        data["ai_review"] = self.ai_review
+        data["ai_review"] = self._sanitize_ai_review(self.ai_review)
         data["global_system_prompt"] = self.global_system_prompt
         data["backup"] = self._sanitize_backup_settings(self.get_backup_settings())
         data["image_storage"] = self._sanitize_image_storage_settings(self.get_image_storage_settings())
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
+        data["waifu2x"] = self._sanitize_waifu2x_settings(self.get_waifu2x_settings())
+        data["doubao"] = self._sanitize_secret_settings(self.get_doubao_settings(), _DOUBAO_SECRET_KEYS)
+        data["zhitu360"] = self._sanitize_secret_settings(self.get_zhitu360_settings(), _ZHITU360_SECRET_KEYS)
+        # The legacy top-level ``proxy`` holds a full ``scheme://user:pass@host``
+        # URL. proxy_runtime's equivalents are already redacted below; this one
+        # was going out verbatim.
+        # Redact in place only — no trimming. get() deliberately reports the
+        # stored value verbatim; get_proxy_settings() is what normalizes.
+        proxy_value = data.get("proxy")
+        if isinstance(proxy_value, str) and proxy_value.strip():
+            from services.proxy_service import _redact_url_credentials
+
+            data["proxy"] = _redact_url_credentials(proxy_value)
         data.pop("auth-key", None)
         return data
 
@@ -737,12 +940,78 @@ class ConfigStore:
             )
         if "third_party_apps" in next_data:
             next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+        # These three normalize with use_env=False on the write path. Reading
+        # them still prefers the environment; persisting must not, or saving
+        # settings once bakes every .env secret into config.json (and from
+        # there into the backup archive). Masked values are likewise restored
+        # from the *stored* config rather than the env-merged getter.
+        if "waifu2x" in next_data:
+            incoming_waifu = next_data.get("waifu2x")
+            if isinstance(incoming_waifu, dict):
+                stored_waifu = _normalize_waifu2x_settings(self.data.get("waifu2x"), use_env=False)
+                incoming_waifu = dict(incoming_waifu)
+                for key in _WAIFU2X_SECRET_KEYS:
+                    if incoming_waifu.get(key) == "********":
+                        incoming_waifu[key] = stored_waifu.get(key) or ""
+                    incoming_waifu.pop(f"has_{key}", None)
+                next_data["waifu2x"] = _normalize_waifu2x_settings(incoming_waifu, use_env=False)
+            else:
+                next_data.pop("waifu2x", None)
+        if "doubao" in next_data:
+            incoming = next_data.get("doubao")
+            if isinstance(incoming, dict):
+                stored = _normalize_doubao_settings(self.data.get("doubao"), use_env=False)
+                incoming = dict(incoming)
+                for key in _DOUBAO_SECRET_KEYS:
+                    if incoming.get(key) == "********":
+                        incoming[key] = stored.get(key) or ""
+                    incoming.pop(f"has_{key}", None)
+                next_data["doubao"] = _normalize_doubao_settings(incoming, use_env=False)
+            else:
+                next_data.pop("doubao", None)
+        if "zhitu360" in next_data:
+            incoming = next_data.get("zhitu360")
+            if isinstance(incoming, dict):
+                stored = _normalize_zhitu360_settings(self.data.get("zhitu360"), use_env=False)
+                incoming = dict(incoming)
+                for key in _ZHITU360_SECRET_KEYS:
+                    if incoming.get(key) == "********":
+                        incoming[key] = stored.get(key) or ""
+                    incoming.pop(f"has_{key}", None)
+                next_data["zhitu360"] = _normalize_zhitu360_settings(incoming, use_env=False)
+            else:
+                next_data.pop("zhitu360", None)
+        if "ai_review" in next_data:
+            incoming_review = next_data.get("ai_review")
+            if isinstance(incoming_review, dict):
+                incoming_review = dict(incoming_review)
+                if incoming_review.get("api_key") == "********":
+                    incoming_review["api_key"] = self.ai_review.get("api_key") or ""
+                incoming_review.pop("has_api_key", None)
+                next_data["ai_review"] = incoming_review
+        if "proxy" in next_data:
+            next_data["proxy"] = self._restore_redacted_url(next_data.get("proxy"), self.data.get("proxy"))
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):
-                previous_clearance = self.get_proxy_runtime_settings().get("clearance")
+                current_runtime = self.get_proxy_runtime_settings()
+                incoming_runtime = dict(incoming_runtime)
+                # These are redacted on the way out; put the stored value back
+                # when the client echoed the placeholder.
+                for url_field in ("proxy_url", "resource_proxy_url"):
+                    incoming_runtime[url_field] = self._restore_redacted_url(
+                        incoming_runtime.get(url_field), current_runtime.get(url_field)
+                    )
+                incoming_clearance = incoming_runtime.get("clearance")
+                previous_clearance = current_runtime.get("clearance")
                 if isinstance(previous_clearance, dict):
-                    incoming_runtime = dict(incoming_runtime)
+                    if isinstance(incoming_clearance, dict):
+                        incoming_clearance = dict(incoming_clearance)
+                        incoming_clearance["flaresolverr_url"] = self._restore_redacted_url(
+                            incoming_clearance.get("flaresolverr_url"),
+                            previous_clearance.get("flaresolverr_url"),
+                        )
+                        incoming_runtime["clearance"] = incoming_clearance
                     incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
@@ -775,6 +1044,42 @@ class ConfigStore:
             out["webdav_password"] = "********"
         return out
 
+    @staticmethod
+    def _sanitize_ai_review(settings: dict[str, object]) -> dict[str, object]:
+        """Mask the AI review provider key for API responses."""
+        out = dict(settings) if isinstance(settings, dict) else {}
+        present = bool(str(out.get("api_key") or "").strip())
+        out["has_api_key"] = present
+        out["api_key"] = "********" if present else ""
+        return out
+
+    @staticmethod
+    def _restore_redacted_url(incoming: object, current: object) -> str:
+        """Keep the stored URL when the client echoed back a redacted one.
+
+        GET /api/settings returns ``scheme://[REDACTED]@host`` for credentialed
+        URLs, and the settings page round-trips its whole config object on save.
+        Without this, one save overwrites the real credentials with the
+        placeholder GET deliberately substituted.
+        """
+        value = str(incoming or "").strip()
+        if value and "[REDACTED]@" in value:
+            return str(current or "").strip()
+        return value
+
+    @staticmethod
+    def _sanitize_secret_settings(settings: dict[str, object], keys: tuple[str, ...]) -> dict[str, object]:
+        out = dict(settings) if isinstance(settings, dict) else {}
+        for key in keys:
+            present = bool(str(out.get(key) or "").strip())
+            out[f"has_{key}"] = present
+            out[key] = "********" if present else ""
+        return out
+
+    @staticmethod
+    def _sanitize_waifu2x_settings(settings: dict[str, object]) -> dict[str, object]:
+        return ConfigStore._sanitize_secret_settings(settings, _WAIFU2X_SECRET_KEYS)
+
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
 
@@ -784,6 +1089,45 @@ class ConfigStore:
             from services.storage.factory import create_storage_backend
             self._storage_backend = create_storage_backend(DATA_DIR)
         return self._storage_backend
+
+
+# Files under data/ that hold credentials. Everything written through
+# utils.atomic is already 0600; these are the ones a plain write_text() created
+# before, plus anything an operator dropped in by hand. ./data is bind-mounted
+# in every compose file, so 0644 here means world-readable on the host.
+_PRIVATE_DATA_FILES = (
+    "accounts.json",
+    "auth_keys.json",
+    "g2a_config.json",
+    "gpt_register.env",
+    "gpt_register_config.json",
+    "gpt_register_jobs.json",
+    "grok_accounts.json",
+    "logs.jsonl",
+    "register_engines.db",
+)
+_PRIVATE_DATA_GLOBS = ("gpt_register_logs/*.json",)
+
+
+def harden_data_permissions() -> list[str]:
+    """chmod 0600 the credential-bearing files under data/ and config.json.
+
+    Returns the paths that actually changed, so startup can say so once instead
+    of silently fixing it on every boot.
+    """
+    from utils.atomic import secure_file_mode
+
+    changed: list[str] = []
+    candidates = [CONFIG_FILE, *(DATA_DIR / name for name in _PRIVATE_DATA_FILES)]
+    for pattern in _PRIVATE_DATA_GLOBS:
+        candidates.extend(DATA_DIR.glob(pattern))
+    for path in candidates:
+        try:
+            if path.is_file() and secure_file_mode(path):
+                changed.append(str(path))
+        except OSError:
+            continue
+    return changed
 
 
 def load_backup_state() -> dict[str, object]:

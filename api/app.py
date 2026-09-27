@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import asynccontextmanager
 from threading import Event, Thread
 
@@ -8,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import accounts, ai, gpt_register, grok_accounts, image_tasks, system
+from api import accounts, ai, cn_images, gpt_register, grok_accounts, image_tasks, system, waifu2x
 from api.errors import install_exception_handlers
 from api.support import (
     resolve_web_asset,
@@ -98,6 +99,14 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        from services.config import harden_data_permissions
+
+        tightened = harden_data_permissions()
+        if tightened:
+            preview = ", ".join(tightened[:3])
+            if len(tightened) > 3:
+                preview += f" 等 {len(tightened)} 个"
+            print(f"[startup] 已收紧凭据文件权限为 0600: {preview}", flush=True)
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         grok_thread = start_grok_account_watcher(stop_event)
@@ -126,7 +135,18 @@ def create_app() -> FastAPI:
             log_trim_thread.join(timeout=1)
             backup_service.stop()
 
-    app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
+    # FastAPI's interactive docs are served without auth and enumerate every
+    # route, including the admin surface (/api/auth/users, /api/gpt-register/*)
+    # with full request schemas. Off unless explicitly enabled for local work.
+    docs_enabled = str(os.getenv("CHATGPT2API_ENABLE_DOCS") or "").strip().lower() in {"1", "true", "yes", "on"}
+    app = FastAPI(
+        title="chatgpt2api",
+        version=app_version,
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
     install_exception_handlers(app)
     app.add_middleware(RequestBodyLimitMiddleware)
     app.add_middleware(
@@ -136,11 +156,13 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.include_router(cn_images.create_router())
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())
     app.include_router(grok_accounts.create_router())
     app.include_router(gpt_register.create_router())
     app.include_router(image_tasks.create_router())
+    app.include_router(waifu2x.create_router())
     app.include_router(system.create_router(app_version))
 
     @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
