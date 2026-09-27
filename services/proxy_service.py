@@ -7,7 +7,7 @@ import json
 import re
 import threading
 import time
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 from urllib import request as urllib_request
 from urllib.parse import quote, urlparse
 
@@ -611,6 +611,15 @@ class ProxySettingsStore:
             runtime = {}
         return runtime if isinstance(runtime, dict) else {}
 
+    def stored_proxy_urls(self) -> list[str]:
+        """Configured proxy URLs as stored, for resolving redacted echoes."""
+        runtime = self._get_runtime_settings()
+        return [
+            _clean(self._config.get_proxy_settings()),
+            _clean(runtime.get("proxy_url")),
+            _clean(runtime.get("resource_proxy_url")),
+        ]
+
     def _bundle_for_headers(
         self,
         profile: ProxyRuntimeProfile,
@@ -746,7 +755,12 @@ def _coerce_timeout(value: object) -> float:
 
 
 def _is_valid_proxy_url(url: str) -> bool:
-    parsed = urlparse(normalize_proxy_url(url))
+    # urlsplit raises on brackets it can't read as an IPv6 host — and 3.13
+    # even checks them when they sit in the userinfo.
+    try:
+        parsed = urlparse(normalize_proxy_url(url))
+    except ValueError:
+        return False
     return parsed.scheme in {"http", "https", "socks5", "socks5h"} and bool(parsed.netloc)
 
 
@@ -817,9 +831,53 @@ def _redact_url_credentials(text: str) -> str:
     )
 
 
+def redact_proxy_url(value: str) -> str:
+    """Display form of a stored proxy setting, credentials replaced.
+
+    Also covers the ``host:port:user:pass`` shorthand the settings page
+    accepts, which the URL regex alone passes through in plaintext.
+    """
+    text = str(value or "")
+    stripped = text.strip()
+    if stripped and "://" not in stripped:
+        converted = _colon_proxy_to_url(stripped)
+        if "@" in converted:
+            return _redact_url_credentials(converted)
+    return _redact_url_credentials(text)
+
+
+def unredact_proxy_url(value: object, stored: Iterable[object], label: str = "代理地址") -> str:
+    """Swap an echoed ``scheme://[REDACTED]@host`` back to the stored URL.
+
+    The settings page only ever sees the redacted form, and sends it back on
+    save and on 测试代理. The placeholder resolves only while the whole URL
+    still matches a stored one: once host or port is edited there's no telling
+    which credentials were meant, and quietly keeping the old URL would drop
+    the edit.
+    """
+    text = str(value or "").strip()
+    if "[REDACTED]@" not in text:
+        return text
+    for candidate in stored:
+        original = str(candidate or "").strip()
+        if original and redact_proxy_url(original) == text:
+            return original
+    raise ValueError(f"{label}里的 [REDACTED] 代表已保存的账号密码，只能原样保留；修改地址时请重新填写完整的账号密码")
+
+
 def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
-    candidate = normalize_proxy_url(_clean(url))
     proxy_source = "input"
+    try:
+        candidate = normalize_proxy_url(unredact_proxy_url(url, proxy_settings.stored_proxy_urls()))
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "status": 0,
+            "latency_ms": 0,
+            "error": str(exc),
+            "proxy_source": proxy_source,
+            "has_proxy": True,
+        }
     if not candidate:
         profile = proxy_settings.get_profile(upstream=True)
         candidate = profile.proxy_url

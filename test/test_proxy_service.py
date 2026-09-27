@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from urllib.parse import urlparse
 
+from services import proxy_service
 from services.config import DEFAULT_PROXY_RUNTIME, config
 from services.proxy_service import (
     UnsafeUrlError,
@@ -599,6 +600,53 @@ class ProxyServiceTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("[REDACTED]", result["error"])
         self.assertNotIn("user:pass", result["error"])
+
+    def test_proxy_test_resolves_redacted_placeholder_to_stored_url(self) -> None:
+        # 设置页只拿得到脱敏值，「测试代理」回传的正是它；须换回已保存的真凭据再测。
+        stored = "socks5h://user:hunter2@192.0.2.19:7890"
+        proxies: list[object] = []
+
+        class RecordingSession:
+            def __init__(self, **kwargs: object) -> None:
+                proxies.append(kwargs.get("proxy"))
+
+            def get(self, *args: object, **kwargs: object) -> object:
+                return type("Response", (), {"status_code": 200})()
+
+            def close(self) -> None:
+                pass
+
+        store = ProxySettingsStore(FakeConfig(legacy_proxy=stored))
+        with patch.object(proxy_service, "proxy_settings", store), patch.object(
+            proxy_service, "create_cffi_session", RecordingSession
+        ):
+            result = proxy_service.test_proxy("socks5h://[REDACTED]@192.0.2.19:7890")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(proxies, [stored])
+
+    def test_proxy_test_rejects_edited_placeholder_without_connecting(self) -> None:
+        store = ProxySettingsStore(FakeConfig(legacy_proxy="socks5h://user:hunter2@192.0.2.19:7890"))
+
+        def no_session(**kwargs: object) -> object:
+            raise AssertionError("placeholder URL must not reach the network")
+
+        with patch.object(proxy_service, "proxy_settings", store), patch.object(
+            proxy_service, "create_cffi_session", no_session
+        ):
+            result = proxy_service.test_proxy("socks5h://[REDACTED]@10.0.0.9:7890")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("[REDACTED]", result["error"])
+        self.assertNotIn("hunter2", json.dumps(result, ensure_ascii=False))
+
+    def test_proxy_test_reports_unparseable_brackets_as_invalid(self) -> None:
+        # urlsplit 对读不懂的方括号直接抛 ValueError，此前一路冒成 500。
+        with patch.object(proxy_service, "proxy_settings", ProxySettingsStore(FakeConfig())):
+            result = proxy_service.test_proxy("http://user[@192.0.2.19:7890")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid proxy url")
 
     def test_concurrent_flaresolverr_refresh_uses_single_flight_per_proxy_and_host(self) -> None:
         runtime = make_runtime(

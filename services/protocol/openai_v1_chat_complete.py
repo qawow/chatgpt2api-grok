@@ -11,6 +11,7 @@ from services.protocol.conversation import (
     ImageOutput,
     collect_image_outputs,
     count_message_image_tokens,
+    count_message_text_tokens,
     count_text_tokens,
     encode_images,
     stream_image_outputs_with_pool,

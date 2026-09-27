@@ -306,6 +306,12 @@ class AccountService:
         if account.get("status") == "异常":
             has_refresh = bool(str(account.get("refresh_token") or "").strip())
             has_password = bool(str(account.get("password") or "").strip())
+            # refresh_access_token keeps password sign-in for session_only rows
+            # to 重新登录 and auto_relogin_after_refresh. Without the latter the
+            # watcher never uses the password, so counting it here re-probed
+            # every dead registered free account once per revoke cooldown.
+            if has_password and cls._is_session_only_account(account) and not config.auto_relogin_after_refresh:
+                has_password = False
             if has_refresh or has_password:
                 return False
             # 异常 + no OAuth refresh + no password: session cookie usually

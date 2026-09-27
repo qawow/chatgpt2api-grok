@@ -607,47 +607,20 @@ function AccountsPageContent() {
 
       const relogined = data.relogined ?? 0;
 
-      // 显示重新登录进度
-      if (relogined > 0) {
-        setProgress({
-          visible: true,
-          current: 0,
-          total: relogined,
-          message: `正在尝试对 ${relogined} 个账号进行移除异常状态`,
-          email: "",
-        });
-        // 模拟重新登录进度
-        let reCount = 0;
-        await new Promise<void>((resolve) => {
-          const timer = setInterval(() => {
-            reCount += 1;
-            if (reCount >= relogined) {
-              clearInterval(timer);
-              setProgress({
-                visible: true,
-                current: relogined,
-                total: relogined,
-                message: "移除异常状态完成",
-                email: "",
-              });
-              setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-              resolve();
-            } else {
-              setProgress((prev) => ({ ...prev, current: reCount }));
-            }
-          }, 150);
-          setTimeout(resolve, 2000);
-        });
-      } else {
-        setProgress({
-          visible: true,
-          current: total,
-          total,
-          message: "刷新完成",
-          email: "",
-        });
-        setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-      }
+      // The server starts these relogins as background threads with no
+      // progress feed. Say they were started rather than animating a made-up
+      // count (that timer also leaked once the 2 s fallback resolved first).
+      setProgress({
+        visible: true,
+        current: total,
+        total,
+        message: relogined > 0 ? `刷新完成，已在后台对 ${relogined} 个异常账号发起重新登录` : "刷新完成",
+        email: "",
+      });
+      setTimeout(
+        () => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }),
+        relogined > 0 ? 2000 : 800,
+      );
 
       if ((data.errors ?? []).length > 0) {
         const firstError = data.errors?.[0]?.error;

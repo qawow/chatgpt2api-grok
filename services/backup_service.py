@@ -19,6 +19,10 @@ from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup
 from services.image_storage_service import IMAGE_INDEX_FILE
 from services.image_tags_service import TAGS_FILE
 
+# First retry after a failed scheduled run; doubles per consecutive failure,
+# capped at the configured interval.
+_BACKUP_RETRY_BASE_SECS = 5 * 60
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -343,13 +347,21 @@ class BackupService:
         state = self.get_status()
         if state.get("running"):
             return
-        interval_minutes = int(settings.get("interval_minutes") or 360)
+        interval_secs = int(settings.get("interval_minutes") or 360) * 60
+        failures = int(state.get("consecutive_failures") or 0)
+        if state.get("last_status") == "error" and failures > 0:
+            # A failed run used to wait out the whole interval (6 h by default)
+            # like a successful one. Back off from 5 min instead, doubling per
+            # consecutive failure: quick recovery from a transient R2/network
+            # blip, without rebuilding a large archive every few minutes while
+            # the credentials stay broken.
+            interval_secs = min(interval_secs, _BACKUP_RETRY_BASE_SECS * 2 ** min(failures - 1, 16))
         last_finished_raw = _clean(state.get("last_finished_at"))
         if last_finished_raw:
             try:
                 last_finished = datetime.fromisoformat(last_finished_raw.replace("Z", "+00:00"))
                 elapsed = (_utc_now() - last_finished.astimezone(UTC)).total_seconds()
-                if elapsed < interval_minutes * 60:
+                if elapsed < interval_secs:
                     return
             except Exception:
                 pass
@@ -483,6 +495,7 @@ class BackupService:
                 "last_status": "idle",
                 "last_error": None,
                 "last_object_key": current.get("last_object_key"),
+                "consecutive_failures": current.get("consecutive_failures"),
             })
         try:
             result = self._run_backup_once(trigger=trigger)
@@ -492,6 +505,7 @@ class BackupService:
                 "last_status": "success",
                 "last_error": None,
                 "last_object_key": result["key"],
+                "consecutive_failures": 0,
             })
             return result
         except Exception as exc:
@@ -501,6 +515,7 @@ class BackupService:
                 "last_status": "error",
                 "last_error": str(exc) or exc.__class__.__name__,
                 "last_object_key": current.get("last_object_key"),
+                "consecutive_failures": int(current.get("consecutive_failures") or 0) + 1,
             })
             raise
         finally:
@@ -645,6 +660,11 @@ class BackupService:
                     "snapshots/auth_keys.json",
                     _json_bytes(config.get_storage_backend().load_auth_keys()),
                 )
+            if include.get("grok_accounts"):
+                self._add_file_to_archive(archive, config.grok_accounts_file, "data/grok_accounts.json")
+            if include.get("register"):
+                self._add_file_to_archive(archive, DATA_DIR / "gpt_register.env", "data/gpt_register.env")
+                self._add_file_to_archive(archive, DATA_DIR / "gpt_register_config.json", "data/gpt_register_config.json")
             if include.get("images"):
                 self._add_file_to_archive(archive, TAGS_FILE, "data/image_tags.json")
                 self._add_directory_to_archive(archive, config.images_dir, "data/images")

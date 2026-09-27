@@ -11,8 +11,11 @@ import time
 from services.storage.base import StorageBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "data"
-CONFIG_FILE = BASE_DIR / "config.json"
+# Both default to the checkout. The overrides move runtime state elsewhere: a
+# second instance, or the test suite, which must never write into a live data/
+# (it used to leave fixture images and log rows in the real gallery and logs).
+DATA_DIR = Path(os.environ.get("CHATGPT2API_DATA_DIR") or BASE_DIR / "data").expanduser()
+CONFIG_FILE = Path(os.environ.get("CHATGPT2API_CONFIG_FILE") or BASE_DIR / "config.json").expanduser()
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
@@ -22,6 +25,9 @@ DEFAULT_BACKUP_INCLUDE = {
     "image_tasks": True,
     "accounts_snapshot": True,
     "auth_keys_snapshot": True,
+    # docs/operations.md lists these under 至少备份; the archive used to skip them.
+    "grok_accounts": True,
+    "register": True,
     "images": False,
 }
 
@@ -177,6 +183,7 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
         "last_status": str(source.get("last_status") or "idle").strip() or "idle",
         "last_error": str(source.get("last_error") or "").strip() or None,
         "last_object_key": str(source.get("last_object_key") or "").strip() or None,
+        "consecutive_failures": _normalize_positive_int(source.get("consecutive_failures"), 0, 0),
     }
 
 
@@ -874,9 +881,9 @@ class ConfigStore:
         # stored value verbatim; get_proxy_settings() is what normalizes.
         proxy_value = data.get("proxy")
         if isinstance(proxy_value, str) and proxy_value.strip():
-            from services.proxy_service import _redact_url_credentials
+            from services.proxy_service import redact_proxy_url
 
-            data["proxy"] = _redact_url_credentials(proxy_value)
+            data["proxy"] = redact_proxy_url(proxy_value)
         data.pop("auth-key", None)
         return data
 
@@ -887,14 +894,14 @@ class ConfigStore:
         return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
 
     def get_public_proxy_runtime_settings(self) -> dict[str, object]:
-        from services.proxy_service import _redact_url_credentials
+        from services.proxy_service import redact_proxy_url
 
         runtime = copy.deepcopy(self.get_proxy_runtime_settings())
         # Redact credentials in proxy URLs (http://user:pass@host → http://[REDACTED]@host)
         for url_field in ("proxy_url", "resource_proxy_url"):
             val = str(runtime.get(url_field) or "").strip()
             if val:
-                runtime[url_field] = _redact_url_credentials(val)
+                runtime[url_field] = redact_proxy_url(val)
         clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
         if isinstance(clearance, dict):
             cf_cookies = str(clearance.get("cf_cookies") or "").strip()
@@ -906,7 +913,7 @@ class ConfigStore:
             # Redact FlareSolverr URL credentials too
             fs_url = str(clearance.get("flaresolverr_url") or "").strip()
             if fs_url:
-                clearance["flaresolverr_url"] = _redact_url_credentials(fs_url)
+                clearance["flaresolverr_url"] = redact_proxy_url(fs_url)
         return runtime
 
     def get_third_party_apps_settings(self) -> dict[str, object]:
@@ -990,7 +997,9 @@ class ConfigStore:
                 incoming_review.pop("has_api_key", None)
                 next_data["ai_review"] = incoming_review
         if "proxy" in next_data:
-            next_data["proxy"] = self._restore_redacted_url(next_data.get("proxy"), self.data.get("proxy"))
+            next_data["proxy"] = self._restore_redacted_url(
+                next_data.get("proxy"), self.data.get("proxy"), "全局代理"
+            )
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):
@@ -998,9 +1007,9 @@ class ConfigStore:
                 incoming_runtime = dict(incoming_runtime)
                 # These are redacted on the way out; put the stored value back
                 # when the client echoed the placeholder.
-                for url_field in ("proxy_url", "resource_proxy_url"):
+                for url_field, label in (("proxy_url", "清障代理 URL"), ("resource_proxy_url", "资源代理 URL")):
                     incoming_runtime[url_field] = self._restore_redacted_url(
-                        incoming_runtime.get(url_field), current_runtime.get(url_field)
+                        incoming_runtime.get(url_field), current_runtime.get(url_field), label
                     )
                 incoming_clearance = incoming_runtime.get("clearance")
                 previous_clearance = current_runtime.get("clearance")
@@ -1010,6 +1019,7 @@ class ConfigStore:
                         incoming_clearance["flaresolverr_url"] = self._restore_redacted_url(
                             incoming_clearance.get("flaresolverr_url"),
                             previous_clearance.get("flaresolverr_url"),
+                            "FlareSolverr URL",
                         )
                         incoming_runtime["clearance"] = incoming_clearance
                     incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
@@ -1054,18 +1064,19 @@ class ConfigStore:
         return out
 
     @staticmethod
-    def _restore_redacted_url(incoming: object, current: object) -> str:
+    def _restore_redacted_url(incoming: object, current: object, label: str) -> str:
         """Keep the stored URL when the client echoed back a redacted one.
 
         GET /api/settings returns ``scheme://[REDACTED]@host`` for credentialed
         URLs, and the settings page round-trips its whole config object on save.
         Without this, one save overwrites the real credentials with the
-        placeholder GET deliberately substituted.
+        placeholder GET deliberately substituted. An edited URL that still
+        carries the placeholder raises ValueError (400) instead of silently
+        reverting to the stored one.
         """
-        value = str(incoming or "").strip()
-        if value and "[REDACTED]@" in value:
-            return str(current or "").strip()
-        return value
+        from services.proxy_service import unredact_proxy_url
+
+        return unredact_proxy_url(incoming, [current], label)
 
     @staticmethod
     def _sanitize_secret_settings(settings: dict[str, object], keys: tuple[str, ...]) -> dict[str, object]:

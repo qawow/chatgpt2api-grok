@@ -75,6 +75,15 @@ class ImageContentPolicyError(RuntimeError):
     pass
 
 
+class ArkoseRequiredError(RuntimeError):
+    """chat-requirements asked for an Arkose challenge, which isn't implemented.
+
+    Upstream demands it by account / egress risk (fresh free accounts, flagged
+    IPs), so it condemns this attempt, not the token: callers move on to the
+    next account instead of failing the request or marking the account dead.
+    """
+
+
 @dataclass
 class ChatRequirements:
     """保存一次对话请求所需的 sentinel token。"""
@@ -760,36 +769,6 @@ class OpenAIBackendAPI:
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         }
-
-    def _build_requirements(self, data: Dict[str, Any], source_p: str = "") -> ChatRequirements:
-        """把 sentinel 响应整理成后续对话需要的 token 集合。"""
-        if (data.get("arkose") or {}).get("required"):
-            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
-
-        proof_token = ""
-        proof_info = data.get("proofofwork") or {}
-        if proof_info.get("required"):
-            proof_token = build_proof_token(
-                proof_info.get("seed", ""),
-                proof_info.get("difficulty", ""),
-                self.user_agent,
-                script_sources=self.pow_script_sources,
-                data_build=self.pow_data_build,
-                **self._pow_profile(),
-            )
-
-        turnstile_token = ""
-        turnstile_info = data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p) or ""
-
-        return ChatRequirements(
-            token=data.get("token", ""),
-            proof_token=proof_token,
-            turnstile_token=turnstile_token,
-            so_token=data.get("so_token", ""),
-            raw_finalize=data,
-        )
 
     def _conversation_headers(self, path: str, requirements: ChatRequirements) -> Dict[str, str]:
         """根据当前 requirements 构造对话 SSE 请求头。"""
@@ -2318,7 +2297,7 @@ class OpenAIBackendAPI:
         prepare_data = response.json()
 
         if (prepare_data.get("arkose") or {}).get("required"):
-            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
+            raise ArkoseRequiredError("chat requirements requires arkose token (arkose_required), which is not implemented")
 
         proof_token = ""
         proof_info = prepare_data.get("proofofwork") or {}

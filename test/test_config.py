@@ -1,29 +1,33 @@
-import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-ROOT_CONFIG_FILE = ROOT_DIR / "config.json"
-
-
 class ConfigLoadingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls._created_root_config = False
-        if not ROOT_CONFIG_FILE.exists():
-            ROOT_CONFIG_FILE.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
-            cls._created_root_config = True
-
+        # test/__init__.py already points CONFIG_FILE at a scratch path, so
+        # this no longer has to plant a config.json in the checkout.
         from services import config as config_module
 
         cls.config_module = config_module
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls._created_root_config and ROOT_CONFIG_FILE.exists():
-            ROOT_CONFIG_FILE.unlink()
+    def test_data_dir_and_config_file_follow_env_overrides(self) -> None:
+        """测试包靠这两个变量避开真实 data/；落回仓库目录就说明隔离失效了。"""
+        module = self.config_module
+        self.assertEqual(module.DATA_DIR, Path(os.environ["CHATGPT2API_DATA_DIR"]))
+        self.assertEqual(module.CONFIG_FILE, Path(os.environ["CHATGPT2API_CONFIG_FILE"]))
+        self.assertNotEqual(module.DATA_DIR, module.BASE_DIR / "data")
+
+    def test_singletons_write_under_the_overridden_data_dir(self) -> None:
+        from services.grok_account_service import GROK_ACCOUNTS_FILE
+        from services.image_storage_service import IMAGE_INDEX_FILE
+        from services.log_service import log_service
+
+        data_dir = self.config_module.DATA_DIR
+        for path in (log_service.path, IMAGE_INDEX_FILE, GROK_ACCOUNTS_FILE, self.config_module.config.images_dir):
+            self.assertTrue(Path(path).is_relative_to(data_dir), path)
 
     def test_load_settings_ignores_directory_config_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

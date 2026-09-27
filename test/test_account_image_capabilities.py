@@ -733,6 +733,28 @@ class AccountCapabilityTests(unittest.TestCase):
             )
             self.assertIn(jwt, service.list_normal_tokens())
 
+    def test_dead_session_only_password_counts_only_with_auto_relogin(self) -> None:
+        """巡检只在开了 auto_relogin_after_refresh 时才会用密码重登 session_only 号；
+        否则把密码当恢复手段，会让每个注册来的死号每过一轮吊销冷却就被白探一次。"""
+        expired = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        dead = {
+            "access_token": "dead-registered",
+            "status": "异常",
+            "type": "free",
+            "session_token": "sess",
+            "email": "a@example.com",
+            "password": "pw",
+            "last_token_refresh_error": "无可用续期手段",
+            "last_token_refresh_error_at": expired,
+        }
+        self.assertFalse(AccountService._revoked_cooldown_active(dead))
+        with patch.dict(config.data, {"auto_relogin_after_refresh": False}):
+            self.assertTrue(AccountService._should_skip_periodic_refresh(dead))
+            oauth = {**dead, "refresh_token": "rt"}
+            self.assertFalse(AccountService._should_skip_periodic_refresh(oauth))
+        with patch.dict(config.data, {"auto_relogin_after_refresh": True}):
+            self.assertFalse(AccountService._should_skip_periodic_refresh(dead))
+
     def test_revoked_cooldown_blocks_recover_and_refresh_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
@@ -870,13 +892,20 @@ class AccountCapabilityTests(unittest.TestCase):
                     },
                 ]
             )
-            abnormal = service.list_abnormal_tokens()
+            with patch.dict(config.data, {"auto_relogin_after_refresh": True}):
+                abnormal = service.list_abnormal_tokens()
             self.assertIn("plus-abnormal", abnormal)
             self.assertIn("free-abnormal-password", abnormal)
             # session-only free without refresh_token is NOT recoverable
             self.assertNotIn("free-abnormal-session", abnormal)
             # 禁用 is never a candidate
             self.assertNotIn("disabled", abnormal)
+            # Without auto relogin the watcher never uses the password of a
+            # refresh-token-less account, so probing it recovers nothing.
+            with patch.dict(config.data, {"auto_relogin_after_refresh": False}):
+                abnormal = service.list_abnormal_tokens()
+            self.assertIn("plus-abnormal", abnormal)
+            self.assertNotIn("free-abnormal-password", abnormal)
 
     def test_list_abnormal_tokens_excludes_revoked_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

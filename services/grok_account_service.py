@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -16,8 +17,11 @@ from services.grok_backend_api import (
     refresh_access_token,
 )
 
-# Keep path independent of config import side-effects (storage backends etc.)
-_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+# Keep path independent of config import side-effects (storage backends etc.);
+# honors the same CHATGPT2API_DATA_DIR override as services.config.
+_DATA_DIR = Path(
+    os.environ.get("CHATGPT2API_DATA_DIR") or Path(__file__).resolve().parents[1] / "data"
+).expanduser()
 GROK_ACCOUNTS_FILE = _DATA_DIR / "grok_accounts.json"
 
 

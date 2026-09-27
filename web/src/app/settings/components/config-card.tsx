@@ -117,6 +117,11 @@ export function ConfigCard() {
             <p className="text-xs leading-5 text-stone-500">
               留空表示不使用代理。支持协议://账号:密码@主机:端口，也可直接粘贴代理商的 主机:端口:账号:密码；示例 http://user:pass@127.0.0.1:7890、127.0.0.1:7890:user:pass。账号密码含 @/: 等特殊字符时需 URL 编码。
             </p>
+            {String(config?.proxy || "").includes("[REDACTED]") ? (
+              <p className="text-xs leading-5 text-amber-700">
+                已保存的账号密码不回显，以 [REDACTED] 代替；原样保存或测试会沿用已保存的凭据，修改地址时请重新填写完整的账号密码。
+              </p>
+            ) : null}
             {proxyTestResult ? (
               <div
                 className={`rounded-xl border px-3 py-2 text-xs leading-6 ${

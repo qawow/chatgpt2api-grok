@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.10 - 2026-09-28
+
++ [修复] 全局代理保存后「测试代理」必定失败：1.8.9 起设置页只拿得到脱敏后的 `socks5h://[REDACTED]@主机:端口`，测试时把它原样当成账号密码去连，Python 3.13 的 URL 解析还会因方括号直接抛错（接口 500）。现在测试会把脱敏占位换回已保存的真实凭据；保存时若改了主机或端口却仍保留 `[REDACTED]`，返回明确的 400 提示，不再悄悄沿用旧地址。设置页 `主机:端口:账号:密码` 简写此前绕过了脱敏、明文回传，一并修正。已保存的凭据一直完好，运行时读取的也始终是真实值。
++ [修复] 上游对高风险账号 / 出口要求 Arkose 验证时抛裸 `RuntimeError`，第一个号就整单失败、不换号。现视为该号本次不可用：按普通失败结算（不标异常、不删号）并换下一个号，全部账号都被要求时返回 503 `upstream_arkose_required`。
++ [修复] 巡检每小时白探一次「异常 + 有密码」的 session_only 死号：未开 `auto_relogin_after_refresh` 时巡检根本不会用密码重登这类号，却把密码算作可恢复手段。手动「检测」不受影响。
++ [修复] 备份包补上 `docs/operations.md`「至少备份」里列出却一直漏掉的 Grok 号池（`data/grok_accounts.json`）与注册机密钥 / 表单（`data/gpt_register.env`、`data/gpt_register_config.json`），设置页可分别关闭。定时备份失败后不再像成功一样等满整个周期（默认 6 小时），改为 5 分钟起按连续失败次数翻倍重试，封顶为备份周期。
++ [新增] `CHATGPT2API_DATA_DIR` / `CHATGPT2API_CONFIG_FILE` 可把数据目录与配置文件指到别处（默认不变）。
++ [调整] 账号页「刷新」后不再用假的进度动画冒充重新登录进度（重登在服务端后台线程执行，并无进度可查；该动画的定时器还会泄漏），改为提示已在后台发起的重登数量。
++ [清理] 删除 `openai_v1_response.py` 里 1.8.0 移除搜索 / 文本接口后残留的孤儿函数（引用了已不存在的符号，误调即 `NameError`）与 `openai_backend_api.py` 中不可达的 `_build_requirements`；`openai_v1_chat_complete.py` 补上缺失的 `count_message_text_tokens` 导入。
++ [测试] 测试套件不再写入仓库里正在使用的 `data/`：此前每跑一次都会往真实图库存一张测试图片、往日志追加约 110 条假记录，并虚增「累计入库」计数。`test/__init__.py` 现在把数据目录和配置文件指向临时目录。
+
 ## 1.8.9 - 2026-09-28
 
 + [新增] 非官方豆包网页生图：`POST /v1/doubao`、`GET /v1/doubao/status`。上游 `POST www.doubao.com/chat/completion`（`aid=497858`，`skill_type=4` ImageGeneration）。需要登录 Cookie；人机验证走请求 `captcha`、`solve_url` 或 Capsolver/2Captcha/YesCaptcha。可选透传 `a_bogus`。`POST /v1/images/generations` 且 `model=doubao*` 走同一后端。文档 `docs/doubao.md`。

@@ -21,7 +21,7 @@ from services.config import ConfigStore
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 
-PROXY_URL = "socks5h://ob:hunter2@192.168.2.19:7890"
+PROXY_URL = "socks5h://user:hunter2@192.0.2.19:7890"
 AI_REVIEW_KEY = "sk-review-plaintext"
 
 
@@ -44,7 +44,7 @@ class SettingsRedactionTests(unittest.TestCase):
     def test_get_redacts_legacy_proxy_credentials(self) -> None:
         store, _ = _store()
         self.assertNotIn("hunter2", json.dumps(store.get()))
-        self.assertEqual(store.get()["proxy"], "socks5h://[REDACTED]@192.168.2.19:7890")
+        self.assertEqual(store.get()["proxy"], "socks5h://[REDACTED]@192.0.2.19:7890")
 
     def test_get_masks_ai_review_api_key(self) -> None:
         store, _ = _store()
@@ -66,6 +66,32 @@ class SettingsRedactionTests(unittest.TestCase):
         raw = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(raw["proxy"], PROXY_URL)
         self.assertEqual(raw["ai_review"]["api_key"], AI_REVIEW_KEY)
+
+    def test_editing_around_redacted_credentials_is_rejected(self) -> None:
+        """改了主机却留着 [REDACTED]：此前会静默换回原地址，修改直接丢失。"""
+        store, path = _store()
+        with self.assertRaisesRegex(ValueError, "全局代理"):
+            store.update({"proxy": "socks5h://[REDACTED]@10.0.0.9:7890"})
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["proxy"], PROXY_URL)
+
+    def test_runtime_proxy_edit_with_placeholder_names_the_field(self) -> None:
+        store, _ = _store(proxy_runtime={"proxy_url": "http://user:hunter2@10.0.0.1:8118"})
+        runtime = store.get()["proxy_runtime"]
+        self.assertEqual(runtime["proxy_url"], "http://[REDACTED]@10.0.0.1:8118")
+        runtime["proxy_url"] = "http://[REDACTED]@10.0.0.2:8118"
+        with self.assertRaisesRegex(ValueError, "清障代理 URL"):
+            store.update({"proxy_runtime": runtime})
+
+    def test_colon_shorthand_proxy_is_redacted_and_round_trips(self) -> None:
+        """设置页推荐的 主机:端口:账号:密码 写法此前绕过了 URL 脱敏，明文回传。"""
+        shorthand = "192.0.2.19:7890:user:hunter2"
+        store, path = _store(proxy=shorthand)
+        self.assertEqual(store.get()["proxy"], "http://[REDACTED]@192.0.2.19:7890")
+        self.assertNotIn("hunter2", json.dumps(store.get()))
+        store.update(dict(store.get()))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["proxy"], shorthand)
 
     def test_env_only_secrets_are_not_persisted(self) -> None:
         env = {

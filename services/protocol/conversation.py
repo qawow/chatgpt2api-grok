@@ -15,7 +15,12 @@ from services.account_service import AccountService, account_service
 from services.image_task_control import ImageTaskControl
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    ArkoseRequiredError,
+    ImageContentPolicyError,
+    ImagePollTimeoutError,
+    OpenAIBackendAPI,
+)
 from services.proxy_service import proxy_settings
 from utils.helper import (
     IMAGE_MODELS,
@@ -1770,6 +1775,30 @@ def _generate_single_image_impl(
             return outputs
         except ImageResultSettlementError:
             raise
+        except ArkoseRequiredError as exc:
+            # A risk verdict on this account/egress, not a dead token: it used
+            # to fall through to the generic branch and fail the request on the
+            # first account. Settle it as a plain failure (no invalidation) and
+            # let the next account try.
+            error_text = str(exc)
+            logger.warning({
+                "event": "image_arkose_required",
+                "request_token": token,
+                "account_email": account_email,
+                "proxy_source": state["current_proxy_source"],
+                "index": index,
+            })
+            lease.finish(False)
+            exclude_account(token, error_text)
+            if len(state["failed_connection_tokens"]) < MAX_CONNECTION_ACCOUNT_RETRIES:
+                continue
+            raise ImageGenerationError(
+                "Upstream demanded an Arkose challenge from every account tried; "
+                "please retry later or switch the egress IP.",
+                status_code=503,
+                code="upstream_arkose_required",
+                account_email=account_email,
+            ) from exc
         except ImagePollTimeoutError as exc:
             if account_email:
                 setattr(exc, "account_email", account_email)

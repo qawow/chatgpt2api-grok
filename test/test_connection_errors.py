@@ -750,3 +750,103 @@ class ImageFailoverRegressionTests(unittest.TestCase):
         self.assertEqual(created, ["token-a"])
         self.assertEqual(outputs[-1].kind, "result")
         self.assertEqual(outputs[-1].data[0]["url"], "http://example.test/ok.png")
+
+
+class ArkoseFailoverTests(unittest.TestCase):
+    """上游对高风险号/出口要求 arkose 时，此前抛裸 RuntimeError：不换号直接整单失败。"""
+
+    def test_prepare_demanding_arkose_raises_typed_error(self) -> None:
+        from services import openai_backend_api as mod
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            def json(self) -> dict:
+                return {"arkose": {"required": True, "dx": "x"}, "proofofwork": {"required": False}}
+
+        backend = mod.OpenAIBackendAPI.__new__(mod.OpenAIBackendAPI)
+        backend.access_token = "token-a"
+        backend.base_url = "https://chatgpt.example"
+        backend.user_agent = "ua"
+        backend.pow_script_sources = []
+        backend.pow_data_build = ""
+        backend.session = type("Session", (), {"post": lambda self, *args, **kwargs: Response()})()
+        with (
+            patch.object(mod, "build_legacy_requirements_token", return_value="p"),
+            patch.object(mod.OpenAIBackendAPI, "_headers", lambda self, path, extra=None: {}),
+            patch.object(mod.OpenAIBackendAPI, "_persist_session_cookie", lambda self: None),
+            patch.object(mod.OpenAIBackendAPI, "_pow_profile", lambda self: {}),
+        ):
+            with self.assertRaises(mod.ArkoseRequiredError):
+                backend._fetch_chat_requirements()
+
+    def _run(self, arkose_tokens: set[str]):
+        from services.openai_backend_api import ArkoseRequiredError
+
+        created: list[str] = []
+
+        class FakeBackend:
+            def __init__(self, access_token: str = "", *, force_proxy: str | None = None) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+                created.append(access_token)
+
+            def close(self) -> None:
+                return None
+
+        def fake_stream(backend, request, index, total):
+            if backend.access_token in arkose_tokens:
+                raise ArkoseRequiredError("chat requirements requires arkose token (arkose_required)")
+            yield ImageOutput(
+                kind="result", model=request.model, index=index, total=total,
+                data=[{"url": "http://example.test/ok.png"}],
+            )
+
+        def get_token(**kwargs):
+            excluded = kwargs.get("excluded_tokens") or set()
+            for token in ("token-a", "token-b", "token-c"):
+                if token not in excluded:
+                    return token
+            return ""
+
+        with (
+            patch("services.protocol.conversation.account_service") as accounts,
+            patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            patch(
+                "services.protocol.conversation.proxy_settings.list_egress_candidates",
+                return_value=[("global", "socks5h://live.example:1080")],
+            ),
+        ):
+            accounts.get_available_access_token.side_effect = get_token
+            accounts.get_account.side_effect = lambda token: {"email": f"{token}@example.com"}
+            try:
+                outputs = _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="cat"), 1, 1)
+                error = None
+            except ImageGenerationError as exc:
+                outputs, error = [], exc
+        return created, outputs, error, accounts
+
+    def test_arkose_switches_account_without_invalidating_it(self) -> None:
+        created, outputs, error, accounts = self._run({"token-a"})
+
+        self.assertIsNone(error)
+        self.assertEqual(created, ["token-a", "token-b"])
+        self.assertEqual(outputs[-1].data[0]["url"], "http://example.test/ok.png")
+        # 风控判定不是废 token：不刷新、不删号，只按一次普通失败结算
+        accounts.remove_invalid_token.assert_not_called()
+        accounts.refresh_access_token.assert_not_called()
+        accounts.mark_image_result.assert_any_call("token-a", False, release_slot=False)
+
+    def test_arkose_on_every_account_reports_it_plainly(self) -> None:
+        from services.config import config
+
+        with patch.dict(config.data, {"image_account_failover_retries": 2}):
+            created, _outputs, error, accounts = self._run({"token-a", "token-b", "token-c"})
+
+        self.assertEqual(created, ["token-a", "token-b"])
+        self.assertIsNotNone(error)
+        self.assertEqual(error.code, "upstream_arkose_required")
+        self.assertEqual(error.status_code, 503)
+        accounts.remove_invalid_token.assert_not_called()

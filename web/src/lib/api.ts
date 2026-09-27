@@ -219,6 +219,8 @@ export type BackupInclude = {
   image_tasks: boolean;
   accounts_snapshot: boolean;
   auth_keys_snapshot: boolean;
+  grok_accounts: boolean;
+  register: boolean;
   images: boolean;
 };
 
