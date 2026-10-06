@@ -433,11 +433,21 @@ class ProxySettingsStore:
         skipped = {normalize_proxy_url(item) for item in (skip_proxy_urls or set())}
         last_error: Exception | None = None
         request_headers = dict(headers or {})
+        # One scalar budget across all candidates: a slow-but-dead primary must
+        # not multiply the caller's worst-case latency by the candidate count.
+        deadline = time.monotonic() + float(timeout) if timeout and float(timeout) > 0 else None
         for _source, proxy_url in self.list_egress_candidates(
             account=account, resource=resource, upstream=upstream
         ):
             if proxy_url in skipped:
                 continue
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                attempt_timeout = remaining
+            else:
+                attempt_timeout = timeout
             session = create_cffi_session(
                 **self.build_session_kwargs(
                     account=account,
@@ -454,7 +464,7 @@ class ProxySettingsStore:
                         lambda target: session.get(
                             target,
                             headers=request_headers,
-                            timeout=timeout,
+                            timeout=attempt_timeout,
                             allow_redirects=False,
                         ),
                         url,
@@ -463,7 +473,7 @@ class ProxySettingsStore:
                     response = session.get(
                         url,
                         headers=request_headers,
-                        timeout=timeout,
+                        timeout=attempt_timeout,
                         allow_redirects=True,
                     )
                 return FetchedResponse(

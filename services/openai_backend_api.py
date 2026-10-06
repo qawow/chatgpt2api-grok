@@ -1411,7 +1411,7 @@ class OpenAIBackendAPI:
                 self.base_url + path,
                 headers=self._codex_responses_headers(),
                 json=payload,
-                timeout=1200,
+                timeout=self._request_timeout(1200),
             )
             if response.status_code >= 400:
                 body_text = response.text or ""
@@ -1593,7 +1593,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=300,
+            timeout=self._request_timeout(300),
             stream=True,
         )
         ensure_ok(response, path)
@@ -2407,7 +2407,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
             json=payload,
-            timeout=300,
+            timeout=self._request_timeout(300),
             stream=True,
         )
         ensure_ok(response, path)

@@ -694,5 +694,84 @@ class ProxyServiceTests(unittest.TestCase):
         self.assertIsNotNone(results[0])
 
 
+class EgressFallbackBudgetTests(unittest.TestCase):
+    def test_budget_is_shared_across_candidates(self) -> None:
+        from unittest import mock
+
+        store = ProxySettingsStore(FakeConfig())
+        clock = {"t": 100.0}
+
+        class FakeTime:
+            def monotonic(self):
+                return clock["t"]
+
+            def time(self):
+                return clock["t"]
+
+        sessions = []
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                sessions.append(self)
+
+            def get(self, url, **kwargs):
+                clock["t"] += 61.0  # first attempt consumes the whole budget
+                raise OSError("connection refused")
+
+            def close(self):
+                pass
+
+        candidates = [("primary", "socks5h://p.example:1080"), ("direct", "")]
+        with mock.patch.object(store, "list_egress_candidates", return_value=candidates), \
+                mock.patch("services.proxy_service.create_cffi_session", FakeSession), \
+                mock.patch("services.proxy_service.time", FakeTime()):
+            with self.assertRaises(OSError):
+                store.get_with_egress_fallback("https://example.invalid", timeout=60)
+
+        self.assertEqual(len(sessions), 1)
+
+    def test_remaining_budget_passes_shrinking_timeout(self) -> None:
+        from unittest import mock
+
+        store = ProxySettingsStore(FakeConfig())
+        clock = {"t": 100.0}
+
+        class FakeTime:
+            def monotonic(self):
+                return clock["t"]
+
+            def time(self):
+                return clock["t"]
+
+        seen = []
+
+        class FakeResp:
+            content = b"ok"
+            status_code = 200
+            headers: dict = {}
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                pass
+
+            def get(self, url, timeout=0, **kwargs):
+                seen.append(timeout)
+                if len(seen) == 1:
+                    clock["t"] += 10.0  # first candidate eats 10s then dies
+                    raise OSError("connection refused")
+                return FakeResp()
+
+            def close(self):
+                pass
+
+        candidates = [("primary", "socks5h://p.example:1080"), ("direct", "")]
+        with mock.patch.object(store, "list_egress_candidates", return_value=candidates), \
+                mock.patch("services.proxy_service.create_cffi_session", FakeSession), \
+                mock.patch("services.proxy_service.time", FakeTime()):
+            store.get_with_egress_fallback("https://example.invalid", timeout=60)
+
+        self.assertEqual(seen, [60, 50])
+
+
 if __name__ == "__main__":
     unittest.main()

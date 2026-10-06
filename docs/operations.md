@@ -52,7 +52,8 @@ docker compose -f docker-compose.warp.yml up -d --build
 ### 账号隔离（ChatGPT 号池内）
 
 - 账号字段 `proxy` 有值时，刷新 / 生图 / 探活**只走该出口**，不再回落 runtime / 全局 / 直连（对齐 CPA / [codex2api](https://github.com/james-6-23/codex2api)）。
-- 未绑定代理的号仍按 runtime → 全局 → 直连回退；死 SOCKS 会跳过已拉黑出口。
+- 未绑定代理的号仍按 runtime → 全局 → 直连回退；死 SOCKS 会跳过已拉黑出口；`get_with_egress_fallback` 类单次抓取在全部候选间共享一个超时预算，最坏延迟不随候选数放大。
+- 流式响应（SSE）的标量超时只覆盖建连+响应头：正文读取由 libcurl 低速中止保护（低于 1 字节/秒持续 30–180 秒即断开），黑洞出口不再永久挂死读取线程；codex 响应等长超时请求随任务剩余预算收缩。
 - 注册默认 `bind_register_proxy=true`：入库时把注册代理写到账号。多个号绑同一 SOCKS **仍是同一出口 IP**；真要一号一 IP，给注册机配多出口代理池。
 - 设备指纹（`oai-device-id` / UA / impersonate）按号写入并复用；token 刷新锁、Cloudflare clearance 按号拆开。
 - `session_only`（无 `refresh_token`）**可以生图**。`chat_requirements_prepare` 401 不当 hard revoke、不清零剩余额度、不自动删号。

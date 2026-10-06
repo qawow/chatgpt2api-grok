@@ -205,3 +205,62 @@ class CurlTlsHelperTests(unittest.TestCase):
             session.close()
 
         self.assertEqual(len(inner.get.call_args_list), 6)
+
+    def test_stream_call_sets_low_speed_idle_guard(self) -> None:
+        from curl_cffi.const import CurlOpt
+
+        inner = MagicMock()
+        inner.get.return_value = "ok"
+        with patch("curl_cffi.requests.Session", return_value=inner):
+            session = create_cffi_session(proxy="")
+            self.assertEqual(session.get("https://example.invalid", stream=True, timeout=60), "ok")
+            session.close()
+
+        set_calls = [call.args for call in inner.curl.setopt.call_args_list if call.args]
+        self.assertTrue(any(c[0] == CurlOpt.LOW_SPEED_LIMIT and c[1] == 1 for c in set_calls))
+        self.assertTrue(any(c[0] == CurlOpt.LOW_SPEED_TIME and c[1] == 60.0 for c in set_calls))
+
+    def test_stream_idle_guard_window_is_clamped(self) -> None:
+        from curl_cffi.const import CurlOpt
+
+        for timeout, expected in ((300, 180.0), (5, 30.0), (None, 180.0)):
+            inner = MagicMock()
+            inner.get.return_value = "ok"
+            with patch("curl_cffi.requests.Session", return_value=inner):
+                session = create_cffi_session(proxy="")
+                session.get("https://example.invalid", stream=True, timeout=timeout)
+                session.close()
+            windows = [
+                c[1] for c in (call.args for call in inner.curl.setopt.call_args_list if call.args)
+                if c[0] == CurlOpt.LOW_SPEED_TIME
+            ]
+            self.assertEqual(windows, [expected], f"timeout={timeout}")
+
+    def test_non_stream_call_skips_idle_guard(self) -> None:
+        inner = MagicMock()
+        inner.get.return_value = "ok"
+        with patch("curl_cffi.requests.Session", return_value=inner):
+            session = create_cffi_session(proxy="")
+            session.get("https://example.invalid", timeout=60)
+            session.close()
+        inner.curl.setopt.assert_not_called()
+
+
+class RequestTimeoutBudgetTests(unittest.TestCase):
+    """_request_timeout locks the scalar-request budget to the task deadline."""
+
+    def test_timeout_is_bounded_by_task_control(self) -> None:
+        from types import SimpleNamespace
+
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.task_control = SimpleNamespace(remaining=lambda maximum: 42.0)
+        self.assertEqual(backend._request_timeout(1200), 42.0)
+
+    def test_timeout_defaults_to_maximum_without_control(self) -> None:
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.task_control = None
+        self.assertEqual(backend._request_timeout(300), 300)

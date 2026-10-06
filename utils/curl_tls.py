@@ -100,6 +100,32 @@ def create_cffi_session(**session_kwargs: Any):
     return _TlsLibraryFallbackSession(Session, chain, kwargs, prefer_http11=prefer_http11)
 
 
+def _apply_stream_idle_guard(inner: Any, timeout: Any) -> None:
+    """Low-speed abort for streamed bodies.
+
+    Verified empirically: curl_cffi's scalar ``timeout`` on a streamed call
+    only bounds connect + response headers; body reads are unbounded, so a
+    black-holed egress that already sent its headers hangs the reader thread
+    forever (task watchdogs can only mark the task failed — the socket read
+    stays blocked). libcurl's low-speed abort kills a transfer trickling below
+    1 byte/sec for the window below.
+    """
+    curl = getattr(inner, "curl", None)
+    if curl is None:
+        return
+    try:
+        from curl_cffi.const import CurlOpt
+    except Exception:
+        return
+    window = timeout if isinstance(timeout, (int, float)) and timeout > 0 else 180.0
+    window = min(180.0, max(30.0, float(window)))
+    try:
+        curl.setopt(CurlOpt.LOW_SPEED_LIMIT, 1)
+        curl.setopt(CurlOpt.LOW_SPEED_TIME, window)
+    except Exception:
+        pass
+
+
 class _TlsLibraryFallbackSession:
     def __init__(
         self,
@@ -191,6 +217,8 @@ class _TlsLibraryFallbackSession:
                 call_kwargs["timeout"] = remaining
             if self._http11:
                 call_kwargs.setdefault("http_version", _http11_constant())
+            if kwargs.get("stream"):
+                _apply_stream_idle_guard(self._inner, call_kwargs.get("timeout"))
             try:
                 result = getattr(self._inner, name)(*args, **call_kwargs)
                 self._openssl_retries = 0
