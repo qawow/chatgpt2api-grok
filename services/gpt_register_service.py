@@ -717,7 +717,9 @@ class GptRegisterService:
         # Image picker signals empty pool here; the replenish watcher sleeps on
         # it to react in seconds instead of waiting out the poll interval.
         self._pool_pressure = threading.Event()
-        self._pool_pressure_at = 0.0
+        # -inf, not 0: time.monotonic() is near zero on a freshly booted VM,
+        # and a 0 baseline would swallow the very first pressure notify.
+        self._pool_pressure_at = float("-inf")
         self._load_jobs()
 
     def notify_pool_pressure(self) -> None:
