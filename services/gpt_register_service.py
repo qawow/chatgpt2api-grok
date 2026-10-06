@@ -1117,6 +1117,11 @@ class GptRegisterService:
                 level="warn",
             )
             concurrency = len(proxy_pool)
+        # Batches rotate by index but always started at pool[0]; a per-job
+        # random start spreads successive batches across a multi-gateway pool.
+        pool_offset = random.randrange(len(proxy_pool)) if proxy_pool else 0
+        if proxy_pool and pool_offset:
+            self._append_log(job_id, f"代理池随机起点 {pool_offset}")
         success = failed = added = completed = 0
         items: list[dict[str, Any]] = []
         t0 = time.time()
@@ -1163,10 +1168,10 @@ class GptRegisterService:
             per_settings = dict(settings)
             if proxy_pool:
                 # count=1 (auto-replenish) always runs index 1: strict round-robin
-                # would pin every replenish registration to pool[0]. Same reasoning
-                # as the domain pool above; batches keep index rotation.
+                # would pin every replenish registration to pool[0]. Batches keep
+                # index rotation but start at the per-job random offset above.
                 per_settings["proxy"] = (
-                    random.choice(proxy_pool) if total == 1 else pick_proxy(proxy_pool, index)
+                    random.choice(proxy_pool) if total == 1 else pick_proxy(proxy_pool, index + pool_offset)
                 )
             if domain_pool:
                 # random, not index round-robin: auto-replenish jobs are count=1

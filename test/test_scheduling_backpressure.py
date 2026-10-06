@@ -390,5 +390,62 @@ class PlanSplitTests(unittest.TestCase):
             self.assertEqual(counts.get("free"), 1)
 
 
+class TextImageBusyPreferenceTests(unittest.TestCase):
+    def test_text_picker_avoids_image_busy_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir, [
+                {"access_token": "t1", "status": "正常", "quota": 1, "session_token": "s"},
+                {"access_token": "t2", "status": "正常", "quota": 1, "session_token": "s"},
+            ])
+            with service._image_slot_condition:
+                service._image_inflight["t1"] = [time.monotonic() + 300]
+            with mock.patch.object(service, "refresh_access_token", side_effect=lambda t, **kw: t):
+                picks = {service.get_text_access_token() for _ in range(6)}
+            self.assertEqual(picks, {"t2"})
+
+    def test_text_picker_falls_back_when_all_image_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir, [
+                {"access_token": "t1", "status": "正常", "quota": 1, "session_token": "s"},
+                {"access_token": "t2", "status": "正常", "quota": 1, "session_token": "s"},
+            ])
+            with service._image_slot_condition:
+                service._image_inflight["t1"] = [time.monotonic() + 300]
+                service._image_inflight["t2"] = [time.monotonic() + 300]
+            with mock.patch.object(service, "refresh_access_token", side_effect=lambda t, **kw: t):
+                picks = {service.get_text_access_token() for _ in range(6)}
+            self.assertEqual(picks, {"t1", "t2"})
+
+
+class LeaseBoundsTests(unittest.TestCase):
+    def test_lease_outlives_large_task_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir, [])
+            with mock.patch.object(type(config), "image_task_timeout_secs", new_callable=PropertyMock, return_value=3600.0):
+                self.assertEqual(service._image_lease_secs(), 7200.0)
+            with mock.patch.object(type(config), "image_task_timeout_secs", new_callable=PropertyMock, return_value=600.0):
+                self.assertEqual(service._image_lease_secs(), 1200.0)
+
+
+class BusyHeadersTests(unittest.TestCase):
+    def test_upstream_busy_response_carries_retry_after(self) -> None:
+        from services.log_service import _image_error_response
+        from services.protocol.conversation import ImageGenerationError
+
+        exc = ImageGenerationError(
+            "image picker wait budget exhausted: account slots are busy, retry shortly",
+            status_code=429, error_type="rate_limit_exceeded", code="upstream_busy",
+            headers={"Retry-After": "30"},
+        )
+        resp = _image_error_response(exc)
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.headers.get("Retry-After"), "30")
+        self.assertIn("upstream_busy", str(resp.body, encoding="utf-8"))
+
+        plain = ImageGenerationError("boom", status_code=502)
+        resp2 = _image_error_response(plain)
+        self.assertNotIn("retry-after", resp2.headers)
+
+
 if __name__ == "__main__":
     unittest.main()

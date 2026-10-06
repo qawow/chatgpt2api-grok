@@ -1740,7 +1740,9 @@ class AccountService:
         return tokens
 
     _IMAGE_LEASE_MIN_SECS = 120.0
-    _IMAGE_LEASE_MAX_SECS = 1800.0
+    # 2× the largest sane image_task_timeout_secs (3600): a lease that expires
+    # mid-generation would let the picker oversubscribe a still-running token.
+    _IMAGE_LEASE_MAX_SECS = 7200.0
 
     def _image_lease_secs(self) -> float:
         """A lease must outlive any legitimate generation, then die with its worker."""
@@ -2341,6 +2343,13 @@ class AccountService:
                 fresh = [t for t in pool if not self._text_penalty_active_locked(t)]
                 if fresh:
                     pool = fresh
+            if len(pool) > 1:
+                # Prefer credentials not currently running an image generation:
+                # text+image on one account is a known upstream 429 source.
+                # Preference only — a fully busy pool still serves text.
+                idle = [t for t in pool if self._image_inflight_count_locked(t) == 0]
+                if idle:
+                    pool = idle
             access_token = pool[self._index % len(pool)]
             self._index += 1
         # Only force refresh when token is near expiry / the account hit a hard

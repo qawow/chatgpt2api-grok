@@ -46,6 +46,7 @@ class ImageGenerationError(Exception):
         param: str | None = None,
         account_email: str = "",
         conversation_id: str = "",
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -54,6 +55,7 @@ class ImageGenerationError(Exception):
         self.param = param
         self.account_email = account_email
         self.conversation_id = conversation_id
+        self.headers = headers
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -1680,12 +1682,17 @@ def _generate_single_image_impl(
             message = str(exc) or "image generation failed"
             if state["failed_connection_tokens"] and state["last_connection_error"]:
                 last_message = image_stream_error_message(str(state["last_connection_error"]))
-                message = f"{message}; last attempt: {last_message}" if unavailable else last_message
+                if unavailable:
+                    message = f"{message}; last attempt: {last_message}"
+                elif not busy:
+                    # busy keeps the wait-budget explanation: it says why 429
+                    message = last_message
             raise ImageGenerationError(
                 message, account_email=account_email,
                 status_code=429 if (unavailable or busy) else 502,
                 error_type="insufficient_quota" if unavailable else ("rate_limit_exceeded" if busy else "server_error"),
                 code="insufficient_quota" if unavailable else ("upstream_busy" if busy else "upstream_error"),
+                headers={"Retry-After": "30"} if busy else None,
             ) from exc
 
         # The slot picker may have waited behind another request while the

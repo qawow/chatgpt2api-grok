@@ -528,7 +528,11 @@ def _image_error_response(exc: Exception) -> JSONResponse:
             429,
         )
     if hasattr(exc, "to_openai_error") and hasattr(exc, "status_code"):
-        return JSONResponse(status_code=int(exc.status_code), content=exc.to_openai_error())
+        return JSONResponse(
+            status_code=int(exc.status_code),
+            content=exc.to_openai_error(),
+            headers=getattr(exc, "headers", None),
+        )
     return openai_error_response(message, 502)
 
 
