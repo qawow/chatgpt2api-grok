@@ -1839,7 +1839,9 @@ class AccountService:
             my_ticket = self._slot_ticket
             waiter = {
                 "ticket": my_ticket,
-                "excluded": excluded_tokens,
+                # Snapshot: juniors copy this set while computing forbidden;
+                # a live caller-owned set could be mutated concurrently.
+                "excluded": set(excluded_tokens or set()),
                 "plan_type": plan_type,
                 "source_type": source_type,
                 "plan_types": plan_types,
@@ -1922,7 +1924,6 @@ class AccountService:
     ) -> list[dict]:
         """First-failing filter per account, mirroring the pick conditions. Caller holds the lock."""
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
-        now = time.time()
         out: list[dict] = []
         for item in self._accounts.values():
             token = str(item.get("access_token") or "")
