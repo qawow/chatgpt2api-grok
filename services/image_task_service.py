@@ -144,6 +144,32 @@ class ImageTaskService:
     def _account_failure_cooldown_secs() -> float:
         return max(0.0, float(config.image_transient_failure_cooldown_secs))
 
+    @classmethod
+    def _failure_retry_at(cls, checkpoint: dict[str, Any]) -> float:
+        """Resolve the park deadline for a failed credential.
+
+        An upstream-stated window always beats the generic transient cooldown:
+        a ``quota`` refusal parks until the reset it named (default one day when
+        it named none), a ``cooldown`` refusal parks for the pacing window it
+        named (default one hour). Without this both kinds were parked for
+        ``image_transient_failure_cooldown_secs`` (60s) and the picker handed the
+        same exhausted credential straight back out on the very next attempt.
+        """
+        now = time.time()
+        kind = _clean(checkpoint.get("failure_kind"), "transient")
+        if kind not in {"quota", "cooldown"}:
+            return now + cls._account_failure_cooldown_secs()
+        try:
+            retry_after = float(checkpoint.get("retry_after_secs") or 0.0)
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        if retry_after <= 0:
+            retry_after = float(
+                config.image_tool_quota_cooldown_secs if kind == "quota"
+                else config.image_tool_short_cooldown_secs
+            )
+        return now + max(0.0, retry_after)
+
     def __init__(
         self,
         path: Path,
@@ -348,7 +374,7 @@ class ImageTaskService:
                     failures = dict(task.get("account_failures") or {})
                     failures[failed_hash] = {
                         "kind": checkpoint.get("failure_kind", "transient"),
-                        "retry_at": time.time() + self._account_failure_cooldown_secs(),
+                        "retry_at": self._failure_retry_at(checkpoint),
                         "attempt": attempt,
                     }
                     updates["account_failures"] = failures

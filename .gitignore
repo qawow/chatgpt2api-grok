@@ -40,6 +40,9 @@ backups/
 # Local audit / issue notes
 issues/
 
+# 本地核验/存活观察产物（含凭据文件）
+.verify/
+
 # Research clones / j-space ledger
 .tmp-research/
 .ref/

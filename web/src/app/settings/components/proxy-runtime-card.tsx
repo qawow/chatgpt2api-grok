@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  formatProxyTestResult,
   testProxy,
   testProxyClearance,
   type ClearanceTestResult,
@@ -62,9 +63,9 @@ export function ProxyRuntimeCard() {
       const data = await testProxy();
       setProxyResult(data.result);
       if (data.result.ok) {
-        toast.success(`清障代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        toast.success(formatProxyTestResult(data.result));
       } else {
-        toast.error(`清障代理不可用：${data.result.error ?? "未知错误"}`);
+        toast.error(formatProxyTestResult(data.result));
       }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "测试清障代理失败");
@@ -210,9 +211,7 @@ export function ProxyRuntimeCard() {
 
           {proxyResult ? (
             <div className={`rounded-xl border px-3 py-2 text-xs leading-6 md:col-span-2 ${proxyResult.ok ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-rose-200 bg-rose-50 text-rose-800"}`}>
-              {proxyResult.ok
-                ? `代理可用：HTTP ${proxyResult.status}，用时 ${proxyResult.latency_ms} ms，来源 ${proxyResult.proxy_source ?? "unknown"}`
-                : `代理不可用：${proxyResult.error ?? "未知错误"}（用时 ${proxyResult.latency_ms} ms）`}
+              {formatProxyTestResult(proxyResult)}
             </div>
           ) : null}
         </div>

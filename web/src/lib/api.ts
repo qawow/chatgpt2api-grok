@@ -195,6 +195,9 @@ export type SettingsConfig = {
   image_poll_failover_retries?: number | string;
   image_text_failover_retries?: number | string;
   image_transient_failure_cooldown_secs?: number | string;
+  image_tool_short_cooldown_secs?: number | string;
+  image_tool_quota_cooldown_secs?: number | string;
+  image_gate_scheduling_enabled?: boolean;
   image_parallel_generation?: boolean;
   image_settle_enabled?: boolean;
   image_check_before_hit_enabled?: boolean;
@@ -803,12 +806,20 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
+export type SystemLogsPage = {
+  items: SystemLog[];
+  has_more?: boolean;
+  next_cursor?: string;
+};
+
+export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string; limit?: number; cursor?: string }) {
   const params = new URLSearchParams();
   if (filters.type) params.set("type", filters.type);
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
+  if (filters.limit !== undefined) params.set("limit", String(filters.limit));
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  return httpRequest<SystemLogsPage>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
 }
 
 export async function deleteSystemLogs(ids: string[]) {
@@ -851,7 +862,37 @@ export type ProxyTestResult = {
   error: string | null;
   proxy_source?: string;
   has_proxy?: boolean;
+  reachable?: boolean;
+  failure_kind?: string;
+  http_status?: number;
+  curl_code?: number;
+  proxy_id?: string;
+  gateway?: string;
+  target_host?: string;
+  retry_after_seconds?: number;
 };
+
+export function formatProxyTestResult(result: ProxyTestResult): string {
+  const failures: Record<string, string> = {
+    proxy_auth: "网关鉴权失败", proxy_connect: "网关握手失败",
+    timeout: "连接超时", dns: "DNS 解析失败", tls: "TLS 错误",
+    transport: "连接中断", challenge: "上游返回挑战页",
+    http_auth: "目标接口要求认证", http_forbidden: "目标接口返回 403",
+    rate_limit: "上游限流", upstream: "上游服务错误",
+    redirect: "目标接口返回重定向", unexpected_html: "目标接口返回 HTML",
+    configuration: "代理配置待检查", unexpected_response: "目标响应结构异常",
+  };
+  const status = result.ok
+    ? "目标检查通过（仅连通性）"
+    : failures[result.failure_kind || ""] || result.error || "检查失败";
+  const details = [
+    result.status ? `HTTP ${result.status}` : "尚未收到 HTTP 响应",
+    `${result.latency_ms} ms`,
+    result.gateway,
+    result.proxy_source ? `来源 ${result.proxy_source}` : "",
+  ].filter(Boolean).join(" · ");
+  return `${status}：${details}`;
+}
 
 export type ClearanceTestResult = {
   ok: boolean;

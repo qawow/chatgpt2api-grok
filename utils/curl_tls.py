@@ -7,6 +7,7 @@ impersonate uses HTTP/2. The same proxy works with HTTP/1.1.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 DEFAULT_IMPERSONATE = "chrome142"
@@ -179,8 +180,15 @@ class _TlsLibraryFallbackSession:
 
     def _call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         last: BaseException | None = None
+        timeout = kwargs.get("timeout")
+        deadline = time.monotonic() + timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         while True:
             call_kwargs = dict(kwargs)
+            if last is not None and deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("curl: (28) Operation timed out during TLS library recovery") from last
+                call_kwargs["timeout"] = remaining
             if self._http11:
                 call_kwargs.setdefault("http_version", _http11_constant())
             try:

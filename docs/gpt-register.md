@@ -145,8 +145,16 @@ Postfix 收信后 ≤100ms 落库，注册机直接走它的 REST API，不用�
    测试成功会列出可用域名，点一下加入域名池；域名池留空则由 tempmail 在已激活域名里随机挑。
 3. **域名模式**：`single` = `abc@example.com`；`multi` = 多级子域名，每个号一个独立主机名，用来分散按域名的批量封禁。
    `multi` 需要域名配了通配 MX（`*.example.com`，任意层级都会命中）；只支持通配 MX 的域名只能用 `multi`。
-   - **子域名层数**（`tempmail_subdomain_depth`，默认 2）：注册机自己生成几级 4~8 位随机标签，如 `abc@k3x9q.m2a8.example.com`。
+   - **子域名层数**（`tempmail_subdomain_depth`，默认 17，范围 0–24）：注册机自己生成几级主机名标签，如 `abc@mail2.mx1.smtp3.….example.com`。
+     17 级是默认值：地址约 109~155 字符，层数够深，能把每个号摊到完全独立的主机名上。
+     24 级实测可正常收信；生成时会按剩余长度预算裁剪标签，保证地址不越过 RFC 5321 的 254 字符上限，所以上限设在 24。
+     标签混用 `mail`/`mx`/`smtp`/`correo`… 词根 + 数字后缀（`mail02`、`mx38`、`smtp207`、`edge-02`），
+     不是纯随机串——纯随机串（`x9k2m`）本身就是「一次性邮箱」的强特征。
+     local-part 用 `secrets` 生成且长度抖动（默认 12 上下浮动），避免固定长度指纹。
      设为 `0` 则交给 tempmail 生成——它会拼 10~14 级 `gmail`/`yahoo`/`proton`… 单词（实测 73 字符的地址），又长又夹带邮箱品牌名。
+   - **黑名单预检**：建号前查 `dbl.spamhaus.org` / `dbl.nordspam.com`，主域命中就换域名池里下一个干净主域
+     （DBL 会向下继承——`dpdns.org` 被收录时它的 18 级子域同样命中，所以只看主域即可）。结果缓存 30 分钟，
+     解析失败按未命中处理、不拦路。`SKIP_BLOCKLISTED_DOMAINS = False` 可关掉。
    - **域名池写法**：`example.com`（主域，按上面的模式建号）、`*.example.com`（在其下随机子域名，强制 multi）、
      `a.example.com`（固定子域名，所有号共用这个主机名）、`*.a.example.com`（在 `a.` 下再随机）。
      主域靠 `/api/domains` 反查（缓存 10 分钟，查不到会立即刷新一次），不属于该实例的域名在建号前就报错。
@@ -158,8 +166,8 @@ TEMPMAIL_BASE_URL=https://mail.example.com
 TEMPMAIL_API_KEY=tm_xxx
 # 可选
 # TEMPMAIL_DOMAIN=example.com     # 固定域名（后台域名池优先）
-# TEMPMAIL_MODE=single            # single | multi | 空=服务端随机
-# TEMPMAIL_SUBDOMAIN_DEPTH=2      # multi 时自己生成的随机子域名层数；0=交给 tempmail
+# TEMPMAIL_MODE=multi             # single | multi | 空=服务端随机
+# TEMPMAIL_SUBDOMAIN_DEPTH=17     # multi 时自己生成的主机名层数；0=交给 tempmail
 # TEMPMAIL_PROXY=socks5h://...    # 默认直连，不走注册代理
 ```
 
@@ -316,9 +324,9 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `tempmail_base_url` | 空 | tempmail 站点根地址（自动去掉结尾 `/api`，没写协议补 `https://`） |
 | `tempmail_api_key` | 空 | `tm_` 开头；读配置时返回空串 + `has_tempmail_api_key`，写入空串表示不修改 |
 | `tempmail_domains` | 空 | tempmail 域名池（分隔规则同 `cfd1_domains`）；空 = 服务端随机挑已激活域名 |
-| `tempmail_mode` | `single` | `single` 普通域名 / `multi` 多级子域名 / 空 = 服务端随机 |
-| `tempmail_subdomain_depth` | 2 | `multi` 时注册机自己生成的随机子域名层数（0–5）；0 = 交给 tempmail 生成（10~14 级单词） |
-| `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*`。多条按行/逗号分隔成池，并发注册时 round-robin 分给各号（配合 `bind_register_proxy` 实现按号隔离出口） |
+| `tempmail_mode` | `multi` | `single` 普通域名 / `multi` 多级子域名 / 空 = 服务端随机 |
+| `tempmail_subdomain_depth` | 17 | `multi` 时注册机自己生成的主机名层数（0–24）；0 = 交给 tempmail 生成（10~14 级单词）。标签为 `mail`/`mx`/`smtp` 词根 + 数字，非纯随机串 |
+| `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*`。多条按行/逗号分隔成池，并发注册时 round-robin 分给各号（配合 `bind_register_proxy` 实现按号隔离出口）。轮换池（Resin 等）自动加粘性会话后缀，见 §6.7.2 |
 | `bind_register_proxy` | true | 入库时把代理绑到账号；绑了代理的号不再回落到全局/直连（按号隔离出口） |
 | `plan_type` | `free` | 写入号池的 type |
 | `source_type` | 空 | 空则自动（register / codex） |
@@ -578,9 +586,23 @@ OPENAI_OTP_LOGIN_CHALLENGE_FAST_FAIL=1
 # ---- 出口 / 熔断（对齐 gpt-auto-register 实战经验）----
 # socks5:// 会自动改成 socks5h://（DNS 走代理）
 # TLS curl(35) 握手失败会在同一 session 上重试，避免重建后 409 invalid_state
+# SOCKS5 curl(97) 上游拒连同样重试（轮换池的常态）
 # 批量任务连续 N 次网络错误后停止后续号（默认 3；0=关闭）
 # GPT_REGISTER_CIRCUIT_BREAK=3
 # 设置页「出站代理」可填多条（换行或逗号），并发时 round-robin
+
+# ---- 粘性出口（轮换代理必需）----
+# 轮换池默认每条 TCP 连接换一次出口 IP。一次注册跨 chatgpt.com /
+# auth.openai.com 打 30+ 个请求，出口中途变化 → Cloudflare 403 challenge
+# + OAuth 409 invalid_state。开启后把会话 ID 拼进代理用户名，把出口钉死。
+# socks5h:// 默认开启；REGISTER_PROXY_STICKY=0 关闭，=1 强制（含 http://）
+# REGISTER_PROXY_STICKY=1
+# 固定会话 ID（默认每次注册随机生成一个，即一号一出口）
+# REGISTER_PROXY_SESSION_ID=oa1
+# 例（Resin）：REGISTER_PROXY_DEFAULT=socks5h://用户:密码@proxy.example:2260
+#   → 实际使用 socks5h://用户.oa3f9c2b1d4e:密码@proxy.example:2260
+# warmup 拿不到 oai-did 时自动换出口重试，默认 3 次（0=关闭）
+# OPENAI_WARMUP_ROTATE_ATTEMPTS=3
 ```
 
 > 实测：auto-OTP 后若 `OPENAI_FORCE_PASSWORD_ON_AUTO_OTP=1`（或旧逻辑强制密码），
@@ -614,6 +636,45 @@ Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关�
 > 2. 后端对同一邮箱再跑 Codex OTP（`POST /api/accounts/codex-upgrade`），无需浏览器粘贴 callback  
 > 3. 成功写入带 `refresh_token` 的新凭证并删除旧 session 行；`add_phone` 等失败会提示原因，号仍保留  
 > 4. 备用：导入对话框里的浏览器 OAuth 粘贴 callback（`/api/accounts/oauth/*`）仍可用
+
+### 6.7.2 粘性出口（轮换代理）
+
+轮换代理（Resin、住宅池等）**默认每条 TCP 连接换一次出口 IP**。一次注册要跨
+`chatgpt.com` 与 `auth.openai.com` 打 30+ 个请求，出口中途变化会导致：
+
+- Cloudflare 把会话判成劫持 → `403` + `cf-mitigated: challenge`（`Just a moment...`）
+- OAuth `state` 对不上 → `409 invalid_state`
+- warmup 种不下 `oai-did` → `初始化会话失败: oai_did_missing`
+
+多数轮换池支持在**代理用户名后拼会话 ID**把出口钉死。Resin 的语法是
+`用户名.会话ID`：
+
+```env
+# data/gpt_register.env —— 只写基础凭据，会话后缀由程序自动加
+REGISTER_PROXY_DEFAULT=socks5h://USER:PASSWORD@proxy.example:2260
+# 实际出站：socks5h://USER.oa3f9c2b1d4e:PASSWORD@proxy.example:2260
+```
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `REGISTER_PROXY_STICKY` | `socks5h://` 自动开启 | `0` 关闭；`1` 强制（连 `http://` 也加后缀）。已有后缀（用户名含 `.`）不重复添加 |
+| `REGISTER_PROXY_SESSION_ID` | 每次注册随机 | 固定会话 ID。**不设时每号一个随机 ID，即一号一出口**；设成同一值则所有号共用一个出口（同 IP 多号，容易连带封） |
+| `OPENAI_WARMUP_ROTATE_ATTEMPTS` | 3 | warmup 拿不到 `oai-did` 时最多换几次出口；`0` = 关闭换出口 |
+
+行为要点：
+
+1. **一号一出口**：`resolve_proxy` 每次调用生成新会话 ID，批量注册的各号互不共用 IP。
+2. **自动换出口**：warmup 连续 4 次拿不到 `oai-did`（出口被 Cloudflare 拦）时，
+   自动换新会话 ID 重建 session 重试，默认最多 3 次。实测新鲜出口首次通过率
+   约 71%，换 3 次后累计约 98%，比整个号报废便宜得多。
+3. **SOCKS5 抖动重试**：轮换池常回 `curl: (97) cannot complete SOCKS5 connection`，
+   已并入可重试错误（同 session 内重试，保留 cookie，避免 409）。
+4. `socks5://` 仍自动升级为 `socks5h://`（DNS 走代理）。
+5. 代理池（多条）与粘性共存：先 round-robin 选一条，再给这条加独立会话后缀。
+
+> 实测（自建 Resin 网关，`proxy.example:2260` 占位）：裸凭据下每连接换 IP；加 `.会话ID` 后
+> 8 条并发连接 + 6 次跨主机请求全部命中同一 IP。Resin 池以机房 IP 为主，
+> 混有少量住宅段，出口质量参差，故自动换出口很重要。
 
 ### 6.8 完成日志与排障输出
 

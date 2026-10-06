@@ -9,6 +9,7 @@ import threading
 import time
 
 from dataclasses import dataclass
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -82,6 +83,147 @@ class ArkoseRequiredError(RuntimeError):
     IPs), so it condemns this attempt, not the token: callers move on to the
     next account instead of failing the request or marking the account dead.
     """
+
+
+class ToolCooldownError(RuntimeError):
+    """image_gen tool refused this turn: per-account short cooldown.
+
+    Upstream shape (tool message, ``content_type`` "text")::
+
+        "You're generating images too quickly. To ensure the best experience for
+         everyone, we have rate limits in place. Please wait for an hour before
+         generating more images. ..."
+
+    This refusal consumes **no** quota: it is a pacing gate keyed to the
+    account (observed to persist across rotating egress IPs while other pooled
+    accounts kept generating). Callers should park the credential briefly and
+    try another account rather than failing the request.
+    """
+
+    def __init__(self, message: str = "", *, retry_after_secs: float = 3600.0) -> None:
+        super().__init__(message or "upstream image tool is cooling down for this account")
+        self.retry_after_secs = max(0.0, float(retry_after_secs))
+
+
+class ToolQuotaError(RuntimeError):
+    """image_gen tool refused this turn: this account's image quota is spent.
+
+    Upstream shape (tool message, ``content_type`` "system_error", ``name``
+    "ChatGPTAgentToolRateLimitException")::
+
+        "你已达到 Free 套餐的图像生成请求上限。上限将在 10小时 后重置，届时可创建更多图像。"
+
+    Like the cooldown, the refusal consumes **no** quota. ``limits_progress``
+    keeps advertising a decoupled remainder, so the reset window stated here
+    (or ``blocked_features.resets_after``) is the only reliable signal: the
+    account must be parked until ``resets_after``.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        resets_after: str = "",
+        resets_after_text: str = "",
+        retry_after_secs: float = 0.0,
+    ) -> None:
+        super().__init__(message or "upstream image tool quota exhausted for this account")
+        self.resets_after = str(resets_after or "")
+        self.resets_after_text = str(resets_after_text or "")
+        self.retry_after_secs = max(0.0, float(retry_after_secs))
+
+
+# Structural markers of an image_gen tool rate-limit refusal. Match on
+# content_type / name plus these stable sentence fragments — never on
+# ``author.name``, which is an obfuscated per-build hash ("t2uay3k.sj1i4kz")
+# that rotates without notice.
+_IMAGE_TOOL_QUOTA_EXCEPTIONS = ("ChatGPTAgentToolRateLimitException",)
+_IMAGE_TOOL_COOLDOWN_MARKERS = ("too quickly", "rate limits in place")
+_IMAGE_TOOL_QUOTA_MARKERS = ("图像生成请求上限", "image generation request limit")
+_RESET_HOURS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:小时|hours?|hrs?)", re.IGNORECASE)
+_RESET_MINUTES_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:分钟|minutes?|mins?)", re.IGNORECASE)
+DEFAULT_TOOL_COOLDOWN_SECS = 3600.0
+
+
+def parse_reset_window_secs(text: str) -> float:
+    """Best-effort seconds until reset parsed from an upstream reset sentence.
+
+    Handles "10小时", "5小时 内", "in 2 hours", "45 minutes". Returns 0.0 when
+    the sentence carries no duration, so callers can fall back to their own
+    default instead of treating "unknown" as "already reset".
+    """
+    body = str(text or "")
+    match = _RESET_HOURS_RE.search(body)
+    if match:
+        try:
+            return max(0.0, float(match.group(1)) * 3600.0)
+        except ValueError:
+            return 0.0
+    match = _RESET_MINUTES_RE.search(body)
+    if match:
+        try:
+            return max(0.0, float(match.group(1)) * 60.0)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _as_tool_message(candidate: Any) -> Dict[str, Any]:
+    """Accept a bare message dict, a conversation mapping node, or an SSE event."""
+    if not isinstance(candidate, dict):
+        return {}
+    if isinstance(candidate.get("content"), dict) and isinstance(candidate.get("author"), dict):
+        return candidate
+    inner = candidate.get("message")
+    if isinstance(inner, dict):
+        return inner
+    value = candidate.get("v")
+    if isinstance(value, dict):
+        inner = value.get("message")
+        if isinstance(inner, dict):
+            return inner
+    return {}
+
+
+def _content_text(content: Dict[str, Any]) -> str:
+    parts: list[str] = []
+    raw_parts = content.get("parts")
+    if isinstance(raw_parts, list):
+        for part in raw_parts:
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+    text = str(content.get("text") or "").strip()
+    if text:
+        parts.append(text)
+    return "\n".join(parts)
+
+
+def classify_image_tool_refusal(candidate: Any) -> tuple[str, str, float] | None:
+    """Classify an upstream image_gen tool message into a refusal kind.
+
+    Returns ``(kind, text, retry_after_secs)`` where ``kind`` is ``"quota"`` or
+    ``"cooldown"``, or ``None`` when the payload is not a rate-limit refusal
+    (successful image tool messages are ``content_type`` "multimodal_text" and
+    never match).
+    """
+    message = _as_tool_message(candidate)
+    if not message:
+        return None
+    author = message.get("author") or {}
+    if str(author.get("role") or "").strip().lower() != "tool":
+        return None
+    content = message.get("content")
+    if not isinstance(content, dict):
+        return None
+    content_type = str(content.get("content_type") or "").strip()
+    text = _content_text(content)
+    if content_type == "system_error" and str(content.get("name") or "") in _IMAGE_TOOL_QUOTA_EXCEPTIONS:
+        return "quota", text, parse_reset_window_secs(text)
+    if content_type == "text" and any(marker in text for marker in _IMAGE_TOOL_COOLDOWN_MARKERS):
+        return "cooldown", text, parse_reset_window_secs(text) or DEFAULT_TOOL_COOLDOWN_SECS
+    if any(marker in text for marker in _IMAGE_TOOL_QUOTA_MARKERS):
+        return "quota", text, parse_reset_window_secs(text)
+    return None
 
 
 @dataclass
@@ -654,6 +796,50 @@ class OpenAIBackendAPI:
                 return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
         return 0, None
 
+    @staticmethod
+    def _extract_image_gate(blocked_features: Any) -> Dict[str, Any] | None:
+        """Extract the real image_gen gate from ``conversation/init``.
+
+        ``blocked_features`` is the enforcement face of the per-account image
+        budget; ``limits_progress`` is a decoupled ledger that keeps advertising
+        a remainder after the gate has already closed (measured: remaining=20
+        while the account hard-blocked at 5). Returns ``None`` when the account
+        is not gated, so callers can distinguish "no gate" from "gate with an
+        unparseable window".
+        """
+        if not isinstance(blocked_features, list):
+            return None
+        for item in blocked_features:
+            if not isinstance(item, dict) or str(item.get("name") or "") != "image_gen":
+                continue
+            limit = item.get("limit")
+            try:
+                limit_value = float(limit) if limit is not None else None
+            except (TypeError, ValueError):
+                limit_value = None
+            resets_after = str(item.get("resets_after") or "")
+            resets_at = 0.0
+            if resets_after:
+                try:
+                    resets_at = datetime.fromisoformat(
+                        resets_after.replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    resets_at = 0.0
+            return {
+                "name": "image_gen",
+                "limit": limit_value,
+                "resets_after": resets_after,
+                "resets_after_text": str(item.get("resets_after_text") or ""),
+                "resets_at": resets_at,
+                "description": str(item.get("description") or "")[:300],
+                "block_reason": str(item.get("block_reason") or ""),
+                "title": str(item.get("title") or ""),
+                "call_to_action": item.get("call_to_action") or [],
+                "observed_at": time.time(),
+            }
+        return None
+
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
@@ -731,6 +917,15 @@ class OpenAIBackendAPI:
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
         quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
+        # blocked_features is the enforcement face of the image budget; the
+        # advertised limits_progress remainder is decoupled from it, so persist
+        # the gate and let the picker schedule off it (see _extract_image_gate).
+        blocked_features = init_payload.get("blocked_features")
+        image_gate = self._extract_image_gate(blocked_features)
+        # Only a payload that actually carried the list proves the gate state.
+        # Without this flag a response missing the field entirely would be read
+        # as "no gate", and the caller would unpark a live quota park.
+        gate_probe_ok = isinstance(blocked_features, list)
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
@@ -738,6 +933,8 @@ class OpenAIBackendAPI:
             "type": plan_type,
             "quota": quota,
             "limits_progress": limits_progress,
+            "image_gate": image_gate,
+            "image_gate_probe_ok": gate_probe_ok,
             "default_model_slug": init_payload.get("default_model_slug"),
             "restore_at": restore_at,
             "status": "限流" if quota == 0 else "正常",
@@ -751,6 +948,8 @@ class OpenAIBackendAPI:
             "default_model_slug": result.get("default_model_slug"),
             "restore_at": result.get("restore_at"),
             "status": result.get("status"),
+            "image_gate_limit": (image_gate or {}).get("limit"),
+            "image_gate_resets_after": (image_gate or {}).get("resets_after"),
         })
         return result
 
@@ -1626,6 +1825,42 @@ class OpenAIBackendAPI:
                 return msg_text[:500]
         return ""
 
+    @staticmethod
+    def _find_tool_refusal_in_conversation(data: Dict[str, Any]) -> tuple[str, str, float] | None:
+        """Scan a conversation document for an image_gen tool rate-limit refusal.
+
+        Needed because a refusal can land in the document without ever reaching
+        the SSE consumer: the stream may drop (proxy half-open) right after the
+        tool message is committed, and ``_poll_image_results_impl`` would then
+        spin for the full budget on a turn that produced no image at all.
+        """
+        mapping = data.get("mapping") or {}
+        for node in mapping.values():
+            classified = classify_image_tool_refusal(node)
+            if classified is not None:
+                return classified
+        return None
+
+    @staticmethod
+    def _raise_tool_refusal(classified: tuple[str, str, float] | None, conversation_id: str = "") -> None:
+        if not classified:
+            return
+        kind, text, retry_after_secs = classified
+        logger.warning({
+            "event": "image_poll_tool_refusal",
+            "conversation_id": conversation_id,
+            "kind": kind,
+            "retry_after_secs": retry_after_secs,
+            "tool_text": text[:300],
+        })
+        if kind == "quota":
+            raise ToolQuotaError(
+                "upstream image quota exhausted for this account",
+                resets_after_text=text[:300],
+                retry_after_secs=retry_after_secs,
+            )
+        raise ToolCooldownError(retry_after_secs=retry_after_secs)
+
     def _poll_image_results(
             self,
             conversation_id: str,
@@ -1785,6 +2020,12 @@ class OpenAIBackendAPI:
                         "error_msg": policy_msg[:200],
                     })
                     raise ImageContentPolicyError(policy_msg)
+                # A tool rate-limit refusal is not a policy violation: it must
+                # stop the poll immediately (no image was ever queued) and be
+                # reported with its own kind so the caller parks the account.
+                self._raise_tool_refusal(
+                    self._find_tool_refusal_in_conversation(conversation), conversation_id
+                )
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
@@ -2183,6 +2424,44 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
 
+    def _raise_if_tool_refusal(self, payload: str) -> None:
+        """Fail fast on an image_gen tool rate-limit refusal inside the SSE body.
+
+        Both refusal kinds arrive as an ordinary HTTP 200 stream with headers
+        byte-identical to a success (no ``retry-after``, no ``x-rate-limit-*``),
+        so the only signal is the tool message itself. Detecting it here saves
+        the caller a full ``image_poll_timeout_secs`` poll plus backoff, which
+        would otherwise be spent chasing an image that was never queued.
+        """
+        if not payload or payload == "[DONE]" or '"tool"' not in payload:
+            return
+        try:
+            event = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return
+        classified = classify_image_tool_refusal(event)
+        if classified is None:
+            return
+        kind, text, retry_after_secs = classified
+        logger.warning({
+            "event": "image_tool_refusal",
+            "kind": kind,
+            "retry_after_secs": retry_after_secs,
+            "tool_text": text[:300],
+        })
+        if kind == "quota":
+            raise ToolQuotaError(
+                "upstream image quota exhausted for this account",
+                resets_after_text=text[:300],
+                retry_after_secs=retry_after_secs,
+            )
+        raise ToolCooldownError(retry_after_secs=retry_after_secs)
+
+    def _iter_image_sse_payloads(self, response: requests.Response) -> Iterator[str]:
+        for payload in iter_sse_payloads(response):
+            self._raise_if_tool_refusal(payload)
+            yield payload
+
     def _stream_picture_conversation(
             self,
             prompt: str,
@@ -2220,7 +2499,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("image generation did not start")
         self._report_progress("generating")
         try:
-            yield from iter_sse_payloads(response)
+            yield from self._iter_image_sse_payloads(response)
         finally:
             response.close()
 

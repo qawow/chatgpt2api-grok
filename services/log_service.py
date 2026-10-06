@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
-import json
 import itertools
+import json
 import os
+import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -19,6 +23,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from services.config import DATA_DIR
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
+from utils.log_safety import redact_text, sanitize_log_value
+from utils.network_diagnostics import error_details
 
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
@@ -29,9 +35,84 @@ LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id", "_image_urls"}
 
 
+class LogCursorError(Exception):
+    """The log snapshot or filters changed; the caller should refresh the list."""
+
+
+@dataclass(frozen=True)
+class _LogSnapshot:
+    dev: int
+    ino: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    digest: str
+
+
+def _parse_log_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+
+
+def _event_times(item: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    wall = _parse_log_datetime(item.get("time"))
+    instant = _parse_log_datetime(item.get("occurred_at"))
+    if instant is None or instant.tzinfo is None:
+        instant = wall if wall is not None and wall.tzinfo is not None else None
+    if wall is not None and instant is not None and len(str(item.get("time", ""))) == 19:
+        wall = wall.replace(microsecond=instant.microsecond)
+    return wall or instant, instant
+
+
+def _date_bound(value: str) -> tuple[datetime, bool] | None:
+    if not value:
+        return None
+    parsed = _parse_log_datetime(value)
+    if parsed is None:
+        raise ValueError("Log dates must be ISO dates or datetimes")
+    return parsed, len(value) == 10 and value[4] == "-" and value[7] == "-"
+
+
+def _with_error_diagnostics(value: Any) -> Any:
+    if isinstance(value, dict):
+        result = {key: _with_error_diagnostics(item) for key, item in value.items()}
+        error = next((value[key] for key in (
+            "error", "error_message", "exception", "last_error", "last_refresh_error", "last_token_refresh_error",
+        ) if value.get(key)), None)
+        if error is not None:
+            for key, item in error_details(error).items():
+                if key in {"failure_kind", "http_status", "curl_code"}:
+                    result.setdefault(key, item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_with_error_diagnostics(item) for item in value]
+    return value
+
+
+def _sanitize_log_item(item: dict[str, Any]) -> dict[str, Any]:
+    parsed = _with_error_diagnostics(item)
+    summary = parsed.get("summary")
+    if isinstance(summary, str) and ("<html" in summary.lower() or "<!doctype html" in summary.lower()):
+        if isinstance(parsed.get("detail"), dict):
+            for key, value in error_details(summary).items():
+                if key in {"failure_kind", "http_status", "curl_code"}:
+                    parsed["detail"].setdefault(key, value)
+        parsed["summary"] = sanitize_log_value({"error": summary})["error"]
+    if "summary" in parsed:
+        parsed["summary"] = redact_text(parsed["summary"], limit=1000)
+    return sanitize_log_value(parsed)
+
+
 class LogService:
+    _BLOCK_SIZE = 64 * 1024
+    _ANCHOR_SIZE = 4096
+
     def __init__(self, path: Path):
-        self.path = path
+        self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -40,16 +121,29 @@ class LogService:
         payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
         return hashlib.sha1(payload).hexdigest()[:24]
 
-    def _parse_line(self, raw_line: str, line_number: int) -> dict[str, Any] | None:
+    @staticmethod
+    def _decode_line(raw_line: str) -> dict[str, Any] | None:
         try:
             item = json.loads(raw_line)
-        except Exception:
+        except (ValueError, RecursionError):
             return None
-        if not isinstance(item, dict):
-            return None
+        return item if isinstance(item, dict) else None
+
+    def _prepare_item(self, item: dict[str, Any], raw_line: str, line_number: int | None) -> dict[str, Any]:
         parsed = dict(item)
-        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line, line_number))
-        return parsed
+        if parsed.get("id"):
+            parsed["id"] = str(parsed["id"])
+        else:
+            if line_number is None:
+                raise ValueError("A legacy log ID requires its physical line number")
+            parsed["id"] = self._legacy_id(raw_line, line_number)
+        _, instant = _event_times(parsed)
+        parsed["time_basis"] = "offset_aware" if instant is not None else "local_timezone_unknown"
+        return _sanitize_log_item(parsed)
+
+    def _parse_line(self, raw_line: str, line_number: int) -> dict[str, Any] | None:
+        item = self._decode_line(raw_line)
+        return self._prepare_item(item, raw_line, line_number) if item is not None else None
 
     @staticmethod
     def _serialize_item(item: dict[str, Any]) -> str:
@@ -57,139 +151,298 @@ class LogService:
 
     @staticmethod
     def _matches_filters(item: dict[str, Any], *, type: str = "", start_date: str = "", end_date: str = "") -> bool:
-        t = str(item.get("time") or "")
-        day = t[:10]
+        return LogService._matches_bounds(item, type, _date_bound(start_date), _date_bound(end_date))
+
+    @staticmethod
+    def _matches_bounds(item: dict[str, Any], type: str, start: tuple | None, end: tuple | None) -> bool:
         if type and item.get("type") != type:
             return False
-        if start_date and day < start_date:
-            return False
-        if end_date and day > end_date:
-            return False
+        wall, instant = _event_times(item)
+        for bound, is_start in ((start, True), (end, False)):
+            if bound is None:
+                continue
+            requested, day_only = bound
+            if day_only:
+                if wall is None:
+                    return False
+                actual, expected = wall.date(), requested.date()
+            elif requested.tzinfo is None:
+                if wall is None:
+                    return False
+                actual, expected = wall.replace(tzinfo=None), requested
+            else:
+                # A historic local wall clock has no known UTC interpretation.
+                if instant is None:
+                    return False
+                actual, expected = instant, requested
+            if (is_start and actual < expected) or (not is_start and actual > expected):
+                return False
         return True
 
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
+        now = datetime.now(timezone.utc)
         item = {
             "id": uuid4().hex,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": now.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "occurred_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "timestamp_ms": int(now.timestamp() * 1000),
+            "time_basis": "offset_aware",
             "type": type,
             "summary": summary,
-            "detail": detail or data,
+            "detail": detail if detail is not None else data,
         }
-        line = self._serialize_item(item) + "\n"
+        line = (self._serialize_item(_sanitize_log_item(item)) + "\n").encode("utf-8")
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as file:
+            fd = os.open(self.path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a+b") as file:
+                if os.fstat(file.fileno()).st_mode & 0o777 != 0o600:
+                    os.fchmod(file.fileno(), 0o600)
+                if file.seek(0, os.SEEK_END):
+                    file.seek(-1, os.SEEK_END)
+                    if file.read(1) != b"\n":
+                        line = b"\n" + line
                 file.write(line)
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        with self._lock:
-            if not self.path.exists():
-                return []
+        return self.list_page(type, start_date, end_date, limit)["items"]
+
+    @staticmethod
+    def _read_at(file: BinaryIO, offset: int, size: int) -> bytes:
+        file.seek(offset)
+        content = file.read(size)
+        if len(content) != size:
+            raise LogCursorError("Log snapshot changed; refresh the log list")
+        return content
+
+    def _snapshot_digest(self, file: BinaryIO, size: int) -> str:
+        # Append-only storage uses inode/size plus fixed prefix/tail anchors.
+        # Mutations managed here replace the inode; appended bytes are ignored.
+        digest = hashlib.sha256(str(size).encode("ascii"))
+        amount = min(size, self._ANCHOR_SIZE)
+        digest.update(self._read_at(file, 0, amount))
+        if size > amount:
+            digest.update(self._read_at(file, max(amount, size - self._ANCHOR_SIZE), min(size - amount, self._ANCHOR_SIZE)))
+        return digest.hexdigest()
+
+    def _snapshot(self, file: BinaryIO) -> _LogSnapshot:
+        stat = os.fstat(file.fileno())
+        return _LogSnapshot(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                            self._snapshot_digest(file, stat.st_size))
+
+    def _validate_snapshot(self, file: BinaryIO, snapshot: _LogSnapshot) -> None:
+        try:
+            current = os.fstat(file.fileno())
+            path_stat = self.path.stat()
+        except FileNotFoundError as exc:
+            raise LogCursorError("Log file changed; refresh the log list") from exc
+        identity = (snapshot.dev, snapshot.ino)
+        if ((current.st_dev, current.st_ino) != identity
+                or (path_stat.st_dev, path_stat.st_ino) != identity
+                or current.st_size < snapshot.size
+                or (current.st_size == snapshot.size
+                    and (current.st_mtime_ns != snapshot.mtime_ns or current.st_ctime_ns != snapshot.ctime_ns))
+                or self._snapshot_digest(file, snapshot.size) != snapshot.digest):
+            raise LogCursorError("Log snapshot changed; refresh the log list")
+
+    @staticmethod
+    def _encode_cursor(snapshot: _LogSnapshot, offset: int, line_number: int | None, filters: str) -> str:
+        payload = {"v": 1, "snapshot": vars(snapshot), "offset": offset, "line_number": line_number, "filters": filters}
+        return base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_cursor(cursor: str) -> tuple[_LogSnapshot, int, int | None, str]:
+        try:
+            if not isinstance(cursor, str) or not cursor or len(cursor) > 4096:
+                raise ValueError
+            if any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for char in cursor):
+                raise ValueError
+            raw = cursor.encode("ascii")
+            decoded = base64.b64decode(raw + b"=" * (-len(raw) % 4), altchars=b"-_", validate=True)
+            if base64.urlsafe_b64encode(decoded).rstrip(b"=") != raw:
+                raise ValueError
+            payload = json.loads(decoded)
+            if not isinstance(payload, dict) or set(payload) != {"v", "snapshot", "offset", "line_number", "filters"}:
+                raise ValueError
+            if not isinstance(payload["v"], int) or isinstance(payload["v"], bool) or payload["v"] != 1:
+                raise ValueError
+            data = payload["snapshot"]
+            fields = {"dev", "ino", "size", "mtime_ns", "ctime_ns", "digest"}
+            if not isinstance(data, dict) or set(data) != fields:
+                raise ValueError
+            if any(not isinstance(data[key], int) or isinstance(data[key], bool) or data[key] < 0 for key in fields - {"digest"}):
+                raise ValueError
+            for digest in (data["digest"], payload["filters"]):
+                if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                    raise ValueError
+            offset, line_number = payload["offset"], payload["line_number"]
+            if not isinstance(offset, int) or isinstance(offset, bool) or not 0 < offset <= data["size"]:
+                raise ValueError
+            if line_number is not None and (not isinstance(line_number, int) or isinstance(line_number, bool)
+                                            or not 0 <= line_number <= data["size"]):
+                raise ValueError
+            return _LogSnapshot(**data), offset, line_number, payload["filters"]
+        except (ValueError, TypeError, UnicodeError, binascii.Error, RecursionError) as exc:
+            raise ValueError("Malformed log cursor") from exc
+
+    def _reverse_lines(self, file: BinaryIO, upper: int) -> Iterator[tuple[int, int, bytes]]:
+        position = line_end = upper
+        fragments: list[bytes] = []
+        while position:
+            amount = min(position, self._BLOCK_SIZE)
+            position -= amount
+            block = self._read_at(file, position, amount)
+            right = len(block)
+            while True:
+                at = block.rfind(b"\n", 0, right)
+                if at < 0:
+                    fragments.append(block[:right])
+                    break
+                fragments.append(block[at + 1:right])
+                raw_line = b"".join(reversed(fragments))
+                fragments.clear()
+                line_start = position + at + 1
+                if line_start < upper:
+                    yield line_start, line_end, raw_line.removesuffix(b"\r")
+                line_end = position + at + 1
+                right = at
+        if upper:
+            yield 0, line_end, b"".join(reversed(fragments)).removesuffix(b"\r")
+
+    def _line_number_before(self, file: BinaryIO, offset: int) -> int:
+        # Only legacy rows need this once per pagination chain. Modern IDs keep
+        # the common path proportional to the tail scanned, not the file size.
+        position = count = 0
+        while position < offset:
+            amount = min(offset - position, self._BLOCK_SIZE)
+            count += self._read_at(file, position, amount).count(b"\n")
+            position += amount
+        return count
+
+    def list_page(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200,
+                  cursor: str = "") -> dict[str, Any]:
+        """Read newest-first within a fixed append-only file snapshot.
+
+        Date-only bounds include the entire displayed local day. Naive ISO
+        datetimes compare displayed wall clocks; offset-aware bounds compare
+        actual instants and exclude legacy rows with unknown time zones.
+        Appends are visible after refreshing, not partway through this cursor.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("Log limit must be a positive integer")
+        if any(not isinstance(value, str) for value in (type, start_date, end_date, cursor)):
+            raise ValueError("Log filters and cursor must be strings")
+        type, start_date, end_date = type.strip(), start_date.strip(), end_date.strip()
+        start, end = _date_bound(start_date), _date_bound(end_date)
+        filters = hashlib.sha256(json.dumps([type, start_date, end_date]).encode("utf-8")).hexdigest()
+        state = self._decode_cursor(cursor) if cursor else None
+        if state is not None and state[3] != filters:
+            raise LogCursorError("Log filters changed; refresh the log list")
+        file = None
+        try:
+            with self._lock:
+                try:
+                    file = self.path.open("rb")
+                except FileNotFoundError as exc:
+                    if state is not None:
+                        raise LogCursorError("Log file changed; refresh the log list") from exc
+                    return {"items": [], "has_more": False, "next_cursor": ""}
+                if state is None:
+                    snapshot = self._snapshot(file)
+                    upper, line_number = snapshot.size, None
+                else:
+                    snapshot, upper, line_number, _ = state
+                    self._validate_snapshot(file, snapshot)
+                    if upper < snapshot.size and self._read_at(file, upper - 1, 1) != b"\n":
+                        raise ValueError("Malformed log cursor offset")
             items: list[dict[str, Any]] = []
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
-                continue
-            items.append(item)
-            if len(items) >= limit:
-                break
-        return items
+            next_cursor = ""
+            for offset, line_end, raw_bytes in self._reverse_lines(file, upper):
+                current_number = line_number
+                if line_number is not None:
+                    line_number -= 1
+                try:
+                    raw_line = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                item = self._decode_line(raw_line)
+                if item is None or not self._matches_bounds(item, type, start, end):
+                    continue
+                if len(items) == limit:
+                    next_cursor = self._encode_cursor(snapshot, line_end, current_number, filters)
+                    break
+                if not item.get("id") and current_number is None:
+                    current_number = self._line_number_before(file, offset)
+                    line_number = current_number - 1
+                items.append(self._prepare_item(item, raw_line, current_number))
+            with self._lock:
+                self._validate_snapshot(file, snapshot)
+            return {"items": items, "has_more": bool(next_cursor), "next_cursor": next_cursor}
+        finally:
+            if file is not None:
+                file.close()
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not target_ids:
             return {"removed": 0}
+        result = self._rewrite(lambda item: item is None or item["id"] not in target_ids)
+        return {"removed": result["removed"]}
+
+    def _rewrite(self, keep: Callable[[dict[str, Any] | None], bool]) -> dict[str, int]:
+        removed = kept = 0
         with self._lock:
             if not self.path.exists():
-                return {"removed": 0}
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-            kept_lines: list[str] = []
-            removed = 0
-            for line_number, raw_line in enumerate(lines):
-                item = self._parse_line(raw_line, line_number)
-                if item is None:
-                    kept_lines.append(raw_line)
-                    continue
-                if str(item.get("id") or "") in target_ids:
-                    removed += 1
-                    continue
-                kept_lines.append(self._serialize_item(item))
-            content = "\n".join(kept_lines)
-            if content:
-                content += "\n"
-            # Atomic write to prevent corruption on crash.
-            from utils.atomic import atomic_write_text
-            atomic_write_text(self.path, content)
-        return {"removed": removed}
-
-    def trim(self, retention_days: int) -> dict[str, int]:
-        """Drop log entries older than ``retention_days``.
-
-        ``logs.jsonl`` is append-only and nothing else caps its growth; without
-        this it grows forever and every ``list()`` / ``delete()`` pays the full
-        file in memory. The trim streams line by line (memory stays O(1) in the
-        file size — only kept lines are buffered) and swaps the file in place
-        atomically. ``retention_days <= 0`` disables trimming.
-        """
-        if retention_days <= 0 or not self.path.exists():
-            return {"removed": 0, "kept": 0}
-        cutoff = datetime.now() - timedelta(days=int(retention_days))
-        cutoff_key = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-        removed = 0
-        kept = 0
-        tmp_path = self.path.with_name(self.path.name + ".trim")
-        with self._lock:
+                return {"removed": 0, "kept": 0}
+            fd, tmp_name = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp")
             try:
-                # Create the replacement owner-only: os.replace below hands its
-                # mode to logs.jsonl, and a default-umask 0644 here is what kept
-                # resetting the log (prompts, upstream error strings) to
-                # world-readable on every retention pass.
-                tmp_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with self.path.open("r", encoding="utf-8") as src, \
-                        os.fdopen(tmp_fd, "w", encoding="utf-8") as dst:
-                    for raw_line in src:
-                        if _line_within_retention(raw_line, cutoff_key):
-                            dst.write(raw_line)
+                with os.fdopen(fd, "wb") as dst, self.path.open("rb") as src:
+                    for line_number, raw_bytes in enumerate(src):
+                        try:
+                            raw_line = raw_bytes.removesuffix(b"\n").removesuffix(b"\r").decode("utf-8")
+                            item = self._parse_line(raw_line, line_number)
+                        except UnicodeDecodeError:
+                            item = None
+                        if keep(item):
+                            # Persist legacy IDs before removals change their line numbers.
+                            dst.write((self._serialize_item(item) + "\n").encode("utf-8") if item is not None else raw_bytes)
                             kept += 1
                         else:
                             removed += 1
+                    dst.flush()
+                    os.fsync(dst.fileno())
                 if removed:
-                    os.replace(tmp_path, self.path)
-                else:
-                    tmp_path.unlink(missing_ok=True)
-            except OSError:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return {"removed": 0, "kept": kept}
+                    os.replace(tmp_name, self.path)
+            finally:
+                Path(tmp_name).unlink(missing_ok=True)
         return {"removed": removed, "kept": kept}
+
+    def trim(self, retention_days: int) -> dict[str, int]:
+        """Stream retention cleanup to an owner-only atomic replacement."""
+        if retention_days <= 0:
+            return {"removed": 0, "kept": 0}
+        cutoff = datetime.now().astimezone() - timedelta(days=int(retention_days))
+        try:
+            return self._rewrite(lambda item: item is None or _item_within_retention(item, cutoff))
+        except OSError:
+            return {"removed": 0, "kept": 0}
 
 
 log_service = LogService(DATA_DIR / "logs.jsonl")
 
 
-_TIME_FIELD = '"time":"'
-
-
 def _line_within_retention(raw_line: str, cutoff_key: str) -> bool:
-    """Keep lines whose ``time`` is at/after the cutoff.
+    item = LogService._decode_line(raw_line)
+    cutoff = _parse_log_datetime(cutoff_key)
+    return item is None or cutoff is None or _item_within_retention(item, cutoff)
 
-    Timestamps are written as fixed-width ``YYYY-MM-DD HH:MM:SS``, so a string
-    comparison is exact. Unparseable lines are kept so a malformed entry can
-    never wipe the log; the top-level ``time`` key is serialized before any
-    nested detail, so the first match is the right one.
-    """
-    at = raw_line.find(_TIME_FIELD)
-    if at < 0:
+
+def _item_within_retention(item: dict[str, Any], cutoff: datetime) -> bool:
+    wall, instant = _event_times(item)
+    if instant is not None and cutoff.tzinfo is not None:
+        return instant >= cutoff
+    if wall is None:
         return True
-    start = at + len(_TIME_FIELD)
-    end = raw_line.find('"', start)
-    if end <= start:
-        return True
-    return raw_line[start:end] >= cutoff_key
+    return wall.replace(tzinfo=None) >= cutoff.replace(tzinfo=None)
 
 
 def _collect_urls(value: object) -> list[str]:

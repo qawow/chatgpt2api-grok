@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 # after warmup is a common source of authorize/continue 409 invalid_state.
 _TLS_HANDSHAKE_MARKERS = (
     "curl: (35)",
+    "curl: (97)",  # SOCKS5 upstream refused this connection (rotating proxy)
+    "cannot complete socks5 connection",
     "tls connect error",
     "openssl_internal",
     "sslerror",

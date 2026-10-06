@@ -436,6 +436,271 @@ class ProxyNormalizeTest(unittest.TestCase):
         )
 
 
+class ProxyStickySessionTest(unittest.TestCase):
+    """Rotating pools (Resin) need one exit IP for a whole registration.
+
+    Measured: `user.<sid>` pins the exit across connections and hosts; without
+    it the IP changes per TCP connection and Cloudflare answers 403.
+    """
+
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("REGISTER_PROXY_STICKY", None)
+        os.environ.pop("REGISTER_PROXY_SESSION_ID", None)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def test_socks5h_gets_session_suffix(self):
+        from core.proxy_env import apply_sticky_session
+
+        out = apply_sticky_session(
+            "socks5h://fixture-user:fixture-pass@proxy.invalid:2260", "oa123"
+        )
+        self.assertEqual(
+            out, "socks5h://fixture-user.oa123:fixture-pass@proxy.invalid:2260"
+        )
+
+    def test_plain_socks5_is_upgraded_and_suffixed(self):
+        from core.proxy_env import apply_sticky_session
+
+        self.assertEqual(
+            apply_sticky_session("socks5://u:p@h:1080", "s1"),
+            "socks5h://u.s1:p@h:1080",
+        )
+
+    def test_http_proxy_left_alone_by_default(self):
+        from core.proxy_env import apply_sticky_session
+
+        # http:// proxies do not use the rotating-provider username convention.
+        self.assertEqual(
+            apply_sticky_session("http://u:p@h:8080", "s1"),
+            "http://u:p@h:8080",
+        )
+
+    def test_explicit_enable_covers_http(self):
+        from core.proxy_env import apply_sticky_session
+
+        with mock.patch.dict(os.environ, {"REGISTER_PROXY_STICKY": "1"}):
+            self.assertEqual(
+                apply_sticky_session("http://u:p@h:8080", "s1"),
+                "http://u.s1:p@h:8080",
+            )
+
+    def test_explicit_disable_wins(self):
+        from core.proxy_env import apply_sticky_session
+
+        with mock.patch.dict(os.environ, {"REGISTER_PROXY_STICKY": "0"}):
+            self.assertEqual(
+                apply_sticky_session("socks5h://u:p@h:1080", "s1"),
+                "socks5h://u:p@h:1080",
+            )
+
+    def test_idempotent_when_already_sticky(self):
+        from core.proxy_env import apply_sticky_session
+
+        once = apply_sticky_session("socks5h://u:p@h:1080", "s1")
+        twice = apply_sticky_session(once, "s2")
+        self.assertEqual(once, twice)
+
+    def test_no_credentials_is_a_noop(self):
+        from core.proxy_env import apply_sticky_session
+
+        self.assertEqual(
+            apply_sticky_session("socks5h://h:1080", "s1"), "socks5h://h:1080"
+        )
+        self.assertIsNone(apply_sticky_session("", "s1"))
+
+    def test_rotate_swaps_session_and_keeps_credentials(self):
+        from core.proxy_env import rotate_sticky_session
+
+        rotated = rotate_sticky_session("socks5h://u.old:p@h:1080", "new")
+        self.assertEqual(rotated, "socks5h://u.new:p@h:1080")
+        # Repeated rotation must not accumulate suffixes.
+        self.assertEqual(
+            rotate_sticky_session(rotated, "again"), "socks5h://u.again:p@h:1080"
+        )
+
+    def test_rotate_without_credentials_is_a_noop(self):
+        from core.proxy_env import rotate_sticky_session
+
+        self.assertEqual(rotate_sticky_session("socks5h://h:1080", "s1"), "socks5h://h:1080")
+
+    def test_resolve_proxy_applies_sticky(self):
+        from core.proxy_env import resolve_proxy
+
+        out = resolve_proxy("socks5h://u:p@h:1080")
+        self.assertTrue(out.startswith("socks5h://u."), out)
+        self.assertTrue(out.endswith(":p@h:1080"), out)
+
+    def test_password_with_at_sign_survives(self):
+        from core.proxy_env import apply_sticky_session
+
+        out = apply_sticky_session("socks5h://u:p%40ss@h:1080", "s1")
+        self.assertEqual(out, "socks5h://u.s1:p%40ss@h:1080")
+
+
+class Socks5RetryMarkerTest(unittest.TestCase):
+    def test_socks5_failure_is_retryable(self):
+        from core.http_client import is_get_transport_error, is_tls_handshake_error
+
+        exc = RuntimeError(
+            "Failed to perform, curl: (97) cannot complete SOCKS5 connection "
+            "to chatgpt.com. (1)"
+        )
+        self.assertTrue(is_tls_handshake_error(exc))
+        self.assertTrue(is_get_transport_error(exc))
+
+
+class WarmupExitRotationTest(unittest.TestCase):
+    """A Cloudflare-challenged exit must be swapped before the run is wasted.
+
+    Remote failure signature (bare rotating creds, no sticky session):
+      warmup 未种到 oai-did (2/4) status=403 body=<html>...Just a moment...
+      warmup 4 次均未种到 oai-did
+      失败 email=- error=初始化会话失败: oai_did_missing
+    """
+
+    def setUp(self):
+        # warmup backs off 0.6s * attempt; skip the real waiting.
+        self._sleep = mock.patch("platforms.chatgpt.register.time.sleep")
+        self._sleep.start()
+        # These fixtures hand-count the per-exit budget to prove *rotation*
+        # happens; pin it so they stay valid if the production default moves.
+        self._budget = mock.patch.dict(
+            os.environ, {"OPENAI_WARMUP_EXIT_ATTEMPTS": "4"}
+        )
+        self._budget.start()
+
+    def tearDown(self):
+        self._budget.stop()
+        self._sleep.stop()
+
+    def test_default_per_exit_budget_rotates_early(self):
+        """A challenged exit is swapped after 2 GETs, not 4.
+
+        Retrying a dead exit measured 34-35s per attempt (each GET also eats two
+        transport retries), so 4 attempts burned ~120s before the first rotation
+        while a healthy exit plants oai-did on the first GET.
+        """
+        from platforms.chatgpt.register import _warmup_exit_attempts, _warmup_timeout_secs
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_warmup_exit_attempts(), 2)
+            self.assertLess(_warmup_timeout_secs(), 30.0)
+        with mock.patch.dict(os.environ, {"OPENAI_WARMUP_EXIT_ATTEMPTS": "5"}):
+            self.assertEqual(_warmup_exit_attempts(), 5)
+
+    def _engine(self, proxy):
+        eng = RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x")),
+            proxy_url=proxy,
+        )
+        return eng
+
+    def test_rotates_exit_when_no_oai_did(self):
+        proxy = "socks5h://fixture-user:fixture-pass@proxy.invalid:2260"
+        eng = self._engine(proxy)
+        seen = []
+        calls = {"n": 0}
+
+        def get(url, **kwargs):
+            calls["n"] += 1
+            seen.append(eng.proxy_url)
+            if calls["n"] <= 4:
+                return SimpleNamespace(status_code=403, text="<html>Just a moment</html>")
+            return SimpleNamespace(status_code=200, text="ok")
+
+        fake = SimpleNamespace(get=get, close=lambda: None, cookies={})
+        eng.session = fake
+        # Stub the client so rotation does not build a real curl session.
+        eng.http_client = SimpleNamespace(
+            proxy_url=proxy, _session=fake, session=fake, browser={}
+        )
+        eng._cookie_value = lambda name: "did-123" if calls["n"] > 4 else None
+        eng._response_body_snip = lambda r: "Just a moment"
+
+        ok = eng._warmup_chatgpt_home()
+
+        self.assertTrue(ok)
+        # The exit must have changed exactly once, after the 4 failed attempts.
+        self.assertEqual(len(set(seen)), 2, seen)
+        self.assertNotEqual(seen[0], seen[-1])
+        self.assertIn("fixture-user.", seen[-1])
+
+    def test_keeps_rotating_until_an_exit_works(self):
+        """Some exits are challenged on every attempt; keep swapping."""
+        proxy = "socks5h://fixture-user:fixture-pass@proxy.invalid:2260"
+        eng = self._engine(proxy)
+        seen = []
+        calls = {"n": 0}
+
+        def get(url, **kwargs):
+            calls["n"] += 1
+            seen.append(eng.proxy_url)
+            # 4 warmup attempts + 2 rotations fail, the 3rd rotation succeeds.
+            if calls["n"] <= 6:
+                return SimpleNamespace(status_code=403, text="<html>Just a moment</html>")
+            return SimpleNamespace(status_code=200, text="ok")
+
+        fake = SimpleNamespace(get=get, close=lambda: None, cookies={})
+        eng.session = fake
+        eng.http_client = SimpleNamespace(
+            proxy_url=proxy, _session=fake, session=fake, browser={}
+        )
+        eng._cookie_value = lambda name: "did-ok" if calls["n"] > 6 else None
+        eng._response_body_snip = lambda r: "Just a moment"
+
+        self.assertTrue(eng._warmup_chatgpt_home())
+        # 4 original attempts + 3 rotations = 3 distinct exit urls.
+        self.assertEqual(len(set(seen)), 4, seen)
+        self.assertEqual(len(seen), 7)
+
+    def test_rotation_budget_is_configurable(self):
+        proxy = "socks5h://fixture-user:p@proxy.invalid:2260"
+        eng = self._engine(proxy)
+        calls = {"n": 0}
+
+        def get(url, **kwargs):
+            calls["n"] += 1
+            return SimpleNamespace(status_code=403, text="challenge")
+
+        fake = SimpleNamespace(get=get, close=lambda: None, cookies={})
+        eng.session = fake
+        eng.http_client = SimpleNamespace(
+            proxy_url=proxy, _session=fake, session=fake, browser={}
+        )
+        eng._cookie_value = lambda name: None
+        eng._response_body_snip = lambda r: "challenge"
+
+        with mock.patch.dict(os.environ, {"OPENAI_WARMUP_ROTATE_ATTEMPTS": "0"}):
+            self.assertFalse(eng._warmup_chatgpt_home())
+        # 0 rotations → only the 4 initial attempts.
+        self.assertEqual(calls["n"], 4)
+
+    def test_no_rotation_for_direct_egress(self):
+        eng = self._engine(None)
+        calls = {"n": 0}
+
+        def get(url, **kwargs):
+            calls["n"] += 1
+            return SimpleNamespace(status_code=403, text="challenge")
+
+        fake = SimpleNamespace(get=get, close=lambda: None, cookies={})
+        eng.session = fake
+        eng.http_client = SimpleNamespace(
+            proxy_url=None, _session=fake, session=fake, browser={}
+        )
+        eng._cookie_value = lambda name: None
+        eng._response_body_snip = lambda r: "challenge"
+
+        self.assertFalse(eng._warmup_chatgpt_home())
+        # Direct egress has nothing to rotate; 4 attempts only.
+        self.assertEqual(calls["n"], 4)
+        self.assertIsNone(eng.proxy_url)
+
+
 class TlsRetrySessionTest(unittest.TestCase):
     def test_retries_tls_handshake_then_succeeds(self):
         from core.http_client import TlsRetrySession, is_tls_handshake_error
@@ -619,7 +884,8 @@ class OtpKickoffOrderTest(unittest.TestCase):
             cookies=Jar(),
             get=mock.Mock(return_value=resp),
         )
-        with mock.patch("platforms.chatgpt.register.time.sleep", return_value=None):
+        with mock.patch("platforms.chatgpt.register.time.sleep", return_value=None), \
+                mock.patch.dict(os.environ, {"OPENAI_WARMUP_EXIT_ATTEMPTS": "4"}):
             self.assertFalse(eng._warmup_chatgpt_home())
         self.assertGreaterEqual(eng.session.get.call_count, 4)
 
@@ -740,10 +1006,23 @@ class LiveAutoOtpProtocolTest(unittest.TestCase):
 
     def test_auto_otp_waits_longer_before_resend(self):
         eng = self._eng()
-        self.assertEqual(eng._otp_wait_policy(), (25, 50, 3))
+        # Budget moved off the 300s dead-wait: a deliverable address answers in
+        # 0.5-5s, an undeliverable one never answers however long we sit.
+        sl, every, resends = eng._otp_wait_policy()
+        self.assertEqual((sl, resends), (10, 1))
+        self.assertLessEqual(every, 40)
+        self.assertLessEqual(eng._otp_total_timeout_secs(), 120)
+        manual = every
         eng._otp_auto_sent = True
         eng._is_passwordless_signup = True
-        self.assertEqual(eng._otp_wait_policy(), (25, 75, 2))
+        self.assertGreaterEqual(eng._otp_wait_policy()[1], manual)
+        with mock.patch.dict(os.environ, {
+                "OPENAI_OTP_SLICE_SECS": "25",
+                "OPENAI_OTP_RESEND_EVERY": "75",
+                "OPENAI_OTP_MAX_RESENDS": "2",
+                "OPENAI_OTP_TOTAL_TIMEOUT_SECS": "300"}):
+            self.assertEqual(eng._otp_wait_policy(), (25, 75, 2))
+            self.assertEqual(eng._otp_total_timeout_secs(), 300)
 
     def test_sentinel_prefers_vm_so_not_40k_server_blob(self):
         from platforms.chatgpt.register import SentinelPayload, _build_sentinel_header_bundle

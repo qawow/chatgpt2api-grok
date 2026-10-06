@@ -683,6 +683,50 @@ class ConfigStore:
             return 60
 
     @property
+    def image_tool_short_cooldown_secs(self) -> int:
+        """Fallback park time for a per-account image_gen tool pacing refusal.
+
+        Used only when the refusal text carries no parseable window. Observed
+        refusals say "wait for an hour", so the default matches that claim; the
+        value never applies when upstream states its own reset window.
+        """
+        try:
+            return max(0, min(86400, int(self.data.get("image_tool_short_cooldown_secs", 3600))))
+        except (TypeError, ValueError):
+            return 3600
+
+    @property
+    def image_tool_quota_cooldown_secs(self) -> int:
+        """Fallback park time for a per-account image_gen quota exhaustion.
+
+        Only used when neither the refusal text nor ``blocked_features`` yields a
+        reset window. Free-tier windows observed upstream run 5h / 10h / 24h, so
+        the default parks the credential for a full day rather than handing it
+        back to the picker after the generic 60s transient cooldown.
+        """
+        try:
+            return max(0, min(7 * 86400, int(self.data.get("image_tool_quota_cooldown_secs", 86400))))
+        except (TypeError, ValueError):
+            return 86400
+
+    @property
+    def image_gate_scheduling_enabled(self) -> bool:
+        """Honor the per-account image_gen gate from ``blocked_features``.
+
+        When enabled, an account whose gate is closed is withheld from the image
+        picker until its stated reset. The gate is the enforcement face of the
+        budget while ``limits_progress`` is a decoupled ledger (an account
+        advertising remaining=20 was observed to hard-block at 5), so scheduling
+        off the advertised remainder alone oversubscribes the credential and
+        burns a turn on a guaranteed refusal. Disable to fall back to the old
+        quota-only behavior.
+        """
+        value = self.data.get("image_gate_scheduling_enabled", True)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
     def image_parallel_generation(self) -> bool:
         value = self.data.get("image_parallel_generation", True)
         if isinstance(value, str):
@@ -853,6 +897,9 @@ class ConfigStore:
         data["image_poll_failover_retries"] = self.image_poll_failover_retries
         data["image_text_failover_retries"] = self.image_text_failover_retries
         data["image_transient_failure_cooldown_secs"] = self.image_transient_failure_cooldown_secs
+        data["image_tool_short_cooldown_secs"] = self.image_tool_short_cooldown_secs
+        data["image_tool_quota_cooldown_secs"] = self.image_tool_quota_cooldown_secs
+        data["image_gate_scheduling_enabled"] = self.image_gate_scheduling_enabled
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts

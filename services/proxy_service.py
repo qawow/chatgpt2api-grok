@@ -19,6 +19,8 @@ from utils.curl_tls import (
     sanitize_curl_ssl_env,
 )
 from utils.ssrf import UnsafeUrlError, assert_safe_url, fetch_following_redirects
+from utils.log_safety import redact_text
+from utils.network_diagnostics import error_details, proxy_identity, response_diagnostics
 
 _UNUSABLE_EGRESS_TTL_SECS = 10 * 60
 _unusable_egress_until: dict[str, float] = {}
@@ -758,10 +760,17 @@ def _is_valid_proxy_url(url: str) -> bool:
     # urlsplit raises on brackets it can't read as an IPv6 host â€” and 3.13
     # even checks them when they sit in the userinfo.
     try:
-        parsed = urlparse(normalize_proxy_url(url))
+        candidate = normalize_proxy_url(url)
+        parsed = urlparse(candidate)
+        port = parsed.port
+        return (
+            parsed.scheme in {"http", "https", "socks5", "socks5h"}
+            and bool(parsed.hostname)
+            and (port is None or 1 <= port <= 65535)
+            and not any(char.isspace() for char in candidate)
+        )
     except ValueError:
         return False
-    return parsed.scheme in {"http", "https", "socks5", "socks5h"} and bool(parsed.netloc)
 
 
 def _domain_matches(host: str, domain: str) -> bool:
@@ -866,75 +875,84 @@ def unredact_proxy_url(value: object, stored: Iterable[object], label: str = "ä»
 
 
 def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
+    import math
+
     proxy_source = "input"
     try:
         candidate = normalize_proxy_url(unredact_proxy_url(url, proxy_settings.stored_proxy_urls()))
     except ValueError as exc:
         return {
-            "ok": False,
-            "status": 0,
-            "latency_ms": 0,
-            "error": str(exc),
-            "proxy_source": proxy_source,
-            "has_proxy": True,
+            "ok": False, "reachable": False, "status": 0, "latency_ms": 0,
+            "failure_kind": "configuration", "error": redact_text(exc, limit=800),
+            "proxy_source": proxy_source, "has_proxy": True,
         }
     if not candidate:
         profile = proxy_settings.get_profile(upstream=True)
         candidate = profile.proxy_url
         proxy_source = profile.proxy_source
-    result_base = {"proxy_source": proxy_source, "has_proxy": bool(candidate)}
-    if not candidate:
+    result_base = {
+        "proxy_source": proxy_source, "has_proxy": bool(candidate),
+        "target_host": "chatgpt.com", **proxy_identity(candidate),
+    }
+    if not candidate or not _is_valid_proxy_url(candidate):
         return {
-            "ok": False,
-            "status": 0,
-            "latency_ms": 0,
-            "error": "no active proxy configured",
+            "ok": False, "reachable": False, "status": 0, "latency_ms": 0,
+            "failure_kind": "configuration",
+            "error": "invalid proxy url" if candidate else "no active proxy configured",
             **result_base,
         }
-    if not _is_valid_proxy_url(candidate):
-        return {
-            "ok": False,
-            "status": 0,
-            "latency_ms": 0,
-            "error": "invalid proxy url",
-            **result_base,
-        }
-    # Use the same session kwargs as production so the test actually
-    # reflects live egress (impersonate / skip_ssl_verify / proxy).
-    kwargs = proxy_settings.build_session_kwargs(impersonate="chrome142", verify=True, proxy=candidate)
-    session = create_cffi_session(**kwargs)
-    started = time.perf_counter()
     try:
+        budget = float(timeout)
+        if not math.isfinite(budget):
+            raise ValueError("non-finite timeout")
+        budget = max(0.1, min(budget, 60.0))
+    except (TypeError, ValueError, OverflowError):
+        budget = 15.0
+    started = time.perf_counter()
+    session = None
+    try:
+        # Keep runtime TLS options, but test the actual input URL rather than
+        # silently substituting the global gateway when runtime mode is enabled.
+        kwargs = proxy_settings.build_session_kwargs(
+            impersonate="chrome142", verify=True, upstream=True, force_proxy=candidate,
+        )
+        kwargs["trust_env"] = False
+        session = create_cffi_session(**kwargs)
         response = session.get(
             "https://chatgpt.com/api/auth/csrf",
-            headers={
-                "user-agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/143.0.0.0 Safari/537.36"
-                )
-            },
-            timeout=timeout,
+            timeout=budget,
+            allow_redirects=False,
         )
-        latency_ms = int((time.perf_counter() - started) * 1000)
+        status = int(response.status_code)
+        diagnostic = response_diagnostics(
+            status, getattr(response, "text", ""), getattr(response, "headers", {}),
+        )
+        if diagnostic["ok"]:
+            try:
+                payload = json.loads(getattr(response, "text", ""))
+            except (ValueError, TypeError):
+                payload = None
+            if (status != 200 or not isinstance(payload, dict)
+                    or not isinstance(payload.get("csrfToken"), str) or not payload["csrfToken"].strip()):
+                diagnostic.update(ok=False, failure_kind="unexpected_response")
         return {
-            "ok": response.status_code < 500,
-            "status": int(response.status_code),
-            "latency_ms": latency_ms,
-            "error": None if response.status_code < 500 else f"HTTP {response.status_code}",
-            **result_base,
+            **result_base, **diagnostic, "status": status,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "error": None if diagnostic["ok"] else f"HTTP {status} ({diagnostic['failure_kind']})",
         }
     except Exception as exc:
-        latency_ms = int((time.perf_counter() - started) * 1000)
         return {
-            "ok": False,
-            "status": 0,
-            "latency_ms": latency_ms,
-            "error": _redact_url_credentials(str(exc) or exc.__class__.__name__),
-            **result_base,
+            **result_base, **error_details(exc),
+            "ok": False, "reachable": False, "status": 0,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "error": redact_text(exc or exc.__class__.__name__, limit=800),
         }
     finally:
-        session.close()
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def test_clearance(target_url: str = "https://chatgpt.com") -> dict:

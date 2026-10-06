@@ -162,6 +162,9 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_poll_failover_retries: Number(config.image_poll_failover_retries ?? 4),
     image_text_failover_retries: Number(config.image_text_failover_retries ?? 3),
     image_transient_failure_cooldown_secs: Number(config.image_transient_failure_cooldown_secs ?? 60),
+    image_tool_short_cooldown_secs: Number(config.image_tool_short_cooldown_secs ?? 3600),
+    image_tool_quota_cooldown_secs: Number(config.image_tool_quota_cooldown_secs ?? 86400),
+    image_gate_scheduling_enabled: Boolean(config.image_gate_scheduling_enabled !== false),
     image_parallel_generation: Boolean(config.image_parallel_generation !== false),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -249,6 +252,9 @@ type SettingsStore = {
   setImagePollFailoverRetries: (value: string) => void;
   setImageTextFailoverRetries: (value: string) => void;
   setImageTransientFailureCooldownSecs: (value: string) => void;
+  setImageToolShortCooldownSecs: (value: string) => void;
+  setImageToolQuotaCooldownSecs: (value: string) => void;
+  setImageGateSchedulingEnabled: (value: boolean) => void;
   setImageParallelGeneration: (value: boolean) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
@@ -338,6 +344,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_poll_failover_retries: Math.max(0, Math.min(20, Number(config.image_poll_failover_retries ?? 4))),
         image_text_failover_retries: Math.max(0, Math.min(20, Number(config.image_text_failover_retries ?? 3))),
         image_transient_failure_cooldown_secs: Math.max(0, Math.min(3600, Number(config.image_transient_failure_cooldown_secs ?? 60))),
+        image_tool_short_cooldown_secs: Math.max(0, Math.min(86400, Number(config.image_tool_short_cooldown_secs ?? 3600))),
+        image_tool_quota_cooldown_secs: Math.max(0, Math.min(7 * 86400, Number(config.image_tool_quota_cooldown_secs ?? 86400))),
+        image_gate_scheduling_enabled: Boolean(config.image_gate_scheduling_enabled !== false),
         image_parallel_generation: Boolean(config.image_parallel_generation !== false),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -463,6 +472,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageTransientFailureCooldownSecs: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_transient_failure_cooldown_secs: value } } : {});
+  },
+
+  setImageToolShortCooldownSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_tool_short_cooldown_secs: value } } : {});
+  },
+
+  setImageToolQuotaCooldownSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_tool_quota_cooldown_secs: value } } : {});
+  },
+
+  setImageGateSchedulingEnabled: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_gate_scheduling_enabled: value } } : {});
   },
 
   setImageParallelGeneration: (value) => {

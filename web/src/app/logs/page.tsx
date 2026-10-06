@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, ImageIcon, LoaderCircle, RefreshCw, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -15,6 +15,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
+import { HttpRequestError } from "@/lib/request";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LogType = {
@@ -60,6 +61,13 @@ function LogsContent() {
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [page, setPage] = useState(1);
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState("");
+  const [paginationKnown, setPaginationKnown] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const requestGeneration = useRef(0);
+  const loadingMoreRef = useRef(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
@@ -74,17 +82,62 @@ function LogsContent() {
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(item.id));
   const allSelected = items.length > 0 && items.every((item) => selectedSet.has(item.id));
 
-  const loadLogs = async () => {
+  const loadLogs = useCallback(async () => {
+    const generation = ++requestGeneration.current;
+    loadingMoreRef.current = false;
+    setIsLoadingMore(false);
     setIsLoading(true);
+    setLoadError("");
+    setItems([]);
+    setSelectedIds([]);
+    setHasMore(false);
+    setNextCursor("");
+    setPage(1);
     try {
-      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
+      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate, limit: 100 });
+      if (generation !== requestGeneration.current) return;
       setItems(data.items);
-      setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
-      setPage(1);
+      setHasMore(Boolean(data.has_more && data.next_cursor));
+      setNextCursor(data.next_cursor || "");
+      setPaginationKnown(typeof data.has_more === "boolean");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载日志失败");
+      if (generation !== requestGeneration.current) return;
+      const message = error instanceof Error ? error.message : "加载日志失败";
+      setLoadError(message);
+      toast.error(message);
     } finally {
-      setIsLoading(false);
+      if (generation === requestGeneration.current) setIsLoading(false);
+    }
+  }, [type, startDate, endDate]);
+
+  const loadMore = async () => {
+    if (isLoading || loadingMoreRef.current || !hasMore || !nextCursor) return;
+    const generation = requestGeneration.current;
+    loadingMoreRef.current = true;
+    setIsLoadingMore(true);
+    try {
+      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate, limit: 100, cursor: nextCursor });
+      if (generation !== requestGeneration.current) return;
+      setItems((current) => {
+        const ids = new Set(current.map((item) => item.id));
+        return [...current, ...data.items.filter((item) => !ids.has(item.id))];
+      });
+      setHasMore(Boolean(data.has_more && data.next_cursor));
+      setNextCursor(data.next_cursor || "");
+      setPaginationKnown(typeof data.has_more === "boolean");
+    } catch (error) {
+      if (generation !== requestGeneration.current) return;
+      if (error instanceof HttpRequestError && error.code === "log_cursor_expired") {
+        toast.info("日志已删除或归档，列表已从最新记录重新加载");
+        await loadLogs();
+      } else {
+        toast.error(error instanceof Error ? error.message : "加载更多日志失败");
+      }
+    } finally {
+      if (generation === requestGeneration.current) {
+        loadingMoreRef.current = false;
+        setIsLoadingMore(false);
+      }
     }
   };
 
@@ -111,6 +164,7 @@ function LogsContent() {
   const confirmDelete = async () => {
     const ids = deletingItems.map((item) => item.id);
     if (ids.length === 0) return;
+    const generation = requestGeneration.current;
     setIsDeleting(true);
     try {
       const data = await deleteSystemLogs(ids);
@@ -121,7 +175,7 @@ function LogsContent() {
         setDetailOpen(false);
         setDetailLog(null);
       }
-      await loadLogs();
+      if (generation === requestGeneration.current) await loadLogs();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "删除日志失败");
     } finally {
@@ -131,7 +185,8 @@ function LogsContent() {
 
   useEffect(() => {
     void loadLogs();
-  }, [type, startDate, endDate]);
+    return () => { requestGeneration.current += 1; };
+  }, [loadLogs]);
 
   return (
     <section className="space-y-5">
@@ -163,14 +218,14 @@ function LogsContent() {
         <CardContent className="p-0">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-100 px-5 py-4">
             <div className="flex flex-wrap items-center gap-3 text-sm text-stone-600">
-              <span>共 {items.length} 条</span>
+              <span>{isLoading ? "正在加载" : `已加载 ${items.length} 条`}{!isLoading && hasMore ? " · 还有更早记录" : ""}{!isLoading && paginationKnown && !hasMore && !loadError ? " · 已到最早记录" : ""}</span>
               <label className="flex items-center gap-2">
                 <Checkbox checked={currentPageSelected} onCheckedChange={(checked) => toggleIds(currentRows.map((item) => item.id), Boolean(checked))} />
                 本页全选
               </label>
               <label className="flex items-center gap-2">
                 <Checkbox checked={allSelected} onCheckedChange={(checked) => toggleIds(items.map((item) => item.id), Boolean(checked))} />
-                全选结果
+                全选已加载
               </label>
               {selectedIds.length > 0 ? <span>已选 {selectedIds.length} 条</span> : null}
             </div>
@@ -321,8 +376,14 @@ function LogsContent() {
               );
             })}
           </div>
-          <div className="flex items-center justify-end gap-2 border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
-            <span>第 {safePage} / {pageCount} 页，共 {items.length} 条</span>
+          {loadError ? <div role="alert" className="px-6 py-4 text-sm text-rose-600">{loadError}</div> : null}
+          {!paginationKnown && !isLoading ? <div className="px-6 py-3 text-xs text-amber-700">当前服务端尚未返回分页信息，仅展示本批日志；总量未知。</div> : null}
+          <div className="flex flex-wrap items-center justify-end gap-2 border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
+            {hasMore ? <Button variant="outline" className="mr-auto h-9 rounded-lg" onClick={() => void loadMore()} disabled={isLoading || isLoadingMore || isDeleting}>
+              {isLoadingMore ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              加载更早日志
+            </Button> : null}
+            <span>第 {safePage} / {pageCount} 页（已加载 {items.length} 条）</span>
             <Button variant="outline" size="icon" className="size-9 rounded-lg border-stone-200 bg-white" disabled={safePage <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
               <ChevronLeft className="size-4" />
             </Button>
@@ -330,7 +391,7 @@ function LogsContent() {
               <ChevronRight className="size-4" />
             </Button>
           </div>
-          {!isLoading && items.length === 0 ? <div className="px-6 py-14 text-center text-sm text-stone-500">没有找到日志</div> : null}
+          {!isLoading && !loadError && items.length === 0 ? <div className="px-6 py-14 text-center text-sm text-stone-500">没有找到日志</div> : null}
         </CardContent>
       </Card>
       <Dialog open={detailOpen} onOpenChange={setDetailOpen}>

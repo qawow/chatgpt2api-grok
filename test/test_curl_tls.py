@@ -166,6 +166,24 @@ class CurlTlsHelperTests(unittest.TestCase):
         self.assertEqual(inner_ok.cookies[0].name, "__Secure-next-auth.session-token")
         self.assertEqual(inner_ok.cookies[0].value, "sess")
 
+    def test_tls_recovery_only_uses_remaining_timeout(self) -> None:
+        inner = MagicMock()
+        inner.get.side_effect = [OSError(OPENSSL_INVALID), "ok"]
+        with patch("curl_cffi.requests.Session", return_value=inner), patch("utils.curl_tls.time.monotonic", side_effect=[10.0, 11.5]):
+            session = create_cffi_session(proxy="")
+            self.assertEqual(session.get("https://example.invalid", timeout=3.0), "ok")
+        self.assertEqual(inner.get.call_args_list[0].kwargs["timeout"], 3.0)
+        self.assertEqual(inner.get.call_args_list[1].kwargs["timeout"], 1.5)
+
+    def test_expired_tls_recovery_budget_stops_before_retry(self) -> None:
+        inner = MagicMock()
+        inner.get.side_effect = OSError(OPENSSL_INVALID)
+        with patch("curl_cffi.requests.Session", return_value=inner), patch("utils.curl_tls.time.monotonic", side_effect=[10.0, 14.0]):
+            session = create_cffi_session(proxy="")
+            with self.assertRaises(TimeoutError):
+                session.get("https://example.invalid", timeout=3.0)
+        self.assertEqual(inner.get.call_count, 1)
+
     def test_invalid_library_counter_resets_after_success(self) -> None:
         inner = MagicMock()
         inner.get.side_effect = [

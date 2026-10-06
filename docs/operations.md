@@ -195,7 +195,34 @@ docker logs -f chatgpt2api
 # 系统日志：data/logs.jsonl（type=account，摘要「GPT注册任务结束」）
 ```
 
-日志保留：`logs.jsonl` 只追加、且列表/删除接口每次读全文件，不清理会无限膨胀。`log_retention_days`（默认 30，`0` 不清理）在启动时与每 6 小时流式裁剪——内存不随文件体积增长，坏行保留不误删。日志页变慢时先看这个。
+日志保留：`log_retention_days`（默认 30，`0` 保留全部）在启动时与每 6 小时流式裁剪。列表按文件尾部分块读取；删除和保留期裁剪仍需扫描历史，坏行保留。日志文件由同一个 `LogService` 实例协调写入、删除和裁剪；多进程部署应交给单一写者或外部日志系统，当前锁仅覆盖实例内线程。
+
+### Resin 与代理检查
+
+`POST /api/proxy/test` 检查选中的网关，保留完整用户名及会话标签，沿用运行配置中的 TLS 选项；显式输入覆盖全局代理。SOCKS 使用 `socks5h` 远端 DNS。结果中的 `gateway` 和 `proxy_id` 可用于关联同一代理配置，后者由协议、网关和完整凭据等信息的哈希组成，凭据变化会产生新标识。
+
+- `reachable` 只表示收到了 HTTP 响应；`ok` 还要求 CSRF 检查端点返回有效的 200 JSON 结构。连通检查通过与账号/API 可用性是两回事。
+- `failure_kind` 区分配置、代理认证（407 或 SOCKS 认证错误）、握手、DNS、TLS、超时、HTTP 401/403、挑战页、429、上游 5xx 和响应结构异常；支持时附带 `http_status`、`curl_code`、`retry_after_seconds`。
+- 默认请求预算为 15 秒，上限 60 秒；标量预算在本地 TLS 库回退重试之间共享。检查沿用明确选中的网关，无隐式出口轮换。
+- 可选的出口观测缓存仅记录显式诊断。一次 trace 请求仅关联该次返回的 IP；缓存有效期 15 分钟、最多 1024 项、每项 32 条样本。成功和失败都会过期，损坏文件会报错并保留原件。该缓存独立于账号选号和注册调度。
+
+### 日志完整性与脱敏
+
+`GET /api/logs` 保留原有 `items`，新增 `has_more` 和 `next_cursor`；默认 200 条，`limit` 范围 1–1000。下一页携带相同筛选和返回的游标。游标锁定追加前的快照：新增记录在刷新后出现；删除或裁剪导致快照失效时返回 409 / `log_cursor_expired`，前端刷新当前筛选。历史缺少时区的记录保留 `local_timezone_unknown`，带时区的筛选仅比较有明确时间基准的记录。
+
+日志页每批加载 100 条，可继续“加载更早日志”；“已加载”与“全选已加载”描述当前已取得范围，末页显示“已到最早记录”。旧服务端缺少分页字段时显示总量未知。
+
+控制台 Logger、系统日志写入/读取、注册任务历史和完成报告共用凭据脱敏，覆盖代理 userinfo、密码、会话 token、Authorization、Cookie 和 OTP。错误中的 HTML 省略，保留故障分类；历史文件读取时同样脱敏，既有磁盘副本仍按原有权限管理。配置和账号凭据存储保持业务用途，脱敏对象仅是日志和任务历史输出。账号周期观测略过重复时间戳，额度、状态和图片门控变化仍留事件；匿名 `token:<hash>` 在更新与删除记录之间保持可关联。
+
+验证命令（全部使用本地 fixture）：
+
+```bash
+CHATGPT2API_AUTH_KEY=chatgpt2api .venv/bin/python -m unittest discover -s test -t .
+.venv/bin/python -m pytest -q test/test_log_pagination.py test/test_log_retention.py test/test_call_log_image_urls.py
+npm --prefix web run build
+```
+
+TypeScript 独立检查在 `web` 目录运行 `node_modules/.bin/tsc --noEmit --incremental false`。Next.js 当前配置会跳过构建内类型校验，两项都应验证。本地源码与 `web/out` 构建产物需要随应用镜像部署；编译通过并不会更新其他主机正在运行的容器。
 
 ### 出口（代理）熔断
 
@@ -205,7 +232,7 @@ docker logs -f chatgpt2api
 - `egress_blacklist_window_secs`（默认 60）：失败计数窗口。
 - `OPENSSL_internal:invalid library` 是本地 curl_cffi/HTTP2 问题，不计失败、也不拉黑（见 1.8.0 说明）。
 
-排障：代理偶发不通时先看是否命中熔断（`POST /api/proxy/test` 直连测一次），而不是反复换号。
+排障：代理偶发连接失败时先看是否命中熔断；`POST /api/proxy/test` 通过选定代理检查目标端点，结果按具体故障分类处理。
 
 | 症状 | 方向 |
 | --- | --- |

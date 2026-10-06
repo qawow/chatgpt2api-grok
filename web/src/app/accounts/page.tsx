@@ -51,6 +51,7 @@ import {
   fetchModels,
   fetchRefreshProgress,
   fetchReLoginProgress,
+  formatProxyTestResult,
   reLoginAccounts,
   refreshAccounts,
   refreshGrokAccounts,
@@ -815,8 +816,8 @@ function AccountsPageContent() {
     try {
       const data = await testProxy(candidate);
       data.result.ok
-        ? toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`)
-        : toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+        ? toast.success(formatProxyTestResult(data.result))
+        : toast.error(formatProxyTestResult(data.result));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "测试代理失败");
     } finally {

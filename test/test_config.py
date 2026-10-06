@@ -75,6 +75,36 @@ class ConfigLoadingTests(unittest.TestCase):
         self.assertEqual(config.image_text_failover_retries, 3)
         self.assertEqual(config.image_transient_failure_cooldown_secs, 3600)
 
+    def test_tool_refusal_cooldowns_have_safe_bounds(self) -> None:
+        # These park a credential out of the image pool, so a typo in settings
+        # must not be able to park an account for a year (or forever).
+        config = self.config_module.ConfigStore.__new__(self.config_module.ConfigStore)
+        config.data = {
+            "image_tool_short_cooldown_secs": 10 ** 9,
+            "image_tool_quota_cooldown_secs": -5,
+            "image_gate_scheduling_enabled": "yes",
+        }
+        self.assertEqual(config.image_tool_short_cooldown_secs, 86400)
+        self.assertEqual(config.image_tool_quota_cooldown_secs, 0)
+        self.assertTrue(config.image_gate_scheduling_enabled)
+
+        config.data = {"image_gate_scheduling_enabled": "off"}
+        self.assertFalse(config.image_gate_scheduling_enabled)
+        config.data = {"image_gate_scheduling_enabled": False}
+        self.assertFalse(config.image_gate_scheduling_enabled)
+
+    def test_tool_refusal_defaults_match_observed_upstream_windows(self) -> None:
+        # L3 refusals say "wait for an hour"; quota windows observed upstream run
+        # 5h/10h/24h, so the fallback must not be the generic 60s transient value.
+        config = self.config_module.ConfigStore.__new__(self.config_module.ConfigStore)
+        config.data = {}
+        self.assertEqual(config.image_tool_short_cooldown_secs, 3600)
+        self.assertEqual(config.image_tool_quota_cooldown_secs, 86400)
+        self.assertTrue(config.image_gate_scheduling_enabled)
+        self.assertGreater(
+            config.image_tool_quota_cooldown_secs, config.image_transient_failure_cooldown_secs
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

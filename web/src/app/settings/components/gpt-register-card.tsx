@@ -52,8 +52,8 @@ const DEFAULT_FORM: GptRegisterSettings = {
   has_tempmail_api_key: false,
   tempmail_domains: "",
   tempmail_domain: "",
-  tempmail_mode: "single",
-  tempmail_subdomain_depth: 2,
+  tempmail_mode: "multi",
+  tempmail_subdomain_depth: 17,
   push_enabled: true,
   push_mode: "local",
   chatgpt2api_base_url: "",
@@ -188,7 +188,7 @@ export function GptRegisterCard() {
       auto_replenish_fail_cooldown_secs: Math.max(60, Number(form.auto_replenish_fail_cooldown_secs ?? 600)),
       auto_replenish_min_total_quota: Math.max(0, Number(form.auto_replenish_min_total_quota ?? 0)),
       circuit_break: Math.max(0, Math.min(20, Number(form.circuit_break ?? 3))),
-      tempmail_subdomain_depth: Math.max(0, Math.min(5, Number(form.tempmail_subdomain_depth ?? 2))),
+      tempmail_subdomain_depth: Math.max(0, Math.min(24, Number(form.tempmail_subdomain_depth ?? 17))),
       executor: "protocol",
       mail_provider: form.mail_provider === "tempmail" ? "tempmail" : "cloudflare_d1_api",
       captcha: "",
@@ -455,16 +455,16 @@ export function GptRegisterCard() {
                   {form.tempmail_mode === "multi" ? (
                     <Field
                       label="子域名层数"
-                      hint="注册机自己生成几级随机子域名，2 = abc@k3x9q.m2a8.example.com。0 = 交给 tempmail 生成（10~14 级 gmail/yahoo 等单词拼接，地址很长）"
+                      hint="注册机自己生成几级随机子域名，17 = abc@mail2.mx1.smtp3.….example.com。0 = 交给 tempmail 生成（10~14 级 gmail/yahoo 等单词拼接，地址很长）。上限 24（实测可用）。标签混用 mail/mx/smtp 词根，不是纯随机串"
                     >
                       <Input
                         type="number"
                         min={0}
-                        max={5}
-                        value={String(form.tempmail_subdomain_depth ?? 2)}
+                        max={24}
+                        value={String(form.tempmail_subdomain_depth ?? 17)}
                         onChange={(e) => {
                           const n = parseInt(e.target.value, 10);
-                          setField("tempmail_subdomain_depth", Number.isNaN(n) ? 2 : Math.max(0, Math.min(5, n)));
+                          setField("tempmail_subdomain_depth", Number.isNaN(n) ? 17 : Math.max(0, Math.min(24, n)));
                         }}
                         className="h-10 rounded-xl border-stone-200 bg-white"
                         disabled={running}
@@ -535,7 +535,7 @@ export function GptRegisterCard() {
               )}
               <Field
                 label="出站代理"
-                hint="留空读 REGISTER_PROXY_DEFAULT。多条按行或逗号分隔，并发时 round-robin 分给各号"
+                hint="留空读 REGISTER_PROXY_DEFAULT。多条按行或逗号分隔，并发时 round-robin 分给各号。轮换代理（Resin 等）自动加粘性会话后缀，一号一出口"
               >
                 <Textarea
                   value={form.proxy}

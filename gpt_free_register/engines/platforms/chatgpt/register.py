@@ -13,6 +13,7 @@ import random
 import logging
 import secrets
 import string
+import urllib.parse
 from typing import Optional, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -140,6 +141,58 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return str(os.environ.get(name, default) or default).strip().lower() in {
         "1", "true", "yes", "on",
     }
+
+
+def _warmup_rotate_attempts() -> int:
+    """How many fresh exits warmup may try after the first one is challenged.
+
+    Measured on Resin: ~71% of fresh exits clear Cloudflare on the first
+    request. 3 rotations put the cumulative odds near 98%; each rotation costs
+    one GET, far less than a wasted registration.
+    """
+    raw = str(os.environ.get("OPENAI_WARMUP_ROTATE_ATTEMPTS") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except Exception:
+            pass
+    return 3
+
+
+def _warmup_exit_attempts() -> int:
+    """GETs allowed on one exit before rotating to a fresh one.
+
+    The rotation docstring above already argues a fresh exit is worth more than
+    another retry on a challenged one, yet this loop used to hammer a single
+    exit 4 times first: measured 34-35s per attempt once the exit was dead
+    (each GET also eats two transport-layer retries), so ~120s burned before
+    the first rotation. A healthy exit plants oai-did on attempt 1, so keeping
+    two attempts only covers plain network jitter.
+    """
+    raw = str(os.environ.get("OPENAI_WARMUP_EXIT_ATTEMPTS") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    return 2
+
+
+def _warmup_timeout_secs() -> float:
+    """Per-GET budget while planting oai-did.
+
+    Live exits answer in 1.4-11.4s (measured); a dead exit only ever consumes
+    the full timeout, so 30s was paid purely to the failing case.
+    """
+    raw = str(os.environ.get("OPENAI_WARMUP_TIMEOUT_SECS") or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    return 15.0
 
 
 def _so_collect_seconds(flow: str) -> float:
@@ -423,6 +476,7 @@ class RegistrationEngine:
         self._signup_sentinel: Optional[SentinelPayload] = None
         self._password_sentinel: Optional[SentinelPayload] = None
         self._create_account_continue_url: Optional[str] = None
+        self._last_create_account_error: str = ""
         self._otp_continue_url: Optional[str] = None
         self._otp_page_type: Optional[str] = None
 
@@ -568,6 +622,8 @@ class RegistrationEngine:
             "next-auth.callback-url",
             "next-auth.session-token",
             "oai-client-auth-session",
+            "auth-session-minimized",
+            "auth-session-minimized-client-checksum",
             "oai-sc",
         )
         jar = getattr(self.session, "cookies", None)
@@ -844,7 +900,14 @@ class RegistrationEngine:
         return headers
 
     def _warmup_chatgpt_home(self) -> bool:
-        """Plant oai-did before spending a mailbox. Fail here → 409 later."""
+        """Plant oai-did before spending a mailbox. Fail here → 409 later.
+
+        Rotating pools hand out exits of mixed reputation; measured on Resin
+        only ~71% of fresh exits clear Cloudflare on the first try, and some
+        are challenged on every attempt. After a full round of failures re-pin
+        the sticky session to a fresh exit and try again, instead of burning
+        the whole run on one bad IP (3 rotations ≈ 98% cumulative).
+        """
         from .constants import CHATGPT_APP
 
         if not getattr(self, "session", None):
@@ -854,11 +917,13 @@ class RegistrationEngine:
             self._log(f"warmup 已有 oai-did: {oai_did[:20]}...")
             return True
         nav = self._navigation_headers(fetch_site="none")
-        for warm in range(1, 5):
+        exit_attempts = _warmup_exit_attempts()
+        warm_timeout = _warmup_timeout_secs()
+        for warm in range(1, exit_attempts + 1):
             try:
-                home = self.session.get(f"{CHATGPT_APP}/", headers=nav, timeout=30)
+                home = self.session.get(f"{CHATGPT_APP}/", headers=nav, timeout=warm_timeout)
             except Exception as exc:
-                self._log(f"warmup chatgpt.com 异常 ({warm}/4): {exc}", "warning")
+                self._log(f"warmup chatgpt.com 异常 ({warm}/{exit_attempts}): {exc}", "warning")
                 time.sleep(0.6 * warm)
                 continue
             home_status = getattr(home, "status_code", "?")
@@ -867,13 +932,81 @@ class RegistrationEngine:
                 self._log(f"warmup oai-did ok status={home_status}: {oai_did[:20]}...")
                 return True
             self._log(
-                f"warmup 未种到 oai-did ({warm}/4) status={home_status} "
+                f"warmup 未种到 oai-did ({warm}/{exit_attempts}) status={home_status} "
                 f"body={self._response_body_snip(home)}",
                 "warning",
             )
             time.sleep(0.6 * warm)
-        self._log("warmup 4 次均未种到 oai-did", "error")
+
+        for rot in range(1, _warmup_rotate_attempts() + 1):
+            if not self._rotate_warmup_exit():
+                break
+            try:
+                home = self.session.get(f"{CHATGPT_APP}/", headers=nav, timeout=warm_timeout)
+            except Exception as exc:
+                self._log(f"warmup 换出口 {rot} 异常: {exc}", "warning")
+                continue
+            oai_did = self._cookie_value("oai-did")
+            if oai_did:
+                self._log(
+                    f"warmup 换出口 {rot} 后 oai-did ok "
+                    f"status={getattr(home, 'status_code', '?')}: {oai_did[:20]}..."
+                )
+                return True
+            self._log(
+                f"warmup 换出口 {rot} 仍未种到 oai-did "
+                f"status={getattr(home, 'status_code', '?')} "
+                f"body={self._response_body_snip(home)}",
+                "warning",
+            )
+
+        self._log("warmup 未种到 oai-did（含换出口重试）", "error")
         return False
+
+    def _rotate_warmup_exit(self) -> bool:
+        """Re-pin the sticky proxy to a new exit and rebuild the session.
+
+        Only meaningful for credential-bearing sticky proxies; returns False
+        (leaving the session untouched) for direct or fixed egress.
+        """
+        from core.proxy_env import rotate_sticky_session
+
+        current = getattr(self, "proxy_url", None)
+        rotated = rotate_sticky_session(current)
+        if not rotated or rotated == current:
+            return False
+        try:
+            old_session = getattr(self, "session", None)
+            if old_session is not None:
+                try:
+                    old_session.close()
+                except Exception:
+                    pass
+            self.proxy_url = rotated
+            self.http_client.proxy_url = rotated
+            # The cached session holds the old exit; drop it so the next access
+            # builds a fresh Session bound to the rotated proxy.
+            self.http_client._session = None
+            self.session = self.http_client.session
+            try:
+                from .browser_profile import apply_profile_to_session
+
+                apply_profile_to_session(self.session, getattr(self.http_client, "browser", None))
+            except Exception:
+                pass
+            self._log(f"warmup 换出口重试: {self._mask_proxy(rotated)}")
+            return True
+        except Exception as exc:
+            self._log(f"warmup 换出口失败: {exc}", "warning")
+            return False
+
+    def _mask_proxy(self, proxy: Optional[str]) -> str:
+        try:
+            from core.proxy_env import mask_proxy
+
+            return mask_proxy(proxy)
+        except Exception:
+            return "(proxy)"
 
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID，并探测 authorize 跟随是否已落到 email-verification。"""
@@ -1250,12 +1383,7 @@ class RegistrationEngine:
                     self._log(
                         "auto-OTP 存在但仍按 OPENAI_FORCE_PASSWORD_ON_AUTO_OTP 走密码路径"
                     )
-                try:
-                    names = sorted({c.name for c in self.session.cookies})
-                    auth_sess = bool(self.session.cookies.get("oai-client-auth-session"))
-                    self._log(f"skip-continue cookies={len(names)} auth_session={auth_sess}")
-                except Exception:
-                    pass
+                self._log_cookie_snapshot("skip-continue")
                 return SignupFormResult(
                     success=True,
                     page_type="email_otp_verification",
@@ -1417,12 +1545,7 @@ class RegistrationEngine:
                     elif continue_url:
                         self._log(f"跳过非 auth continue_url: {continue_url[:80]}", "warning")
                     # cookie presence is critical for OTP validate
-                    try:
-                        names = sorted({c.name for c in self.session.cookies})
-                        auth_sess = bool(self.session.cookies.get("oai-client-auth-session"))
-                        self._log(f"signup 后 cookies={len(names)} auth_session={auth_sess}")
-                    except Exception:
-                        pass
+                    self._log_cookie_snapshot("signup 后")
                 elif force_password_path:
                     self._log(
                         f"改走密码注册路径 (mode={verification_mode or '-'} "
@@ -1484,7 +1607,7 @@ class RegistrationEngine:
                             f"turnstile={'yes' if self._password_sentinel.t else 'no'}"
                         )
 
-                self._log(f"生成密码[{index}/{len(candidates)}]: {password}")
+                self._log(f"生成密码[{index}/{len(candidates)}]: [REDACTED]")
 
                 register_body = json.dumps({
                     "password": password,
@@ -1566,6 +1689,43 @@ class RegistrationEngine:
     # local-part (collision odds are negligible), so the de-dupe guard was
     # dropped rather than faked.
 
+    def _log_cookie_snapshot(self, label: str) -> None:
+        """Log cookie count + auth-session cookie name without raising.
+
+        curl_cffi's CookieJar iterates as plain str (cookie names), not Cookie
+        objects, so the historical ``{c.name for c in jar}`` idiom raised
+        AttributeError and the surrounding bare except swallowed the whole
+        diagnostic line. Keep this defensive: it must never break the flow.
+        """
+        jar = getattr(getattr(self, "session", None), "cookies", None)
+        if jar is None:
+            self._log(f"{label} cookies=? auth_session=? (session 未初始化)", "warning")
+            return
+        names: list[str] = []
+        try:
+            names = [str(n) for n in jar.keys()]
+        except Exception:
+            try:
+                for item in jar:
+                    name = getattr(item, "name", None) or str(item)
+                    if name:
+                        names.append(str(name))
+            except Exception:
+                names = []
+        # auth session 单独取，前面的名字收集失败也不能吞掉这一项。
+        # OpenAI 会改这个 cookie 的名字（oai-client-auth-session →
+        # auth-session-minimized），所以两个名字都认，并把命中的名字打出来，
+        # 下次再改名时日志能直接看出是"换名"而不是"没下发"。
+        try:
+            matched = next(
+                (n for n in self.AUTH_SESSION_COOKIE_NAMES if self._cookie_value(n)),
+                "",
+            )
+            auth_sess = matched or False
+        except Exception:
+            auth_sess = "?"
+        self._log(f"{label} cookies={len(set(names))} auth_session={auth_sess}")
+
     def _cookie_value(self, name: str) -> str:
         """Read a cookie by name without requiring a specific domain."""
         jar = getattr(getattr(self, "session", None), "cookies", None)
@@ -1596,6 +1756,23 @@ class RegistrationEngine:
                 return str(value)
         except Exception:
             pass
+        return ""
+
+    # OpenAI renamed the auth-session cookie: newer deployments issue
+    # ``auth-session-minimized`` (a JWT with the same session_id payload) while
+    # older ones issued ``oai-client-auth-session``. Accept both so a server-side
+    # rename doesn't silently break workspace extraction or fire false warnings.
+    AUTH_SESSION_COOKIE_NAMES = (
+        "oai-client-auth-session",
+        "auth-session-minimized",
+    )
+
+    def _auth_session_cookie(self) -> str:
+        """Return the auth-session cookie value under either known name."""
+        for name in self.AUTH_SESSION_COOKIE_NAMES:
+            value = self._cookie_value(name)
+            if value:
+                return value
         return ""
 
     @staticmethod
@@ -1642,6 +1819,65 @@ class RegistrationEngine:
             self._log(f"跟随 OTP continue_url: {url[:100]}")
         except Exception as exc:
             self._log(f"跟随 OTP continue_url 失败: {exc}", "warning")
+
+    def _reauthorize_for_session(self) -> str:
+        """registration_disallowed 兜底：用已有 auth session cookie 重新 authorize。
+
+        create_account 被 OpenAI 拒绝时账号其实已在服务端建立（email-verification
+        已过），重发 authorize（去掉 prompt=login）即可拿到带 code= 的 callback。
+        参考实现 gpt-auto-register/auth_flow.py L3206-3209 / L2723-2770。
+        """
+        start_url = str(getattr(self, "oauth_start", None).auth_url if getattr(self, "oauth_start", None) else "")
+        if not start_url:
+            self._log("reauthorize 跳过：无 oauth_start.auth_url", "warning")
+            return ""
+        self._log("create_account 被拒，尝试 reauthorize 兜底获取 session ...")
+        try:
+            parsed = urllib.parse.urlparse(start_url)
+            params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            params.pop("prompt", None)
+            new_query = urllib.parse.urlencode({k: v[0] for k, v in params.items()})
+            authorize_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
+        except Exception as exc:
+            self._log(f"reauthorize URL 重建失败: {exc}", "warning")
+            return ""
+
+        try:
+            resp = self.session.get(authorize_url, allow_redirects=False, timeout=20)
+        except Exception as exc:
+            self._log(f"reauthorize 请求失败: {exc}", "warning")
+            return ""
+        current_url = str(resp.headers.get("Location") or "")
+        self._log(f"reauthorize status={resp.status_code} location={current_url[:140] or '-'}")
+        if resp.status_code not in (301, 302, 303, 307, 308) or not current_url:
+            final = str(getattr(resp, "url", "") or "")
+            if "code=" in final:
+                self._log("reauthorize: 直接命中 callback URL")
+                return final
+            return ""
+        for hop in range(10):
+            if "code=" in current_url and "state=" in current_url:
+                self._log(f"reauthorize: 找到 callback URL (hop={hop + 1})")
+                return current_url
+            try:
+                hop_resp = self.session.get(current_url, allow_redirects=False, timeout=20)
+            except Exception as exc:
+                self._log(f"reauthorize hop{hop + 1} 失败: {exc}", "warning")
+                break
+            nxt = str(hop_resp.headers.get("Location") or "")
+            self._log(
+                f"reauthorize hop{hop + 1}: {hop_resp.status_code} "
+                f"{current_url.split('?')[0][:70]} -> {nxt.split('?')[0][:70] or '-'}"
+            )
+            if hop_resp.status_code not in (301, 302, 303, 307, 308) or not nxt:
+                final = str(getattr(hop_resp, "url", current_url) or current_url)
+                if "code=" in final:
+                    self._log(f"reauthorize: 最终 URL 命中 callback (hop={hop + 1})")
+                    return final
+                break
+            current_url = nxt
+        self._log("reauthorize 未取得 callback URL", "warning")
+        return ""
 
     def _resolve_session_callback_url(self) -> str:
         """Find the NextAuth callback with code= after create_account / existing login.
@@ -1741,8 +1977,8 @@ class RegistrationEngine:
             self._note_otp_mode_from_payload(response.json())
         except Exception:
             pass
-        if not self._cookie_value("oai-client-auth-session"):
-            self._log(f"警告: {label} 后缺少 oai-client-auth-session", "warning")
+        if not self._auth_session_cookie():
+            self._log(f"警告: {label} 后缺少 auth session cookie", "warning")
         return True
 
     def _send_verification_code(self, *, prefer_resend: bool = False) -> bool:
@@ -1846,13 +2082,44 @@ class RegistrationEngine:
             return 35.0
 
     def _otp_wait_policy(self) -> tuple[int, int, int]:
-        """Return (slice_secs, resend_every, max_resends) for the OTP wait loop."""
+        """Return (slice_secs, resend_every, max_resends) for the OTP wait loop.
+
+        Measured against the self-hosted tempmail: a *deliverable* address answers
+        in 0.5-5s end to end, while an undeliverable one burned 318s of wall clock
+        (300s of it pure waiting) across four send_otp calls that all returned 200
+        and produced no message at all. Resends #2 and #3 changed nothing, so the
+        budget now favours failing early and letting the job retry with a fresh
+        address and exit — that is what actually converts.
+        """
+
+        def _env_int(name: str, default: int) -> int:
+            raw = str(os.environ.get(name) or "").strip()
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+                return value if value > 0 else default
+            except Exception:
+                return default
+
         auto_otp = bool(getattr(self, "_otp_auto_sent", False)) and bool(
             getattr(self, "_is_passwordless_signup", False)
         )
-        if auto_otp:
-            return 25, 75, 2
-        return 25, 50, 3
+        slice_secs = _env_int("OPENAI_OTP_SLICE_SECS", 10)
+        resend_every = _env_int("OPENAI_OTP_RESEND_EVERY", 30 if auto_otp else 25)
+        max_resends = _env_int("OPENAI_OTP_MAX_RESENDS", 1)
+        return slice_secs, resend_every, max_resends
+
+    def _otp_total_timeout_secs(self) -> int:
+        raw = str(os.environ.get("OPENAI_OTP_TOTAL_TIMEOUT_SECS") or "").strip()
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+        return 90
 
     def _get_verification_code(self) -> Optional[str]:
         """获取验证码（分段轮询 + 会话保活 + 中途重发，降低 invalid_state / 投递丢信）。
@@ -1864,7 +2131,7 @@ class RegistrationEngine:
         try:
             self._log(f"正在等待邮箱 {self.email} 的验证码...")
             email_id = self.email_info.get("service_id") if self.email_info else None
-            total_timeout = 300
+            total_timeout = self._otp_total_timeout_secs()
             slice_secs, resend_every, max_resends = self._otp_wait_policy()
             # login_challenge rarely delivers to catch-all; use short budget.
             login_challenge = bool(getattr(self, "_otp_login_challenge", False))
@@ -1907,7 +2174,7 @@ class RegistrationEngine:
                             "warning",
                         )
                     else:
-                        self._log(f"成功获取验证码: {code}")
+                        self._log("成功获取验证码")
                         # refresh page right before validate
                         self._keep_auth_session_alive()
                         return code
@@ -2075,6 +2342,7 @@ class RegistrationEngine:
 
     def _create_user_account(self) -> bool:
         """创建用户账户"""
+        self._last_create_account_error = ""
         try:
             user_info = generate_random_user_info()
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
@@ -2149,6 +2417,11 @@ class RegistrationEngine:
             if response is None or response.status_code != 200:
                 body = response.text[:200] if response is not None else (last_transport_err or "no response")
                 self._log(f"账户创建失败: {body}", "warning")
+                # registration_disallowed 需触发 reauthorize 兜底（见 register() 第 12 步）
+                for code in ("registration_disallowed", "account_creation_failed"):
+                    if code in body:
+                        self._last_create_account_error = code
+                        break
                 return False
 
             # 提取 continue_url（ChatGPT Web 流程直接返回 OAuth callback URL）
@@ -2414,7 +2687,7 @@ class RegistrationEngine:
     def _get_workspace_id(self) -> Optional[str]:
         """获取 Workspace ID"""
         try:
-            auth_cookie = self.session.cookies.get("oai-client-auth-session")
+            auth_cookie = self._auth_session_cookie()
             if not auth_cookie:
                 self._log("未能获取到授权 Cookie", "error")
                 return None
@@ -2429,20 +2702,34 @@ class RegistrationEngine:
                     self._log("授权 Cookie 格式错误", "error")
                     return None
 
-                # 解码第一个 segment
-                payload = segments[0]
-                pad = "=" * ((4 - (len(payload) % 4)) % 4)
-                decoded = base64.urlsafe_b64decode((payload + pad).encode("ascii"))
-                auth_json = json_module.loads(decoded.decode("utf-8"))
+                # workspace_id 可能在第 1/第 2 段，也可能在 workspaces[0].id。
+                # oai-client-auth-session 的载荷在第 1 段；新式
+                # auth-session-minimized 是标准 JWT（第 1 段是 header），
+                # 因此两段都要扫，避免换名后直接解析失败。
+                auth_json: dict = {}
+                for payload in segments[:2]:
+                    if not payload:
+                        continue
+                    try:
+                        pad = "=" * ((4 - (len(payload) % 4)) % 4)
+                        decoded = base64.urlsafe_b64decode((payload + pad).encode("ascii"))
+                        candidate = json_module.loads(decoded.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(candidate, dict):
+                        auth_json.update(candidate)
 
-                workspaces = auth_json.get("workspaces") or []
-                if not workspaces:
-                    self._log("授权 Cookie 里没有 workspace 信息", "error")
-                    return None
-
-                workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+                workspace_id = str(auth_json.get("workspace_id") or "").strip()
                 if not workspace_id:
-                    self._log("无法解析 workspace_id", "error")
+                    workspaces = auth_json.get("workspaces") or []
+                    for item in workspaces:
+                        if isinstance(item, dict):
+                            workspace_id = str(item.get("id") or "").strip()
+                            if workspace_id:
+                                break
+
+                if not workspace_id:
+                    self._log("授权 Cookie 里没有 workspace 信息", "error")
                     return None
 
                 self._log(f"Workspace ID: {workspace_id}")
@@ -2746,8 +3033,18 @@ class RegistrationEngine:
                 # 正常注册流程: about_you → create_account
                 self._log("12. 创建用户账户...")
                 if not self._create_user_account():
-                    result.error_message = "创建用户账户失败"
-                    return result
+                    # registration_disallowed: 账号可能已建立，reauthorize 兜底取 session
+                    if self._last_create_account_error == "registration_disallowed":
+                        fallback = self._reauthorize_for_session()
+                        if fallback and "code=" in fallback:
+                            self._create_account_continue_url = fallback
+                            self._log("reauthorize 兜底成功，跳过 create_account 继续换取 session")
+                        else:
+                            result.error_message = "创建用户账户失败"
+                            return result
+                    else:
+                        result.error_message = "创建用户账户失败"
+                        return result
             elif self._is_existing_account:
                 self._log("12. [已注册账号] 跳过创建用户账户")
             else:
@@ -2902,7 +3199,7 @@ class RegistrationEngine:
                         code = self._get_verification_code()
                         if not code:
                             raise RuntimeError("Codex OTP 获取失败")
-                        self._log(f"Codex OTP: {code}")
+                        self._log("Codex OTP 已获取")
 
                         # 验证 OTP
                         otp_resp = login_session.post(

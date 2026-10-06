@@ -5,6 +5,8 @@ import logging
 import re
 from typing import Any
 
+from utils.log_safety import sanitize_log_value
+
 
 class Logger:
     _DATA_URL_RE = re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+")
@@ -68,8 +70,10 @@ class Logger:
         if isinstance(value, dict):
             sanitized = {}
             for key, item in value.items():
-                lowered_key = key.lower()
-                if isinstance(item, str) and ("token" in lowered_key or lowered_key == "dx"):
+                lowered_key = str(key).lower()
+                if isinstance(item, str) and item.startswith("token:"):
+                    sanitized[key] = item
+                elif isinstance(item, str) and ("token" in lowered_key or lowered_key == "dx"):
                     sanitized[key] = self._mask_string(item)
                 elif isinstance(item, str) and ("base64" in lowered_key or lowered_key == "b64_json"):
                     sanitized[key] = self._mask_base64(item)
@@ -85,7 +89,7 @@ class Logger:
         return value
 
     def _message(self, value: Any) -> str:
-        sanitized = self._sanitize(value)
+        sanitized = self._sanitize(sanitize_log_value(value))
         if isinstance(sanitized, str):
             return sanitized
         return json.dumps(sanitized, ensure_ascii=False, default=str)

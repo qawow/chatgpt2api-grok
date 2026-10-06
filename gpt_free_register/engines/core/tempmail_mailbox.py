@@ -17,7 +17,7 @@ from __future__ import annotations
 import email.utils
 import hashlib
 import logging
-import random
+import secrets
 import string
 import threading
 import time
@@ -26,6 +26,35 @@ from datetime import datetime
 from core.base_mailbox import BaseMailbox, CloudflareD1Mailbox, MailboxAccount
 
 logger = logging.getLogger(__name__)
+
+# 标签形状：真实邮件主机名（mail1 / mx2 / smtp3 / mx-a / email01），不是纯随机串。
+# 纯随机串（如 x9k2m）在地址里是「临时邮箱」的强特征；混入 mail/mx/smtp 词根更像企业域。
+_LABEL_ROOTS = (
+    "mail", "mx", "smtp", "mailer", "mailbox", "inbox", "mxmail", "mailgw",
+    "email", "imap", "pop", "relay", "post", "host", "edge", "gate", "node",
+    "correo", "posta", "courriel", "serwer", "correio", "messagerie",
+)
+_LABEL_SUFFIXES = ("", "1", "2", "3", "01", "02", "03", "10", "20", "x", "a", "b", "s", "i", "n", "e")
+# 无词根时的备选：短小写词，避免出现纯随机 4~8 位串
+_LABEL_WORDS = (
+    "alpha", "bravo", "cedar", "delta", "eagle", "flint", "gamma", "harbor", "iris",
+    "juno", "kelp", "lumen", "maple", "north", "orbit", "pixel", "quartz", "raven",
+    "sierra", "tango", "umber", "violet", "willow", "xenon", "yarrow", "zephyr",
+    "amber", "birch", "cobalt", "dune", "ember", "frost", "grove", "haze", "inlet",
+    "jasper", "kite", "larch", "mica", "nimbus", "onyx", "prism", "quill", "ridge",
+)
+# 标签要满足服务端 domainLabelPattern：^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$
+_LABEL_MAX_LEN = 63
+
+# 域名黑名单预检：DBL 会向下继承（dpdns.org 命中时其 18 级子域同样命中），
+# 所以只看「域名池里的主域」就能判断整棵子树。命中就别再拿它建号了。
+_DBL_ZONES = (
+    "dbl.spamhaus.org",
+    "dbl.nordspam.com",
+)
+_DBL_CACHE: dict[str, tuple[float, bool]] = {}
+_DBL_LOCK = threading.Lock()
+_DBL_TTL_SECS = 1800
 
 # api_key 指纹 -> 限流静默截止时间（本机时钟）。所有注册线程共享，
 # 否则别的线程的轮询会一直给服务端窗口续期。
@@ -74,11 +103,17 @@ class TempMailMailbox(BaseMailbox):
     LIST_MAX_PAGES = 10
     # Codex 补 OTP 复用旧地址时，剩余 TTL 少于这个值就删掉重建。
     MIN_REMAINING_TTL_SECS = 180
-    # multi 模式默认自己生成 2 级随机子域名（abc@k3x9q.m2a8.example.com）。
+    # multi 模式默认自己生成 17 级子域名（abc@mail2.mx1.smtp3.….example.com）。
     # 0 = 交给 tempmail 生成：它会拼 10~14 级 gmail/yahoo/proton… 单词，地址又长又像伪装。
-    DEFAULT_SUBDOMAIN_DEPTH = 2
-    MAX_SUBDOMAIN_DEPTH = 5
+    DEFAULT_SUBDOMAIN_DEPTH = 17
+    # 24 级实测可用（地址仍在上限内）；再深地址会逼近 RFC 5321 的 254 字符上限。
+    # 改这里要同步 services/gpt_register_service.py 的 TEMPMAIL_MAX_SUBDOMAIN_DEPTH。
+    MAX_SUBDOMAIN_DEPTH = 24
+    # RFC 5321 路径上限 254 字符；域名部分留够 local-part（含 @）的预算。
+    MAX_DOMAIN_LEN = 240
     DOMAINS_CACHE_TTL_SECS = 600
+    # 主域被 DBL 之类拉黑时直接跳过：整棵子树都会命中，建号也收不到信。
+    SKIP_BLOCKLISTED_DOMAINS = True
 
     def __init__(
         self,
@@ -217,18 +252,102 @@ class TempMailMailbox(BaseMailbox):
     # ------------------------------------------------------------ 建号 / 找回
 
     def _make_local_part(self) -> str:
-        body = "".join(random.choices(string.ascii_lowercase + string.digits, k=self.local_part_length))
+        """local-part：密码学随机，长度在配置值附近抖动，避免固定长度指纹。"""
+        size = max(6, self.local_part_length + secrets.randbelow(6) - 2)
+        body = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(size))
         return f"{self.local_part_prefix}{body}"
 
+    def _local_part_budget(self) -> int:
+        """最长 local-part 的字符数（含前缀），用于给域名留长度预算。"""
+        return len(self.local_part_prefix) + max(6, self.local_part_length + 3) + 1  # +1 = '@'
+
     @staticmethod
-    def _random_labels(depth: int) -> str:
-        """depth 个 4~8 位随机标签，字母开头（满足 tempmail 的 domainLabelPattern）。"""
-        labels = []
-        for _ in range(max(0, depth)):
-            size = random.randint(4, 8)
-            labels.append(random.choice(string.ascii_lowercase)
-                          + "".join(random.choices(string.ascii_lowercase + string.digits, k=size - 1)))
-        return ".".join(labels)
+    def _random_label(limit: int = _LABEL_MAX_LEN) -> str:
+        """单个主机名标签：优先 mail/mx/smtp 词根 + 可选数字，退化为短词。
+
+        纯随机串（x9k2m）在地址里是「一次性邮箱」的强特征；词根 + 数字更像企业
+        邮件主机（mail2 / mx1 / smtp3 / mx-a）。服务端 domainLabelPattern 允许
+        数字开头与连字符：^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$
+        """
+        if secrets.randbelow(100) < 80:
+            root = secrets.choice(_LABEL_ROOTS)
+            suffix = secrets.choice(_LABEL_SUFFIXES)
+            sep = secrets.choice(("", "", "-")) if suffix and secrets.randbelow(100) < 25 else ""
+            label = f"{root}{sep}{suffix}"
+        else:
+            label = secrets.choice(_LABEL_WORDS)
+        # 偶尔再叠一个数字，进一步拉开形状；仍保证合法
+        if secrets.randbelow(100) < 35:
+            label = f"{label}{secrets.randbelow(100)}"
+        label = label[:max(1, limit)].rstrip("-")
+        return label or "mail"
+
+    @classmethod
+    def _random_labels(cls, depth: int, *, base_len: int = 0, local_len: int = 0) -> str:
+        """depth 个主机名标签，字母/数字开头（满足 tempmail 的 domainLabelPattern）。
+
+        层数很深时按剩余长度预算裁剪每个标签，保证整个地址不越过
+        RFC 5321 的 254 字符路径上限（见 MAX_DOMAIN_LEN）。
+        """
+        count = max(0, depth)
+        if not count:
+            return ""
+        budget = cls.MAX_DOMAIN_LEN - (count - 1) - max(0, base_len) - max(0, local_len)
+        per_label = max(1, budget // count)
+        return ".".join(cls._random_label(min(_LABEL_MAX_LEN, per_label)) for _ in range(count))
+
+    # --------------------------------------------------------- 域名黑名单预检
+
+    @staticmethod
+    def _dbl_lookup(name: str) -> bool:
+        """name 在 DBL 命中返回 True；解析失败/超时返回 False（不拦路）。"""
+        import socket
+
+        try:
+            socket.gethostbyname(name)
+            return True
+        except (socket.gaierror, socket.herror, OSError):
+            return False
+        except Exception:  # 任何解析层异常都不该拦住建号
+            return False
+
+    def domain_is_blocklisted(self, base_domain: str) -> bool:
+        """主域是否被 Spamhaus DBL / NordSpam 收录（子域会继承，只需查主域）。"""
+        base = str(base_domain or "").strip().lower().lstrip("*.").rstrip(".")
+        if not base or not self.SKIP_BLOCKLISTED_DOMAINS:
+            return False
+        now = time.time()
+        with _DBL_LOCK:
+            hit = _DBL_CACHE.get(base)
+        if hit and now - hit[0] < _DBL_TTL_SECS:
+            return hit[1]
+        try:
+            blocked = any(self._dbl_lookup(f"{base}.{zone}") for zone in _DBL_ZONES)
+        except Exception as exc:
+            print(f"[tempmail] DBL 查询 {base} 异常（{type(exc).__name__}），按未命中处理")
+            blocked = False
+        with _DBL_LOCK:
+            _DBL_CACHE[base] = (now, blocked)
+        return blocked
+
+    def _first_clean_base(self) -> str:
+        """域名池里的干净主域，随机取一个；查不到/全黑时返回空串（调用方回退）。"""
+        try:
+            rows = self._active_domains()
+        except Exception as exc:  # 域名查询失败不能连累建号
+            print(f"[tempmail] 域名列表查询失败（{type(exc).__name__}），跳过黑名单预检")
+            return ""
+        candidates: list[str] = []
+        for row in rows:
+            base = str(row.get("base_domain") or row.get("domain") or "").strip().lower().lstrip("*.")
+            if base and base not in candidates:
+                candidates.append(base)
+        clean = [base for base in candidates if not self.domain_is_blocklisted(base)]
+        if clean:
+            return secrets.choice(clean)
+        if candidates:
+            print(f"[tempmail] 警告：域名池全部命中黑名单（{', '.join(candidates)}），仍按原域名建号")
+        return ""
 
     def _active_domains(self, *, refresh: bool = False) -> list[dict]:
         cache_key = (self.base_url, self._key_fp)
@@ -260,9 +379,14 @@ class TempMailMailbox(BaseMailbox):
         host = self.domain[2:] if wildcard else self.domain
         if not host:
             # 没指定域名：由 tempmail 挑。multi 时自定义子域名会拼到它挑的主域上。
+            # 但服务端可能挑到黑名单主域（如 cyt233.dpdns.org），所以先自己挑一个干净的。
+            clean = self._first_clean_base()
             body = {"mode": self.mode} if self.mode else {}
+            if clean:
+                body["domain"] = clean
             if self.mode == "multi" and self.subdomain_depth:
-                body["subdomain"] = self._random_labels(self.subdomain_depth)
+                body["subdomain"] = self._random_labels(self.subdomain_depth,
+                                                        local_len=self._local_part_budget())
             return body
         split = self._split_host(host)
         if split is None:
@@ -274,11 +398,26 @@ class TempMailMailbox(BaseMailbox):
         if wildcard or self.mode == "multi":
             # 带固定前缀时不能交给服务端生成（它只会直接挂在主域下），至少自己生成默认层数
             depth = self.subdomain_depth or (self.DEFAULT_SUBDOMAIN_DEPTH if prefix else 0)
-            subdomain = ".".join(part for part in (self._random_labels(depth), prefix) if part)
+            # 主域被 DBL 拉黑时子域同样命中，换池子里干净的主域
+            if self.domain_is_blocklisted(base):
+                alt = self._first_clean_base()
+                if alt and alt != base:
+                    print(f"[tempmail] 主域 {base} 命中 DBL（子域会继承），改用 {alt}")
+                    base, prefix = alt, ""
+            # 前缀要算进长度预算，否则固定前缀 + 深层数会越过 254 字符
+            fixed = f".{prefix}" if prefix else ""
+            labels = self._random_labels(depth, base_len=len(base) + len(fixed),
+                                         local_len=self._local_part_budget())
+            subdomain = ".".join(part for part in (labels, prefix) if part)
             body = {"domain": base, "mode": "multi"}
             if subdomain:
                 body["subdomain"] = subdomain
             return body
+        if self.domain_is_blocklisted(base):
+            alt = self._first_clean_base()
+            if alt and alt != base:
+                print(f"[tempmail] 主域 {base} 命中 DBL，改用 {alt}")
+                return {"domain": alt, "mode": self.mode} if self.mode else {"domain": alt}
         return {"domain": base, "mode": self.mode} if self.mode else {"domain": base}
 
     def _create(self, body: dict) -> dict:
@@ -482,7 +621,7 @@ class TempMailMailbox(BaseMailbox):
                     seen.add(mid)
                     if code:
                         consumed.add(mid)
-                        print(f"[tempmail] 验证码: {code}")
+                        print("[tempmail] 验证码已收到")
                         return code
             except TempMailError as exc:
                 last_err = str(exc)[:160]

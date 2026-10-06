@@ -159,10 +159,17 @@ class TempmailTestCase(unittest.TestCase):
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
         tm._COOLDOWN_UNTIL.clear()
         tm._DOMAINS_CACHE.clear()
+        tm._DBL_CACHE.clear()
         self.addCleanup(tm._COOLDOWN_UNTIL.clear)
         self.addCleanup(tm._DOMAINS_CACHE.clear)
+        self.addCleanup(tm._DBL_CACHE.clear)
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
+        # 单元测试不能真的去解析 DBL（慢且不稳定）；默认「全部干净」，
+        # 需要黑名单行为的用例自己 mock domain_is_blocklisted / _first_clean_base。
+        patcher = mock.patch.object(TempMailMailbox, "domain_is_blocklisted", return_value=False)
+        self.is_blocklisted = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def mailbox(self, **kwargs) -> TempMailMailbox:
         opts = {"base_url": self.base_url, "api_key": GOOD_KEY, "domain": "mail.test", "mode": "single"}
@@ -312,30 +319,70 @@ class WaitForCodeTests(TempmailTestCase):
         self.assertEqual(len(self.fake.requests), sent)
 
 
-LABEL_RE = re.compile(r"^[a-z][a-z0-9]{3,7}$")
+# 服务端 domainLabelPattern：^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$
+LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 class MultiLevelDomainTests(TempmailTestCase):
     def created(self) -> dict:
         return self.fake.created_bodies[-1]
 
-    def test_multi_mode_generates_a_short_random_subdomain(self):
+    def test_multi_mode_generates_the_default_deep_subdomain(self):
         account = self.mailbox(mode="multi").get_email()
         body = self.created()
         self.assertEqual((body["mode"], body["domain"]), ("multi", "mail.test"))
         labels = body["subdomain"].split(".")
-        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(labels), tm.TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH)
+        self.assertEqual(tm.TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH, 17)
         self.assertTrue(all(LABEL_RE.match(label) for label in labels), labels)
         self.assertEqual(account.email.split("@", 1)[1], f"{body['subdomain']}.mail.test")
+
+    def test_labels_look_like_mail_hosts_not_random_noise(self):
+        """标签应含 mail/mx/smtp 词根或真实词，避免纯随机串特征。"""
+        roots = tm._LABEL_ROOTS + tm._LABEL_WORDS
+        for _ in range(30):
+            label = tm.TempMailMailbox._random_label()
+            self.assertTrue(LABEL_RE.match(label), label)
+            self.assertTrue(any(label.startswith(root) for root in roots), label)
+
+    def test_labels_are_unique_enough_for_a_whole_address(self):
+        hosts = {tm.TempMailMailbox._random_labels(17) for _ in range(20)}
+        self.assertEqual(len(hosts), 20)
 
     def test_every_account_gets_its_own_host(self):
         box = self.mailbox(mode="multi")
         hosts = {box.get_email().email.split("@", 1)[1] for _ in range(5)}
         self.assertEqual(len(hosts), 5)
 
+    def test_local_part_length_varies(self):
+        box = self.mailbox()
+        lengths = {len(box._make_local_part()) for _ in range(40)}
+        self.assertGreater(len(lengths), 1, "local-part 长度固定会被当成指纹")
+
     def test_depth_zero_leaves_the_subdomain_to_tempmail(self):
         self.mailbox(mode="multi", subdomain_depth=0).get_email()
         self.assertNotIn("subdomain", self.created())
+
+    def test_deep_subdomain_is_accepted_by_the_server(self):
+        """24 级实测可收信；这里验证 24 级地址能完整走到建号 + 收码。"""
+        depth = tm.TempMailMailbox.MAX_SUBDOMAIN_DEPTH
+        box = self.mailbox(mode="multi", subdomain_depth=depth)
+        account = box.get_email()
+        labels = self.created()["subdomain"].split(".")
+        self.assertEqual(len(labels), depth)
+        self.assertTrue(all(LABEL_RE.match(label) for label in labels), labels)
+        self.assertEqual(account.email.split("@", 1)[1],
+                         f"{self.created()['subdomain']}.mail.test")
+        self.deliver_later(0.05, account.email, subject="Your temporary ChatGPT verification code",
+                           body_text="Your code is 654321")
+        self.assertEqual(box.wait_for_code(account, timeout=10), "654321")
+
+    def test_address_stays_within_rfc5321_length(self):
+        """最深 + 最长 local-part 时，地址仍要低于 RFC 5321 的 254 字符上限。"""
+        box = self.mailbox(mode="multi", subdomain_depth=tm.TempMailMailbox.MAX_SUBDOMAIN_DEPTH,
+                           local_part_length=64)
+        for _ in range(5):
+            self.assertLessEqual(len(box.get_email().email), 254)
 
     def test_wildcard_pool_entry_forces_multi(self):
         account = self.mailbox(domain="*.wild.test", mode="single", subdomain_depth=3).get_email()
@@ -362,12 +409,31 @@ class MultiLevelDomainTests(TempmailTestCase):
         self.mailbox(domain="mail.test", mode="single").get_email()
         self.assertEqual(self.created(), {"domain": "mail.test", "mode": "single", "address": mock.ANY})
 
-    def test_multi_without_domain_lets_tempmail_pick_the_base(self):
+    def test_multi_without_domain_picks_a_clean_base_itself(self):
+        """域名池留空时不能把主域交给服务端挑——它可能挑到黑名单域（如 dpdns.org）。"""
+        self.mailbox(domain="", mode="multi").get_email()
+        body = self.created()
+        self.assertEqual(body["mode"], "multi")
+        # 干净主域是随机取的，断言它确实来自池子而不是被交给服务端
+        self.assertIn(body["domain"], {"mail.test", "wild.test"})
+        self.assertEqual(len(body["subdomain"].split(".")),
+                         tm.TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH)
+
+    def test_without_domain_and_everything_blocklisted_falls_back_to_server(self):
+        self.is_blocklisted.return_value = True
         self.mailbox(domain="", mode="multi").get_email()
         body = self.created()
         self.assertEqual(body["mode"], "multi")
         self.assertNotIn("domain", body)
-        self.assertEqual(len(body["subdomain"].split(".")), 2)
+
+    def test_blocklisted_pool_entry_switches_to_a_clean_domain(self):
+        """选到 dpdns.org 这类被 DBL 收录的主域时，要自动换池里干净的那个。"""
+        self.is_blocklisted.side_effect = lambda base: base == "wild.test"
+        self.mailbox(domain="*.wild.test", mode="multi").get_email()
+        body = self.created()
+        self.assertEqual(body["domain"], "mail.test")   # 池里唯一干净的主域
+        self.assertEqual(len(body["subdomain"].split(".")),
+                         tm.TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH)
 
     def test_foreign_domain_fails_before_creating_anything(self):
         with self.assertRaises(TempMailError) as ctx:
@@ -452,7 +518,7 @@ class ServiceSettingsTests(unittest.TestCase):
         self.assertEqual(s["tempmail_api_key"], "tm_x")
         self.assertEqual(self.svc.normalize_settings({"mail_provider": "outlook"})["mail_provider"],
                          "cloudflare_d1_api")
-        self.assertEqual(self.svc.normalize_settings(None)["tempmail_mode"], "single")
+        self.assertEqual(self.svc.normalize_settings(None)["tempmail_mode"], "multi")
 
     def test_api_key_is_masked_and_kept_on_blank_patch(self):
         stored = self.svc.normalize_settings({"tempmail_api_key": "tm_secret"})
@@ -634,8 +700,19 @@ class RunnerWiringTests(unittest.TestCase):
         self.assertEqual(box.subdomain_depth, 0)
 
     def test_subdomain_depth_is_clamped(self):
-        from services.gpt_register_service import normalize_settings
+        from services.gpt_register_service import TEMPMAIL_MAX_SUBDOMAIN_DEPTH, normalize_settings
 
-        self.assertEqual(normalize_settings({"tempmail_subdomain_depth": 9})["tempmail_subdomain_depth"], 5)
+        self.assertEqual(normalize_settings({"tempmail_subdomain_depth": 99})["tempmail_subdomain_depth"],
+                         TEMPMAIL_MAX_SUBDOMAIN_DEPTH)
         self.assertEqual(normalize_settings({"tempmail_subdomain_depth": -1})["tempmail_subdomain_depth"], 0)
-        self.assertEqual(normalize_settings({})["tempmail_subdomain_depth"], 2)
+        self.assertEqual(normalize_settings({})["tempmail_subdomain_depth"], 17)
+
+    def test_engine_depth_cap_matches_the_service_cap(self):
+        """两处上限必须一致：services 放开了但引擎还钳着，深子域会被静默压回。"""
+        from gpt_free_register.engines.core.tempmail_mailbox import TempMailMailbox
+        from services.gpt_register_service import TEMPMAIL_MAX_SUBDOMAIN_DEPTH
+
+        self.assertEqual(TempMailMailbox.MAX_SUBDOMAIN_DEPTH, TEMPMAIL_MAX_SUBDOMAIN_DEPTH)
+        self.assertEqual(TempMailMailbox(subdomain_depth=TEMPMAIL_MAX_SUBDOMAIN_DEPTH,
+                                        base_url="https://m", api_key="k").subdomain_depth,
+                         TEMPMAIL_MAX_SUBDOMAIN_DEPTH)

@@ -83,16 +83,33 @@ class OpenAIHTTPClient(HTTPClient):
         with location=None so a transient cloudflare.com timeout does not abort
         the whole registration — the real OpenAI requests use the same proxy
         and will surface their own errors if it is truly down.
+
+        The budget is deliberately small: a dying SOCKS exit made this probe burn
+        66s of a run (3 attempts x 10s plus backoff, and the SOCKS connect can
+        overrun the read timeout) and every one of those seconds bought nothing,
+        because the failure path returns "continue anyway". The value only feeds
+        Accept-Language/OAI-Language plus the CN block; a live exit answers in
+        well under a second.
         """
         blocked = {
             x.strip().upper()
             for x in str(os.environ.get("OPENAI_BLOCK_REGIONS", "CN") or "CN").split(",")
             if x.strip()
         }
+        try:
+            attempts = max(1, int(os.environ.get("OPENAI_IP_PROBE_ATTEMPTS") or 2))
+        except Exception:
+            attempts = 2
+        try:
+            probe_timeout = float(os.environ.get("OPENAI_IP_PROBE_TIMEOUT_SECS") or 4)
+        except Exception:
+            probe_timeout = 4.0
+        if probe_timeout <= 0:
+            probe_timeout = 4.0
         last_err = ""
-        for attempt in range(1, 4):
+        for attempt in range(1, attempts + 1):
             try:
-                response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
+                response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=probe_timeout)
                 trace_text = response.text or ""
                 loc_match = re.search(r"loc=([A-Z]+)", trace_text)
                 loc = loc_match.group(1) if loc_match else None
@@ -101,10 +118,10 @@ class OpenAIHTTPClient(HTTPClient):
                 return True, loc
             except Exception as e:
                 last_err = str(e)
-                if attempt < 3:
+                if attempt < attempts:
                     import time as _time
 
-                    _time.sleep(0.8 * attempt)
+                    _time.sleep(0.4 * attempt)
         logger.warning(f"检查 IP 地理位置失败（放行继续）: {last_err}")
         return True, None
 

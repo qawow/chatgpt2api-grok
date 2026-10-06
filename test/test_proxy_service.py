@@ -611,7 +611,7 @@ class ProxyServiceTests(unittest.TestCase):
                 proxies.append(kwargs.get("proxy"))
 
             def get(self, *args: object, **kwargs: object) -> object:
-                return type("Response", (), {"status_code": 200})()
+                return type("Response", (), {"status_code": 200, "text": '{"csrfToken":"fixture"}', "headers": {}})()
 
             def close(self) -> None:
                 pass

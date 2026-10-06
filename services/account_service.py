@@ -19,6 +19,8 @@ from services.log_service import (
 )
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
+from utils.log import logger
+from utils.network_diagnostics import error_details
 
 
 class AccountService:
@@ -169,21 +171,33 @@ class AccountService:
 
     @staticmethod
     def _is_soft_network_refresh_error(error: str) -> bool:
-        text = str(error or "").lower()
+        return error_details(error)["failure_kind"] in {
+            "timeout", "dns", "proxy_auth", "proxy_connect", "transport", "tls",
+            "challenge", "http_forbidden", "rate_limit", "upstream",
+        }
+
+    @classmethod
+    def _allows_password_relogin(cls, account: dict | None, event: str,
+                                 errors: list[str]) -> bool:
+        """Keep transient or unknown failures from replacing a live session.
+
+        Absence of a recognized transport error is not proof of revocation.
+        Manual re-login remains an explicit operator action.
+        """
+        ev = str(event or "").lower()
+        if "relogin" in ev or "re_login" in ev:
+            return True
+        if not cls._is_session_only_account(account):
+            return True
+        confirmed = (
+            "token_revoked", "invalidated oauth", "app_session_terminated",
+            "token invalidated (/backend-api/me)", "token invalidated (me)",
+            "session_refresh_token_still_invalid", "refreshed_token_still_invalid_on_me",
+        )
         return any(
-            token in text
-            for token in (
-                "timeout",
-                "timed out",
-                "connection",
-                "curl: (28)",
-                "curl: (7)",
-                "curl: (35)",
-                "openssl_internal",
-                "invalid library",
-                "proxyerror",
-                "proxy error",
-            )
+            not cls._is_soft_network_refresh_error(error)
+            and any(marker in str(error).lower() for marker in confirmed)
+            for error in errors
         )
 
     @classmethod
@@ -207,8 +221,6 @@ class AccountService:
             "session_refresh_token_still_invalid",
             "refreshed_token_still_invalid",
             "refreshed_token_still_invalid_on_me",
-            "authorize_failed_403",
-            "password_verify_failed_403",
             "无可用续期手段",
             "invalid_access_token",
             # OAuth refresh returns this when the app session is permanently
@@ -340,10 +352,54 @@ class AccountService:
         return False
 
     @staticmethod
+    def _image_gate_park_until(account: dict) -> float:
+        """Epoch seconds until this account's image gate reopens; 0 when open.
+
+        Sources, in order of authority:
+          1. ``image_gate.resets_at`` — the ISO reset from ``blocked_features``,
+             which is the enforcement face of the budget and the only signal
+             that survives the decoupled ``limits_progress`` ledger.
+          2. ``image_gate_park_until`` — set by the image path when a tool
+             refusal arrived with a stated window but no fresh init payload.
+        A gate with no parseable window parks for the configured default rather
+        than being treated as open, because seeing the gate at all means the
+        account is closed right now.
+        """
+        if not isinstance(account, dict):
+            return 0.0
+        if not config.image_gate_scheduling_enabled:
+            return 0.0
+        now = time.time()
+        until = 0.0
+        gate = account.get("image_gate")
+        if isinstance(gate, dict) and gate.get("name") == "image_gen":
+            try:
+                stated = float(gate.get("resets_at") or 0.0)
+            except (TypeError, ValueError):
+                stated = 0.0
+            if stated > 0:
+                # Absolute window: expires on its own, never re-armed below.
+                until = max(until, stated)
+            else:
+                # Gate seen without a parseable window: seeing it at all means
+                # the account is closed, so park the configured default.
+                until = max(until, now + float(config.image_tool_quota_cooldown_secs))
+        try:
+            until = max(until, float(account.get("image_gate_park_until") or 0.0))
+        except (TypeError, ValueError):
+            pass
+        return until if until > now else 0.0
+
+    @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
+            return False
+        # A closed image gate outranks a positive advertised remainder: the
+        # ledger keeps showing leftover images after the gate shut (measured:
+        # remaining=20 on an account that hard-blocked at 5).
+        if AccountService._image_gate_park_until(account) > 0:
             return False
         # Local quota is meaningless once access token is known-dead
         if AccountService._token_looks_revoked(account):
@@ -459,6 +515,13 @@ class AccountService:
         normalized["source_type"] = self._normalize_source_type(source_type)
         limits_progress = normalized.get("limits_progress")
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
+        gate = normalized.get("image_gate")
+        normalized["image_gate"] = gate if isinstance(gate, dict) else None
+        try:
+            park_until = float(normalized.get("image_gate_park_until") or 0.0)
+        except (TypeError, ValueError):
+            park_until = 0.0
+        normalized["image_gate_park_until"] = park_until if park_until > time.time() else 0.0
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
         normalized["restore_at"] = normalized.get("restore_at") or None
         normalized["success"] = int(normalized.get("success") or 0)
@@ -999,11 +1062,8 @@ class AccountService:
             if token_data is None:
                 email = str(account.get("email") or "").strip()
                 password = str(account.get("password") or "").strip()
-                ev = str(event or "")
-                allow_password = bool(email and password) and (
-                    not self._is_session_only_account(account)
-                    or "relogin" in ev
-                    or "re_login" in ev
+                allow_password = bool(email and password) and self._allows_password_relogin(
+                    account, event, errors
                 )
                 if allow_password and force:
                     try:
@@ -1527,6 +1587,54 @@ class AccountService:
     def list_tokens(self) -> list[str]:
         with self._lock:
             return list(self._accounts)
+
+    def park_image_account(
+        self,
+        access_token: str,
+        *,
+        until_ts: float,
+        kind: str = "quota",
+        reason: str = "",
+        gate: dict[str, Any] | None = None,
+    ) -> dict | None:
+        """Park one credential's image capability until ``until_ts``.
+
+        Deliberately not a ``status`` change: the account is alive and its text
+        capability is untouched, and setting 限流 would let
+        ``auto_remove_rate_limited_accounts`` delete the credential outright.
+        Only the image picker consults ``image_gate_park_until``.
+        """
+        if not access_token:
+            return None
+        until_ts = float(until_ts or 0.0)
+        if until_ts <= time.time():
+            return None
+        updates: dict[str, Any] = {
+            "image_gate_park_until": until_ts,
+            "image_gate_park_kind": str(kind or "quota"),
+            "image_gate_park_reason": str(reason or "")[:300],
+        }
+        if isinstance(gate, dict) and gate.get("name") == "image_gen":
+            updates["image_gate"] = gate
+        account = self.update_account(access_token, updates, quiet=True)
+        logger.info({
+            "event": "image_account_parked",
+            "kind": updates["image_gate_park_kind"],
+            "until_ts": until_ts,
+            "seconds": int(until_ts - time.time()),
+            "reason": updates["image_gate_park_reason"][:120],
+        })
+        return account
+
+    def clear_image_account_park(self, access_token: str) -> None:
+        """Reopen a parked credential (used when a fresh probe shows an open gate)."""
+        if not access_token:
+            return
+        self.update_account(
+            access_token,
+            {"image_gate_park_until": 0.0, "image_gate_park_kind": "", "image_gate_park_reason": ""},
+            quiet=True,
+        )
 
     def count_image_available_accounts(self) -> int:
         """Accounts the image picker can use right now (status/quota/revoke)."""
@@ -2213,6 +2321,10 @@ class AccountService:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
+            removed_refs = sorted(
+                anonymize_token(token)
+                for token in target_set if token in self._accounts
+            )
             removed = sum(self._remove_account_locked(token) for token in target_set)
             if removed:
                 if self._accounts:
@@ -2220,7 +2332,9 @@ class AccountService:
                 else:
                     self._index = 0
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
+                log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {
+                    "removed": removed, "account_refs": removed_refs, "source": "delete_accounts",
+                })
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
@@ -2231,6 +2345,7 @@ class AccountService:
         quiet: bool = False,
         *,
         allow_status_override: bool = False,
+        source: str = "update_account",
     ) -> dict | None:
         """Apply ``updates`` to an account.
 
@@ -2264,9 +2379,39 @@ class AccountService:
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
-            if not quiet:
-                log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                                {"token": anonymize_token(access_token), "status": account.get("status")})
+            volatile_fields = {
+                "last_probed_at", "last_used_at", "restore_at", "last_refresh_at", "updated_at",
+            }
+
+            def observed_value(key: str, item: dict):
+                value = item.get(key)
+                if source == "remote_probe":
+                    if key == "image_gate" and isinstance(value, dict):
+                        return {name: field for name, field in value.items() if name != "observed_at"}
+                    if key == "limits_progress" and isinstance(value, list):
+                        return [
+                            {name: field for name, field in row.items() if name != "reset_after"}
+                            if isinstance(row, dict) else row for row in value
+                        ]
+                return value
+
+            changed = sorted(
+                key for key in current.keys() | account.keys()
+                if observed_value(key, current) != observed_value(key, account)
+                and (source != "remote_probe" or key not in volatile_fields)
+            )
+            if not quiet and (changed or allow_status_override):
+                detail = {
+                    "account_ref": anonymize_token(access_token),
+                    "source": source, "status": account.get("status"),
+                    "changed_fields": changed,
+                }
+                if current.get("status") != account.get("status"):
+                    detail["previous_status"] = current.get("status")
+                if current.get("quota") != account.get("quota"):
+                    detail["previous_quota"] = current.get("quota")
+                    detail["quota"] = account.get("quota")
+                log_service.add(LOG_TYPE_ACCOUNT, "更新账号", detail)
             return dict(account)
         return None
 
@@ -2480,7 +2625,43 @@ class AccountService:
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        account = self.update_account(active_token, result, source="remote_probe")
+        self._reconcile_image_park_with_probe(active_token, result, account)
+        return account
+
+    def _reconcile_image_park_with_probe(
+        self, access_token: str, probe: Any, account: dict | None
+    ) -> bool:
+        """Return a parked credential early when a probe proves its gate reopened.
+
+        A refusal text can overstate the window (observed: the tool said 10小时
+        while ``blocked_features`` said 9小时), so waiting out the pessimistic
+        figure wastes real capacity. Only a probe that *explicitly* reports no
+        image_gen gate counts as proof — a probe that merely lacked the field
+        must not silently reopen a parked account.
+
+        Deliberately not applied to a ``cooldown`` park: the L3 pacing verdict
+        consumes no quota, so ``conversation/init`` keeps showing an open gate
+        throughout it. Clearing on that signal would hand the account straight
+        back out mid-cooldown, which is exactly what the park exists to prevent.
+        """
+        if not isinstance(probe, dict) or probe.get("image_gate") is not None:
+            return False
+        # Requires positive proof that the gate list was present and empty. A
+        # response that simply lacked the field must not reopen a parked account.
+        if probe.get("image_gate_probe_ok") is not True:
+            return False
+        if not account:
+            return False
+        if float(account.get("image_gate_park_until") or 0) <= 0:
+            return False
+        if str(account.get("image_gate_park_kind") or "") != "quota":
+            return False
+        self.clear_image_account_park(access_token)
+        account["image_gate_park_until"] = 0.0
+        account["image_gate_park_kind"] = ""
+        logger.info({"event": "image_account_unparked", "reason": "gate_open_on_probe"})
+        return True
 
     # ---- 刷新进度追踪 ----
 

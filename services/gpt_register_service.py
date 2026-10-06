@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
+from utils.log_safety import redact_text, sanitize_log_value
+from utils.network_diagnostics import error_details
 
 GPT_REGISTER_CONFIG_FILE = DATA_DIR / "gpt_register_config.json"
 GPT_REGISTER_JOBS_FILE = DATA_DIR / "gpt_register_jobs.json"
@@ -105,10 +107,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 必须在 DEFAULT_SETTINGS 里，否则 normalize_settings 会把它丢掉。
     "tempmail_domain": "",
     # single = 普通域名 abc@example.com；multi = 多级子域名；空 = 服务端随机
-    "tempmail_mode": "single",
-    # multi 时自己生成几级随机子域名（abc@k3x9q.m2a8.example.com）；
+    # 默认 multi：随机子域名把每个号拆到独立主机名，避免整域共享一个地址形态
+    "tempmail_mode": "multi",
+    # multi 时自己生成几级随机子域名（abc@mail2.mx1.smtp3.….example.com）；
     # 0 = 交给 tempmail 生成（10~14 级 gmail/yahoo… 单词拼接，地址很长）
-    "tempmail_subdomain_depth": 2,
+    "tempmail_subdomain_depth": 17,
     "push_enabled": True,
     "push_mode": "local",  # local | http
     # empty → auto (local in-process import; http mode uses container-aware default)
@@ -141,6 +144,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 与数量水位是 OR 关系：任一不足即触发，spacing/失败冷却/批次共用。
     # 免费号 quota 常为 0，故默认关闭；想用时按每号约 25 张设阈值。
     "auto_replenish_min_total_quota": 0,
+    # 发行上限是注册时随机抽的（实测同一域名同一批里出现 5 / 5 / 25），
+    # 所以想只要高额度号就把阈值设成 25：注册完先读一次 conversation/init，
+    # 低于阈值直接丢弃不入池。0 = 关闭（行为与之前完全一致）。
+    "min_image_cap": 0,
     # 连续网络故障熔断；0=关闭熔断（仍受任务 timeout 保护）。
     "circuit_break": 3,
 }
@@ -248,6 +255,9 @@ def parse_domain_pool(text: object) -> list[str]:
 MAIL_PROVIDER_CFD1 = "cloudflare_d1_api"
 MAIL_PROVIDER_TEMPMAIL = "tempmail"
 TEMPMAIL_MODES = frozenset({"single", "multi"})
+# 子域名最大层数：24 级实测可用（地址仍在上限内），与
+# gpt_free_register/engines/core/tempmail_mailbox.py 的 MAX_SUBDOMAIN_DEPTH 保持一致。
+TEMPMAIL_MAX_SUBDOMAIN_DEPTH = 24
 # Blanked by public_settings; an empty value in a patch keeps the stored one.
 SECRET_SETTING_KEYS = ("chatgpt2api_auth_key", "tempmail_api_key")
 
@@ -466,10 +476,10 @@ def preflight_register_proxy(proxy: str) -> str:
     if status not in {"already_up", "started"} or not _proxy_tcp_open(host, port):
         raise RuntimeError(
             f"注册代理不可达 {host}:{port} (mihomo={status})。"
-            "32 并发会在开跑前集体失败，先把 SOCKS 拉起来。"
+            "请检查网关监听和代理配置。"
         )
     health = _refresh_local_clash_nodes(host)
-    bits = [f"出口预检通过 {_mask_proxy_url(target)}"]
+    bits = [f"网关 TCP 可达 {_mask_proxy_url(target)}（鉴权与目标 HTTP 尚未验证）"]
     if status == "started":
         bits.append("mihomo started")
     if health:
@@ -591,7 +601,9 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["tempmail_domain"] = _clean(out.get("tempmail_domain")).lstrip("@").lower()
     tempmail_mode = _clean(out.get("tempmail_mode")).lower()
     out["tempmail_mode"] = tempmail_mode if tempmail_mode in TEMPMAIL_MODES else ""
-    out["tempmail_subdomain_depth"] = _clamp_int(out.get("tempmail_subdomain_depth"), 2, 0, 5)
+    out["tempmail_subdomain_depth"] = _clamp_int(
+        out.get("tempmail_subdomain_depth"), 17, 0, TEMPMAIL_MAX_SUBDOMAIN_DEPTH
+    )
     out["push_enabled"] = bool(out.get("push_enabled", True))
     push_mode = _clean(out.get("push_mode")).lower() or "local"
     if push_mode not in {"local", "http"}:
@@ -634,6 +646,7 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["auto_replenish_fail_cooldown_secs"] = _clamp_int(
         out.get("auto_replenish_fail_cooldown_secs"), 600, 60, 7200
     )
+    out["min_image_cap"] = _clamp_int(out.get("min_image_cap"), 0, 0, 10000)
     out["auto_replenish_min_total_quota"] = _clamp_int(
         out.get("auto_replenish_min_total_quota"), 0, 0, 10000
     )
@@ -741,7 +754,7 @@ class GptRegisterService:
             if status in _TERMINAL_JOB_STATUSES:
                 self._cancel_flags.pop(jid, None)
         from utils.atomic import atomic_write_json
-        atomic_write_json(GPT_REGISTER_JOBS_FILE, items)
+        atomic_write_json(GPT_REGISTER_JOBS_FILE, sanitize_log_value(items))
 
     def list_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -750,12 +763,12 @@ class GptRegisterService:
                 key=lambda j: str(j.get("created_at") or ""),
                 reverse=True,
             )
-            return [dict(j) for j in items]
+            return [sanitize_log_value(j) for j in items]
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             job = self._jobs.get(_clean(job_id))
-            return dict(job) if job else None
+            return sanitize_log_value(job) if job else None
 
     def cancel_job(self, job_id: str) -> dict[str, Any] | None:
         jid = _clean(job_id)
@@ -771,7 +784,7 @@ class GptRegisterService:
                 job["cancel_requested"] = True
                 self._jobs[jid] = job
                 self._save_jobs()
-            return dict(self._jobs[jid])
+            return sanitize_log_value(self._jobs[jid])
 
     def has_active_job(self) -> bool:
         with self._lock:
@@ -954,7 +967,7 @@ class GptRegisterService:
             daemon=True,
         )
         thread.start()
-        return dict(job)
+        return sanitize_log_value(job)
 
     def _append_log(
         self,
@@ -964,7 +977,7 @@ class GptRegisterService:
         level: str = "info",
         force_save: bool = False,
     ) -> None:
-        msg = str(message or "").strip()
+        msg = redact_text(str(message or "").strip(), limit=1600)
         if not msg:
             return
         # also emit to process stdout for docker logs / journal
@@ -977,7 +990,10 @@ class GptRegisterService:
             if not job:
                 return
             logs = list(job.get("logs") or [])
-            logs.append({"at": _now_iso(), "level": level, "message": msg[:800]})
+            entry = {"at": _now_iso(), "level": level, "message": msg[:800]}
+            if level in {"error", "warn", "warning"}:
+                entry.update(error_details(message))
+            logs.append(entry)
             job["logs"] = logs[-400:]
             job["updated_at"] = _now_iso()
             self._jobs[job_id] = job
@@ -1378,10 +1394,10 @@ class GptRegisterService:
                     for it in (items or [])
                 ],
             }
-            # record embeds settings.proxy (credentialed URL) — keep it 0600.
+            # Completion history remains owner-only even after redaction.
             from utils.atomic import atomic_write_json
 
-            atomic_write_json(path, record)
+            atomic_write_json(path, sanitize_log_value(record))
             self._append_log(job_id, f"完成日志已写入 data/gpt_register_logs/{job_id}.json")
         except Exception as exc:
             self._append_log(job_id, f"写入完成日志文件失败: {exc}", level="warn")
@@ -1445,9 +1461,9 @@ class GptRegisterService:
         logs: list[str] = []
 
         def _log(message: str) -> None:
-            text_msg = str(message or "").strip()
+            text_msg = redact_text(str(message or "").strip(), limit=500)
             if text_msg:
-                logs.append(text_msg[:500])
+                logs.append(text_msg)
 
         try:
             from gpt_free_register.runner import register_chatgpt_once
@@ -1588,7 +1604,7 @@ class GptRegisterService:
             for line in str(blob).splitlines():
                 line = line.strip()
                 if line:
-                    logs.append(f"{stream_name}: {line[:400]}")
+                    logs.append(f"{stream_name}: {redact_text(line, limit=400)}")
         if proc.returncode not in (0, None):
             logs.append(f"returncode={proc.returncode}")
         parsed = _extract_json_object(stdout)
@@ -1648,6 +1664,32 @@ class GptRegisterService:
             "mode": "subprocess",
         }
 
+    @staticmethod
+    def _issued_image_cap(access_token: str, proxy: str) -> int | None:
+        """Read the freshly issued image_gen cap, or None when unknowable.
+
+        A brand-new account has not consumed anything, so /conversation/init
+        reports remaining == cap (its reset_after is the synthetic
+        request_instant + 24h form). Returns None on any transport failure so
+        the caller keeps the account instead of losing it to a bad exit.
+        """
+        if not access_token:
+            return None
+        try:
+            from services.openai_backend_api import OpenAIBackendAPI
+
+            backend = OpenAIBackendAPI(access_token=access_token, force_proxy=proxy or None)
+            info = backend.get_user_info()
+            for row in info.get("limits_progress") or []:
+                if row.get("feature_name") == "image_gen":
+                    return int(row.get("remaining") or 0)
+            gate = info.get("image_gate") or {}
+            if gate.get("limit"):
+                return int(gate["limit"])
+        except Exception as exc:
+            print(f"[gpt-register] 读取发行额度失败（放行）: {exc}", flush=True)
+        return None
+
     def _import_local(self, account: dict[str, Any], settings: dict[str, Any]) -> int:
         """Import registration result into local account_service without HTTP."""
         from services.account_service import account_service
@@ -1658,6 +1700,20 @@ class GptRegisterService:
         access = _clean(account.get("token")) or _clean(extra.get("access_token"))
         if not access:
             return 0
+        # 发行上限随机（实测 5 / 5 / 25 同批出现），低于阈值直接丢，省掉后续
+        # 为一个 5 张号付出的所有维护成本。探测失败时放行，不误杀好号。
+        min_cap = _clamp_int(settings.get("min_image_cap"), 0, 0, 10000)
+        if min_cap > 0:
+            cap = self._issued_image_cap(
+                access, _clean(account.get("proxy")) or _clean(settings.get("proxy"))
+            )
+            if cap is not None and cap < min_cap:
+                print(
+                    f"[gpt-register] 丢弃低额度新号 {_clean(account.get('email')) or '-'}: "
+                    f"发行上限 {cap} < 阈值 {min_cap}",
+                    flush=True,
+                )
+                return 0
         refresh = _clean(extra.get("refresh_token"))
         id_token = _clean(extra.get("id_token"))
         session_only = not bool(refresh)

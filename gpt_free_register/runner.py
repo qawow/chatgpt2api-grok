@@ -19,6 +19,9 @@ from typing import Any, Callable
 PACKAGE_DIR = Path(__file__).resolve().parent
 ENGINES_DIR = PACKAGE_DIR / "engines"
 
+# CFD1_PROXY values that mean "query the Cloudflare D1 API from the local egress".
+_DIRECT_PROXY_VALUES = {"direct", "none", "off", "no", "false", "0"}
+
 _BOOT_LOCK = threading.RLock()
 _BOOTED = False
 
@@ -309,10 +312,16 @@ def register_chatgpt_once(
     # This host often cannot reach api.cloudflare.com directly. Use the register
     # SOCKS for D1 as well; CFD1_PROXY overrides. Factory must not fall back to
     # REGISTER_PROXY_DEFAULT (a dead SOCKS eats the whole OTP window).
+    # Some egresses (observed on the :2260 sticky SOCKS) refuse api.cloudflare.com
+    # outright with "General SOCKS server failure", which also eats the whole OTP
+    # window. CFD1_PROXY=direct pins D1 to the local egress, which is verified to
+    # reach the CF API.
     mailbox_proxy = proxy
     if mail_provider in CFD1_MAIL_PROVIDERS:
         override = str(os.environ.get("CFD1_PROXY") or "").strip()
-        if override:
+        if override.lower() in _DIRECT_PROXY_VALUES:
+            mailbox_proxy = None
+        elif override:
             mailbox_proxy = override
     elif mail_provider == TEMPMAIL_MAIL_PROVIDER:
         # Self-hosted tempmail: direct is fastest; the factory honors TEMPMAIL_PROXY.

@@ -11,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { ImageStorageMode } from "@/lib/api";
-import { testProxy, type ProxyTestResult } from "@/lib/api";
+import { formatProxyTestResult, testProxy, type ProxyTestResult } from "@/lib/api";
 
 import { useSettingsStore } from "../store";
 
@@ -31,6 +31,9 @@ export function ConfigCard() {
   const setImagePollFailoverRetries = useSettingsStore((state) => state.setImagePollFailoverRetries);
   const setImageTextFailoverRetries = useSettingsStore((state) => state.setImageTextFailoverRetries);
   const setImageTransientFailureCooldownSecs = useSettingsStore((state) => state.setImageTransientFailureCooldownSecs);
+  const setImageToolShortCooldownSecs = useSettingsStore((state) => state.setImageToolShortCooldownSecs);
+  const setImageToolQuotaCooldownSecs = useSettingsStore((state) => state.setImageToolQuotaCooldownSecs);
+  const setImageGateSchedulingEnabled = useSettingsStore((state) => state.setImageGateSchedulingEnabled);
   const setImageParallelGeneration = useSettingsStore((state) => state.setImageParallelGeneration);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageCheckBeforeHitEnabled = useSettingsStore((state) => state.setImageCheckBeforeHitEnabled);
@@ -65,9 +68,9 @@ export function ConfigCard() {
       const data = await testProxy(candidate);
       setProxyTestResult(data.result);
       if (data.result.ok) {
-        toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        toast.success(formatProxyTestResult(data.result));
       } else {
-        toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+        toast.error(formatProxyTestResult(data.result));
       }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "测试代理失败");
@@ -130,9 +133,7 @@ export function ConfigCard() {
                     : "border-rose-200 bg-rose-50 text-rose-800"
                 }`}
               >
-                {proxyTestResult.ok
-                  ? `代理可用：HTTP ${proxyTestResult.status}，用时 ${proxyTestResult.latency_ms} ms`
-                  : `代理不可用：${proxyTestResult.error ?? "未知错误"}（用时 ${proxyTestResult.latency_ms} ms）`}
+                {formatProxyTestResult(proxyTestResult)}
               </div>
             ) : null}
             <div className="flex justify-end">
@@ -217,6 +218,26 @@ export function ConfigCard() {
             <label className="text-sm text-stone-700">临时失败冷却秒数</label>
             <Input value={String(config?.image_transient_failure_cooldown_secs ?? 60)} onChange={(event) => setImageTransientFailureCooldownSecs(event.target.value)} placeholder="60" />
             <p className="text-xs text-stone-500">同一任务内临时失败账号的冷却时间，0 表示立即允许再次尝试。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">生图过快冷却秒数</label>
+            <Input value={String(config?.image_tool_short_cooldown_secs ?? 3600)} onChange={(event) => setImageToolShortCooldownSecs(event.target.value)} placeholder="3600" />
+            <p className="text-xs text-stone-500">上游返回「生成过快」时的停放时长（秒）。上游给出明确窗口时以其为准，此项仅在未给出窗口时生效。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">生图额度耗尽停放秒数</label>
+            <Input value={String(config?.image_tool_quota_cooldown_secs ?? 86400)} onChange={(event) => setImageToolQuotaCooldownSecs(event.target.value)} placeholder="86400" />
+            <p className="text-xs text-stone-500">账号生图额度用尽时的停放时长（秒），默认 86400（24 小时）。上游给出重置窗口时以其为准。</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <Checkbox
+                checked={Boolean(config?.image_gate_scheduling_enabled !== false)}
+                onCheckedChange={(checked) => setImageGateSchedulingEnabled(Boolean(checked))}
+              />
+              <span className="text-sm text-stone-700">按上游门禁调度</span>
+            </div>
+            <p className="text-xs text-stone-500">按账号真实生图门禁（blocked_features）停放已用尽账号。展示的剩余额度与真实门禁并不一致，关闭后仅按本地额度调度。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">

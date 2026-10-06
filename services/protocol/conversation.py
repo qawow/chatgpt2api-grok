@@ -20,6 +20,8 @@ from services.openai_backend_api import (
     ImageContentPolicyError,
     ImagePollTimeoutError,
     OpenAIBackendAPI,
+    ToolCooldownError,
+    ToolQuotaError,
 )
 from services.proxy_service import proxy_settings
 from utils.helper import (
@@ -1508,18 +1510,26 @@ def _generate_single_image_impl(
     }
     refreshed_tokens: set[str] = set()
 
-    def exclude_account(active_token: str, error: str, *, revoked: bool = False) -> None:
+    def exclude_account(active_token: str, error: str, *, revoked: bool = False,
+                        failure_kind: str = "", retry_after_secs: float = 0.0) -> None:
         state["failed_connection_tokens"].add(active_token)
         state["last_connection_error"] = error
         state["sticky_token"] = ""
         state["tls_retry_count"] = 0
         state["conn_timeout_retry_count"] = 0
         if request.checkpoint_callback:
-            request.checkpoint_callback({
+            checkpoint = {
                 "failed_account_email": account_email,
                 "failed_token_hash": hashlib.sha256(active_token.encode()).hexdigest(),
-                "failure_kind": "revoked" if revoked else "transient",
-            })
+                "failure_kind": failure_kind or ("revoked" if revoked else "transient"),
+            }
+            # Carry the upstream-stated window so the task service parks this
+            # credential for exactly as long as upstream said, instead of the
+            # generic image_transient_failure_cooldown_secs (60s) that lets the
+            # picker hand the same exhausted account straight back out.
+            if retry_after_secs > 0:
+                checkpoint["retry_after_secs"] = float(retry_after_secs)
+            request.checkpoint_callback(checkpoint)
         if request.progress_callback:
             request.progress_callback("switching_account")
 
@@ -1797,6 +1807,56 @@ def _generate_single_image_impl(
                 "please retry later or switch the egress IP.",
                 status_code=503,
                 code="upstream_arkose_required",
+                account_email=account_email,
+            ) from exc
+        except (ToolCooldownError, ToolQuotaError) as exc:
+            # The image tool refused this turn without consuming any quota.
+            # Both kinds are per-credential pacing verdicts, so they must not
+            # fail the request while other accounts still have budget: park the
+            # credential for the window upstream stated and move on.
+            is_quota = isinstance(exc, ToolQuotaError)
+            retry_after_secs = float(getattr(exc, "retry_after_secs", 0.0) or 0.0)
+            if retry_after_secs <= 0:
+                retry_after_secs = float(config.image_tool_quota_cooldown_secs) if is_quota \
+                    else float(config.image_tool_short_cooldown_secs)
+            error_text = str(exc)
+            logger.warning({
+                "event": "image_tool_quota_exhausted" if is_quota else "image_tool_cooldown",
+                "request_token": token,
+                "account_email": account_email,
+                "retry_after_secs": retry_after_secs,
+                "failed_accounts": len(state["failed_connection_tokens"]),
+                "index": index,
+            })
+            # Results already emitted for this token still win: never discard a
+            # finished image because the tail of the stream carried a refusal.
+            if returned_result and outputs:
+                lease.finish(True)
+                return outputs
+            lease.finish(False)
+            exclude_account(
+                token, error_text,
+                failure_kind="quota" if is_quota else "cooldown",
+                retry_after_secs=retry_after_secs,
+            )
+            # Park the credential for the window upstream stated. The picker
+            # already skips it via failed_connection_tokens for this task, but
+            # without a park the *next* request would immediately re-pick an
+            # account whose gate is closed for hours.
+            account_service.park_image_account(
+                token, until_ts=time.time() + retry_after_secs,
+                kind="quota" if is_quota else "cooldown",
+                reason=error_text,
+            )
+            if len(state["failed_connection_tokens"]) < MAX_CONNECTION_ACCOUNT_RETRIES:
+                continue
+            raise ImageGenerationError(
+                "Every account tried hit the upstream image generation limit; "
+                "no account in the pool can generate right now. "
+                f"Earliest reset in about {max(1, int(retry_after_secs // 60))} minute(s).",
+                status_code=429,
+                error_type="insufficient_quota",
+                code="tool_quota_exhausted" if is_quota else "tool_rate_limited",
                 account_email=account_email,
             ) from exc
         except ImagePollTimeoutError as exc:

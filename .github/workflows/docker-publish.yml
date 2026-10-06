@@ -48,6 +48,9 @@ jobs:
       - name: Run unit tests
         run: uv run python -m unittest discover -s test -t .
 
+      - name: Run log pagination regressions
+        run: uv run python -m pytest -q test/test_log_pagination.py
+
   docker:
     needs: test
     runs-on: ubuntu-latest

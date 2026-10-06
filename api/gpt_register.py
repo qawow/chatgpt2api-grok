@@ -40,7 +40,9 @@ class GptRegisterSettingsUpdate(BaseModel):
     tempmail_domains: str | None = None
     tempmail_domain: str | None = None
     tempmail_mode: str | None = None
-    tempmail_subdomain_depth: int | None = Field(default=None, ge=0, le=5)
+    # 上限与 gpt_free_register/engines/core/tempmail_mailbox.py 的
+    # MAX_SUBDOMAIN_DEPTH / services 的 TEMPMAIL_MAX_SUBDOMAIN_DEPTH 对齐（24 级实测可用）。
+    tempmail_subdomain_depth: int | None = Field(default=None, ge=0, le=24)
     push_enabled: bool | None = None
     push_mode: str | None = None
     chatgpt2api_base_url: str | None = None
@@ -63,6 +65,8 @@ class GptRegisterSettingsUpdate(BaseModel):
     # OR'd with the count watermark; 0 disables. Bounds match _clamp_int in
     # gpt_register_service._normalize_settings.
     auto_replenish_min_total_quota: int | None = Field(default=None, ge=0, le=10000)
+    # 发行上限随机（实测同批 5/5/25），>0 时低于阈值的新号不入池；0 关闭。
+    min_image_cap: int | None = Field(default=None, ge=0, le=10000)
     circuit_break: int | None = Field(default=None, ge=0, le=20)
 
 

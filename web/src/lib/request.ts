@@ -8,10 +8,17 @@ type RequestConfig = AxiosRequestConfig & {
 };
 
 type ErrorPayload = {
-    detail?: string | { error?: string | { message?: string } };
+    detail?: string | { error?: string | { message?: string }; code?: string };
     error?: string | { message?: string };
     message?: string;
 };
+
+export class HttpRequestError extends Error {
+    constructor(message: string, readonly status?: number, readonly code?: string) {
+        super(message);
+        this.name = "HttpRequestError";
+    }
+}
 
 function errorMessageFromValue(value: unknown): string {
     if (typeof value === "string") {
@@ -68,7 +75,8 @@ request.interceptors.response.use(
             payload?.message ||
             error.message ||
             `请求失败 (${status || 500})`;
-        return Promise.reject(new Error(message));
+        const code = typeof payload?.detail === "object" ? payload.detail.code : undefined;
+        return Promise.reject(new HttpRequestError(message, status, code));
     },
 );
 

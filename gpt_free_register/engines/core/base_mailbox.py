@@ -55,8 +55,12 @@ def _create_cfd1(extra: dict, proxy: str | None) -> 'BaseMailbox':
 
     # If caller passed None, only honor CFD1_PROXY. Never REGISTER_PROXY_DEFAULT
     # (stale SOCKS previously swallowed the entire OTP wait).
-    if not proxy:
-        proxy = str(os.getenv("CFD1_PROXY") or "").strip() or None
+    # CFD1_PROXY=direct|none|off means "use the local egress", which is what the
+    # Cloudflare API wants whenever the register SOCKS refuses api.cloudflare.com.
+    _direct = {"direct", "none", "off", "no", "false", "0"}
+    _override = str(os.getenv("CFD1_PROXY") or "").strip()
+    if not proxy and _override and _override.lower() not in _direct:
+        proxy = _override
 
     return CloudflareD1Mailbox(
         api_token=_pick("cfd1_api_token", "cf_api_token", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN"),
@@ -240,9 +244,12 @@ class CloudflareD1Mailbox(BaseMailbox):
         return []
 
     def _make_local_part(self) -> str:
-        import random
+        import secrets
         import string
-        body = "".join(random.choices(string.ascii_lowercase + string.digits, k=self.local_part_length))
+
+        # 长度抖动，避免所有地址都是同一个固定长度（固定长度是明显的机器特征）
+        size = max(6, self.local_part_length + secrets.randbelow(6) - 2)
+        body = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(size))
         prefix = self.local_part_prefix
         if prefix and not prefix.endswith(("-", "_", ".")):
             # keep local-part valid; allow user-provided separator if already present
@@ -450,7 +457,7 @@ class CloudflareD1Mailbox(BaseMailbox):
                         continue
                     code = self._extract_code_from_raw(raw, code_pattern=code_pattern)
                     if code:
-                        print(f"[CF-D1] 验证码: {code}")
+                        print("[CF-D1] 验证码已收到")
                         return code
             except Exception as exc:
                 last_err = str(exc)[:160]
