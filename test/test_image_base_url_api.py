@@ -38,6 +38,55 @@ class ImageBaseUrlApiTests(unittest.TestCase):
 
         self.assertEqual(api_support.resolve_image_base_url(request), "https://public.example.com")
 
+    def test_forwarded_host_beats_request_host_when_unset(self) -> None:
+        self.fake_config.base_url = ""
+        request = SimpleNamespace(
+            url=SimpleNamespace(scheme="http", netloc="10.0.0.8:8000"),
+            headers={
+                "host": "10.0.0.8:8000",
+                "x-forwarded-host": "ai.example.com",
+                "x-forwarded-proto": "https",
+            },
+        )
+
+        self.assertEqual(api_support.resolve_image_base_url(request), "https://ai.example.com")
+
+    def test_forwarded_chain_uses_first_hop(self) -> None:
+        self.fake_config.base_url = ""
+        request = SimpleNamespace(
+            url=SimpleNamespace(scheme="http", netloc="10.0.0.8:8000"),
+            headers={
+                "host": "10.0.0.8:8000",
+                "x-forwarded-host": "edge.example.com, 10.0.0.8:8000",
+                "x-forwarded-proto": "https,http",
+            },
+        )
+
+        self.assertEqual(api_support.resolve_image_base_url(request), "https://edge.example.com")
+
+    def test_configured_base_url_still_wins_over_forwarded(self) -> None:
+        request = SimpleNamespace(
+            url=SimpleNamespace(scheme="http", netloc="10.0.0.8:8000"),
+            headers={
+                "host": "10.0.0.8:8000",
+                "x-forwarded-host": "proxy.example.com",
+            },
+        )
+
+        self.assertEqual(api_support.resolve_image_base_url(request), "https://public.example.com")
+
+    def test_forwarded_host_without_proto_uses_request_scheme(self) -> None:
+        self.fake_config.base_url = ""
+        request = SimpleNamespace(
+            url=SimpleNamespace(scheme="https", netloc="10.0.0.8:8000"),
+            headers={
+                "host": "10.0.0.8:8000",
+                "x-forwarded-host": "ai.example.com",
+            },
+        )
+
+        self.assertEqual(api_support.resolve_image_base_url(request), "https://ai.example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

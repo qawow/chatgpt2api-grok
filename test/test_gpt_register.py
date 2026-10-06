@@ -755,9 +755,13 @@ class RegisterJobRobustnessTests(unittest.TestCase):
         self.jobs_path = self.data / "jobs.json"
 
     def test_inprocess_batch_wall_clock_bounds_hung_registration(self):
+        import threading
         import time as time_mod
 
         import services.gpt_register_service as mod
+
+        release = threading.Event()
+        self.addCleanup(release.set)
 
         with mock.patch.object(mod, "DATA_DIR", self.data), \
                 mock.patch.object(mod, "GPT_REGISTER_JOBS_FILE", self.jobs_path):
@@ -776,7 +780,9 @@ class RegisterJobRobustnessTests(unittest.TestCase):
                 if str(per_settings.get("proxy") or "").startswith("socks5h://a"):
                     return {"ok": True, "email": "fast@example.com", "has_token": True,
                             "added": 1, "logs": [], "mode": "inprocess"}
-                time_mod.sleep(5.5)  # simulates a registration wedged on a dead SOCKS
+                # simulates a registration wedged on a dead SOCKS: blocks until
+                # the test releases it, so the suite never waits on a real sleep
+                release.wait(30)
                 return {"ok": True, "email": "slow@example.com", "has_token": True,
                         "added": 1, "logs": [], "mode": "inprocess"}
 
@@ -798,8 +804,11 @@ class RegisterJobRobustnessTests(unittest.TestCase):
             self.assertIn("注册等待超时", failed_errors)
             logs_text = " ".join(str(entry.get("message") or "") for entry in job.get("logs") or [])
             self.assertIn("批次等待超时", logs_text)
-            # the job must finish before the wedged registration does
-            self.assertLess(duration, 5.4)
+            # wall = timeout(1) + stagger(0.8) + grace(3) = 4.8s: the job must
+            # wait for the wall clock (not fail early) yet return without the
+            # wedged registration, which stays blocked on the event.
+            self.assertGreaterEqual(duration, 4.4)
+            self.assertLess(duration, 6.5)
 
     def test_completion_log_retention_keeps_newest_files(self):
         import services.gpt_register_service as mod

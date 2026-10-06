@@ -76,7 +76,21 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
 
 
 def resolve_image_base_url(request: Request) -> str:
-    return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    """Public origin for URLs handed to clients (image url, tasks, gallery).
+
+    Priority: explicit ``config.base_url`` — set this when a gateway like
+    New API / one-api reaches this instance through a LAN channel address —
+    then X-Forwarded-Host/Proto (real reverse proxy), then the request's
+    own host, which behind a gateway is the LAN address users cannot reach.
+    """
+    configured = config.base_url
+    if configured:
+        return configured
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    if forwarded_host:
+        forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip() or request.url.scheme
+        return f"{forwarded_proto}://{forwarded_host}"
+    return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
 def raise_image_quota_error(exc: Exception) -> None:

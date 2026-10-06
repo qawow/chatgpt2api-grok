@@ -55,6 +55,19 @@ docker compose -f docker-compose.warp.yml up -d --build
 - 未绑定代理的号仍按 runtime → 全局 → 直连回退；死 SOCKS 会跳过已拉黑出口；`get_with_egress_fallback` 类单次抓取在全部候选间共享一个超时预算，最坏延迟不随候选数放大。
 - 流式响应（SSE）的标量超时只覆盖建连+响应头：正文读取由 libcurl 低速中止保护（低于 1 字节/秒持续 30–180 秒即断开），黑洞出口不再永久挂死读取线程；codex 响应等长超时请求随任务剩余预算收缩。
 - 注册默认 `bind_register_proxy=true`：入库时把注册代理写到账号。多个号绑同一 SOCKS **仍是同一出口 IP**；真要一号一 IP，给注册机配多出口代理池。
+
+### 接入 New API / one-api 等网关时的链接生成
+
+响应里交给客户端的 URL（图片 `url`、异步任务链接、日志画廊图）按以下优先级生成：
+
+1. `config.json` 顶层的 `base_url`（或环境变量 `CHATGPT2API_BASE_URL`）——**网关场景必配**；
+2. 反向代理场景：`X-Forwarded-Host` / `X-Forwarded-Proto`（取链首）；
+3. 请求自身的 Host。
+
+New API / one-api 是网关不是代理：它以渠道地址（通常是本项目的局域网地址）重新发起请求，本项目看到的 Host 就是局域网地址，未配置 `base_url` 时返回的链接即局域网。给其他人使用时：
+
+- 本项目有对外可达的域名 / frp / Cloudflare Tunnel：把 `base_url` 配成该对外地址；
+- 外网用户无法直接访问本项目：让客户端用默认的 `response_format=b64_json`（响应中不出现链接），或启用图片存储的 WebDAV 模式并配置 `image_storage.public_base_url`，让 URL 指向可公开访问的存储。
 - 设备指纹（`oai-device-id` / UA / impersonate）按号写入并复用；token 刷新锁、Cloudflare clearance 按号拆开。
 - `session_only`（无 `refresh_token`）**可以生图**。`chat_requirements_prepare` 401 不当 hard revoke、不清零剩余额度、不自动删号。
 - 入库后**不会**自动 Codex 二次登录。5 分钟巡检也不再打健康 session_only 的 `/me`。要补 `refresh_token` 用号池页手动「Codex 补 refresh」（会踢当前 web session）。

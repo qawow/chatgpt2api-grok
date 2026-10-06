@@ -107,6 +107,12 @@ def create_app() -> FastAPI:
             if len(tightened) > 3:
                 preview += f" 等 {len(tightened)} 个"
             print(f"[startup] 已收紧凭据文件权限为 0600: {preview}", flush=True)
+        if not config.base_url:
+            print(
+                "[startup] base_url 未设置：响应中的图片/任务链接将按请求 Host 生成；"
+                "经 New API/one-api 等网关转发时，请在 config.json 设置 base_url 为用户可达地址",
+                flush=True,
+            )
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         grok_thread = start_grok_account_watcher(stop_event)
