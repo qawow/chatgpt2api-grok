@@ -359,11 +359,15 @@ class ImageTaskService:
         def update(**updates: Any) -> None:
             self._update_task(key, expected_attempt=attempt, **updates)
 
-        # 创建进度回调，每个步骤完成后更新任务状态
+        # 创建进度回调，每个步骤完成后更新任务状态。
+        # Contract: these callbacks are invoked bare (no try/except) from the
+        # conversation loop, so they must never raise — _update_task silently
+        # no-ops on CAS mismatch / eviction / terminal status.
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
-                update(started_ts=time.time())
-            update(progress=step)
+                update(started_ts=time.time(), progress=step)
+            else:
+                update(progress=step)
 
         def checkpoint_callback(checkpoint: dict[str, Any]) -> None:
             with self._lock:
