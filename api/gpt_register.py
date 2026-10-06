@@ -26,6 +26,7 @@ class GptRegisterSettingsUpdate(BaseModel):
     stagger_secs: float | None = Field(default=None, ge=0, le=5)
     interval_secs: float | None = Field(default=None, ge=0, le=600)
     timeout_secs: int | None = Field(default=None, ge=60, le=3600)
+    register_log_keep: int | None = Field(default=None, ge=20, le=2000)
     executor: str | None = None
     mail_provider: str | None = None
     captcha: str | None = None

@@ -744,3 +744,91 @@ class ReplenishPoolTest(unittest.TestCase):
                 out = self.svc.maybe_replenish_pool()
         self.assertEqual(out["reason"], "fail_cooldown")
         start.assert_not_called()
+
+
+class RegisterJobRobustnessTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data = Path(self.tmp.name)
+        self.cfg_path = self.data / "gpt_reg.json"
+        self.jobs_path = self.data / "jobs.json"
+
+    def test_inprocess_batch_wall_clock_bounds_hung_registration(self):
+        import time as time_mod
+
+        import services.gpt_register_service as mod
+
+        with mock.patch.object(mod, "DATA_DIR", self.data), \
+                mock.patch.object(mod, "GPT_REGISTER_JOBS_FILE", self.jobs_path):
+            svc = GptRegisterService(config_store=GptRegisterConfig(path=self.cfg_path))
+            settings = normalize_settings(
+                {
+                    "count": 2,
+                    "concurrency": 2,
+                    "interval_secs": 0,
+                    "proxy": "socks5h://a.example:1080,socks5h://b.example:1080",
+                }
+            )
+            settings["timeout_secs"] = 1  # shrink the batch wall clock for the test
+
+            def fake_register(per_settings):
+                if str(per_settings.get("proxy") or "").startswith("socks5h://a"):
+                    return {"ok": True, "email": "fast@example.com", "has_token": True,
+                            "added": 1, "logs": [], "mode": "inprocess"}
+                time_mod.sleep(5.5)  # simulates a registration wedged on a dead SOCKS
+                return {"ok": True, "email": "slow@example.com", "has_token": True,
+                        "added": 1, "logs": [], "mode": "inprocess"}
+
+            svc._jobs["job-hang"] = {
+                "job_id": "job-hang", "status": "running", "logs": [],
+                "created_at": "2026-01-01T00:00:00Z", "trigger": "manual",
+            }
+            with mock.patch.object(svc, "_register_once", side_effect=fake_register):
+                t0 = time_mod.monotonic()
+                svc._run_job_impl("job-hang", settings)
+                duration = time_mod.monotonic() - t0
+
+            job = svc._jobs["job-hang"]
+            self.assertEqual(job.get("status"), "done")
+            summary = job.get("summary") or {}
+            self.assertEqual(summary.get("success"), 1)
+            self.assertEqual(summary.get("failed"), 1)
+            failed_errors = " ".join(str(it.get("error") or "") for it in summary.get("failed_items") or [])
+            self.assertIn("注册等待超时", failed_errors)
+            logs_text = " ".join(str(entry.get("message") or "") for entry in job.get("logs") or [])
+            self.assertIn("批次等待超时", logs_text)
+            # the job must finish before the wedged registration does
+            self.assertLess(duration, 5.4)
+
+    def test_completion_log_retention_keeps_newest_files(self):
+        import services.gpt_register_service as mod
+
+        with mock.patch.object(mod, "DATA_DIR", self.data), \
+                mock.patch.object(mod, "GPT_REGISTER_JOBS_FILE", self.jobs_path):
+            svc = GptRegisterService(config_store=GptRegisterConfig(path=self.cfg_path))
+            svc._jobs["job-keep"] = {
+                "job_id": "job-keep", "status": "done", "logs": [],
+                "created_at": "2026-01-01T00:00:00Z", "trigger": "manual",
+            }
+            logs_dir = self.data / "gpt_register_logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            for i in range(5):
+                p = logs_dir / f"old-{i}.json"
+                p.write_text("{}", encoding="utf-8")
+                stamp = 1700000000 + i * 1000
+                os.utime(p, (stamp, stamp))
+            settings = normalize_settings({})
+            settings["register_log_keep"] = 3
+            svc._emit_completion_log(
+                "job-keep", status="done", success=1, failed=0, added=1,
+                completed=1, total=1, duration=1.0, items=[],
+                error=None, settings=settings,
+            )
+            names = sorted(p.name for p in logs_dir.glob("*.json"))
+            self.assertEqual(len(names), 3)
+            self.assertIn("job-keep.json", names)
+            self.assertIn("old-4.json", names)
+            self.assertIn("old-3.json", names)
+            self.assertNotIn("old-2.json", names)
+            self.assertNotIn("old-0.json", names)

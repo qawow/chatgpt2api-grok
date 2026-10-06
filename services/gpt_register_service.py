@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -84,6 +84,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "stagger_secs": 0.15,
     "interval_secs": 3,
     "timeout_secs": 600,
+    "register_log_keep": 200,  # keep newest N completion logs under data/gpt_register_logs
     "executor": "protocol",
     # 收信渠道：cloudflare_d1_api（CF Email Routing → Worker → D1）
     #          tempmail（自建 123nhh/tempmail，REST 直连，收信快）
@@ -583,6 +584,7 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     out["stagger_secs"] = _clamp_float(out.get("stagger_secs"), 0.15, 0, 5)
     out["interval_secs"] = _clamp_float(out.get("interval_secs"), 3, 0, 600)
     out["timeout_secs"] = _clamp_int(out.get("timeout_secs"), 600, 60, 3600)
+    out["register_log_keep"] = _clamp_int(out.get("register_log_keep"), 200, 20, 2000)
     executor = _clean(out.get("executor")).lower() or "protocol"
     if executor != "protocol":
         executor = "protocol"
@@ -1217,6 +1219,7 @@ class GptRegisterService:
             batch_size = min(concurrency, total - index)
             batch_indexes = list(range(index + 1, index + batch_size + 1))
             index += batch_size
+            timed_out = False
             self._append_log(
                 job_id,
                 f"开始批次 indexes={batch_indexes[0]}-{batch_indexes[-1]} size={batch_size}",
@@ -1225,10 +1228,50 @@ class GptRegisterService:
             if concurrency <= 1:
                 outcomes = [one(batch_indexes[0])]
             else:
-                with ThreadPoolExecutor(max_workers=batch_size) as pool:
-                    futs = [pool.submit(one, i) for i in batch_indexes]
-                    outcomes = [f.result() for f in as_completed(futs)]
-                    outcomes.sort(key=lambda x: int(x.get("index") or 0))
+                # inprocess has no subprocess.run(timeout=...): bound the batch
+                # wall clock so a registration hung on a dead SOCKS cannot wedge
+                # the job forever (2h staleness unlocks replenish, but not this
+                # thread). The straggler thread cannot be killed — it is left to
+                # finish in the background and its late result is dropped.
+                per_attempt = float(settings.get("timeout_secs") or 600)
+                wall = per_attempt + 0.8 * (batch_size - 1) + min(15.0, max(3.0, 0.05 * per_attempt))
+                executor = ThreadPoolExecutor(max_workers=batch_size)
+                future_by_idx = {idx: executor.submit(one, idx) for idx in batch_indexes}
+                outcomes = []
+                yielded: set = set()
+                try:
+                    for fut in as_completed(list(future_by_idx.values()), timeout=wall):
+                        yielded.add(fut)
+                        try:
+                            outcomes.append(fut.result())
+                        except Exception as exc:
+                            outcomes.append({"index": None, "ok": False, "error": str(exc)[:300], "email": None, "logs": []})
+                except FuturesTimeoutError:
+                    timed_out = True
+                for idx, fut in future_by_idx.items():
+                    if fut in yielded:
+                        continue
+                    if fut.done():
+                        try:
+                            outcomes.append(fut.result())
+                        except Exception as exc:
+                            outcomes.append({"index": idx, "ok": False, "error": str(exc)[:300], "email": None, "logs": []})
+                    else:
+                        outcomes.append({
+                            "index": idx,
+                            "ok": False,
+                            "error": f"注册等待超时（>{int(wall)}s，计入失败；如仍在后台完成，结果不入本任务统计）",
+                            "email": None,
+                            "logs": [],
+                        })
+                executor.shutdown(wait=False)
+                outcomes.sort(key=lambda x: int(x.get("index") or 0))
+                if timed_out:
+                    self._append_log(
+                        job_id,
+                        f"批次等待超时（>{int(wall)}s）：出口/邮箱链路疑似挂死，停止后续批次",
+                        level="error",
+                    )
 
             for outcome in outcomes:
                 completed += 1
@@ -1281,6 +1324,10 @@ class GptRegisterService:
                     added=added,
                     items=list(items),
                 )
+
+            if timed_out:
+                # outcomes are accounted above; stop starting further batches
+                break
 
             if (
                 circuit_threshold
@@ -1431,6 +1478,14 @@ class GptRegisterService:
             from utils.atomic import atomic_write_json
 
             atomic_write_json(path, sanitize_log_value(record))
+            # Retention: one JSON per job, unbounded otherwise. Keep newest N.
+            keep = int(settings.get("register_log_keep") or 200)
+            try:
+                files = sorted(out_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for stale_path in files[keep:]:
+                    stale_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             self._append_log(job_id, f"完成日志已写入 data/gpt_register_logs/{job_id}.json")
         except Exception as exc:
             self._append_log(job_id, f"写入完成日志文件失败: {exc}", level="warn")
