@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from unittest.mock import PropertyMock
 from services.account_service import AccountService
 from services.config import config
 from services.storage.json_storage import JSONStorageBackend
+from utils.helper import anonymize_token
 
 _AUTH_KEY_PATCHER: mock._patch_dict | None = None
 
@@ -282,6 +284,108 @@ class ParkClockAlignmentTests(unittest.TestCase):
                 })
             self.assertLess(retry_unknown, park_until)
             self.assertGreater(retry_unknown, time.time())
+
+
+class FifoFairnessTests(unittest.TestCase):
+    def test_forbidden_tokens_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir, [
+                {"access_token": "f1", "status": "正常", "quota": 5, "session_token": "s"},
+                {"access_token": "f2", "status": "正常", "quota": 5, "session_token": "s"},
+            ])
+            with service._image_slot_condition:
+                self.assertEqual(service._pick_image_candidate_token(["f1", "f2"], forbidden={"f1"}), "f2")
+                self.assertEqual(service._pick_image_candidate_token(["f1", "f2"], forbidden={"f1", "f2"}), "")
+
+    def test_elder_waiter_gets_the_slot_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir, [
+                {"access_token": "only", "status": "正常", "quota": 5, "session_token": "s"},
+            ])
+            order: list[str] = []
+            errors: list[Exception] = []
+
+            def waiter(name: str) -> None:
+                try:
+                    token = service._acquire_next_candidate_token()
+                    order.append(name)
+                    service.release_image_slot(token)
+                except Exception as exc:  # noqa: BLE001 - recorded for assertion
+                    errors.append(exc)
+
+            with service._image_slot_condition:
+                service._image_inflight["only"] = [time.monotonic() + 300]
+            with mock.patch.object(service, "_image_slot_wait_secs", return_value=12.0):
+                thread_a = threading.Thread(target=waiter, args=("a",))
+                thread_a.start()
+                time.sleep(0.3)  # A registers its ticket first
+                thread_b = threading.Thread(target=waiter, args=("b",))
+                thread_b.start()
+                time.sleep(0.3)
+                with service._image_slot_condition:
+                    service._image_inflight.pop("only", None)  # occupant finishes
+                    service._image_slot_condition.notify_all()
+                thread_a.join(20)
+                thread_b.join(20)
+            self.assertEqual(errors, [])
+            self.assertEqual(order, ["a", "b"])
+
+
+class SkipDiagnosticsTests(unittest.TestCase):
+    def test_first_failing_filter_reported_per_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir, [
+                {"access_token": "ok", "status": "正常", "quota": 5, "session_token": "s"},
+                {"access_token": "parker", "status": "正常", "quota": 5, "session_token": "s"},
+                {"access_token": "dry", "status": "正常", "quota": 0, "refresh_token": "rt"},
+                {"access_token": "planb", "status": "正常", "quota": 5, "session_token": "s", "type": "plus"},
+            ])
+            service.update_account("parker", {"image_gate_park_until": time.time() + 600}, quiet=True)
+            diag = {row["reason"] for row in service.image_pick_skip_diag(plan_types=("plus",))}
+            self.assertIn("gate_park", diag)
+            self.assertIn("no_quota", diag)
+            self.assertIn("plan_filter", diag)
+            ready_tokens = {
+                anonymize_token("ok")
+                for row in service.image_pick_skip_diag()
+                if row["token"] == anonymize_token("ok")
+            }
+            self.assertEqual(ready_tokens, set())  # healthy accounts are not listed
+
+
+class PoolPressureEventTests(unittest.TestCase):
+    def test_empty_pick_wakes_replenish_and_notify_is_throttled(self) -> None:
+        from services.gpt_register_service import gpt_register_service
+
+        saved_at = gpt_register_service._pool_pressure_at
+        gpt_register_service._pool_pressure.clear()
+        gpt_register_service._pool_pressure_at = 0.0
+        try:
+            self.assertFalse(gpt_register_service.wait_pool_pressure(0.05))
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = _service(tmp_dir, [])  # empty pool
+                with self.assertRaises(RuntimeError):
+                    service.get_available_access_token()
+            self.assertTrue(gpt_register_service.wait_pool_pressure(0.05))
+            # throttled re-notify within 60s must not re-set the event
+            gpt_register_service.notify_pool_pressure()
+            self.assertFalse(gpt_register_service.wait_pool_pressure(0.05))
+        finally:
+            gpt_register_service._pool_pressure.clear()
+            gpt_register_service._pool_pressure_at = saved_at
+
+
+class PlanSplitTests(unittest.TestCase):
+    def test_image_available_counts_split_by_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = _service(tmp_dir, [
+                {"access_token": "p1", "status": "正常", "quota": 3, "session_token": "s", "type": "plus"},
+                {"access_token": "f1", "status": "正常", "quota": 3, "session_token": "s", "type": "free"},
+                {"access_token": "dead", "status": "异常", "quota": 3, "session_token": "s", "type": "plus"},
+            ])
+            counts = service.count_image_available_by_plan()
+            self.assertEqual(counts.get("plus"), 1)
+            self.assertEqual(counts.get("free"), 1)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from pathlib import Path
 from threading import Event, Thread
 
@@ -195,7 +196,23 @@ def start_account_replenish_watcher(stop_event: Event) -> Thread:
             except Exception as exc:
                 print(f"[account-replenish] fail {exc}")
                 wait_secs = 90
-            stop_event.wait(wait_secs)
+            # Sleep the interval, but wake early when the image picker reports
+            # an empty pool: replenish reacts in seconds, not at next poll.
+            # maybe_replenish_pool() still enforces spacing/fail cooldowns, so
+            # spurious wakes stay cheap.
+            end = time.monotonic() + wait_secs
+            while not stop_event.is_set():
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    from services.gpt_register_service import gpt_register_service
+
+                    if gpt_register_service.wait_pool_pressure(min(remaining, 1.0)):
+                        break
+                except Exception:
+                    if stop_event.wait(min(remaining, 1.0)):
+                        break
 
     thread = Thread(target=worker, name="account-replenish", daemon=True)
     thread.start()

@@ -714,7 +714,24 @@ class GptRegisterService:
         self._lock = threading.RLock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._cancel_flags: dict[str, threading.Event] = {}
+        # Image picker signals empty pool here; the replenish watcher sleeps on
+        # it to react in seconds instead of waiting out the poll interval.
+        self._pool_pressure = threading.Event()
+        self._pool_pressure_at = 0.0
         self._load_jobs()
+
+    def notify_pool_pressure(self) -> None:
+        now = time.monotonic()
+        if now - self._pool_pressure_at < 60.0:
+            return
+        self._pool_pressure_at = now
+        self._pool_pressure.set()
+
+    def wait_pool_pressure(self, timeout: float) -> bool:
+        """Wait for a pool-pressure signal; returns True only when woken by one."""
+        woke = self._pool_pressure.wait(max(0.0, float(timeout)))
+        self._pool_pressure.clear()
+        return woke
 
     def _load_jobs(self) -> None:
         if not GPT_REGISTER_JOBS_FILE.exists():
@@ -848,6 +865,10 @@ class GptRegisterService:
         from services.account_service import account_service
 
         available = int(account_service.count_image_available_accounts())
+        try:
+            result["available_by_plan"] = account_service.count_image_available_by_plan()
+        except Exception:
+            pass
         min_available = int(settings["auto_replenish_min_available"])
         target = max(int(settings["auto_replenish_target_available"]), min_available)
         # 额度触发：可用账号剩余额度总和低于阈值（0=关闭）。与数量水位是 OR。
@@ -1139,7 +1160,12 @@ class GptRegisterService:
                 }
             per_settings = dict(settings)
             if proxy_pool:
-                per_settings["proxy"] = pick_proxy(proxy_pool, index)
+                # count=1 (auto-replenish) always runs index 1: strict round-robin
+                # would pin every replenish registration to pool[0]. Same reasoning
+                # as the domain pool above; batches keep index rotation.
+                per_settings["proxy"] = (
+                    random.choice(proxy_pool) if total == 1 else pick_proxy(proxy_pool, index)
+                )
             if domain_pool:
                 # random, not index round-robin: auto-replenish jobs are count=1
                 # (always index 1), which would pin every registration to pool[0].

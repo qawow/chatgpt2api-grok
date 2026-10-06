@@ -75,6 +75,10 @@ class AccountService:
         self._probe_locks: dict[str, Lock] = {}
         # proxy URL -> proxy_id (credential-hashed, never reversed back).
         self._egress_key_cache: dict[str, str] = {}
+        # FIFO fairness: each queued picker registers its currently-eligible
+        # tokens; younger waiters may not take a token an elder could take now.
+        self._slot_ticket = 0
+        self._slot_waiters: list[dict] = []
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -1659,6 +1663,17 @@ class AccountService:
         with self._lock:
             return sum(1 for item in self._accounts.values() if self._is_image_account_available(item))
 
+    def count_image_available_by_plan(self) -> dict[str, int]:
+        """Image-available counts split by plan class (codex demand needs paid plans)."""
+        with self._lock:
+            out: dict[str, int] = {}
+            for item in self._accounts.values():
+                if not self._is_image_account_available(item):
+                    continue
+                plan = str(self._normalize_account_type(item.get("type")) or "free").lower()
+                out[plan] = out.get(plan, 0) + 1
+            return out
+
     def total_image_available_quota(self) -> int:
         """Sum of remaining image quota across accounts the picker can use now.
 
@@ -1820,28 +1835,58 @@ class AccountService:
     ) -> str:
         deadline = time.monotonic() + self._image_slot_wait_secs()
         with self._image_slot_condition:
-            while True:
-                if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
-                    # Build message outside nested lock scope to avoid lock ordering issues.
-                    break
-                self._prune_image_leases_locked()
-                tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-                if tokens:
-                    access_token = self._pick_image_candidate_token(tokens)
-                    existing = self._image_inflight.get(access_token)
-                    leases = (
-                        list(existing) if isinstance(existing, list)
-                        else [time.monotonic() + self._image_lease_secs()] * int(existing or 0)
-                    )
-                    leases.append(time.monotonic() + self._image_lease_secs())
-                    self._image_inflight[access_token] = leases
-                    return access_token
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError(
-                        "image picker wait budget exhausted: account slots are busy, retry shortly"
-                    )
-                self._image_slot_condition.wait(timeout=min(1.0, remaining))
+            self._slot_ticket += 1
+            my_ticket = self._slot_ticket
+            waiter = {
+                "ticket": my_ticket,
+                "excluded": excluded_tokens,
+                "plan_type": plan_type,
+                "source_type": source_type,
+                "plan_types": plan_types,
+            }
+            self._slot_waiters.append(waiter)
+            try:
+                while True:
+                    if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                        # Build message outside nested lock scope to avoid lock ordering issues.
+                        break
+                    self._prune_image_leases_locked()
+                    tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+                    # FIFO gate: never take a token that an elder waiter could
+                    # take right now. Eligible sets are recomputed at check
+                    # time (a just-woken elder's cached view may be stale).
+                    # Heterogeneous plan filters make strict global FIFO
+                    # impossible, so disjoint needs still pass.
+                    forbidden: set[str] = set()
+                    for other in self._slot_waiters:
+                        if other["ticket"] < my_ticket:
+                            forbidden.update(self._list_available_candidate_tokens(
+                                other["excluded"], other["plan_type"], other["source_type"], other["plan_types"],
+                            ))
+                    access_token = self._pick_image_candidate_token(tokens, forbidden=forbidden)
+                    if access_token:
+                        existing = self._image_inflight.get(access_token)
+                        leases = (
+                            list(existing) if isinstance(existing, list)
+                            else [time.monotonic() + self._image_lease_secs()] * int(existing or 0)
+                        )
+                        leases.append(time.monotonic() + self._image_lease_secs())
+                        self._image_inflight[access_token] = leases
+                        return access_token
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._log_image_pick_skip_locked("wait_budget", plan_type, source_type, plan_types)
+                        raise RuntimeError(
+                            "image picker wait budget exhausted: account slots are busy, retry shortly"
+                        )
+                    self._image_slot_condition.wait(timeout=min(1.0, remaining))
+            finally:
+                try:
+                    self._slot_waiters.remove(waiter)
+                except ValueError:
+                    pass
+                self._image_slot_condition.notify_all()
+        self._notify_pool_pressure()
         raise RuntimeError(
             self._image_quota_empty_message(
                 plan_type=plan_type,
@@ -1850,14 +1895,98 @@ class AccountService:
             )
         )
 
-    def _pick_image_candidate_token(self, tokens: list[str]) -> str:
+    def _log_image_pick_skip_locked(
+            self,
+            trigger: str,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        """Per-account skip reasons for failed picks (debug channel only, cheap)."""
+        try:
+            logger.debug({
+                "event": "image_pick_skip",
+                "trigger": trigger,
+                "plan_type": plan_type or "",
+                "source_type": source_type or "",
+                "skips": self._image_pick_skip_diag_locked(plan_type, source_type, plan_types),
+            })
+        except Exception:
+            pass
+
+    def _image_pick_skip_diag_locked(
+            self,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        """First-failing filter per account, mirroring the pick conditions. Caller holds the lock."""
+        max_concurrency = max(1, int(config.image_account_concurrency or 1))
+        now = time.time()
+        out: list[dict] = []
+        for item in self._accounts.values():
+            token = str(item.get("access_token") or "")
+            if not token:
+                continue
+            quota = int(item.get("quota") or 0)
+            reason = ""
+            if str(item.get("status") or "") == "禁用":
+                reason = "disabled"
+            elif self._revoked_cooldown_active(item) or self._token_looks_revoked(item):
+                reason = "revoked"
+            elif self._image_gate_park_until(item) > 0:
+                reason = "gate_park"
+            elif str(item.get("status") or "") != "正常":
+                reason = "status"
+            elif quota <= 0:
+                reason = "no_quota"
+            elif not self._account_matches_plan_type(item, plan_type) or not self._account_matches_any_plan_type(item, plan_types):
+                reason = "plan_filter"
+            elif not self._account_matches_source_type(item, source_type):
+                reason = "source_filter"
+            else:
+                inflight = self._image_inflight_count_locked(token)
+                if inflight >= max_concurrency:
+                    reason = "inflight_concurrency"
+                elif quota > 0 and inflight >= quota:
+                    reason = "inflight_quota"
+            if reason:
+                out.append({"token": anonymize_token(token), "reason": reason, "quota": quota})
+        return out
+
+    def image_pick_skip_diag(
+            self,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> list[dict]:
+        with self._lock:
+            return self._image_pick_skip_diag_locked(plan_type, source_type, plan_types)
+
+    def _notify_pool_pressure(self) -> None:
+        """Tell the auto-replenish watcher the image pool just ran dry (throttled host-side)."""
+        try:
+            from services.gpt_register_service import gpt_register_service
+
+            gpt_register_service.notify_pool_pressure()
+        except Exception:
+            pass
+
+    def _pick_image_candidate_token(self, tokens: list[str], forbidden: set[str] | None = None) -> str:
         """Least in-flight first; ties spread across egresses, then use the most quota.
 
         Egress spreading is a preference, not a cap: a single-gateway pool
         (every account behind one Resin proxy) keeps its full per-account
         concurrency, while multi-egress pools stop stacking picks onto the
-        gateway that is already busy.
+        gateway that is already busy. ``forbidden`` holds tokens reserved by
+        elder waiters (FIFO gate); "" means the caller must keep waiting.
         """
+        if not tokens:
+            return ""
+        if forbidden:
+            tokens = [t for t in tokens if t not in forbidden]
+            if not tokens:
+                return ""
         if len(tokens) == 1:
             return tokens[0]
 
@@ -2161,12 +2290,18 @@ class AccountService:
                 or "token_revoked" in str(i.get("last_refresh_error") or "")
             )
         if ready and total_q > 0:
+            self._notify_pool_pressure()
+            with self._lock:
+                self._log_image_pick_skip_locked("empty_quota", plan_type, source_type, plan_types)
             raise RuntimeError(
                 f"no available image quota: {len(ready)} account(s) have local quota={total_q} "
                 f"but remote token check failed (tried {len(attempted_tokens)}; likely token_revoked). "
                 f"Re-register free accounts with refresh_token, or avoid bulk refresh. "
                 f"dead_hint={dead}"
             )
+        self._notify_pool_pressure()
+        with self._lock:
+            self._log_image_pick_skip_locked("empty_pool", plan_type, source_type, plan_types)
         raise RuntimeError(
             self._image_quota_empty_message(
                 plan_type=plan_type,
