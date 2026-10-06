@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import secrets
 import time
@@ -20,7 +21,7 @@ from services.log_service import (
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 from utils.log import logger
-from utils.network_diagnostics import error_details
+from utils.network_diagnostics import error_details, proxy_identity
 
 
 class AccountService:
@@ -65,7 +66,15 @@ class AccountService:
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
-        self._image_inflight: dict[str, int] = {}
+        self._image_inflight: dict[str, list[float]] = {}
+        # token -> monotonic deadline: brief text-path backoff after a soft network failure.
+        self._text_penalty: dict[str, float] = {}
+        # token -> {"at","ttl","account","error"}: short shared window so a
+        # queue of image picks performs one /me, not one per request.
+        self._probe_cache: dict[str, dict] = {}
+        self._probe_locks: dict[str, Lock] = {}
+        # proxy URL -> proxy_id (credential-hashed, never reversed back).
+        self._egress_key_cache: dict[str, str] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -775,9 +784,18 @@ class AccountService:
             if rotated:
                 self._accounts.pop(old_token, None)
                 self._token_aliases[old_token] = new_token
-                old_inflight = int(self._image_inflight.pop(old_token, 0))
-                if old_inflight:
-                    self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                moved = self._image_inflight.pop(old_token, [])
+                moved = (
+                    list(moved) if isinstance(moved, list)
+                    else [time.monotonic() + self._image_lease_secs()] * int(moved or 0)
+                )
+                if moved:
+                    prior = self._image_inflight.get(new_token)
+                    prior = (
+                        list(prior) if isinstance(prior, list)
+                        else [time.monotonic() + self._image_lease_secs()] * int(prior or 0)
+                    )
+                    self._image_inflight[new_token] = prior + moved
             self._accounts[new_token] = account
             try:
                 self._save_accounts()
@@ -1695,7 +1713,7 @@ class AccountService:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         tokens: list[str] = []
         for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
-            inflight = int(self._image_inflight.get(token, 0))
+            inflight = self._image_inflight_count_locked(token)
             if inflight >= max_concurrency:
                 continue
             quota = int((self._accounts.get(token) or {}).get("quota") or 0)
@@ -1705,6 +1723,47 @@ class AccountService:
                 continue
             tokens.append(token)
         return tokens
+
+    _IMAGE_LEASE_MIN_SECS = 120.0
+    _IMAGE_LEASE_MAX_SECS = 1800.0
+
+    def _image_lease_secs(self) -> float:
+        """A lease must outlive any legitimate generation, then die with its worker."""
+        try:
+            base = float(config.image_task_timeout_secs) * 2
+        except (TypeError, ValueError):
+            base = self._IMAGE_LEASE_MIN_SECS
+        return min(max(base, self._IMAGE_LEASE_MIN_SECS), self._IMAGE_LEASE_MAX_SECS)
+
+    def _image_slot_wait_secs(self) -> float:
+        """Bounded queue wait so a leaked lease cannot wedge every later request."""
+        try:
+            base = float(config.image_task_timeout_secs)
+        except (TypeError, ValueError):
+            base = 120.0
+        return min(max(base, 30.0), 120.0)
+
+    def _image_inflight_count_locked(self, token: str) -> int:
+        value = self._image_inflight.get(token)
+        if isinstance(value, list):
+            now = time.monotonic()
+            return sum(1 for deadline in value if deadline > now)
+        return int(value or 0)
+
+    def _prune_image_leases_locked(self) -> int:
+        now = time.monotonic()
+        reaped = 0
+        for token in list(self._image_inflight):
+            value = self._image_inflight[token]
+            if not isinstance(value, list):
+                continue
+            live = [deadline for deadline in value if deadline > now]
+            reaped += len(value) - len(live)
+            if live:
+                self._image_inflight[token] = live
+            else:
+                self._image_inflight.pop(token, None)
+        return reaped
 
     def _image_quota_empty_message(
             self,
@@ -1759,17 +1818,30 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        deadline = time.monotonic() + self._image_slot_wait_secs()
         with self._image_slot_condition:
             while True:
                 if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
                     # Build message outside nested lock scope to avoid lock ordering issues.
                     break
+                self._prune_image_leases_locked()
                 tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if tokens:
                     access_token = self._pick_image_candidate_token(tokens)
-                    self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
+                    existing = self._image_inflight.get(access_token)
+                    leases = (
+                        list(existing) if isinstance(existing, list)
+                        else [time.monotonic() + self._image_lease_secs()] * int(existing or 0)
+                    )
+                    leases.append(time.monotonic() + self._image_lease_secs())
+                    self._image_inflight[access_token] = leases
                     return access_token
-                self._image_slot_condition.wait(timeout=1.0)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "image picker wait budget exhausted: account slots are busy, retry shortly"
+                    )
+                self._image_slot_condition.wait(timeout=min(1.0, remaining))
         raise RuntimeError(
             self._image_quota_empty_message(
                 plan_type=plan_type,
@@ -1779,27 +1851,65 @@ class AccountService:
         )
 
     def _pick_image_candidate_token(self, tokens: list[str]) -> str:
-        """Prefer least in-flight, then highest remaining quota. Caller holds the slot lock."""
+        """Least in-flight first; ties spread across egresses, then use the most quota.
+
+        Egress spreading is a preference, not a cap: a single-gateway pool
+        (every account behind one Resin proxy) keeps its full per-account
+        concurrency, while multi-egress pools stop stacking picks onto the
+        gateway that is already busy.
+        """
         if len(tokens) == 1:
             return tokens[0]
 
-        def sort_key(token: str) -> tuple[int, int, str]:
-            inflight = int(self._image_inflight.get(token, 0))
+        egress_of: dict[str, str] = {}
+        inflight_of: dict[str, int] = {}
+        egress_load: dict[str, int] = {}
+        for token, account in self._accounts.items():
+            key = self._egress_key_locked(str((account or {}).get("proxy") or ""))
+            load = self._image_inflight_count_locked(token)
+            egress_of[token] = key
+            inflight_of[token] = load
+            if load:
+                egress_load[key] = egress_load.get(key, 0) + load
+
+        def sort_key(token: str) -> tuple[int, int, int, str]:
+            inflight = inflight_of.get(token, 0)
+            egress = egress_load.get(egress_of.get(token, "direct"), 0)
             quota = int((self._accounts.get(token) or {}).get("quota") or 0)
-            return (inflight, -quota, token)
+            return (inflight, egress, -quota, token)
 
         return min(tokens, key=sort_key)
+
+    def _egress_key_locked(self, proxy: str) -> str:
+        cached = self._egress_key_cache.get(proxy)
+        if cached is None:
+            cached = str(proxy_identity(proxy).get("proxy_id") or "direct")
+            if len(self._egress_key_cache) > 256:
+                self._egress_key_cache.clear()
+            self._egress_key_cache[proxy] = cached
+        return cached
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
             return
         with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
-            current_inflight = int(self._image_inflight.get(access_token, 0))
-            if current_inflight <= 1:
-                self._image_inflight.pop(access_token, None)
+            value = self._image_inflight.get(access_token)
+            if isinstance(value, list):
+                now = time.monotonic()
+                live = [deadline for deadline in value if deadline > now]
+                if live:
+                    live.pop(0)
+                if live:
+                    self._image_inflight[access_token] = live
+                else:
+                    self._image_inflight.pop(access_token, None)
             else:
-                self._image_inflight[access_token] = current_inflight - 1
+                current_inflight = int(value or 0)
+                if current_inflight <= 1:
+                    self._image_inflight.pop(access_token, None)
+                else:
+                    self._image_inflight[access_token] = current_inflight - 1
             self._image_slot_condition.notify_all()
 
     _IMAGE_PROBE_JWT_MIN_REMAINING = 5 * 60
@@ -1837,6 +1947,80 @@ class AccountService:
             and self._account_matches_any_plan_type(account, plan_types)
             and self._account_matches_source_type(account, source_type)
         )
+
+    _IMAGE_PROBE_CACHE_SECS = 15.0
+    _IMAGE_PROBE_ERROR_CACHE_SECS = 5.0
+
+    def _probe_remote_account(self, access_token: str, event: str) -> dict:
+        """fetch_remote_info with a short shared cache and per-token singleflight.
+
+        Behind a slow SOCKS a queue of image picks used to run one /me each;
+        within the window they now share one probe — and share one failure,
+        whose message (and therefore hard/soft classification) is preserved.
+        """
+        def cached_answer(now: float) -> dict | None:
+            hit = self._probe_cache.get(access_token)
+            if hit and now - float(hit.get("at") or 0.0) < float(hit.get("ttl") or 0.0):
+                return hit
+            return None
+
+        now = time.monotonic()
+        with self._lock:
+            hit = cached_answer(now)
+            if hit is None:
+                lock = self._probe_locks.setdefault(access_token, Lock())
+            else:
+                lock = None
+        if hit is not None:
+            if hit.get("error"):
+                raise RuntimeError(str(hit["error"]))
+            return dict(hit.get("account") or {})
+        with lock:
+            now = time.monotonic()
+            with self._lock:
+                hit = cached_answer(now)
+                if hit is None and len(self._probe_cache) > 512:
+                    cutoff = now - 60.0
+                    for stale in [k for k, v in self._probe_cache.items() if float(v.get("at") or 0.0) < cutoff]:
+                        self._probe_cache.pop(stale, None)
+            if hit is not None:
+                with self._lock:
+                    self._probe_locks.pop(access_token, None)
+                if hit.get("error"):
+                    raise RuntimeError(str(hit["error"]))
+                return dict(hit.get("account") or {})
+            try:
+                account = self.fetch_remote_info(access_token, event)
+            except Exception as exc:
+                with self._lock:
+                    self._probe_locks.pop(access_token, None)
+                    self._probe_cache[access_token] = {
+                        "at": time.monotonic(),
+                        "ttl": self._IMAGE_PROBE_ERROR_CACHE_SECS,
+                        "error": str(exc or "fetch_remote_info failed"),
+                        "account": None,
+                    }
+                raise
+            with self._lock:
+                self._probe_locks.pop(access_token, None)
+                self._probe_cache[access_token] = {
+                    "at": time.monotonic(),
+                    "ttl": self._IMAGE_PROBE_CACHE_SECS,
+                    "error": "",
+                    "account": dict(account or {}),
+                }
+            return account
+
+    def image_park_until_for_token_hash(self, token_hash: str) -> float:
+        """Wall-clock park deadline for the account owning ``token_hash`` (0 if none)."""
+        if not token_hash:
+            return 0.0
+        with self._lock:
+            for item in self._accounts.values():
+                token = str(item.get("access_token") or "")
+                if token and hashlib.sha256(token.encode()).hexdigest() == token_hash:
+                    return float(item.get("image_gate_park_until") or 0.0)
+        return 0.0
 
     def get_available_access_token(
             self,
@@ -1878,7 +2062,7 @@ class AccountService:
                     ):
                         return access_token
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token")
+                account = self._probe_remote_account(access_token, "get_available_access_token")
             except Exception as exc:
                 err = str(exc or "fetch_remote_info failed")
                 err_l = err.lower()
@@ -2015,15 +2199,50 @@ class AccountService:
             pool = candidates or soft
             if not pool:
                 return ""
+            if len(pool) > 1:
+                # Soft-failed accounts sit out briefly instead of being
+                # re-served on the very next rotation tick.
+                fresh = [t for t in pool if not self._text_penalty_active_locked(t)]
+                if fresh:
+                    pool = fresh
             access_token = pool[self._index % len(pool)]
             self._index += 1
-        # Only force refresh when token is near expiry / account already soft-failed.
-        # Forcing session refresh every chat floods logs and can race bulk refresh_accounts.
+        # Only force refresh when token is near expiry / the account hit a hard
+        # error. A soft network error must not turn every routed request into a
+        # doomed refresh through the same broken proxy.
         acc = self.get_account(access_token) or {}
         if self._revoked_cooldown_active(acc):
             return ""
-        force = str(acc.get("status") or "") in {"异常", "限流"} or bool(acc.get("last_refresh_error"))
+        err = str(acc.get("last_refresh_error") or "")
+        force = (
+            str(acc.get("status") or "") in {"异常", "限流"}
+            or (bool(err) and not self._is_soft_network_refresh_error(err))
+            or AccountService._token_needs_refresh(access_token)
+        )
         return self.refresh_access_token(access_token, force=force, event="get_text_access_token") or access_token
+
+    _TEXT_SOFT_PENALTY_SECS = 60.0
+
+    def note_text_penalty(self, access_token: str, error: object = "") -> None:
+        """Briefly deprioritize an account whose text call hit a soft network failure.
+
+        Only network-class errors qualify; hard auth failures belong to the
+        revoke path, and punishing those here would hide recoverable accounts.
+        """
+        if not access_token:
+            return
+        if not self._is_soft_network_refresh_error(str(error or "")):
+            return
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            now = time.monotonic()
+            for stale in [t for t, until in self._text_penalty.items() if until <= now]:
+                self._text_penalty.pop(stale, None)
+            self._text_penalty[access_token] = now + self._TEXT_SOFT_PENALTY_SECS
+
+    def _text_penalty_active_locked(self, token: str) -> bool:
+        until = self._text_penalty.get(token)
+        return bool(until and until > time.monotonic())
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
@@ -2432,6 +2651,9 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
+                # Persist the cleared error markers: on restart a stale
+                # last_refresh_error would re-arm the forced-refresh path.
+                self._save_accounts()
 
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):

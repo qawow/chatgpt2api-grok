@@ -157,8 +157,19 @@ class ImageTaskService:
         """
         now = time.time()
         kind = _clean(checkpoint.get("failure_kind"), "transient")
+        # The account-level image gate park is authoritative when it runs
+        # longer than this task's own window; otherwise the task retries an
+        # account the picker still refuses and every retry queues for nothing.
+        park_until = 0.0
+        try:
+            from services.account_service import account_service
+            park_until = account_service.image_park_until_for_token_hash(
+                _clean(checkpoint.get("failed_token_hash"))
+            )
+        except Exception:
+            pass
         if kind not in {"quota", "cooldown"}:
-            return now + cls._account_failure_cooldown_secs()
+            return max(now + cls._account_failure_cooldown_secs(), park_until)
         try:
             retry_after = float(checkpoint.get("retry_after_secs") or 0.0)
         except (TypeError, ValueError):
@@ -168,7 +179,7 @@ class ImageTaskService:
                 config.image_tool_quota_cooldown_secs if kind == "quota"
                 else config.image_tool_short_cooldown_secs
             )
-        return now + max(0.0, retry_after)
+        return max(now + max(0.0, retry_after), park_until)
 
     def __init__(
         self,
@@ -573,9 +584,15 @@ class ImageTaskService:
                 fingerprint = _clean(task.get("account_token_hash"))
                 failures = dict(task.get("account_failures") or {})
                 if fingerprint and failures.get(fingerprint, {}).get("attempt") != task.get("attempt", 0):
+                    park_until = 0.0
+                    try:
+                        from services.account_service import account_service
+                        park_until = account_service.image_park_until_for_token_hash(fingerprint)
+                    except Exception:
+                        pass
                     failures[fingerprint] = {
                         "kind": "transient", "attempt": task.get("attempt", 0),
-                    "retry_at": time.time() + self._account_failure_cooldown_secs(),
+                    "retry_at": max(time.time() + self._account_failure_cooldown_secs(), park_until),
                     }
                     task["account_failures"] = failures
             task["updated_at"] = _now_iso()

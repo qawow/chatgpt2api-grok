@@ -797,6 +797,11 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             return
         except Exception as exc:
             error_message = str(exc)
+            if token:
+                # Soft network failure: hold the account out of text rotation
+                # briefly so a dead proxy stops absorbing one doomed request
+                # per tick. Non-network errors are ignored by this classifier.
+                account_service.note_text_penalty(token, error_message)
             if token and not emitted and is_token_invalid_error(error_message):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
@@ -1667,16 +1672,20 @@ def _generate_single_image_impl(
                     account_email=account_email,
                 )
         except RuntimeError as exc:
-            unavailable = "no available" in str(exc).lower()
+            message_l = str(exc).lower()
+            unavailable = "no available" in message_l
+            # Picker wait budget exhausted: the pool exists, slots are just
+            # busy right now. That is retryable throttling, not a server fault.
+            busy = not unavailable and "wait budget exhausted" in message_l
             message = str(exc) or "image generation failed"
             if state["failed_connection_tokens"] and state["last_connection_error"]:
                 last_message = image_stream_error_message(str(state["last_connection_error"]))
                 message = f"{message}; last attempt: {last_message}" if unavailable else last_message
             raise ImageGenerationError(
                 message, account_email=account_email,
-                status_code=429 if unavailable else 502,
-                error_type="insufficient_quota" if unavailable else "server_error",
-                code="insufficient_quota" if unavailable else "upstream_error",
+                status_code=429 if (unavailable or busy) else 502,
+                error_type="insufficient_quota" if unavailable else ("rate_limit_exceeded" if busy else "server_error"),
+                code="insufficient_quota" if unavailable else ("upstream_busy" if busy else "upstream_error"),
             ) from exc
 
         # The slot picker may have waited behind another request while the
