@@ -354,25 +354,27 @@ class SkipDiagnosticsTests(unittest.TestCase):
 
 
 class PoolPressureEventTests(unittest.TestCase):
-    def test_empty_pick_wakes_replenish_and_notify_is_throttled(self) -> None:
-        from services.gpt_register_service import gpt_register_service
+    def test_wait_notify_and_throttle_on_isolated_service(self) -> None:
+        from services.gpt_register_service import GptRegisterService
 
-        saved_at = gpt_register_service._pool_pressure_at
-        gpt_register_service._pool_pressure.clear()
-        gpt_register_service._pool_pressure_at = 0.0
-        try:
-            self.assertFalse(gpt_register_service.wait_pool_pressure(0.05))
+        svc = GptRegisterService()
+        self.assertFalse(svc.wait_pool_pressure(0.05))
+        svc.notify_pool_pressure()
+        self.assertTrue(svc.wait_pool_pressure(0.05))
+        # re-notify within the throttle window must not re-set the event
+        svc.notify_pool_pressure()
+        self.assertFalse(svc.wait_pool_pressure(0.05))
+
+    def test_empty_pick_notifies_via_production_import_path(self) -> None:
+        import services.gpt_register_service as register_module
+
+        sentinel = mock.Mock()
+        with mock.patch.object(register_module, "gpt_register_service", sentinel):
             with tempfile.TemporaryDirectory() as tmp_dir:
                 service = _service(tmp_dir, [])  # empty pool
                 with self.assertRaises(RuntimeError):
                     service.get_available_access_token()
-            self.assertTrue(gpt_register_service.wait_pool_pressure(0.05))
-            # throttled re-notify within 60s must not re-set the event
-            gpt_register_service.notify_pool_pressure()
-            self.assertFalse(gpt_register_service.wait_pool_pressure(0.05))
-        finally:
-            gpt_register_service._pool_pressure.clear()
-            gpt_register_service._pool_pressure_at = saved_at
+        sentinel.notify_pool_pressure.assert_called_once()
 
 
 class PlanSplitTests(unittest.TestCase):
