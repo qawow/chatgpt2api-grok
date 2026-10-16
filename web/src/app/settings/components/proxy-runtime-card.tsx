@@ -106,7 +106,7 @@ export function ProxyRuntimeCard() {
               FlareSolverr 清障
             </div>
             <p className="mt-1 text-xs leading-6 text-stone-500">
-              默认关闭。用于上游请求遇到 Cloudflare 拦截后获取 clearance，可配合 WARP / Privoxy 代理链路重试。
+              默认关闭。FlareSolverr 模式会在已识别的 Cloudflare 挑战响应上按当前出口刷新凭据，重建连接并重试一次；可选启动预热，也可手动测试。
             </p>
           </div>
           <span className={`rounded-full px-3 py-1 text-xs ${runtimeEnabled ? "bg-emerald-50 text-emerald-700" : "bg-stone-100 text-stone-500"}`}>
@@ -184,7 +184,7 @@ export function ProxyRuntimeCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
               disabled={!runtimeEnabled}
             />
-            <p className="text-xs text-stone-500">默认 403，只对 Cloudflare/挑战类错误触发。</p>
+            <p className="text-xs text-stone-500">默认 403。仅识别为 Cloudflare 挑战的响应会刷新并重试一次；普通鉴权失败和限流不会触发。</p>
           </div>
 
           <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
@@ -283,7 +283,7 @@ export function ProxyRuntimeCard() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm text-stone-700">刷新间隔秒数</label>
+              <label className="text-sm text-stone-700">凭据缓存有效秒数</label>
               <Input
                 value={String(clearance.refresh_interval)}
                 onChange={(event) => setProxyRuntimeClearanceField("refresh_interval", event.target.value)}
@@ -324,7 +324,7 @@ export function ProxyRuntimeCard() {
                 onCheckedChange={(checked) => setProxyRuntimeClearanceField("warm_up_on_start", Boolean(checked))}
                 disabled={!runtimeEnabled || clearanceMode === "none"}
               />
-              启动时预热 Clearance
+              启动时在后台预热 Clearance（按账户和出口隔离）
             </label>
 
             <div className="space-y-2">

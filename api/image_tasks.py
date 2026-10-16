@@ -83,7 +83,14 @@ def create_router() -> APIRouter:
         model = str(payload["model"])
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt), prompt)
         images = await read_image_sources(image_sources)
-        masks = await read_image_sources(mask_sources) if mask_sources else None
+        masks = (
+            await read_image_sources(
+                mask_sources,
+                initial_total_bytes=sum(len(item[0]) for item in images),
+            )
+            if mask_sources
+            else None
+        )
         try:
             return await run_in_threadpool(
                 image_task_service.submit_edit,

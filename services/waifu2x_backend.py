@@ -230,7 +230,7 @@ def _session(settings: dict[str, Any] | None = None):
 
     cfg = settings or _settings()
     kwargs = proxy_settings.build_session_kwargs(impersonate="chrome142", verify=True, upstream=True)
-    return create_cffi_session(**kwargs), cfg
+    return proxy_settings.wrap_session(create_cffi_session(**kwargs), proxy_url=str(kwargs.get("proxy") or "")), cfg
 
 
 def _headers(cfg: dict[str, Any]) -> dict[str, str]:

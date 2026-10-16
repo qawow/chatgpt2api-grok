@@ -16,6 +16,7 @@ from services.protocol.conversation import (
 )
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 from utils.image_models import WEB_IMAGE_MODEL
+from utils.helper import parse_image_count
 
 
 def _composite_mask(
@@ -51,11 +52,11 @@ def _composite_mask(
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
+    n = parse_image_count(body.get("n"))
     images = body.get("images") or []
     masks = body.get("mask") or []
     images = _composite_mask(images, masks)
     model = str(body.get("model") or WEB_IMAGE_MODEL)
-    n = int(body.get("n") or 1)
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")

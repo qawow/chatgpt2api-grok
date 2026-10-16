@@ -92,9 +92,11 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         from services.account_service import account_service
 
+        settings = await run_in_threadpool(gpt_register_config.get)
+        pool = await run_in_threadpool(account_service.image_pool_snapshot)
         return {
-            "settings": public_settings(gpt_register_config.get()),
-            "pool": account_service.image_pool_snapshot(),
+            "settings": public_settings(settings),
+            "pool": pool,
         }
 
     @router.post("/api/gpt-register/settings")
@@ -106,7 +108,7 @@ def create_router() -> APIRouter:
         patch = body.model_dump(exclude_none=True)
         if not patch:
             raise HTTPException(status_code=400, detail={"error": "no settings provided"})
-        settings = gpt_register_config.update(patch)
+        settings = await run_in_threadpool(gpt_register_config.update, patch)
         return {"settings": public_settings(settings)}
 
     @router.post("/api/gpt-register/tempmail/test")
@@ -126,12 +128,12 @@ def create_router() -> APIRouter:
     @router.get("/api/gpt-register/jobs")
     async def list_jobs(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"jobs": gpt_register_service.list_jobs()}
+        return {"jobs": await run_in_threadpool(gpt_register_service.list_jobs)}
 
     @router.get("/api/gpt-register/jobs/{job_id}")
     async def get_job(job_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        job = gpt_register_service.get_job(job_id)
+        job = await run_in_threadpool(gpt_register_service.get_job, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail={"error": "job not found"})
         return {"job": job}
@@ -157,7 +159,7 @@ def create_router() -> APIRouter:
     @router.post("/api/gpt-register/jobs/{job_id}/cancel")
     async def cancel_job(job_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        job = gpt_register_service.cancel_job(job_id)
+        job = await run_in_threadpool(gpt_register_service.cancel_job, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail={"error": "job not found"})
         return {"job": job}

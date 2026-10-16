@@ -193,7 +193,7 @@ class OAuthLoginService:
     def _exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict[str, str]:
         """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
         kwargs = proxy_settings.build_session_kwargs(impersonate="chrome142", verify=True, upstream=True)
-        session = create_cffi_session(**kwargs)
+        session = proxy_settings.wrap_session(create_cffi_session(**kwargs), proxy_url=str(kwargs.get("proxy") or ""))
         try:
             response = session.post(
                 f"{auth_base}/api/accounts/oauth/token",

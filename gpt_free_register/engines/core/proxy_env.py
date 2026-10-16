@@ -196,6 +196,41 @@ def rotate_sticky_session(proxy: Optional[str], session_id: Optional[str] = None
     return f"{prefix}{base_user}.{sid}:{password}@{host}"
 
 
+def strip_sticky_session(proxy: Optional[str]) -> Optional[str]:
+    """Drop the ``user.<session_id>`` suffix, keeping the bare credential.
+
+    Not every rotating provider accepts a session suffix, and the ones that do
+    not reject the whole handshake with ``curl: (97) User was rejected by the
+    SOCKS5 server``. Measured on the pool behind ``192.168.2.198:19053``:
+    ``ob`` connects every time while ``ob.<anything>`` is refused outright, so
+    a sticky suffix turns a working proxy into a dead one. Callers use this to
+    fall back to the plain credential after such a rejection.
+    """
+    value = normalize_proxy_url(proxy)
+    if not value:
+        return value
+    split = _split_proxy_url(value)
+    if not split:
+        return value
+    user, password, host = split
+    if "." not in user:
+        return value
+    scheme = value.split("://", 1)[0] if "://" in value else ""
+    prefix = f"{scheme}://" if scheme else ""
+    return f"{prefix}{user.split('.', 1)[0]}:{password}@{host}"
+
+
+def is_socks5_user_rejected(error: object) -> bool:
+    """True when the proxy refused the handshake itself (``curl: (97)``).
+
+    This is a credential/session-suffix problem, not a challenged exit: the
+    proxy never opened the tunnel, so retrying the same URL cannot help and
+    rotating to another session id only produces another rejection.
+    """
+    text = str(error or "")
+    return "(97)" in text and "rejected by the socks5" in text.lower()
+
+
 def normalize_proxy_url(proxy: Optional[str]) -> Optional[str]:
     """Normalize proxy URLs for curl_cffi.
 

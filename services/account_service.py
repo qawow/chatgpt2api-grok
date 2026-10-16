@@ -707,12 +707,13 @@ class AccountService:
         from services.proxy_service import proxy_settings
         from utils.curl_tls import create_cffi_session
 
-        session = create_cffi_session(**proxy_settings.build_session_kwargs(
+        session = proxy_settings.create_session(
             account=account,
             impersonate="chrome142",
             verify=True,
             upstream=True,
-        ))
+            session_factory=create_cffi_session,
+        )
         try:
             response = session.post(
                 self._OAUTH_TOKEN_URL,
@@ -839,14 +840,13 @@ class AccountService:
 
         saw_auth_dead = False
         for _source, proxy_url in proxy_settings.list_egress_candidates(account=account or {}, upstream=True):
-            session = create_cffi_session(
-                **proxy_settings.build_session_kwargs(
-                    account=account or {},
-                    impersonate="chrome142",
-                    verify=True,
-                    upstream=True,
-                    force_proxy=proxy_url,
-                )
+            session = proxy_settings.create_session(
+                account=account or {},
+                impersonate="chrome142",
+                verify=True,
+                upstream=True,
+                force_proxy=proxy_url,
+                session_factory=create_cffi_session,
             )
             try:
                 self._apply_chatgpt_web_identity(session, account)
@@ -932,6 +932,7 @@ class AccountService:
                 force_proxy=proxy_url,
             )
             session = create_cffi_session(**session_kwargs)
+            session = proxy_settings.wrap_session(session, proxy_url=proxy_url, account=account)
             try:
                 self._apply_chatgpt_web_identity(session, account)
                 session.cookies.set(
@@ -1322,6 +1323,7 @@ class AccountService:
             upstream=True,
         )
         session = create_cffi_session(**session_kwargs)
+        session = proxy_settings.wrap_session(session, proxy_url=str(session_kwargs.get("proxy") or ""), account=account)
         
         try:
             device_id = self._chatgpt_device_id(account) or str(uuid.uuid4())
@@ -2553,7 +2555,7 @@ class AccountService:
             for item in self._accounts.values():
                 account = dict(item)
                 token = account.get("access_token") or ""
-                account["image_inflight"] = int(self._image_inflight.get(token, 0))
+                account["image_inflight"] = self._image_inflight_count_locked(token)
                 result.append(account)
             return result
 

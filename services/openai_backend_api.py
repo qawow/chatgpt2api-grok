@@ -22,7 +22,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import _is_egress_connect_error, normalize_proxy_url, proxy_settings
-from utils.curl_tls import create_cffi_session
+from utils.curl_tls import DEFAULT_IMPERSONATE, create_cffi_session
 from utils.egress_locale import resolve_egress_locale
 from utils.helper import (
     LEGACY_WEB_IMAGE_MODELS,
@@ -239,13 +239,186 @@ class ChatRequirements:
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
+
+
+@dataclass(frozen=True)
+class BrowserIdentity:
+    """A self-consistent UA + client-hint set derived from one TLS profile.
+
+    The TLS profile is what upstream observes at the network layer, so every
+    header that names a browser has to agree with it. Real browsers never mix
+    brands or versions, and a mismatch is a fingerprinting signal.
+    """
+
+    family: str
+    major: str
+    user_agent: str
+    sec_ch_ua: str
+    sec_ch_ua_full_version: str
+    sec_ch_ua_full_version_list: str
+    sends_client_hints: bool = True
+
+    def matches_ua(self, candidate: str) -> bool:
+        """True when ``candidate`` names the same browser family and major version."""
+        text = str(candidate or "")
+        if self.family == "firefox":
+            return bool(re.search(rf"Firefox/{re.escape(self.major)}\.", text))
+        if self.family == "safari":
+            return "Safari/" in text and "Chrome" not in text
+        if self.family == "edge":
+            return bool(re.search(rf"Edg/{re.escape(self.major)}\.", text))
+        # chrome
+        if "Edg/" in text or "Firefox/" in text:
+            return False
+        return bool(re.search(rf"Chrome/{re.escape(self.major)}\.", text))
+
+
+def browser_identity(impersonate: str) -> BrowserIdentity:
+    """Build a consistent identity for a ``curl_cffi`` impersonate target.
+
+    ``chrome142`` -> Chrome 142 UA + Chrome 142 client hints. Unknown targets
+    fall back to a Chrome identity at the configured default major version, so
+    the result is always internally consistent even for a target we do not know.
+    """
+    raw = str(impersonate or "").strip().lower()
+    match = re.fullmatch(r"(chrome|edge|firefox|safari)(\d+)?(?:_android|_ios)?[a-z]*", raw)
+    family = match.group(1) if match else "chrome"
+    major = (match.group(2) if match and match.group(2) else "") or DEFAULT_IMPERSONATE.removeprefix(
+        "chrome"
+    )
+    platform = "Windows NT 10.0; Win64; x64"
+    if family == "firefox":
+        ua = f"Mozilla/5.0 ({platform}; rv:{major}.0) Gecko/20100101 Firefox/{major}.0"
+        return BrowserIdentity(family, major, ua, "", "", "", sends_client_hints=False)
+    if family == "safari":
+        ua = (
+            f"Mozilla/5.0 ({platform}) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            f"Version/{major}.0 Safari/605.1.15"
+        )
+        return BrowserIdentity(family, major, ua, "", "", "", sends_client_hints=False)
+    if family == "edge":
+        ua = (
+            f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
+        )
+        return BrowserIdentity(
+            family, major, ua,
+            f'"Microsoft Edge";v="{major}", "Chromium";v="{major}", "Not A(Brand";v="24"',
+            f'"{major}.0.0.0"',
+            f'"Microsoft Edge";v="{major}.0.0.0", "Chromium";v="{major}.0.0.0", '
+            '"Not A(Brand";v="24.0.0.0"',
+        )
+    ua = (
+        f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Safari/537.36"
+    )
+    return BrowserIdentity(
+        family, major, ua,
+        f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not/A)Brand";v="99"',
+        f'"{major}.0.0.0"',
+        f'"Chromium";v="{major}.0.0.0", "Google Chrome";v="{major}.0.0.0", '
+        '"Not/A)Brand";v="99.0.0.0"',
+    )
+
+
 FILE_SERVICE_ID_RE = re.compile(r"file-service://([A-Za-z0-9_-]+)")
+
+# The real client's sentinel header map (bundle module ``a-BiuthBl1``), verbatim.
+# Two entries are new as of the 2026-10-16 bundle and were never sent by this
+# client before: ``telemetryToken`` (OAI-Echo-Logs) and ``timingToken``
+# (OAI-Telemetry).
+SENTINEL_HEADER_CHAT_REQUIREMENTS = "OpenAI-Sentinel-Chat-Requirements-Token"
+SENTINEL_HEADER_CHAT_REQUIREMENTS_PREPARE = "OpenAI-Sentinel-Chat-Requirements-Prepare-Token"
+SENTINEL_HEADER_PROOF = "OpenAI-Sentinel-Proof-Token"
+SENTINEL_HEADER_TURNSTILE = "OpenAI-Sentinel-Turnstile-Token"
+SENTINEL_HEADER_SESSION_OBSERVER = "OpenAI-Sentinel-SO-Token"
+SENTINEL_HEADER_TELEMETRY = "OAI-Echo-Logs"
+SENTINEL_HEADER_TIMING = "OAI-Telemetry"
+
+# ``OAI-Telemetry`` carries the SDK's timing blob; the frontend falls back to
+# this literal whenever the SDK has not produced one yet (bundle ``M="[1,null]"``).
+SENTINEL_TIMING_FALLBACK = "[1,null]"
+
+# ``OAI-Echo-Logs`` is an input-event trace: the first ten
+# ``focusin``/``focusout``/``copy``/``paste``/``touchstart``/``touchend`` events
+# as ``"<type>,<timestamp>"`` pairs joined by commas (bundle ``a--tOLhrKL``).
+_ECHO_LOG_EVENT_TYPES = ("focusin", "focusout", "copy", "paste", "touchstart", "touchend")
+_ECHO_LOG_LIMIT = 10
+
 _AUTH_FILE_HOSTS = ("chatgpt.com", "chat.openai.com")
 _AUTH_FILE_PATH_PREFIXES = (
     "/backend-api/estuary",
     "/backend-api/files/",
     "/backend-api/conversation/",
 )
+
+
+class SentinelEchoLogs:
+    """Input-event trace for the ``OAI-Echo-Logs`` sentinel header.
+
+    The frontend records the first ten ``focusin``/``focusout``/``copy``/
+    ``paste``/``touchstart``/``touchend`` events as ``"<type>,<timestamp>"``
+    pairs and joins them with commas (bundle module ``a--tOLhrKL``). Timestamps
+    are ``event.timeStamp`` values, i.e. milliseconds since the page loaded, so
+    a trace whose timestamps are all zero is not something a browser produces.
+
+    A headless client has no DOM, so the trace is synthesised from the same
+    event shapes a composer submit produces — the composer takes focus, the
+    prompt arrives, the submit is tapped — with timestamps measured from this
+    object's creation, which stands in for page load.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[tuple[int, int]] = []
+        self._origin = time.monotonic()
+
+    def _elapsed_ms(self) -> int:
+        return max(0, int((time.monotonic() - self._origin) * 1000))
+
+    def _record(self, event_type: int) -> None:
+        if len(self._events) >= _ECHO_LOG_LIMIT:
+            return
+        elapsed = self._elapsed_ms()
+        # event.timeStamp is monotonically non-decreasing in a browser.
+        if self._events and elapsed < self._events[-1][1]:
+            elapsed = self._events[-1][1]
+        self._events.append((event_type, elapsed))
+
+    def composer_submit(self) -> None:
+        """Record the trace a one-shot composer submit produces.
+
+        ``focusin`` lands at the current elapsed time (the composer was focused
+        when the client started), then the paste and the two touch events follow
+        over the next few milliseconds.
+        """
+        self._events.clear()
+        self._record(0)   # focusin
+        time.sleep(0.001)
+        self._record(3)   # paste
+        time.sleep(0.001)
+        self._record(4)   # touchstart
+        time.sleep(0.001)
+        self._record(5)   # touchend
+
+    def value(self) -> str:
+        return ",".join(f"{event_type},{timestamp}" for event_type, timestamp in self._events)
+
+
+_echo_logs_tracker = SentinelEchoLogs()
+_echo_logs_lock = threading.Lock()
+
+
+def sentinel_echo_logs() -> str:
+    """Trace string for one request, matching the frontend's composer submit.
+
+    The tracker is process-wide and starts at import time, so its timestamps
+    grow with process lifetime the way ``event.timeStamp`` grows with page
+    lifetime in a browser. A fresh tracker per request would always report
+    single-digit milliseconds, which no real page produces.
+    """
+    with _echo_logs_lock:
+        _echo_logs_tracker.composer_submit()
+        return _echo_logs_tracker.value()
 
 
 def needs_chatgpt_file_auth(url: str) -> bool:
@@ -408,15 +581,17 @@ class OpenAIBackendAPI:
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
-        self.locale = self._resolve_locale()
-        self.progress_callback: Callable[[str], None] | None = None
-        self.session = create_cffi_session(**proxy_settings.build_session_kwargs(
+        session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
             upstream=True,
             force_proxy=force_proxy,
-        ))
+        )
+        self._effective_proxy = str(session_kwargs.get("proxy") or "")
+        self.locale = self._resolve_locale()
+        self.progress_callback: Callable[[str], None] | None = None
+        self.session = create_cffi_session(**session_kwargs)
         self.resource_session = None
         self.session.headers.update({
             "User-Agent": self.user_agent,
@@ -429,8 +604,8 @@ class OpenAIBackendAPI:
             "Sec-Ch-Ua": self.fp["sec-ch-ua"],
             "Sec-Ch-Ua-Arch": '"x86"',
             "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
+            "Sec-Ch-Ua-Full-Version": self.fp["sec-ch-ua-full-version"],
+            "Sec-Ch-Ua-Full-Version-List": self.fp["sec-ch-ua-full-version-list"],
             "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
             "Sec-Ch-Ua-Model": '""',
             "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
@@ -439,6 +614,11 @@ class OpenAIBackendAPI:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
             "OAI-Device-Id": self.device_id,
+            # The real client's default header block (bundle module Kwu @989802)
+            # emits ``{"oai-did": <deviceId>}`` — the name is ``oai-did``, not
+            # ``oai-device-id``. Both are sent so the misnamed legacy header
+            # keeps working for surfaces that learned to expect it.
+            "oai-did": self.device_id,
             "OAI-Session-Id": self.session_id,
             "OAI-Language": "zh-CN",
             "OAI-Client-Version": self.client_version,
@@ -446,6 +626,10 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+        self.session = proxy_settings.wrap_session(
+            self.session, proxy_url=self._effective_proxy, account=lambda: self.account,
+            on_user_agent=self._apply_clearance_user_agent,
+        )
 
         # Free/passwordless register stores web session cookie for recovery.
         self._attach_session_cookie()
@@ -518,9 +702,7 @@ class OpenAIBackendAPI:
             updates["fp"] = next_fp
         if not str(account.get("proxy") or "").strip() and self._force_proxy is None:
             try:
-                pinned = normalize_proxy_url(
-                    proxy_settings.get_profile(account=account, upstream=True).proxy_url
-                )
+                pinned = self._effective_proxy
             except Exception:
                 pinned = ""
             if pinned:
@@ -645,6 +827,11 @@ class OpenAIBackendAPI:
         except Exception:
             return False
 
+    def _apply_clearance_user_agent(self, user_agent: str) -> None:
+        self.user_agent = user_agent
+        self.fp["user-agent"] = user_agent
+        self.session.headers["User-Agent"] = user_agent
+
     def _resource_session(self):
         """Return a session for signed image/CDN resources.
 
@@ -654,18 +841,27 @@ class OpenAIBackendAPI:
         """
         session = getattr(self, "resource_session", None)
         if session is None:
-            session = create_cffi_session(**proxy_settings.build_session_kwargs(
+            profile = proxy_settings.get_profile(account=self.account, resource=True, upstream=True)
+            # A dedicated resource proxy is independent of the API failover
+            # route. An explicitly bound account still wins over both.
+            resource_force = None if profile.proxy_source == "runtime_resource" else self._force_proxy
+            kwargs = proxy_settings.build_session_kwargs(
                 account=self.account,
                 resource=True,
                 upstream=True,
                 impersonate=self.fp["impersonate"],
                 verify=True,
-                force_proxy=self._force_proxy,
-            ))
+                force_proxy=resource_force,
+            )
+            self._resource_proxy = str(kwargs.get("proxy") or "")
+            session = create_cffi_session(**kwargs)
             session.headers.update({
                 "User-Agent": self.user_agent,
                 "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             })
+            session = proxy_settings.wrap_session(
+                session, proxy_url=self._resource_proxy, account=lambda: self.account, resource=True,
+            )
             self.resource_session = session
         return session
 
@@ -695,7 +891,9 @@ class OpenAIBackendAPI:
 
     def _resolve_locale(self):
         """按本实例的出口（force_proxy 或号池/运行时画像）解析客户端环境画像。"""
-        if self._force_proxy is not None:
+        if hasattr(self, "_effective_proxy"):
+            proxy_url = self._effective_proxy or None
+        elif self._force_proxy is not None:
             proxy_url = normalize_proxy_url(self._force_proxy) or None
         else:
             try:
@@ -744,18 +942,26 @@ class OpenAIBackendAPI:
             value = str(account.get(key) or "").strip()
             if value:
                 fp[key] = value
-        fp.setdefault(
-            "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/142.0.7540.34 Safari/537.36",
-        )
         from utils.curl_tls import resolve_session_impersonate
 
-        fp.setdefault("impersonate", "chrome142")
+        fp.setdefault("impersonate", DEFAULT_IMPERSONATE)
         fp["impersonate"] = resolve_session_impersonate(fp.get("impersonate"))
+
+        # The TLS profile is what upstream sees at the network layer and cannot be
+        # spoofed by headers, so every header that names a browser must agree with
+        # it. Deriving them from one source is the only way to guarantee that: the
+        # previous code hard-coded an Edge 143 client-hint set next to a
+        # ``chrome142`` TLS profile and a ``Chrome/142`` UA, which no real browser
+        # can produce.
+        identity = browser_identity(fp["impersonate"])
+        stored_ua = str(fp.get("user-agent") or "").strip()
+        if not stored_ua or not identity.matches_ua(stored_ua):
+            fp["user-agent"] = identity.user_agent
+        fp["sec-ch-ua"] = identity.sec_ch_ua
+        fp["sec-ch-ua-full-version"] = identity.sec_ch_ua_full_version
+        fp["sec-ch-ua-full-version-list"] = identity.sec_ch_ua_full_version_list
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
-        fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
         fp.setdefault("sec-ch-ua-mobile", "?0")
         fp.setdefault("sec-ch-ua-platform", '"Windows"')
         if "screen_width" not in fp or "screen_height" not in fp:
@@ -783,6 +989,7 @@ class OpenAIBackendAPI:
                 headers=headers,
                 target_url=self.base_url + path,
                 account=self.account,
+                force_proxy=getattr(self, "_effective_proxy", getattr(self, "_force_proxy", None)),
             )
             headers = {str(k): str(v) for k, v in merged.items()}
         except Exception:
@@ -974,14 +1181,16 @@ class OpenAIBackendAPI:
         headers = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            "OpenAI-Sentinel-Chat-Requirements-Token": requirements.token,
+            SENTINEL_HEADER_CHAT_REQUIREMENTS: requirements.token,
         }
         if requirements.proof_token:
-            headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
+            headers[SENTINEL_HEADER_PROOF] = requirements.proof_token
         if requirements.turnstile_token:
-            headers["OpenAI-Sentinel-Turnstile-Token"] = requirements.turnstile_token
+            headers[SENTINEL_HEADER_TURNSTILE] = requirements.turnstile_token
         if requirements.so_token:
-            headers["OpenAI-Sentinel-SO-Token"] = requirements.so_token
+            headers[SENTINEL_HEADER_SESSION_OBSERVER] = requirements.so_token
+        headers[SENTINEL_HEADER_TELEMETRY] = sentinel_echo_logs()
+        headers[SENTINEL_HEADER_TIMING] = SENTINEL_TIMING_FALLBACK
         return self._headers(path, headers)
 
     def _api_messages_to_conversation_messages(self, messages: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -1125,12 +1334,29 @@ class OpenAIBackendAPI:
         return payload
 
     def _image_model_slug(self, model: str) -> str:
-        """把标准图片模型名映射到底层 model slug。"""
+        """把标准图片模型名映射到底层 model slug。
+
+        The web picture_v2 path drives image generation through the account's
+        default chat model, so the slug must be one the conversation surface
+        actually advertises. ``auto`` is the only slug that satisfies both
+        requirements:
+
+        * it is what the real client sends by default (captured body:
+          ``"model":"auto"``), and
+        * it is present in the live ``/backend-api/models`` catalog together
+          with ``default_model_slug`` / ``intended_default_model_slug``.
+
+        The previous hard-coded ``gpt-5-3`` is gone from the catalog — the
+        live list is ``gpt-5-6, gpt-5-3-mini, gpt-5-6-mini, gpt-5-6-t-mini,
+        gpt-5-6-t-mini-mini, research, gpt-6, gpt-6-t-mini, gpt-6-mini,
+        gpt-6-t-mini-mini, auto`` — so it could only ever resolve through
+        whichever legacy alias the backend still happened to keep.
+        """
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto"
         if base_model == WEB_IMAGE_MODEL or base_model in LEGACY_WEB_IMAGE_MODELS:
-            return "gpt-5-3"
+            return "auto"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
@@ -1141,14 +1367,16 @@ class OpenAIBackendAPI:
         headers = {
             "Content-Type": "application/json",
             "Accept": accept,
-            "OpenAI-Sentinel-Chat-Requirements-Token": requirements.token,
+            SENTINEL_HEADER_CHAT_REQUIREMENTS: requirements.token,
         }
         if requirements.proof_token:
-            headers["OpenAI-Sentinel-Proof-Token"] = requirements.proof_token
+            headers[SENTINEL_HEADER_PROOF] = requirements.proof_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
         if accept == "text/event-stream":
             headers["X-Oai-Turn-Trace-Id"] = new_uuid()
+        headers[SENTINEL_HEADER_TELEMETRY] = sentinel_echo_logs()
+        headers[SENTINEL_HEADER_TIMING] = SENTINEL_TIMING_FALLBACK
         return self._headers(path, headers)
 
     def _codex_responses_headers(self) -> Dict[str, str]:
@@ -1431,7 +1659,20 @@ class OpenAIBackendAPI:
             raise RuntimeError(f"codex responses network error: {error}") from error
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
-        """为图片生成准备 conduit token。"""
+        """为图片生成准备 conduit token。
+
+        The real client's ``prepareCompletionStream`` always stamps two extra
+        body keys that this client used to omit (bundle @505271):
+
+            prepareCompletionStream({...W, client_prepare_dispatch:"immediate",
+                                     client_prepare_source:"context_change"})
+
+        ``client_prepare_dispatch`` is ``"immediate"`` or ``"debounced"``;
+        ``client_prepare_source`` is normalised to one of
+        ``composer_editor_state`` / ``context_change`` / ``file_picker`` /
+        ``gizmo_override``. A one-shot API call is a composer submit, so
+        ``composer_editor_state`` is the matching source.
+        """
         path = "/backend-api/f/conversation/prepare"
         payload = {
             "action": "next",
@@ -1439,6 +1680,8 @@ class OpenAIBackendAPI:
             "parent_message_id": new_uuid(),
             "model": self._image_model_slug(model),
             "client_prepare_state": "none",
+            "client_prepare_dispatch": "immediate",
+            "client_prepare_source": "composer_editor_state",
             "timezone_offset_min": self.locale.offset_min,
             "timezone": self.locale.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
@@ -2377,7 +2620,7 @@ class OpenAIBackendAPI:
                     impersonate=self.fp["impersonate"],
                     timeout=self._request_timeout(120),
                     headers=headers,
-                    skip_proxy_urls={used_proxy} if used_proxy else set(),
+                    skip_proxy_urls={getattr(self, "_resource_proxy", used_proxy)},
                 )
                 if not 200 <= response.status_code < 300:
                     raise RuntimeError(f"image_download failed: HTTP {response.status_code}") from exc

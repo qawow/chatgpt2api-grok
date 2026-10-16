@@ -115,15 +115,7 @@ _DETECT_USER_AGENT = (
 
 def _detect_once(proxy_url: str | None) -> EgressLocale | None:
     """主探测：ip-api 明文免费档（HTTPS 仅付费档，实测 403）。"""
-    from curl_cffi import requests as curl_requests
-
-    kwargs: dict = {"timeout": 8, "headers": {"User-Agent": _DETECT_USER_AGENT}}
-    if proxy_url:
-        kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-    r = curl_requests.get(
-        "http://ip-api.com/json/?fields=status,countryCode,timezone",
-        **kwargs,
-    )
+    r = _fetch_locale("http://ip-api.com/json/?fields=status,countryCode,timezone", proxy_url)
     data = r.json()
     if data.get("status") == "success" and data.get("timezone"):
         return _build(str(data["timezone"]), str(data.get("countryCode") or ""), "detected")
@@ -132,12 +124,7 @@ def _detect_once(proxy_url: str | None) -> EgressLocale | None:
 
 def _detect_once_fallback(proxy_url: str | None) -> EgressLocale | None:
     """备用探测：ipwho.is（HTTPS 免费档），解析 timezone.id。"""
-    from curl_cffi import requests as curl_requests
-
-    kwargs: dict = {"timeout": 8, "headers": {"User-Agent": _DETECT_USER_AGENT}}
-    if proxy_url:
-        kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-    r = curl_requests.get("https://ipwho.is/?fields=success,country_code,timezone", **kwargs)
+    r = _fetch_locale("https://ipwho.is/?fields=success,country_code,timezone", proxy_url)
     data = r.json()
     if not isinstance(data, dict) or not data.get("success"):
         return None
@@ -146,6 +133,16 @@ def _detect_once_fallback(proxy_url: str | None) -> EgressLocale | None:
     if not tz_id:
         return None
     return _build(tz_id, str(data.get("country_code") or ""), "detected")
+
+
+def _fetch_locale(url: str, proxy_url: str | None):
+    from utils.curl_tls import create_cffi_session
+
+    session = create_cffi_session(proxy=proxy_url or "")
+    try:
+        return session.get(url, timeout=8, headers={"User-Agent": _DETECT_USER_AGENT})
+    finally:
+        session.close()
 
 
 def _detect(proxy_url: str | None) -> EgressLocale | None:

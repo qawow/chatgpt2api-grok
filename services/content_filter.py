@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import re
 
-from curl_cffi import requests
 from fastapi import HTTPException
 
 from services.config import config
 from services.proxy_service import proxy_settings
+from utils.curl_tls import create_cffi_session
 from utils.log import logger
 
 DEFAULT_REVIEW_PROMPT = "判断用户请求是否允许。只回答 ALLOW 或 REJECT。"
@@ -189,13 +189,14 @@ def check_request(text: str) -> None:
                 detail={"error": "AI 审核服务暂时不可用，请稍后重试"},
             )
 
+    session = None
     try:
-        response = requests.post(
+        session = proxy_settings.create_session(upstream=True, session_factory=create_cffi_session)
+        response = session.post(
             f"{base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0},
             timeout=60,
-            **proxy_settings.build_session_kwargs(),
         )
     except Exception as exc:
         _on_failure({
@@ -206,6 +207,9 @@ def check_request(text: str) -> None:
             "original_text_len": len(text),
         })
         return
+    finally:
+        if session is not None:
+            session.close()
 
     try:
         data = response.json()

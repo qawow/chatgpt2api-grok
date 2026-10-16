@@ -152,13 +152,19 @@ def _request(
     from services.proxy_service import _is_egress_connect_error, proxy_settings
 
     last_error: Exception | None = None
+    profile = proxy_settings.get_profile(account=account or {}, upstream=True)
+    kwargs.setdefault("verify", not (profile.runtime_enabled and profile.skip_ssl_verify))
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
     for _source, proxy_url in proxy_settings.list_egress_candidates(
         account=account or {}, upstream=True
     ):
+        remaining = deadline - time.monotonic() if deadline is not None else timeout
+        if deadline is not None and remaining <= 0:
+            raise requests.Timeout("Grok egress timeout budget exhausted") from last_error
         try:
             resp = getattr(_http(), method)(
                 url,
-                timeout=timeout,
+                timeout=remaining,
                 proxies=_proxies(proxy_url, explicit=True),
                 **kwargs,
             )

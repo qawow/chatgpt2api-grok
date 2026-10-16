@@ -5,6 +5,7 @@ import binascii
 import json
 import mimetypes
 import re
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import unquote, unquote_to_bytes, urlparse
@@ -15,13 +16,25 @@ from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
+from utils.helper import parse_image_count
 from utils.image_models import WEB_IMAGE_MODEL
 from utils.ssrf import UnsafeUrlError, assert_safe_url
 
 ImageInput = tuple[bytes, str, str]
-ImageSource = str | UploadFile | ImageInput
+
+
+@dataclass(frozen=True)
+class InlineImageSource:
+    value: str
+    filename: str
+    mime_type: str
+
+
+ImageSource = str | UploadFile | ImageInput | InlineImageSource
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_REFERENCE_COUNT = 16
+MAX_IMAGE_REFERENCE_TOTAL_BYTES = 200 * 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
@@ -53,13 +66,7 @@ def _parse_bool(value: object) -> bool | None:
 
 def _parse_count(value: object) -> int:
     """解析生成数量：保持图片接口的 1 到 4 限制。"""
-    try:
-        count = int(value or 1)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if count < 1 or count > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
-    return count
+    return parse_image_count(value)
 
 
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
@@ -95,14 +102,17 @@ def _json_reference_value(value: object) -> object:
 
 
 def _decode_base64_image(value: object, filename: str, mime_type: str) -> ImageInput:
+    encoded = str(value).strip()
+    if len(encoded) > 4 * ((MAX_IMAGE_REFERENCE_BYTES + 2) // 3):
+        raise HTTPException(status_code=400, detail={"error": "image input exceeds 50MB limit"})
     try:
-        data = base64.b64decode(str(value).strip(), validate=True)
+        data = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
     if not data:
         raise HTTPException(status_code=400, detail={"error": "image file is empty"})
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
+        raise HTTPException(status_code=400, detail={"error": "image input exceeds 50MB limit"})
     return data, filename, mime_type
 
 
@@ -118,7 +128,7 @@ def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
     if inline:
         filename = _clean(value.get("filename") or value.get("file_name"), "image.png")
         mime_type = _clean(value.get("mime_type") or value.get("mimeType"), "image/png")
-        return [_decode_base64_image(inline, filename, mime_type)]
+        return [InlineImageSource(str(inline), filename, mime_type)]
     if not has_url:
         raise HTTPException(status_code=400, detail={"error": "image reference must include image_url"})
     image_url = value.get("image_url", value.get("url"))
@@ -138,11 +148,13 @@ def _sources_from_value(value: object) -> list[ImageSource]:
             return []
         if text.lower().startswith(("data:", "http://", "https://")):
             return [text]
-        return [_decode_base64_image(text, "image.png", "image/png")]
+        return [InlineImageSource(text, "image.png", "image/png")]
     if isinstance(value, list):
         sources: list[ImageSource] = []
         for item in value:
             sources.extend(_sources_from_value(item))
+            if len(sources) > MAX_IMAGE_REFERENCE_COUNT:
+                raise HTTPException(status_code=400, detail={"error": f"too many image references (maximum {MAX_IMAGE_REFERENCE_COUNT})"})
         return sources
     if isinstance(value, dict):
         return _source_from_object(value)
@@ -152,12 +164,18 @@ def _sources_from_value(value: object) -> list[ImageSource]:
 
 
 def _json_image_sources(body: dict[str, Any]) -> list[ImageSource]:
-    """读取 JSON 图片引用：优先支持官方 images 数组字段。"""
-    sources: list[ImageSource] = []
+    """读取 JSON 图片引用：优先支持官方 images 数组字段。
+
+    按优先级查找第一个有效字段：images > image > image_url
+    """
     for key in ("images", "image", "image_url"):
         if key in body:
-            sources.extend(_sources_from_value(body.get(key)))
-    return sources
+            value = body.get(key)
+            if value is not None:
+                sources = _sources_from_value(value)
+                if sources:
+                    return sources
+    return []
 
 
 def _json_mask_sources(body: dict[str, Any]) -> list[ImageSource]:
@@ -225,14 +243,18 @@ def _decode_data_url(url: str) -> ImageInput:
     mime_type = header.split(";", 1)[0].removeprefix("data:") or "image/png"
     if not mime_type.startswith("image/"):
         raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+    if ";base64" in header:
+        return _decode_base64_image(payload, f"image_url.{_extension_from_mime(mime_type)}", mime_type)
+    if len(payload) > 3 * MAX_IMAGE_REFERENCE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image input exceeds 50MB limit"})
     try:
-        data = base64.b64decode(payload, validate=True) if ";base64" in header else unquote_to_bytes(payload)
+        data = unquote_to_bytes(payload)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "invalid data image URL"}) from exc
     if not data:
         raise HTTPException(status_code=400, detail={"error": "image URL is empty"})
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
+        raise HTTPException(status_code=400, detail={"error": "image input exceeds 50MB limit"})
     return data, f"image_url.{_extension_from_mime(mime_type)}", mime_type
 
 
@@ -282,6 +304,7 @@ def _download_image_url(url: str) -> ImageInput:
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
             timeout=60,
             ssrf_guard=True,
+            max_response_bytes=MAX_IMAGE_REFERENCE_BYTES,
         )
     except UnsafeUrlError as exc:
         raise HTTPException(
@@ -304,23 +327,66 @@ def _download_image_url(url: str) -> ImageInput:
     return data, _filename_from_url(parsed.path, mime_type), mime_type
 
 
-async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
-    """读取图片来源：上传文件直接读取，URL 下载后统一返回图片元组。"""
-    images: list[ImageInput] = []
-    for source in sources:
-        if isinstance(source, tuple):
-            images.append(source)
-            continue
-        if _is_upload(source):
-            try:
-                image_data = await source.read()
-            finally:
+async def read_image_sources(
+    sources: list[ImageSource],
+    *,
+    initial_total_bytes: int = 0,
+) -> list[ImageInput]:
+    try:
+        return await _read_image_sources(sources, initial_total_bytes=initial_total_bytes)
+    finally:
+        # Also close files not yet read when a preceding reference fails.
+        for source in sources:
+            if _is_upload(source):
                 await source.close()
-            if not image_data:
-                raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-            images.append((image_data, source.filename or "image.png", source.content_type or "image/png"))
-            continue
-        images.append(await run_in_threadpool(_download_image_url, source))
+
+
+async def _read_image_sources(
+    sources: list[ImageSource],
+    *,
+    initial_total_bytes: int = 0,
+) -> list[ImageInput]:
+    """读取图片来源并限制单次请求的引用数量与累计字节数。"""
+    if len(sources) > MAX_IMAGE_REFERENCE_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"too many image references (maximum {MAX_IMAGE_REFERENCE_COUNT})"},
+        )
+    images: list[ImageInput] = []
+    try:
+        total_bytes = max(0, int(initial_total_bytes))
+    except (TypeError, ValueError):
+        total_bytes = 0
+    if total_bytes > MAX_IMAGE_REFERENCE_TOTAL_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "combined image inputs exceed 200MB limit"},
+        )
+    for source in sources:
+        if isinstance(source, InlineImageSource):
+            image_data, filename, mime_type = await run_in_threadpool(
+                _decode_base64_image, source.value, source.filename, source.mime_type,
+            )
+        elif isinstance(source, tuple):
+            image_data, filename, mime_type = source
+        elif _is_upload(source):
+            read_limit = min(MAX_IMAGE_REFERENCE_BYTES, MAX_IMAGE_REFERENCE_TOTAL_BYTES - total_bytes)
+            image_data = await source.read(read_limit + 1)
+            filename = source.filename or "image.png"
+            mime_type = source.content_type or "image/png"
+        else:
+            image_data, filename, mime_type = await run_in_threadpool(_download_image_url, source)
+        if not image_data:
+            raise HTTPException(status_code=400, detail={"error": "image file is empty"})
+        if len(image_data) > MAX_IMAGE_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image input exceeds 50MB limit"})
+        total_bytes += len(image_data)
+        if total_bytes > MAX_IMAGE_REFERENCE_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "combined image inputs exceed 200MB limit"},
+            )
+        images.append((image_data, filename, mime_type))
     if not images:
         raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
     return images

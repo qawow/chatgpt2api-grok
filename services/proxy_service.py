@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import re
 import threading
@@ -20,6 +21,7 @@ from utils.curl_tls import (
 )
 from utils.ssrf import UnsafeUrlError, assert_safe_url, fetch_following_redirects
 from utils.log_safety import redact_text
+from utils.log import logger
 from utils.network_diagnostics import error_details, proxy_identity, response_diagnostics
 
 _UNUSABLE_EGRESS_TTL_SECS = 10 * 60
@@ -274,6 +276,7 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = False,
+        force_proxy: str | None = None,
     ) -> ProxyRuntimeProfile:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
@@ -305,6 +308,10 @@ class ProxySettingsStore:
         elif legacy_proxy:
             selected_proxy = legacy_proxy
             source = "global"
+
+        if force_proxy is not None:
+            selected_proxy = force_proxy
+            source = "forced" if selected_proxy else "direct"
 
         return ProxyRuntimeProfile(
             proxy_url=normalize_proxy_url(selected_proxy),
@@ -378,8 +385,8 @@ class ProxySettingsStore:
         **session_kwargs,
     ) -> dict[str, object]:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
-        # Always set proxy so curl_cffi does not fall back to HTTP(S)_PROXY/ALL_PROXY
-        # (a dead SOCKS in the environment would 502 every ChatGPT call).
+        # create_cffi_session turns an empty URL into explicit direct routing
+        # and prevents libcurl from reading process-wide proxy variables.
         if force_proxy is not None:
             session_kwargs["proxy"] = normalize_proxy_url(force_proxy)
         else:
@@ -419,6 +426,7 @@ class ProxySettingsStore:
         verify: bool = True,
         skip_proxy_urls: set[str] | frozenset[str] | None = None,
         ssrf_guard: bool = False,
+        max_response_bytes: int | None = None,
     ) -> FetchedResponse:
         """GET ``url``, walking remaining egress after a dead proxy.
 
@@ -458,26 +466,45 @@ class ProxySettingsStore:
                     force_proxy=proxy_url,
                 )
             )
+            session = self.wrap_session(session, proxy_url=proxy_url, account=account, resource=resource)
+            response = None
             try:
+                stream_kwargs = {"stream": True} if max_response_bytes is not None else {}
+
+                def fetch(target: str, *, allow_redirects: bool):
+                    remaining = deadline - time.monotonic() if deadline is not None else attempt_timeout
+                    if deadline is not None and remaining <= 0:
+                        raise TimeoutError("resource egress timeout budget exhausted")
+                    return session.get(
+                        target, headers=request_headers, timeout=remaining,
+                        allow_redirects=allow_redirects, **stream_kwargs,
+                    )
+
                 if ssrf_guard:
                     response = fetch_following_redirects(
-                        lambda target: session.get(
-                            target,
-                            headers=request_headers,
-                            timeout=attempt_timeout,
-                            allow_redirects=False,
-                        ),
+                        lambda target: fetch(target, allow_redirects=False),
                         url,
                     )
                 else:
-                    response = session.get(
-                        url,
-                        headers=request_headers,
-                        timeout=attempt_timeout,
-                        allow_redirects=True,
-                    )
+                    response = fetch(url, allow_redirects=True)
+                if max_response_bytes is None:
+                    content = response.content or b""
+                else:
+                    declared = str(response.headers.get("content-length") or "")
+                    if declared.isdigit() and int(declared) > max_response_bytes:
+                        raise ValueError(f"response exceeds {max_response_bytes} byte limit")
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError("resource egress timeout budget exhausted")
+                        total += len(chunk)
+                        if total > max_response_bytes:
+                            raise ValueError(f"response exceeds {max_response_bytes} byte limit")
+                        chunks.append(chunk)
+                    content = b"".join(chunks)
                 return FetchedResponse(
-                    content=response.content or b"",
+                    content=content,
                     status_code=int(response.status_code),
                     headers={str(key): str(value) for key, value in response.headers.items()},
                 )
@@ -487,7 +514,13 @@ class ProxySettingsStore:
                 last_error = exc
                 if not _is_egress_connect_error(str(exc)):
                     raise
+                mark_egress_unusable(proxy_url, str(exc))
             finally:
+                if response is not None and max_response_bytes is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
                 try:
                     session.close()
                 except Exception:
@@ -504,9 +537,10 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = True,
+        force_proxy: str | None = None,
     ) -> dict[str, object]:
         merged_headers: dict[str, object] = dict(headers or {})
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream, force_proxy=force_proxy)
         if not profile.clearance_enabled:
             return merged_headers
 
@@ -534,8 +568,12 @@ class ProxySettingsStore:
         resource: bool = False,
         force: bool = False,
         upstream: bool = True,
+        force_proxy: str | None = None,
+        timeout: float | None = None,
+        on_challenge: bool = False,
+        rejected_bundle: ClearanceBundle | None = None,
     ) -> ClearanceBundle | None:
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream, force_proxy=force_proxy)
         if not profile.clearance_enabled:
             return None
 
@@ -550,23 +588,33 @@ class ProxySettingsStore:
             return None
 
         cached_before = self._get_cached_bundle(key)
+        if on_challenge and cached_before is not None and cached_before is not rejected_bundle:
+            return cached_before
         if cached_before is not None and not force and cached_before.is_valid_for(target_host, profile.proxy_url):
             return cached_before
 
         lock = self._get_flight_lock(key)
+        started = time.monotonic()
+        budget = min(profile.timeout_sec, timeout) if timeout is not None else profile.timeout_sec
         if not lock.acquire(blocking=False):
-            with lock:
-                pass
-            return self._get_cached_bundle(key) or cached_before
+            if not lock.acquire(timeout=max(0, budget)):
+                return None
+            lock.release()
+            return self._get_cached_bundle(key)
 
         try:
             cached_now = self._get_cached_bundle(key)
+            if on_challenge and cached_now is not None and cached_now is not rejected_bundle:
+                return cached_now
             if cached_now is not None and not force and cached_now.is_valid_for(target_host, profile.proxy_url):
                 return cached_now
 
             flaresolverr_url = str(profile.clearance.get("flaresolverr_url") or "").strip()
             provider = self._get_provider(flaresolverr_url)
-            new_bundle = provider.get_clearance(target_url, proxy_url=profile.proxy_url, timeout_sec=profile.timeout_sec)
+            remaining = budget - (time.monotonic() - started)
+            if remaining < 1:
+                return None
+            new_bundle = provider.get_clearance(target_url, proxy_url=profile.proxy_url, timeout_sec=remaining)
             if new_bundle is not None:
                 expires_at = time.time() + profile.refresh_interval if profile.refresh_interval else None
                 if (
@@ -582,7 +630,10 @@ class ProxySettingsStore:
                     )
                 self._set_cached_bundle(key, new_bundle)
                 return new_bundle
-            return cached_now or cached_before
+            return None if on_challenge else (cached_now or cached_before)
+        except Exception as exc:
+            logger.warning({"event": "clearance_refresh_failed", "error": redact_text(exc, limit=400)})
+            return None
         finally:
             lock.release()
 
@@ -593,8 +644,9 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = True,
+        force_proxy: str | None = None,
     ) -> None:
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream, force_proxy=force_proxy)
         target_host = _host_from_url(target_url)
         key = self._cache_key(profile.proxy_url, target_host, account)
         with self._lock:
@@ -603,6 +655,9 @@ class ProxySettingsStore:
     def get_runtime_status(self) -> dict[str, object]:
         profile = self.get_profile(upstream=True)
         with self._lock:
+            for key, bundle in list(self._clearance_cache.items()):
+                if not bundle.is_valid_for(key[1], key[0]):
+                    self._clearance_cache.pop(key, None)
             cached_hosts = [key[1] for key in self._clearance_cache if len(key) >= 2]
             cached_count = len(self._clearance_cache)
         return {
@@ -640,6 +695,10 @@ class ProxySettingsStore:
     ) -> ClearanceBundle | None:
         key = self._cache_key(profile.proxy_url, target_host, account)
         if profile.clearance_mode == "manual":
+            # Globally saved cookies may include login credentials. Do not send
+            # them to arbitrary reference-image or CDN hosts.
+            if target_host != "chatgpt.com":
+                return None
             bundle = self._build_manual_bundle(profile, target_host)
             if bundle is not None:
                 self._set_cached_bundle(key, bundle)
@@ -647,6 +706,56 @@ class ProxySettingsStore:
         if profile.clearance_mode == "flaresolverr":
             return self._get_cached_bundle(key)
         return None
+
+    def clearance_bundle(self, target_url: str, *, account=None, resource=False, force_proxy=None):
+        profile = self.get_profile(account=account, resource=resource, upstream=True, force_proxy=force_proxy)
+        if not profile.clearance_enabled:
+            return None
+        return self._bundle_for_headers(profile, _host_from_url(target_url), account)
+
+    def wrap_session(self, session, *, proxy_url: str, account=None, resource=False, on_user_agent=None):
+        from services.clearance_session import ClearanceSession
+
+        current = account() if callable(account) else account
+        if not self.get_profile(account=current, resource=resource, upstream=True, force_proxy=proxy_url).clearance_enabled:
+            return session
+        return ClearanceSession(session, self, proxy_url=proxy_url, account=account,
+                                resource=resource, on_user_agent=on_user_agent)
+
+    def create_session(self, *, account=None, resource=False, upstream=True, force_proxy=None,
+                       session_factory=None, **kwargs):
+        options = self.build_session_kwargs(account=account, resource=resource, upstream=upstream,
+                                            force_proxy=force_proxy, **kwargs)
+        session = (session_factory or create_cffi_session)(**options)
+        return self.wrap_session(session, proxy_url=str(options.get("proxy") or ""),
+                                 account=account, resource=resource)
+
+    def start_clearance_warmup(self, stop_event: threading.Event, accounts_provider=None):
+        profile = self.get_profile(upstream=True)
+        if not profile.clearance_enabled or not profile.clearance.get("warm_up_on_start"):
+            return None
+
+        def warmup():
+            try:
+                accounts = list(accounts_provider()) if accounts_provider is not None else []
+                seen = set()
+                for account in [None, *accounts]:
+                    if stop_event.is_set():
+                        break
+                    if account and (account.get("disabled") or account.get("status") == "禁用"):
+                        continue
+                    proxy_url = self.build_session_kwargs(account=account, upstream=True)["proxy"]
+                    key = self._cache_key(str(proxy_url), "chatgpt.com", account)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    self.refresh_clearance(account=account, force_proxy=str(proxy_url))
+            except Exception as exc:
+                logger.warning({"event": "clearance_warmup_failed", "error": redact_text(exc, limit=400)})
+
+        thread = threading.Thread(target=warmup, name="clearance-warmup", daemon=True)
+        thread.start()
+        return thread
 
     def _build_manual_bundle(self, profile: ProxyRuntimeProfile, target_host: str) -> ClearanceBundle | None:
         cookies = _parse_cookie_header(str(profile.clearance.get("cf_cookies") or ""))
@@ -687,7 +796,11 @@ class ProxySettingsStore:
 
     def _get_cached_bundle(self, key: tuple) -> ClearanceBundle | None:
         with self._lock:
-            return self._clearance_cache.get(key)
+            bundle = self._clearance_cache.get(key)
+            if bundle is not None and not bundle.is_valid_for(key[1], key[0]):
+                self._clearance_cache.pop(key, None)
+                return None
+            return bundle
 
     def _set_cached_bundle(self, key: tuple, bundle: ClearanceBundle) -> None:
         with self._lock:
@@ -697,10 +810,15 @@ class ProxySettingsStore:
     def _account_isolation_id(account: dict | None) -> str:
         if not isinstance(account, dict):
             return ""
-        for key in ("oai-device-id", "email", "account_id", "user_id"):
+        for key in ("account_id", "user_id", "email"):
             text = str(account.get(key) or "").strip()
             if text:
                 return text.lower()
+        token = str(account.get("access_token") or "").strip()
+        if token:
+            return hashlib.sha256(token.encode()).hexdigest()
+        if account.get("oai-device-id"):
+            return str(account["oai-device-id"]).strip().lower()
         raw_fp = account.get("fp")
         if isinstance(raw_fp, dict):
             text = str(raw_fp.get("oai-device-id") or "").strip()

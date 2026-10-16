@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 import time
+from threading import Lock, RLock
 
 from services.storage.base import StorageBackend
 
@@ -534,8 +535,16 @@ def _load_settings() -> LoadedSettings:
 
 
 class ConfigStore:
+    cleanup_scan_dirty_interval_secs = 300.0
+    cleanup_scan_clean_interval_secs = 3600.0
+
     def __init__(self, path: Path):
         self.path = path
+        self._lock = RLock()
+        # Separate from the settings lock: WebDAV sync holds the index lock
+        # while reading settings, so cleanup must not hold both in reverse.
+        self._cleanup_lock = Lock()
+        self._cleanup_next_scan_at = 0.0
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._storage_backend: StorageBackend | None = None
@@ -571,17 +580,21 @@ class ConfigStore:
         return DATA_DIR / "grok_accounts.json"
 
     def get_grok_settings(self) -> dict[str, object]:
-        raw = self.data.get("grok")
-        return dict(raw) if isinstance(raw, dict) else {}
+        with self._lock:
+            raw = self.data.get("grok")
+            return copy.deepcopy(raw) if isinstance(raw, dict) else {}
 
     def get_waifu2x_settings(self) -> dict[str, object]:
-        return _normalize_waifu2x_settings(self.data.get("waifu2x"))
+        with self._lock:
+            return _normalize_waifu2x_settings(self.data.get("waifu2x"))
 
     def get_doubao_settings(self) -> dict[str, object]:
-        return _normalize_doubao_settings(self.data.get("doubao"))
+        with self._lock:
+            return _normalize_doubao_settings(self.data.get("doubao"))
 
     def get_zhitu360_settings(self) -> dict[str, object]:
-        return _normalize_zhitu360_settings(self.data.get("zhitu360"))
+        with self._lock:
+            return _normalize_zhitu360_settings(self.data.get("zhitu360"))
 
     @property
     def refresh_account_interval_minute(self) -> int:
@@ -596,6 +609,14 @@ class ConfigStore:
             return max(1, int(self.data.get("image_retention_days", 30)))
         except (TypeError, ValueError):
             return 30
+
+    @property
+    def image_min_free_mb(self) -> int:
+        """Free-space threshold for reclaiming local images (default 500MB)."""
+        try:
+            return max(0, int(self.data.get("image_min_free_mb", 500)))
+        except (TypeError, ValueError):
+            return 500
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -852,19 +873,61 @@ class ConfigStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
+    def cleanup_old_images(self, *, force: bool = False) -> int:
+        """Reclaim expired local files, preserving WebDAV copies and their tags."""
+        if not self._cleanup_lock.acquire(blocking=force):
+            return 0
+        scanned = False
         removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        retention_days = self.image_retention_days
+        try:
+            if not force and time.monotonic() < self._cleanup_next_scan_at:
+                return 0
+            scanned = True
+            removed = self._cleanup_old_images(time.time())
+            return removed
+        finally:
+            if scanned:
+                interval = self.cleanup_scan_dirty_interval_secs if removed else self.cleanup_scan_clean_interval_secs
+                self._cleanup_next_scan_at = (
+                    time.monotonic() + interval
+                    if retention_days == self.image_retention_days
+                    else 0.0
+                )
+            self._cleanup_lock.release()
+
+    def _cleanup_old_images(self, now: float) -> int:
+        from services.image_service import _cleanup_empty_dirs, _cleanup_local_image_metadata
+
+        retention_days = self.image_retention_days
+        if retention_days <= 0:
+            return 0
+        cutoff = now - retention_days * 86400
+        root = self.images_dir
+        removed_rels: list[str] = []
+
+        for path in root.rglob("*"):
             try:
-                path.rmdir()
+                if not path.is_file() or path.stat().st_mtime >= cutoff:
+                    continue
             except OSError:
-                pass
-        return removed
+                # Concurrently deleted by the scheduler / another request.
+                continue
+            try:
+                rel = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed_rels.append(rel)
+
+        if removed_rels:
+            _cleanup_local_image_metadata(removed_rels)
+        _cleanup_empty_dirs(root)
+        _cleanup_empty_dirs(self.image_thumbnails_dir)
+        return len(removed_rels)
 
     @property
     def base_url(self) -> str:
@@ -883,9 +946,14 @@ class ConfigStore:
         return value or "0.0.0"
 
     def get(self) -> dict[str, object]:
-        data = dict(self.data)
+        with self._lock:
+            return self._get_unlocked()
+
+    def _get_unlocked(self) -> dict[str, object]:
+        data = copy.deepcopy(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
+        data["image_min_free_mb"] = self.image_min_free_mb
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_sse_idle_timeout_secs"] = self.image_sse_idle_timeout_secs
         data["image_sse_total_timeout_secs"] = self.image_sse_total_timeout_secs
@@ -935,10 +1003,12 @@ class ConfigStore:
         return data
 
     def get_proxy_settings(self) -> str:
-        return str(self.data.get("proxy") or "").strip()
+        with self._lock:
+            return str(self.data.get("proxy") or "").strip()
 
     def get_proxy_runtime_settings(self) -> dict[str, object]:
-        return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
+        with self._lock:
+            return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
 
     def get_public_proxy_runtime_settings(self) -> dict[str, object]:
         from services.proxy_service import redact_proxy_url
@@ -964,11 +1034,16 @@ class ConfigStore:
         return runtime
 
     def get_third_party_apps_settings(self) -> dict[str, object]:
-        return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
+        with self._lock:
+            return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
-        next_data = dict(self.data)
-        next_data.update(dict(data or {}))
+        with self._lock:
+            return self._update_unlocked(data)
+
+    def _update_unlocked(self, data: dict[str, object]) -> dict[str, object]:
+        next_data = copy.deepcopy(self.data)
+        next_data.update(copy.deepcopy(dict(data or {})))
         if "backup" in next_data:
             incoming_backup = next_data.get("backup")
             if isinstance(incoming_backup, dict):
@@ -1073,12 +1148,16 @@ class ConfigStore:
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
+        previous_data = self.data
         self.data = next_data
+        if previous_data.get("image_retention_days") != next_data.get("image_retention_days"):
+            self._cleanup_next_scan_at = 0.0
         self._save()
         return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
-        return _normalize_backup_settings(self.data.get("backup"))
+        with self._lock:
+            return _normalize_backup_settings(self.data.get("backup"))
 
     @staticmethod
     def _sanitize_backup_settings(settings: dict[str, object]) -> dict[str, object]:
@@ -1091,7 +1170,8 @@ class ConfigStore:
         return out
 
     def get_image_storage_settings(self) -> dict[str, object]:
-        return _normalize_image_storage_settings(self.data.get("image_storage"))
+        with self._lock:
+            return _normalize_image_storage_settings(self.data.get("image_storage"))
 
     @staticmethod
     def _sanitize_image_storage_settings(settings: dict[str, object]) -> dict[str, object]:
@@ -1139,14 +1219,16 @@ class ConfigStore:
         return ConfigStore._sanitize_secret_settings(settings, _WAIFU2X_SECRET_KEYS)
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
-        return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
+        with self._lock:
+            return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
 
     def get_storage_backend(self) -> StorageBackend:
         """获取存储后端实例（单例）"""
-        if self._storage_backend is None:
-            from services.storage.factory import create_storage_backend
-            self._storage_backend = create_storage_backend(DATA_DIR)
-        return self._storage_backend
+        with self._lock:
+            if self._storage_backend is None:
+                from services.storage.factory import create_storage_backend
+                self._storage_backend = create_storage_backend(DATA_DIR)
+            return self._storage_backend
 
 
 # Files under data/ that hold credentials. Everything written through

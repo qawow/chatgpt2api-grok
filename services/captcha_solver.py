@@ -56,7 +56,7 @@ def default_session_factory(**overrides: Any):
 
     kwargs = proxy_settings.build_session_kwargs(impersonate="chrome142", verify=True, upstream=True)
     kwargs.update(overrides)
-    return create_cffi_session(**kwargs)
+    return proxy_settings.wrap_session(create_cffi_session(**kwargs), proxy_url=str(kwargs.get("proxy") or ""))
 
 
 def obtain_captcha_token(

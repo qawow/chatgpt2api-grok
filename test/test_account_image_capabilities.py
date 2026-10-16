@@ -196,9 +196,12 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertNotIn(legacy, PUBLIC_IMAGE_MODELS)
 
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
-        self.assertEqual(backend._image_model_slug(WEB_IMAGE_MODEL), "gpt-5-3")
+        # ``auto`` is the account default and the only slug that is both what
+        # the real client sends and present in the live /backend-api/models
+        # catalog; the retired ``gpt-5-3`` is no longer a valid target.
+        self.assertEqual(backend._image_model_slug(WEB_IMAGE_MODEL), "auto")
         for legacy in LEGACY_WEB_IMAGE_MODELS:
-            self.assertEqual(backend._image_model_slug(legacy), "gpt-5-3")
+            self.assertEqual(backend._image_model_slug(legacy), "auto")
         # Codex 链路的 tools[0].model 是上游 id，不跟着改名。
         self.assertEqual(backend._image_model_slug("codex-gpt-image-2"), "codex-gpt-image-2")
 

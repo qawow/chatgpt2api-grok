@@ -116,12 +116,19 @@ def fetch_following_redirects(
         location = headers.get("location") if headers is not None else None
         if not location:
             return response
-        next_url = urljoin(current_url, str(location).strip())
-        if not next_url:
-            return response
-        assert_safe_url(next_url)
-        if next_url in seen:
-            raise UnsafeUrlError("redirect loop detected")
+        try:
+            next_url = urljoin(current_url, str(location).strip())
+            if not next_url:
+                return response
+            assert_safe_url(next_url)
+            if next_url in seen:
+                raise UnsafeUrlError("redirect loop detected")
+        except Exception:
+            try:
+                response.close()
+            except Exception:
+                pass
+            raise
         seen.add(next_url)
         try:
             response.close()
@@ -129,4 +136,8 @@ def fetch_following_redirects(
             pass
         response = fetch(next_url)
         current_url = next_url
+    try:
+        response.close()
+    except Exception:
+        pass
     raise UnsafeUrlError(f"exceeded {max_redirects} redirects")

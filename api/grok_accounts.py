@@ -44,7 +44,7 @@ def create_router() -> APIRouter:
     @router.get("/api/grok/accounts")
     async def list_grok_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": grok_account_service.list_accounts(), "provider": "grok"}
+        return {"items": await run_in_threadpool(grok_account_service.list_accounts), "provider": "grok"}
 
     @router.post("/api/grok/accounts")
     async def create_grok_accounts(
@@ -67,7 +67,7 @@ def create_router() -> APIRouter:
         tokens = [str(t or "").strip() for t in body.tokens if str(t or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return grok_account_service.delete_accounts(tokens)
+        return await run_in_threadpool(grok_account_service.delete_accounts, tokens)
 
     @router.post("/api/grok/accounts/refresh")
     async def refresh_grok_accounts(
@@ -103,10 +103,13 @@ def create_router() -> APIRouter:
         }
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "no updates provided"})
-        item = grok_account_service.update_account(token, updates)
+        item = await run_in_threadpool(grok_account_service.update_account, token, updates)
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": item, "items": grok_account_service.list_accounts()}
+        return {
+            "item": item,
+            "items": await run_in_threadpool(grok_account_service.list_accounts),
+        }
 
     @router.post("/api/grok/accounts/import-files")
     async def import_grok_files(

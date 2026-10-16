@@ -133,7 +133,7 @@ class ConnectionErrorClassifierTests(unittest.TestCase):
 
 
 class ImageConnectionFailoverTests(unittest.TestCase):
-    def test_dead_account_proxy_falls_back_to_direct_same_account(self) -> None:
+    def test_dead_global_proxy_falls_back_to_direct_same_account(self) -> None:
         created: list[tuple[str, str | None]] = []
 
         class FakeBackend:
@@ -163,12 +163,12 @@ class ImageConnectionFailoverTests(unittest.TestCase):
             patch("services.protocol.conversation.stream_image_outputs", fake_stream),
             patch(
                 "services.protocol.conversation.proxy_settings.list_egress_candidates",
-                return_value=[("account", "socks5h://dead.example:1080"), ("direct", "")],
+                return_value=[("global", "socks5h://dead.example:1080"), ("direct", "")],
             ),
             patch("services.protocol.conversation.time.sleep"),
         ):
             accounts.get_available_access_token.return_value = "token-a"
-            accounts.get_account.return_value = {"email": "a@example.com", "proxy": "socks5h://dead.example:1080"}
+            accounts.get_account.return_value = {"email": "a@example.com"}
             outputs = _generate_single_image(
                 ConversationRequest(model="gpt-image-2", prompt="cat"),
                 1,

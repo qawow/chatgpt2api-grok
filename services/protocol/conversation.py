@@ -9,7 +9,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, NamedTuple
 
 from services.account_service import AccountService, account_service
 from services.image_task_control import ImageTaskControl
@@ -93,6 +93,121 @@ def is_token_invalid_error(message: str) -> bool:
         or "status=401" in text
         or "upstream session expired" in text
     )
+
+
+def is_model_not_found_error(error: object) -> bool:
+    """Detect upstream's ``404 {"detail":"Model not found"}`` on the conversation surface.
+
+    Error-surface mapping proved this is not a bad-slug verdict: ``model=""``,
+    ``model="   "`` and ``model="zzz-not-a-model"`` all return the identical
+    body, and so does every slug the account's own ``/backend-api/models``
+    catalog advertises (35 slugs swept). Both ``/backend-api/f/conversation``
+    and the legacy ``/backend-api/conversation`` answer it the same way, while
+    ``/f/conversation/prepare`` succeeds and ``/f/conversation/resume`` returns
+    a normal Pydantic validation error.
+
+    It is also **not** an account-level terminal state. The anonymous surfaces
+    ``/backend-anon/conversation`` and ``/backend-anon/f/conversation`` return
+    the same 404 with no credential at all, and a freshly minted device id does
+    not change it. The condition therefore lives on the ``-convo`` backend
+    (``x-build: 814069032b2f-convo``), not on the credential — so callers must
+    not treat a single hit as proof that this account is spent.
+
+    Body validation runs *before* model resolution, which is what makes the
+    error readable: an absent ``conversation_origin`` reaches model resolution
+    and fails there, whereas ``tpp``/``flora`` reach it and succeed (they answer
+    ``conversation_model_origin_mismatch`` instead). The valid origin enum, read
+    straight off the server's own Pydantic error on ``/conversation/init``, is
+    ``apple, apple_xcode, apple_image_playground, apple_shortcuts, kakao_talk,
+    fyp_feedback, pulse, finserv_app, bigbrain, flora, tpp,
+    workspace_agent_in_slack, viber, whatsapp, telegram`` — plain web chat is
+    the absent value, so ``chat``/``codex``/``other``/``work`` are all invalid.
+
+    Deliberately does not match the sibling 404 whose body is
+    ``{"detail":{"message":"Conversation not found",...}}``: that one is a
+    per-conversation miss and is retryable with a different conversation id.
+    """
+    status = getattr(error, "status_code", None)
+    body = getattr(error, "body", None)
+    if status == 404 and isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, str) and "model not found" in detail.lower():
+            return True
+    text = str(error or "").lower()
+    return "model not found" in text and "status=404" in text
+
+
+# ── Global "Model not found" circuit breaker ─────────────────────────────────
+# The 404 above is a backend-wide condition, not a per-credential one (see the
+# docstring). Parking every credential that touches it for the full quota
+# cooldown would drain the whole pool on a fault that has nothing to do with
+# the accounts, so the breaker separates the two cases:
+#   * a single credential hitting it  -> genuine per-account miss, park long;
+#   * several distinct credentials hitting it inside the window -> global fault,
+#     park short and trip the breaker so later callers fail fast instead of
+#     walking the pool one 3.6-4.9s upstream round-trip at a time.
+_MODEL_NOT_FOUND_LOCK = threading.Lock()
+_MODEL_NOT_FOUND_STATE: dict[str, Any] = {"tokens": {}, "tripped_until": 0.0}
+MODEL_NOT_FOUND_WINDOW_SECS = 300.0
+MODEL_NOT_FOUND_GLOBAL_MIN_ACCOUNTS = 2
+MODEL_NOT_FOUND_BREAKER_SECS = 60.0
+
+
+class ModelNotFoundVerdict(NamedTuple):
+    """Outcome of recording one ``Model not found`` hit.
+
+    ``window_tokens`` lists every credential seen inside the window, so the
+    caller can shorten parks that were already applied while the condition
+    still looked isolated.
+    """
+
+    is_global: bool
+    park_secs: float
+    window_tokens: tuple[str, ...]
+
+
+def note_model_not_found(token: str) -> ModelNotFoundVerdict:
+    """Record one ``Model not found`` hit and decide how to treat it.
+
+    ``is_global`` turns true once ``MODEL_NOT_FOUND_GLOBAL_MIN_ACCOUNTS``
+    distinct credentials have hit the condition inside
+    ``MODEL_NOT_FOUND_WINDOW_SECS``. Global hits park for
+    ``MODEL_NOT_FOUND_BREAKER_SECS`` (so the credential is retried soon after
+    upstream recovers) instead of the quota cooldown; isolated hits keep the
+    long park because they really do look like a spent credential.
+    """
+    now = time.time()
+    token = str(token or "")
+    with _MODEL_NOT_FOUND_LOCK:
+        tokens = {
+            key: ts
+            for key, ts in _MODEL_NOT_FOUND_STATE["tokens"].items()
+            if now - float(ts) <= MODEL_NOT_FOUND_WINDOW_SECS
+        }
+        if token:
+            tokens[token] = now
+        _MODEL_NOT_FOUND_STATE["tokens"] = tokens
+        is_global = len(tokens) >= MODEL_NOT_FOUND_GLOBAL_MIN_ACCOUNTS
+        if is_global:
+            _MODEL_NOT_FOUND_STATE["tripped_until"] = now + MODEL_NOT_FOUND_BREAKER_SECS
+        park_secs = (
+            MODEL_NOT_FOUND_BREAKER_SECS if is_global
+            else float(config.image_tool_quota_cooldown_secs)
+        )
+        return ModelNotFoundVerdict(is_global, park_secs, tuple(tokens))
+
+
+def model_not_found_breaker_remaining() -> float:
+    """Seconds left on the global breaker (0.0 when it is not tripped)."""
+    with _MODEL_NOT_FOUND_LOCK:
+        return max(0.0, float(_MODEL_NOT_FOUND_STATE["tripped_until"]) - time.time())
+
+
+def reset_model_not_found_breaker() -> None:
+    """Clear the breaker and its window (used by tests and manual recovery)."""
+    with _MODEL_NOT_FOUND_LOCK:
+        _MODEL_NOT_FOUND_STATE["tokens"] = {}
+        _MODEL_NOT_FOUND_STATE["tripped_until"] = 0.0
 
 
 def is_soft_prepare_auth_error(message: str) -> bool:
@@ -1494,6 +1609,19 @@ def _generate_single_image_impl(
     该函数在独立线程中运行，每个线程使用不同的账号，
     实现并行生图，避免串行超时阻塞。
     """
+    # 全局熔断：-convo 后端整体回 404 Model not found 时，新请求不该再走一遍
+    # 号池（每个凭据都要白等一轮 3.6~4.9 秒的上游往返）。熔断窗口很短
+    # （默认 60 秒），上游恢复后自动放行。
+    breaker_left = model_not_found_breaker_remaining()
+    if breaker_left > 0:
+        raise ImageGenerationError(
+            "Upstream conversation backend is answering 404 Model not found "
+            "globally; failing fast until the breaker window elapses.",
+            status_code=503,
+            code="upstream_model_not_found_global",
+            account_email="",
+        )
+
     # TLS/超时：同出口短重试；代理拒连则立刻换下一条出口
     MAX_TLS_RETRIES = 3
     MAX_CONNECTION_ACCOUNT_RETRIES = max(1, int(config.image_account_failover_retries))
@@ -1724,8 +1852,6 @@ def _generate_single_image_impl(
             failed_proxies = state["failed_proxy_urls"]
             candidates = proxy_settings.list_egress_candidates(account=account, upstream=True)
             state["egress_queue"] = [(src, url) for src, url in candidates if url not in failed_proxies]
-            if not state["egress_queue"] and "" not in failed_proxies:
-                state["egress_queue"] = [("direct", "")]
             if not state["egress_queue"]:
                 state["failed_connection_tokens"].add(token)
                 lease.finish(False)
@@ -2012,6 +2138,70 @@ def _generate_single_image_impl(
             if returned_result and outputs:
                 lease.finish(True)
                 return outputs
+            if not emitted_for_token and is_model_not_found_error(exc):
+                # 不能像瞬态错误那样把账号放回池子——那只会让下一次请求再挑中它，
+                # 白等一轮 3.6~4.9 秒的上游往返。
+                #
+                # 但也不能一律按「账号级终态」处理：匿名链路同样回这个 404
+                # （见 is_model_not_found_error 的说明），说明它可能是 -convo
+                # 后端的全局故障。熔断器据此把两种情况分开——单个凭据命中按
+                # 配额冷却长停，多个不同凭据在窗口内命中则判定为全局故障，
+                # 短停并在窗口内快速失败，避免把整个号池按 24 小时烧掉。
+                lease.finish(False)
+                exclude_account(token, last_error, failure_kind="model_unavailable")
+                verdict = note_model_not_found(token)
+                account_service.park_image_account(
+                    token,
+                    until_ts=time.time() + verdict.park_secs,
+                    kind="model_unavailable",
+                    reason=last_error,
+                )
+                if verdict.is_global:
+                    # 之前几个凭据是在「看起来只是局部故障」时被长停的，
+                    # 现在判定为全局故障，必须把它们的停放一并改短，
+                    # 否则一次后端抖动仍会烧掉它们 24 小时。
+                    for earlier in verdict.window_tokens:
+                        if earlier == token:
+                            continue
+                        account_service.park_image_account(
+                            earlier,
+                            until_ts=time.time() + MODEL_NOT_FOUND_BREAKER_SECS,
+                            kind="model_unavailable",
+                            reason=last_error,
+                        )
+                logger.warning({
+                    "event": "image_model_not_found",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "park_secs": int(verdict.park_secs),
+                    "global": verdict.is_global,
+                    "window_accounts": len(verdict.window_tokens),
+                    "breaker_secs": int(model_not_found_breaker_remaining()),
+                    "failed_accounts": len(state["failed_connection_tokens"]),
+                    "index": index,
+                    "error": last_error[:200],
+                })
+                if verdict.is_global:
+                    # 全局故障：不再逐个账号重试（每个都要等一轮上游往返），
+                    # 直接把判定结果交给调用方，并保留原始错误便于排查。
+                    raise ImageGenerationError(
+                        "Upstream conversation backend answered 404 Model not found "
+                        "for multiple distinct credentials, which the anonymous "
+                        "surfaces reproduce without any credential at all — this is "
+                        "a backend-wide condition, not a spent account.",
+                        status_code=503,
+                        code="upstream_model_not_found_global",
+                        account_email=account_email,
+                    ) from exc
+                if len(state["failed_connection_tokens"]) < MAX_CONNECTION_ACCOUNT_RETRIES:
+                    continue
+                raise ImageGenerationError(
+                    "No account in the pool exposes a usable conversation model; "
+                    "upstream answered 404 Model not found for every credential tried.",
+                    status_code=503,
+                    code="upstream_model_not_found",
+                    account_email=account_email,
+                ) from exc
             if not emitted_for_token and is_upstream_connection_error(last_error):
                 if recover_connection(token, last_error):
                     continue

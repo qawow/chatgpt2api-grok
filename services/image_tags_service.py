@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import RLock
 
 from services.config import DATA_DIR
 
 TAGS_FILE = DATA_DIR / "image_tags.json"
+_tags_lock = RLock()
 
 
 def _ensure_file() -> None:
@@ -15,19 +17,21 @@ def _ensure_file() -> None:
 
 
 def load_tags() -> dict[str, list[str]]:
-    _ensure_file()
-    try:
-        data = json.loads(TAGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    with _tags_lock:
+        _ensure_file()
+        try:
+            data = json.loads(TAGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
 
 
 def save_tags(data: dict[str, list[str]]) -> None:
     from utils.atomic import atomic_write_json
 
-    _ensure_file()
-    atomic_write_json(TAGS_FILE, data)
+    with _tags_lock:
+        _ensure_file()
+        atomic_write_json(TAGS_FILE, data)
 
 
 def get_tags(image_rel: str) -> list[str]:
@@ -35,35 +39,50 @@ def get_tags(image_rel: str) -> list[str]:
 
 
 def set_tags(image_rel: str, tags: list[str]) -> list[str]:
-    data = load_tags()
-    cleaned = list(dict.fromkeys(t.strip() for t in tags if t.strip()))
-    if cleaned:
-        data[image_rel] = cleaned
-    else:
-        data.pop(image_rel, None)
-    save_tags(data)
-    return cleaned
+    with _tags_lock:
+        data = load_tags()
+        cleaned = list(dict.fromkeys(t.strip() for t in tags if t.strip()))
+        if cleaned:
+            data[image_rel] = cleaned
+        else:
+            data.pop(image_rel, None)
+        save_tags(data)
+        return cleaned
 
 
 def remove_tags(image_rel: str) -> None:
-    data = load_tags()
-    if data.pop(image_rel, None) is not None:
-        save_tags(data)
+    remove_tags_batch([image_rel])
+
+
+def remove_tags_batch(image_rels: list[str]) -> None:
+    """Drop a cleanup batch in one transaction without losing concurrent edits."""
+    if not image_rels:
+        return
+    with _tags_lock:
+        data = load_tags()
+        changed = False
+        for rel in image_rels:
+            if rel in data:
+                data.pop(rel)
+                changed = True
+        if changed:
+            save_tags(data)
 
 
 def delete_tag(tag: str) -> int:
     """从所有图片中删除指定标签，返回受影响的图片数。"""
-    data = load_tags()
-    count = 0
-    for rel in list(data):
-        if tag in data[rel]:
-            data[rel] = [t for t in data[rel] if t != tag]
-            if not data[rel]:
-                del data[rel]
-            count += 1
-    if count > 0:
-        save_tags(data)
-    return count
+    with _tags_lock:
+        data = load_tags()
+        count = 0
+        for rel in list(data):
+            if tag in data[rel]:
+                data[rel] = [t for t in data[rel] if t != tag]
+                if not data[rel]:
+                    del data[rel]
+                count += 1
+        if count > 0:
+            save_tags(data)
+        return count
 
 
 def get_all_tags() -> list[str]:

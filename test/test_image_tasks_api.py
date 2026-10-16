@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+import api.image_inputs as image_inputs
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -63,6 +64,20 @@ class FakeImageTaskService:
 
 
 class ImageTasksApiTests(unittest.TestCase):
+    def test_edit_task_rejects_combined_image_and_mask_oversize_before_submission(self):
+        reference = "data:image/png;base64," + base64.b64encode(b"x" * 41).decode()
+        with (
+            mock.patch.object(image_inputs, "MAX_IMAGE_REFERENCE_BYTES", 50),
+            mock.patch.object(image_inputs, "MAX_IMAGE_REFERENCE_TOTAL_BYTES", 200),
+        ):
+            response = self.client.post(
+                "/api/image-tasks/edits", headers=AUTH_HEADERS,
+                json={"client_task_id": "fixture-limit", "prompt": "local limit check", "images": [reference] * 4, "mask": reference},
+            )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("combined image inputs", response.text)
+        self.assertEqual(self.fake_service.edit_calls, [])
+
     def setUp(self):
         self.fake_service = FakeImageTaskService()
         self.service_patcher = mock.patch.object(image_tasks_module, "image_task_service", self.fake_service)

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import time
+import copy
+from http.cookiejar import Cookie, CookieJar
 from typing import Any
 
 DEFAULT_IMPERSONATE = "chrome142"
@@ -89,6 +91,18 @@ def create_cffi_session(**session_kwargs: Any):
 
     sanitize_curl_ssl_env()
     kwargs = dict(session_kwargs)
+    kwargs.setdefault("trust_env", False)
+    if not kwargs["trust_env"]:
+        from curl_cffi.const import CurlOpt
+
+        # curl_cffi 0.15 ignores proxy="" and does not pass trust_env to
+        # libcurl. A nonempty map containing an empty URL disables env proxy.
+        if not kwargs.get("proxy") and not kwargs.get("proxies"):
+            kwargs["proxies"] = {"all": ""}
+        options = dict(kwargs.get("curl_options") or {})
+        # Explicit proxy settings must also take precedence over NO_PROXY.
+        options.setdefault(CurlOpt.NOPROXY, "")
+        kwargs["curl_options"] = options
     chain = impersonate_fallback_chain(kwargs.get("impersonate"))
     if chain[0]:
         kwargs["impersonate"] = chain[0]
@@ -143,7 +157,7 @@ class _TlsLibraryFallbackSession:
         self._openssl_retries = 0
         self._inner = self._factory(**self._kwargs)
 
-    def _snapshot_cookies(self) -> list[tuple[str, str, str, str]]:
+    def _snapshot_cookies(self) -> list[Any]:
         """Copy real CookieJar entries. Cap/abort on mock or corrupt jars."""
         try:
             jar = getattr(self._inner, "cookies", None)
@@ -151,15 +165,18 @@ class _TlsLibraryFallbackSession:
             return []
         if jar is None:
             return []
-        snapped: list[tuple[str, str, str, str]] = []
+        snapped: list[Any] = []
         try:
-            for index, cookie in enumerate(jar):
+            for index, cookie in enumerate(getattr(jar, "jar", jar)):
                 if index >= 64:
                     return []
                 name = getattr(cookie, "name", None)
                 value = getattr(cookie, "value", None)
                 if not isinstance(name, str) or not name or value is None:
                     return []
+                if isinstance(cookie, Cookie):
+                    snapped.append(copy.copy(cookie))
+                    continue
                 snapped.append((
                     name,
                     str(value),
@@ -170,11 +187,15 @@ class _TlsLibraryFallbackSession:
             return []
         return snapped
 
-    def _restore_cookies(self, cookies: list[tuple[str, str, str, str]]) -> None:
+    def _restore_cookies(self, cookies: list[Any]) -> None:
         dest = getattr(self._inner, "cookies", None)
         if dest is None or not cookies:
             return
-        for name, value, domain, path in cookies:
+        for cookie in cookies:
+            if isinstance(cookie, Cookie) and isinstance(getattr(dest, "jar", None), CookieJar):
+                dest.jar.set_cookie(copy.copy(cookie))
+                continue
+            name, value, domain, path = cookie
             try:
                 dest.set(name, value, domain=domain, path=path)
             except TypeError:
@@ -262,6 +283,10 @@ class _TlsLibraryFallbackSession:
             self._inner.close()
         except Exception:
             pass
+
+    def reset(self) -> None:
+        """Replace the connection pool while retaining account identity."""
+        self._recreate_inner()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

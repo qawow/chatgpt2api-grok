@@ -7,7 +7,7 @@ from unittest import mock
 
 from PIL import Image
 
-from services.image_storage_service import ImageStorageService
+from services.image_storage_service import ImageStorageError, ImageStorageService, WebDAVClient
 
 
 def png_bytes() -> bytes:
@@ -19,9 +19,14 @@ def png_bytes() -> bytes:
 class FakeWebDAVClient:
     uploaded: dict[str, bytes] = {}
     deleted: list[str] = []
+    instances: list["FakeWebDAVClient"] = []
 
     def __init__(self, _settings):
-        pass
+        self.closed = False
+        self.instances.append(self)
+
+    def close(self):
+        self.closed = True
 
     def put(self, rel: str, payload: bytes) -> str:
         self.uploaded[rel] = payload
@@ -65,6 +70,7 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.mock_config.get_image_storage_settings.side_effect = lambda: dict(self.settings)
         FakeWebDAVClient.uploaded = {}
         FakeWebDAVClient.deleted = []
+        FakeWebDAVClient.instances = []
 
     def service(self) -> ImageStorageService:
         return ImageStorageService(self.data_dir / "image_index.json")
@@ -91,6 +97,8 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertFalse((self.images_dir / stored.rel).exists())
         self.assertIn(stored.rel, FakeWebDAVClient.uploaded)
         self.assertEqual(payload, FakeWebDAVClient.uploaded[stored.rel])
+        self.assertEqual(len(FakeWebDAVClient.instances), 2)
+        self.assertTrue(all(client.closed for client in FakeWebDAVClient.instances))
 
     def test_list_items_ignores_non_image_files(self):
         image = png_bytes()
@@ -133,6 +141,70 @@ class ImageStorageServiceTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn(".chatgpt2api_webdav_test.txt", FakeWebDAVClient.deleted)
+        self.assertTrue(FakeWebDAVClient.instances[0].closed)
+
+    def test_delete_and_bulk_sync_close_clients(self):
+        self.settings.update({"enabled": True, "mode": "both", "webdav_url": "https://dav.example.test"})
+        service = self.service()
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            stored = service.save(png_bytes())
+            self.assertTrue(service.delete(stored.rel))
+            local = self.images_dir / "sync.jpg"
+            local.write_bytes(png_bytes())
+            self.assertEqual(service.sync_all()["uploaded"], 1)
+        self.assertEqual(len(FakeWebDAVClient.instances), 3)
+        self.assertTrue(all(client.closed for client in FakeWebDAVClient.instances))
+
+    def test_webdav_clients_close_on_each_failure_path(self):
+        self.settings.update({"enabled": True, "mode": "webdav", "webdav_url": "https://dav.example.test"})
+        rel = "2026/01/01/failure.png"
+        for operation in ("save", "get_bytes", "delete", "test_webdav", "sync_all"):
+            with self.subTest(operation=operation):
+                service = self.service()
+                service._save_index({rel: {"webdav": operation != "sync_all"}})
+                path = self.images_dir / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.unlink(missing_ok=True)
+                client = mock.Mock()
+                for method in ("put", "get", "delete", "test"):
+                    getattr(client, method).side_effect = ImageStorageError("fixture failure")
+                with mock.patch("services.image_storage_service.WebDAVClient", return_value=client):
+                    if operation == "sync_all":
+                        path.write_bytes(png_bytes())
+                        self.assertEqual(service.sync_all()["failed"], 1)
+                    else:
+                        with self.assertRaises(ImageStorageError):
+                            getattr(service, operation)(*(
+                                (png_bytes(),) if operation == "save" else
+                                () if operation == "test_webdav" else (rel,)
+                            ))
+                client.close.assert_called_once_with()
+
+    def test_real_webdav_probe_closes_session_once_including_invalid_urls(self):
+        for url in ("https://dav.example.test", "", "invalid://dav.example.test"):
+            with self.subTest(url=url):
+                self.settings.update({"webdav_url": url})
+                session = mock.Mock()
+                with (
+                    mock.patch("services.image_storage_service.requests.Session", return_value=session),
+                    mock.patch.object(WebDAVClient, "put"),
+                    mock.patch.object(WebDAVClient, "delete"),
+                ):
+                    result = self.service().test_webdav()
+                self.assertEqual(result["ok"], url.startswith("https://"))
+                session.close.assert_called_once_with()
+
+    def test_sync_closes_client_when_index_write_fails(self):
+        self.settings.update({"enabled": True, "mode": "webdav", "webdav_url": "https://dav.example.test"})
+        service = self.service()
+        client = mock.Mock()
+        with (
+            mock.patch("services.image_storage_service.WebDAVClient", return_value=client),
+            mock.patch.object(service, "_save_index", side_effect=OSError("fixture disk error")),
+        ):
+            with self.assertRaises(OSError):
+                service.sync_all()
+        client.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

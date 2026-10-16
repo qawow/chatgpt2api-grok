@@ -561,12 +561,33 @@ def extract_chat_prompt(body: dict[str, object]) -> str:
 
 def parse_image_count(raw_value: object) -> int:
     try:
-        value = int(raw_value or 1)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
+        value = coerce_image_count(raw_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
     if value < 1 or value > 4:
         raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
     return value
+
+
+def coerce_image_count(raw_value: object, default: int = 1) -> int:
+    """Normalize scalar or singleton-form ``n``; reject ambiguous counts."""
+    value: object = raw_value
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1 or isinstance(value[0], (list, tuple, dict)):
+            raise ValueError("n must be a single integer")
+        value = value[0]
+    # Keep the existing default for omitted/empty/zero form fields.
+    if value is None or value == "" or value == 0:
+        return default
+    if not isinstance(value, (str, int, float)):
+        raise ValueError("n must be an integer")
+    try:
+        count = int(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("n must be an integer") from exc
+    if isinstance(value, float) and value != count:
+        raise ValueError("n must be an integer")
+    return count
 
 
 def image_result_urls(image_result: dict[str, object]) -> list[str]:

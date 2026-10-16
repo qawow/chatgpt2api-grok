@@ -10,6 +10,7 @@ from typing import Any
 from services.grok_account_service import grok_account_service
 from services.grok_backend_api import GrokBackendError, b64_to_bytes, generate_image
 from utils.grok_models import GROK_TEXT_MODELS_DISABLED, is_grok_text_model, resolve_grok_image_model
+from utils.helper import parse_image_count
 
 
 def _persist_urls(data_items: list[dict[str, Any]], *, base_url: str | None, response_format: str) -> list[dict[str, Any]]:
@@ -39,7 +40,7 @@ def _persist_urls(data_items: list[dict[str, Any]], *, base_url: str | None, res
 def _handle_via_local_pool(body: dict[str, Any]) -> dict[str, Any]:
     prompt = str(body.get("prompt") or "").strip()
     model = resolve_grok_image_model(body.get("model"))
-    n = max(1, min(int(body.get("n") or 1), 4))
+    n = parse_image_count(body.get("n"))
     size = body.get("size")
     response_format = str(body.get("response_format") or "b64_json").strip() or "b64_json"
     base_url = str(body.get("base_url") or "").strip() or None

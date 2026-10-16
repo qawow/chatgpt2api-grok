@@ -170,7 +170,10 @@ def create_router() -> APIRouter:
             )
         payload["images"] = await read_image_sources(image_sources)
         if mask_sources:
-            payload["mask"] = await read_image_sources(mask_sources)
+            payload["mask"] = await read_image_sources(
+                mask_sources,
+                initial_total_bytes=sum(len(item[0]) for item in payload["images"]),
+            )
         payload["base_url"] = resolve_image_base_url(request)
         return await call.run(openai_v1_image_edit.handle, payload)
 

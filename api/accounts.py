@@ -127,16 +127,20 @@ def create_router() -> APIRouter:
     @router.get("/api/auth/users")
     async def list_user_keys(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": auth_service.list_keys(role="user")}
+        return {"items": await run_in_threadpool(auth_service.list_keys, role="user")}
 
     @router.post("/api/auth/users")
     async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            item, raw_key = auth_service.create_key(role="user", name=body.name)
+            item, raw_key = await run_in_threadpool(auth_service.create_key, role="user", name=body.name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
+        return {
+            "item": item,
+            "key": raw_key,
+            "items": await run_in_threadpool(auth_service.list_keys, role="user"),
+        }
 
     @router.post("/api/auth/users/{key_id}")
     async def update_user_key(
@@ -157,24 +161,28 @@ def create_router() -> APIRouter:
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
         try:
-            item = auth_service.update_key(key_id, updates, role="user")
+            item = await run_in_threadpool(auth_service.update_key, key_id, updates, role="user")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"item": item, "items": auth_service.list_keys(role="user")}
+        return {
+            "item": item,
+            "items": await run_in_threadpool(auth_service.list_keys, role="user"),
+        }
 
     @router.delete("/api/auth/users/{key_id}")
     async def delete_user_key(key_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        if not auth_service.delete_key(key_id, role="user"):
+        removed = await run_in_threadpool(auth_service.delete_key, key_id, role="user")
+        if not removed:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"items": auth_service.list_keys(role="user")}
+        return {"items": await run_in_threadpool(auth_service.list_keys, role="user")}
 
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        return {"items": await run_in_threadpool(account_service.list_accounts)}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -185,16 +193,16 @@ def create_router() -> APIRouter:
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
         if account_payloads:
-            result = account_service.add_account_items(account_payloads)
+            result = await run_in_threadpool(account_service.add_account_items, account_payloads)
             payload_token_set = set(_unique_tokens(payload_tokens))
             extra_tokens = [token for token in tokens if token not in payload_token_set]
             if extra_tokens:
-                extra_result = account_service.add_accounts(extra_tokens)
+                extra_result = await run_in_threadpool(account_service.add_accounts, extra_tokens)
                 result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
         else:
-            result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+            result = await run_in_threadpool(account_service.add_accounts, tokens)
+        refresh_result = await run_in_threadpool(account_service.refresh_accounts, tokens)
         return {
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
@@ -208,14 +216,14 @@ def create_router() -> APIRouter:
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return account_service.delete_accounts(tokens)
+        return await run_in_threadpool(account_service.delete_accounts, tokens)
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
         if not access_tokens:
-            access_tokens = account_service.list_tokens()
+            access_tokens = await run_in_threadpool(account_service.list_tokens)
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
@@ -244,7 +252,7 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts/refresh/progress/{progress_id}")
     async def get_refresh_progress(progress_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        progress = account_service.get_refresh_progress(progress_id)
+        progress = await run_in_threadpool(account_service.get_refresh_progress, progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
         return progress
@@ -273,7 +281,7 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts/re-login/progress/{progress_id}")
     async def get_relogin_progress(progress_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        progress = account_service.get_relogin_progress(progress_id)
+        progress = await run_in_threadpool(account_service.get_relogin_progress, progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
         return progress
@@ -282,7 +290,7 @@ def create_router() -> APIRouter:
     async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         access_tokens = _unique_tokens(body.access_tokens)
-        items = account_service.build_export_items(access_tokens)
+        items = await run_in_threadpool(account_service.build_export_items, access_tokens)
         if not items:
             raise HTTPException(
                 status_code=400,
@@ -291,7 +299,7 @@ def create_router() -> APIRouter:
 
         timestamp = _download_timestamp()
         if body.format == "zip":
-            content = _account_zip_bytes(items)
+            content = await run_in_threadpool(_account_zip_bytes, items)
             return Response(
                 content,
                 media_type="application/zip",
@@ -315,10 +323,15 @@ def create_router() -> APIRouter:
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
         # The only path allowed to clear a manual 禁用.
-        account = account_service.update_account(access_token, updates, allow_status_override=True)
+        account = await run_in_threadpool(
+            account_service.update_account,
+            access_token,
+            updates,
+            allow_status_override=True,
+        )
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return {"item": account, "items": await run_in_threadpool(account_service.list_accounts)}
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(
@@ -404,7 +417,7 @@ def create_router() -> APIRouter:
         # Resolve email/password from pool if only access_token given
         if access_token and (not email or not password):
             try:
-                accounts = account_service.list_accounts() or []
+                accounts = await run_in_threadpool(account_service.list_accounts) or []
             except Exception:
                 accounts = []
             for acc in accounts if isinstance(accounts, list) else []:
@@ -448,7 +461,7 @@ def create_router() -> APIRouter:
         items = result.get("items")
         if not items:
             try:
-                items = account_service.list_accounts()
+                items = await run_in_threadpool(account_service.list_accounts)
             except Exception:
                 items = []
         return {

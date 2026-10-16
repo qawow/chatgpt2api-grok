@@ -22,6 +22,7 @@ from api.support import (
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
+from services.proxy_service import proxy_settings
 
 
 class _BodyTooLarge(Exception):
@@ -119,6 +120,9 @@ def create_app() -> FastAPI:
         replenish_thread = start_account_replenish_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         log_trim_thread = start_log_retention_watcher(stop_event)
+        from services.account_service import account_service
+
+        clearance_thread = proxy_settings.start_clearance_warmup(stop_event, account_service.list_accounts)
         backup_service.start()
         config.cleanup_old_images()
         def _warmup_tiktoken() -> None:
@@ -139,6 +143,8 @@ def create_app() -> FastAPI:
             replenish_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             log_trim_thread.join(timeout=1)
+            if clearance_thread is not None:
+                clearance_thread.join(timeout=1)
             backup_service.stop()
 
     # FastAPI's interactive docs are served without auth and enumerate every

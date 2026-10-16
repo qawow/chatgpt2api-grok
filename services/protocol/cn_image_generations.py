@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from utils.image_models import DEFAULT_ZHITU360_MODEL, is_doubao_model, is_zhitu_model
+from utils.helper import parse_image_count
 
 
 def openai_image_items(
@@ -76,12 +77,13 @@ def handle_doubao(body: dict[str, Any]) -> dict[str, Any]:
 def handle_zhitu(body: dict[str, Any]) -> dict[str, Any]:
     from services.zhitu360_backend import generate, size_to_ratio
 
+    n = parse_image_count(body.get("n"))
     result = generate(
         str(body.get("prompt") or ""),
         model=str(body.get("model") or DEFAULT_ZHITU360_MODEL),
         ratio=size_to_ratio(body.get("ratio") or body.get("size") or "1:1"),
         style=str(body.get("style") or "auto"),
-        n=int(body.get("n") or 1),
+        n=n,
         cookies=str(body.get("cookies") or ""),
         captcha=str(body.get("captcha") or ""),
     )

@@ -3,6 +3,8 @@
 证据来源标注：**[实测]** = 本次对现网抓取/测量；**[静态]** = 代码走查，附 `文件:行号`。
 分析基线：HEAD `b368b6a`，工作区含未提交改动。
 
+本轮未发布更新：第 18 节及第 24 节第 2–4 项记录的是上述基线的清障缺口，现已补齐挑战识别、单次恢复、后台预热、UA/账户缓存及资源下载链路，见 [UNRELEASED.md](../UNRELEASED.md)。本轮以隔离的本地模拟服务验证，没有重新执行本文的现网探针。
+
 ---
 
 ## 1. 一次生图的真实协议时序 [实测]
@@ -404,13 +406,33 @@ Cache-Control: no-cache   Pragma: no-cache   Priority: u=1, i
 Sec-Ch-Ua / Sec-Ch-Ua-Arch:"x86" / -Bitness:"64" / -Full-Version / -Full-Version-List /
 -Mobile / -Model:"" / -Platform / -Platform-Version:"19.0.0"
 Sec-Fetch-Dest: empty  -Mode: cors  -Site: same-origin
-OAI-Device-Id / OAI-Session-Id / OAI-Language: zh-CN
+OAI-Device-Id / oai-did / OAI-Session-Id / OAI-Language: zh-CN
 OAI-Client-Version: prod-a194cd50d4416d3c0b47c740f206b12ce60f5887
 OAI-Client-Build-Number: 6708908
 Authorization: Bearer <access_token>
 ChatGPT-Account-Id: <uuid>
 X-OpenAI-Target-Path / X-OpenAI-Target-Route: <与真实 path 完全一致，由 _headers() 自动注入>
 ```
+
+> **真实客户端的头名**（bundle 模块 `Kwu` @989802 的 `g(e,t)`）是 **`oai-did`**，
+> 不是 `OAI-Device-Id`：
+>
+> ```js
+> function g(e,t){return{
+>   originator: "Codex Browser",              // 模块 jV @76629
+>   "x-openai-web-frontend": "codex_webview",
+>   "x-openai-codex-window-type": "browser",
+>   [OAI-Language]: <lang>,                   // 模块 PL
+>   ...{"oai-did": <deviceId>},               // 模块 J0 @583247
+>   ...gyr(e,t),
+> }}
+> ```
+>
+> 两个都发，兼容既有下游。`/f/conversation` 另经 `B(e)` @519894 注入
+> `x-conduit-token` / integrity 头 / `ChatGPT-Account-ID` + `ChatGPT-Account-Id` /
+> `x-oai-turn-trace-id`。真实客户端**不发** `X-OpenAI-Target-Path` / `-Route`
+> （`getRequestTarget` 只返回 `{headers, url}`），这两个头是本仓库自行注入的；
+> 实测移除它们不改变任何响应。
 
 `_bootstrap_headers()` 是另一套（`Sec-Fetch-Dest: document`、`-Mode: navigate`、`-Site: none`、
 `Upgrade-Insecure-Requests: 1`），用于第 2 发的首页预热。
@@ -467,9 +489,16 @@ SSE 后约 200ms 立即查文档会撞上游瞬时 429（文档尚未落库）�
 
 ## 13. 对外接口映射
 
-模型名 → 内部 slug：`gpt-image-2.5` / `gpt-image-2` → `"gpt-5-3"`；`codex-gpt-image-2` → 原名；
+模型名 → 内部 slug：`gpt-image-2.5` / `gpt-image-2` → `"auto"`；`codex-gpt-image-2` → 原名；
 其余 → `"auto"`。`system_hints=["picture_v2"]` 是**是否走图工具的唯一开关**——
 含它则走 `_stream_picture_conversation` 专用图链路，否则走通用 conversation。
+
+> **为什么是 `auto` 而不是 `gpt-5-3`**：`gpt-5-3` 已从 `/backend-api/models`
+> 目录下架。实测目录（2026-10-16）为 `gpt-5-6`、`gpt-5-3-mini`、`gpt-5-6-mini`、
+> `gpt-5-6-t-mini`、`gpt-5-6-t-mini-mini`、`research`、`gpt-6`、`gpt-6-t-mini`、
+> `gpt-6-mini`、`gpt-6-t-mini-mini`、`auto`。`auto` 同时满足两个条件：它是账号的
+> `default_model_slug` / `intended_default_model_slug`，也是真实客户端抓包里的
+> 默认取值（`"model":"auto"`）。
 
 `size`/`quality` 见第 5 节（web 是提示词、codex 是真参数）。
 `thinking_effort` 经 `_normalize_thinking_effort()` 归一后才写入 payload。
@@ -643,10 +672,10 @@ SSE 后约 200ms 立即查文档会撞上游瞬时 429（文档尚未落库）�
 —— **代理会传给 FlareSolverr 以保证 clearance 与实际出口同 IP**；而 FlareSolverr 自身请求
 用 `ProxyHandler({})` 清空环境代理（否则 docker DNS 名被 SOCKS 黑洞）。
 
-缓存键 `(proxy_url, host, 账号隔离id)`，隔离 id 取 `oai-device-id→email→account_id→user_id`
+缓存键 `(proxy_url, host, 账号隔离id)`；当前隔离 ID 优先取账户 ID、用户 ID、邮箱或令牌摘要，再回退设备 ID，避免启动后补齐设备 ID 使预热失配。
 → 同出口不同账号的 clearance **互不串用**。
 
-### 已定位缺陷
+### 基线中的缺陷（本轮已补齐相关执行链）
 
 1. **FlareSolverr 返回的 `userAgent` 永远不生效**：`build_headers` 只在缺 UA 时写入，
    而 `session.headers` 在构造期已写死 UA，`_headers()` 从它起步 ⇒ **只有 cookie 被注入**。
@@ -797,9 +826,76 @@ return current_text              # 其余 op 一律静默忽略
 
 图链路专用 `ImageGenerationError` 实际出现的 `code`：`task_cancelled`、`insufficient_quota`、
 `upstream_text_reply`、`content_policy_violation`、`no_image_generated`、`upstream_arkose_required`、
-`tool_quota_exhausted`、`tool_rate_limited`。
+`tool_quota_exhausted`、`tool_rate_limited`、`upstream_model_not_found`、
+`upstream_model_not_found_global`。
 `public_image_error_message` 会把含 `backend-api/`、`status=`、`body=`、`chatgpt.com` 的
 内部细节整条替换成通用文案，防上游信息泄漏。
+
+### `404 {"detail":"Model not found"}` 的错误面 [实测]
+
+会话端点返回这个 404 时**不是** slug 写错，也**不是**账号级终态：
+
+| 探测 | 结果 |
+|---|---|
+| `model=""` / `"   "` / `"zzz-not-a-model"` | 404（与合法 slug 完全相同） |
+| 目录全量 11 个 slug + 权限清单项，共 35 个 | 全部 404 |
+| `POST /backend-api/conversation`（legacy） | 同一个 404 |
+| `POST /backend-anon/conversation`（**无凭据**） | 同一个 404 |
+| 换全新 `oai-did` / `oai-device-id` | 同一个 404 |
+| `POST /f/conversation/prepare` | **200**，签发 conduit_token |
+| `POST /f/conversation/resume` | 标准 Pydantic 校验错误 |
+
+匿名链路在完全不带凭据时复现同一个 404 ⇒ 条件落在 `-convo` 后端
+（响应头 `x-build: 814069032b2f-convo`，与 `/models` 的 `x-build: 814069032b2f` 不同），
+不在凭据上。因此处置策略是**熔断**而非逐个停放：
+
+- 单个凭据命中 → 局部故障，按 `image_tool_quota_cooldown_secs`（默认 24h）停放；
+- 300 秒窗口内 2 个及以上不同凭据命中 → 全局故障，改走 60 秒短停并立即抛
+  `upstream_model_not_found_global`，不再逐个账号重试；
+- 判定为全局时，窗口内先前被长停的凭据会被**回溯改短**；
+- 熔断期内新请求在入口直接失败，不再走一遍号池。
+
+### 体校验先于模型解析 [实测]
+
+`conversation_origin` 是两条服务端路径的分水岭：
+
+| 请求体 | 结果 |
+|---|---|
+| `{}` / `{"action":"next"}` / 任意类型错误 | 422 `Invalid conversation body`（通用掩码） |
+| 合法体，**不传** `conversation_origin` | 404 `Model not found`（体校验通过，模型解析失败） |
+| 合法体 + `"tpp"` 或 `"flora"` | 422 `conversation_model_origin_mismatch`（模型解析**成功**） |
+| 合法体 + 其他任意值 | 422 `Invalid conversation body`（枚举拒绝） |
+
+合法枚举由服务端自述（`POST /conversation/init` 的 Pydantic 错误）：
+
+```
+apple, apple_xcode, apple_image_playground, apple_shortcuts, kakao_talk,
+fyp_feedback, pulse, finserv_app, bigbrain, flora, tpp,
+workspace_agent_in_slack, viber, whatsapp, telegram
+```
+
+**普通 web chat 就是「不传」**，所以 `chat` / `codex` / `other` / `work` 全部非法。
+`requested_default_model` 的耦合条件也显式排除 tpp/flora：
+
+```js
+y = ("next"===t && "tpp"!==r && "flora"!==r && d!==u) ? d : void 0;
+```
+
+### prepare 体的两个必填字段 [静态]
+
+真实客户端 `prepareCompletionStream` 总会补上（bundle @505271）：
+
+```js
+prepareCompletionStream({...W, client_prepare_dispatch:"immediate",
+                         client_prepare_source:"context_change"})
+```
+
+- `client_prepare_dispatch` ∈ {`immediate`, `debounced`}；
+- `client_prepare_source` 归一化后只有 4 个值（bundle @986911）：
+  `composer_editor_state` / `context_change` / `file_picker` / `gizmo_override`。
+
+另注：`client_prepare_state` **只在 prepare 发送**（值恒为 `"sent"`），
+submit 体不带该字段。
 
 ---
 

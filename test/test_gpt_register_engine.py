@@ -541,6 +541,171 @@ class ProxyStickySessionTest(unittest.TestCase):
         self.assertEqual(out, "socks5h://u.s1:p%40ss@h:1080")
 
 
+class StickySuffixRejectionTest(unittest.TestCase):
+    """A pool that refuses ``user.<session_id>`` must not be left suffixed.
+
+    Remote failure signature (this deployment's pool, 2026-10-16):
+      warmup chatgpt.com 异常 (4/4): Failed to perform, curl: (97)
+        User was rejected by the SOCKS5 server (1 1).
+      warmup 换出口重试: socks5h://ob.oa345fa096b952:***@...
+      warmup 换出口 1 异常: curl: (97) User was rejected by the SOCKS5 server
+      失败 error=初始化会话失败: oai_did_missing
+
+    Measured against ``192.168.2.198:19053``: the bare username ``ob``
+    connects on every attempt while ``ob.<anything>`` is refused outright, so
+    the sticky suffix turned a working proxy into a dead one.
+    """
+
+    def test_strip_removes_the_session_suffix(self):
+        from core.proxy_env import strip_sticky_session
+
+        self.assertEqual(
+            strip_sticky_session("socks5h://u.s1:p@h:1080"), "socks5h://u:p@h:1080"
+        )
+        self.assertEqual(
+            strip_sticky_session("socks5h://u.old1.old2:p@h:1080"),
+            "socks5h://u:p@h:1080",
+        )
+
+    def test_strip_is_a_noop_without_a_suffix(self):
+        from core.proxy_env import strip_sticky_session
+
+        self.assertEqual(
+            strip_sticky_session("socks5h://u:p@h:1080"), "socks5h://u:p@h:1080"
+        )
+        self.assertIsNone(strip_sticky_session(""))
+        self.assertIsNone(strip_sticky_session(None))
+
+    def test_strip_is_a_noop_without_credentials(self):
+        from core.proxy_env import strip_sticky_session
+
+        self.assertEqual(strip_sticky_session("socks5h://h:1080"), "socks5h://h:1080")
+
+    def test_strip_round_trips_apply_and_rotate(self):
+        from core.proxy_env import (
+            apply_sticky_session,
+            rotate_sticky_session,
+            strip_sticky_session,
+        )
+
+        raw = "socks5h://u:p@h:1080"
+        self.assertEqual(strip_sticky_session(apply_sticky_session(raw, "s1")), raw)
+        self.assertEqual(
+            strip_sticky_session(rotate_sticky_session(apply_sticky_session(raw, "s1"), "s2")),
+            raw,
+        )
+
+    def test_only_the_socks5_credential_rejection_matches(self):
+        from core.proxy_env import is_socks5_user_rejected
+
+        rejected = (
+            "Failed to perform, curl: (97) User was rejected by the SOCKS5 server "
+            "(1 1).. See https://curl.se/libcurl/c/libcurl-errors.html first for "
+            "more details."
+        )
+        self.assertTrue(is_socks5_user_rejected(rejected))
+        # A challenged exit is a different failure and must keep rotating.
+        self.assertFalse(is_socks5_user_rejected(
+            "Failed to perform, curl: (35) TLS connect error: error:00000000"
+        ))
+        self.assertFalse(is_socks5_user_rejected(
+            "Failed to perform, curl: (97) cannot complete SOCKS5 connection to chatgpt.com. (1)"
+        ))
+        self.assertFalse(is_socks5_user_rejected(""))
+        self.assertFalse(is_socks5_user_rejected(None))
+
+
+class WarmupStickyFallbackTest(unittest.TestCase):
+    """warmup must drop the suffix and retry instead of dying with oai_did_missing."""
+
+    def setUp(self):
+        self._sleep = mock.patch("platforms.chatgpt.register.time.sleep")
+        self._sleep.start()
+        self._budget = mock.patch.dict(
+            os.environ, {"OPENAI_WARMUP_EXIT_ATTEMPTS": "2"}
+        )
+        self._budget.start()
+
+    def tearDown(self):
+        # Leaving these patches running leaks OPENAI_WARMUP_EXIT_ATTEMPTS into
+        # later test modules and changes their registration behaviour.
+        self._budget.stop()
+        self._sleep.stop()
+
+    def _engine(self, proxy: str):
+        from platforms.chatgpt.register import RegistrationEngine
+
+        return RegistrationEngine(
+            email_service=SimpleNamespace(service_type=SimpleNamespace(value="x")),
+            proxy_url=proxy,
+        )
+
+    def test_rejection_rebinds_to_the_bare_credential(self):
+        sticky = "socks5h://ob.oa345fa096b952:pw@192.168.2.198:19053"
+        eng = self._engine(sticky)
+        rebound: list[str] = []
+        rejected = RuntimeError(
+            "Failed to perform, curl: (97) User was rejected by the SOCKS5 server (1 1)."
+        )
+
+        def get(url, **kwargs):
+            if "." in eng.proxy_url.split("://", 1)[1].split(":", 1)[0]:
+                raise rejected
+            return SimpleNamespace(status_code=200, text="ok")
+
+        fake = SimpleNamespace(get=get, close=lambda: None, cookies={})
+        eng.session = fake
+        eng.http_client = SimpleNamespace(
+            proxy_url=sticky, _session=fake, session=fake, browser={}
+        )
+        eng._cookie_value = lambda name: (
+            None if "." in eng.proxy_url.split("://", 1)[1].split(":", 1)[0] else "did-123"
+        )
+        eng._response_body_snip = lambda r: "ok"
+
+        real_rebind = eng._rebind_session
+
+        def tracked_rebind(url: str) -> None:
+            rebound.append(url)
+            real_rebind(url)
+
+        eng._rebind_session = tracked_rebind  # type: ignore[assignment]
+
+        self.assertTrue(eng._warmup_chatgpt_home())
+        self.assertEqual(rebound, ["socks5h://ob:pw@192.168.2.198:19053"])
+        self.assertEqual(eng.proxy_url, "socks5h://ob:pw@192.168.2.198:19053")
+
+    def test_a_challenged_exit_is_not_treated_as_a_rejection(self):
+        """TLS flake must keep rotating; only curl (97) triggers the strip."""
+        proxy = "socks5h://fixture-user:fixture-pass@proxy.invalid:2260"
+        eng = self._engine(proxy)
+        eng.session = SimpleNamespace(
+            get=mock.Mock(side_effect=RuntimeError(
+                "Failed to perform, curl: (35) TLS connect error: error:00000000"
+            )),
+            close=lambda: None,
+            cookies={},
+        )
+        eng.http_client = SimpleNamespace(
+            proxy_url=proxy, _session=eng.session, session=eng.session, browser={}
+        )
+        eng._cookie_value = lambda name: None
+        eng._response_body_snip = lambda r: ""
+
+        self.assertFalse(eng._warmup_chatgpt_home())
+        # Rotation happened (suffixed), and the bare credential was never used.
+        self.assertIn(".", eng.proxy_url.split("://", 1)[1].split(":", 1)[0])
+
+    def test_no_suffix_means_nothing_to_strip(self):
+        proxy = "socks5h://ob:pw@192.168.2.198:19053"
+        eng = self._engine(proxy)
+        eng._rebind_session = mock.Mock()  # type: ignore[assignment]
+        self.assertFalse(eng._drop_sticky_session_on_rejection(
+            "Failed to perform, curl: (97) User was rejected by the SOCKS5 server (1 1)."
+        ))
+        eng._rebind_session.assert_not_called()
+
+
 class Socks5RetryMarkerTest(unittest.TestCase):
     def test_socks5_failure_is_retryable(self):
         from core.http_client import is_get_transport_error, is_tls_handshake_error

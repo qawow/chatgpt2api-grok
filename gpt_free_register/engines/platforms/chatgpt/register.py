@@ -924,6 +924,30 @@ class RegistrationEngine:
                 home = self.session.get(f"{CHATGPT_APP}/", headers=nav, timeout=warm_timeout)
             except Exception as exc:
                 self._log(f"warmup chatgpt.com 异常 ({warm}/{exit_attempts}): {exc}", "warning")
+                # A SOCKS5 credential rejection means the sticky session suffix
+                # itself was refused, not that the exit was challenged. Retrying
+                # or rotating would only reproduce it, so drop the suffix and
+                # rebuild the session on the bare credential.
+                if self._drop_sticky_session_on_rejection(exc):
+                    try:
+                        home = self.session.get(f"{CHATGPT_APP}/", headers=nav,
+                                                timeout=warm_timeout)
+                    except Exception as retry_exc:
+                        self._log(f"warmup 去 sticky 后仍异常: {retry_exc}", "warning")
+                        time.sleep(0.6 * warm)
+                        continue
+                    retry_did = self._cookie_value("oai-did")
+                    if retry_did:
+                        self._log(f"warmup 去 sticky 后 oai-did ok "
+                                  f"status={getattr(home, 'status_code', '?')}: "
+                                  f"{retry_did[:20]}...")
+                        return True
+                    self._log(
+                        f"warmup 去 sticky 后仍未种到 oai-did "
+                        f"status={getattr(home, 'status_code', '?')} "
+                        f"body={self._response_body_snip(home)}",
+                        "warning",
+                    )
                 time.sleep(0.6 * warm)
                 continue
             home_status = getattr(home, "status_code", "?")
@@ -945,6 +969,30 @@ class RegistrationEngine:
                 home = self.session.get(f"{CHATGPT_APP}/", headers=nav, timeout=warm_timeout)
             except Exception as exc:
                 self._log(f"warmup 换出口 {rot} 异常: {exc}", "warning")
+                # Rotating only mints another suffixed username, which this pool
+                # refuses just the same. Fall back to the bare credential and
+                # stop rotating rather than burning every attempt on it.
+                if self._drop_sticky_session_on_rejection(exc):
+                    try:
+                        home = self.session.get(f"{CHATGPT_APP}/", headers=nav,
+                                                timeout=warm_timeout)
+                    except Exception as retry_exc:
+                        self._log(f"warmup 换出口 {rot} 去 sticky 后仍异常: {retry_exc}",
+                                  "warning")
+                        break
+                    retry_did = self._cookie_value("oai-did")
+                    if retry_did:
+                        self._log(f"warmup 换出口 {rot} 去 sticky 后 oai-did ok "
+                                  f"status={getattr(home, 'status_code', '?')}: "
+                                  f"{retry_did[:20]}...")
+                        return True
+                    self._log(
+                        f"warmup 换出口 {rot} 去 sticky 后仍未种到 oai-did "
+                        f"status={getattr(home, 'status_code', '?')} "
+                        f"body={self._response_body_snip(home)}",
+                        "warning",
+                    )
+                    break
                 continue
             oai_did = self._cookie_value("oai-did")
             if oai_did:
@@ -963,6 +1011,53 @@ class RegistrationEngine:
         self._log("warmup 未种到 oai-did（含换出口重试）", "error")
         return False
 
+    def _rebind_session(self, proxy_url: str) -> None:
+        """Point the client at ``proxy_url`` and rebuild its cached session."""
+        old_session = getattr(self, "session", None)
+        if old_session is not None:
+            try:
+                old_session.close()
+            except Exception:
+                pass
+        self.proxy_url = proxy_url
+        self.http_client.proxy_url = proxy_url
+        # The cached session holds the old exit; drop it so the next access
+        # builds a fresh Session bound to the new proxy.
+        self.http_client._session = None
+        self.session = self.http_client.session
+        try:
+            from .browser_profile import apply_profile_to_session
+
+            apply_profile_to_session(self.session, getattr(self.http_client, "browser", None))
+        except Exception:
+            pass
+
+    def _drop_sticky_session_on_rejection(self, exc: object) -> bool:
+        """Retry on the bare credential after ``curl: (97)``.
+
+        Not every rotating provider accepts a ``user.<session_id>`` suffix; the
+        one behind this deployment refuses every suffixed username while the
+        bare credential connects fine. Without this fallback the sticky suffix
+        silently turns a working proxy into a dead one and the run dies with
+        ``初始化会话失败: oai_did_missing``. Returns True when the session was
+        rebound and the caller should retry once.
+        """
+        from core.proxy_env import is_socks5_user_rejected, strip_sticky_session
+
+        if not is_socks5_user_rejected(exc):
+            return False
+        current = getattr(self, "proxy_url", None)
+        bare = strip_sticky_session(current)
+        if not bare or bare == current:
+            return False
+        try:
+            self._rebind_session(bare)
+        except Exception as rebind_exc:
+            self._log(f"warmup 去 sticky 重建会话失败: {rebind_exc}", "warning")
+            return False
+        self._log(f"warmup SOCKS5 拒绝 sticky 用户名，回退到裸凭据: {self._mask_proxy(bare)}")
+        return True
+
     def _rotate_warmup_exit(self) -> bool:
         """Re-pin the sticky proxy to a new exit and rebuild the session.
 
@@ -976,24 +1071,7 @@ class RegistrationEngine:
         if not rotated or rotated == current:
             return False
         try:
-            old_session = getattr(self, "session", None)
-            if old_session is not None:
-                try:
-                    old_session.close()
-                except Exception:
-                    pass
-            self.proxy_url = rotated
-            self.http_client.proxy_url = rotated
-            # The cached session holds the old exit; drop it so the next access
-            # builds a fresh Session bound to the rotated proxy.
-            self.http_client._session = None
-            self.session = self.http_client.session
-            try:
-                from .browser_profile import apply_profile_to_session
-
-                apply_profile_to_session(self.session, getattr(self.http_client, "browser", None))
-            except Exception:
-                pass
+            self._rebind_session(rotated)
             self._log(f"warmup 换出口重试: {self._mask_proxy(rotated)}")
             return True
         except Exception as exc:
