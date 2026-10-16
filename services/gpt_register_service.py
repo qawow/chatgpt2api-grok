@@ -112,7 +112,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "tempmail_mode": "multi",
     # multi 时自己生成几级随机子域名（abc@mail2.mx1.smtp3.….example.com）；
     # 0 = 交给 tempmail 生成（10~14 级 gmail/yahoo… 单词拼接，地址很长）
-    "tempmail_subdomain_depth": 17,
+    "tempmail_subdomain_depth": 10,
     "push_enabled": True,
     "push_mode": "local",  # local | http
     # empty → auto (local in-process import; http mode uses container-aware default)
@@ -604,7 +604,7 @@ def normalize_settings(raw: object | None) -> dict[str, Any]:
     tempmail_mode = _clean(out.get("tempmail_mode")).lower()
     out["tempmail_mode"] = tempmail_mode if tempmail_mode in TEMPMAIL_MODES else ""
     out["tempmail_subdomain_depth"] = _clamp_int(
-        out.get("tempmail_subdomain_depth"), 17, 0, TEMPMAIL_MAX_SUBDOMAIN_DEPTH
+        out.get("tempmail_subdomain_depth"), 10, 0, TEMPMAIL_MAX_SUBDOMAIN_DEPTH
     )
     out["push_enabled"] = bool(out.get("push_enabled", True))
     push_mode = _clean(out.get("push_mode")).lower() or "local"

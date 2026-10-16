@@ -333,7 +333,9 @@ class MultiLevelDomainTests(TempmailTestCase):
         self.assertEqual((body["mode"], body["domain"]), ("multi", "mail.test"))
         labels = body["subdomain"].split(".")
         self.assertEqual(len(labels), tm.TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH)
-        self.assertEqual(tm.TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH, 17)
+        # 10 层：每层约 32,112 个标签，单域名可用地址约 10^63，地址空间远非瓶颈；
+        # 实测 1-17 层投递表现一致，深度不是投递的决定因素（域名才是）。
+        self.assertEqual(tm.TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH, 10)
         self.assertTrue(all(LABEL_RE.match(label) for label in labels), labels)
         self.assertEqual(account.email.split("@", 1)[1], f"{body['subdomain']}.mail.test")
 
@@ -705,7 +707,7 @@ class RunnerWiringTests(unittest.TestCase):
         self.assertEqual(normalize_settings({"tempmail_subdomain_depth": 99})["tempmail_subdomain_depth"],
                          TEMPMAIL_MAX_SUBDOMAIN_DEPTH)
         self.assertEqual(normalize_settings({"tempmail_subdomain_depth": -1})["tempmail_subdomain_depth"], 0)
-        self.assertEqual(normalize_settings({})["tempmail_subdomain_depth"], 17)
+        self.assertEqual(normalize_settings({})["tempmail_subdomain_depth"], 10)
 
     def test_engine_depth_cap_matches_the_service_cap(self):
         """两处上限必须一致：services 放开了但引擎还钳着，深子域会被静默压回。"""

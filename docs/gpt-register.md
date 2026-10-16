@@ -165,11 +165,27 @@ Postfix 收信后 ≤100ms 落库，注册机直接走它的 REST API，不用�
 TEMPMAIL_BASE_URL=https://mail.example.com
 TEMPMAIL_API_KEY=tm_xxx
 # 可选
-# TEMPMAIL_DOMAIN=example.com     # 固定域名（后台域名池优先）
+# TEMPMAIL_DOMAIN=example.com     # 固定域名（单数优先于域名池）
 # TEMPMAIL_MODE=multi             # single | multi | 空=服务端随机
-# TEMPMAIL_SUBDOMAIN_DEPTH=17     # multi 时自己生成的主机名层数；0=交给 tempmail
+# TEMPMAIL_SUBDOMAIN_DEPTH=10     # multi 时自己生成的主机名层数；0=交给 tempmail
 # TEMPMAIL_PROXY=socks5h://...    # 默认直连，不走注册代理
 ```
+
+> **投递能力是域名级的，务必先验证。** 设置页的「收信域名池」（`tempmail_domains`）
+> 逐号随机轮换；1.8.13 起该池真正生效（此前工厂只读单数的 `tempmail_domain`，
+> 池被静默忽略）。实测 2026-10-16：
+
+| 域名 | 结果 |
+| --- | --- |
+| `5122331.xyz` | ✅ depth 1 / 10 / 12 / 17 全部可投递（0.5–5 秒到达） |
+| `233159.xyz` | ❌ depth 1 与 12 全部超时，邮箱 0 封 |
+| `awa91.cyou` | ❌ depth 10 连续 3 次超时，邮箱 0 封 |
+| `cyt233.dpdns.org` | ❌ 命中 DBL 黑名单，子域继承 |
+
+失败域名**建号 API 返回 200**，只是邮件永远不到，所以只能靠实跑验证。
+两个失败域名的 DNS 都正常（DoH 查得通配符 MX `10 mail.<domain>.`），
+问题在服务端的域名投递配置。**深度不是原因** —— 同一域名从 1 层到 17 层
+表现一致。
 
 注意事项：
 
@@ -314,7 +330,7 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `count` | 1 | 注册数量 1–50 |
-| `concurrency` | 1 | 并发 1–5；稳优先默认 1；多出口时可提到 2–3（钳到代理池大小） |
+| `concurrency` | 1 | 并发 1–32；稳优先默认 1。1.8.13 起**不再**被代理池大小钳制 —— 单代理也能真并发（3 并发实测 132.8s 完成 3 号，串行 250.9s）。要限制每出口并发数用 `max_per_proxy` |
 | `interval_secs` | 3 | 每号间隔秒 |
 | `timeout_secs` | 600 | 单号超时（subprocess 严格生效） |
 | `executor` | `protocol` | `protocol` / `headless` / `headed`；推荐 protocol |
@@ -323,10 +339,10 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `cfd1_domains` | 空 | 域名池：多条按行/逗号分隔，每次注册随机取一个（优先于 `cfd1_domain`），对抗上游按邮箱域名的批量封禁波。所有域名须配置 Cloudflare Email Routing catch-all 到同一个 Worker/D1 |
 | `tempmail_base_url` | 空 | tempmail 站点根地址（自动去掉结尾 `/api`，没写协议补 `https://`） |
 | `tempmail_api_key` | 空 | `tm_` 开头；读配置时返回空串 + `has_tempmail_api_key`，写入空串表示不修改 |
-| `tempmail_domains` | 空 | tempmail 域名池（分隔规则同 `cfd1_domains`）；空 = 服务端随机挑已激活域名 |
+| `tempmail_domains` | 空 | tempmail 域名池（分隔规则同 `cfd1_domains`），逐号随机轮换；空 = 服务端随机挑已激活域名。1.8.13 起该池真正生效（此前工厂只读单数 `tempmail_domain`，池被静默忽略）。**务必先实跑验证域名可投递** —— 见 §3.2.1 |
 | `tempmail_mode` | `multi` | `single` 普通域名 / `multi` 多级子域名 / 空 = 服务端随机 |
-| `tempmail_subdomain_depth` | 17 | `multi` 时注册机自己生成的主机名层数（0–24）；0 = 交给 tempmail 生成（10~14 级单词）。标签为 `mail`/`mx`/`smtp` 词根 + 数字，非纯随机串 |
-| `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*`。多条按行/逗号分隔成池，并发注册时 round-robin 分给各号（配合 `bind_register_proxy` 实现按号隔离出口）。轮换池（Resin 等）自动加粘性会话后缀，见 §6.7.2 |
+| `tempmail_subdomain_depth` | **10** | `multi` 时注册机自己生成的主机名层数（0–24）；0 = 交给 tempmail 生成（10~14 级单词）。标签为 `mail`/`mx`/`smtp` 词根 + 数字，非纯随机串。每层约 32,112 个标签，depth=10 时单域名可用地址约 10^63 —— 地址空间不是瓶颈，**投递能力才是**（见 §3.2.1） |
+| `proxy` | 空 | 出站代理；空则读 `REGISTER_PROXY*`。多条按行/逗号分隔成池，并发注册时 round-robin 分给各号（配合 `bind_register_proxy` 实现按号隔离出口）。轮换池（Resin 等）自动加粘性会话后缀，见 §6.7.2；网关拒绝后缀时自动回退，见 §6.7.3 |
 | `bind_register_proxy` | true | 入库时把代理绑到账号；绑了代理的号不再回落到全局/直连（按号隔离出口） |
 | `plan_type` | `free` | 写入号池的 type |
 | `source_type` | 空 | 空则自动（register / codex） |
@@ -342,6 +358,7 @@ print(result["email"], bool(result.get("token")), result.get("error"))
 | `auto_codex_upgrade` | **false** | 已停用自动调度。入库后不再后台 Codex（二次登录会踢 session）。补 refresh 请用号池按钮 |
 | `register_no_delay` | false | 关闭步骤间随机延迟；默认保留抖动，批量更稳 |
 | `so_collect_ms` | 空 | create_account 前 SO 采集等待毫秒；空=默认 0；需要旧行为时设 `5000` |
+| `max_per_proxy` | 0 | 每个出口允许的并发注册数；0 = 不限。1.8.13 起该字段才真正生效（此前 `_proxy_semaphore` 定义了但无调用点）。钳制按 `pool_size × max_per_proxy` |
 | `auto_replenish_enabled` | **true** | 可生图账号低于阈值时，用当前注册配置自动开任务 |
 | `auto_replenish_min_available` | 1 | 号池最少可用（`_is_image_account_available`）账号数 |
 | `auto_replenish_target_available` | 4 | 主动维持的水位：低于 target 就小步补，不等跌破 min 才抢救 |
@@ -489,7 +506,7 @@ curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
 | OTP 发送 | 优先 `POST /email-otp/send`，失败再 GET；429/5xx 短重试 |
 | OTP 收信 | 透传 `otp_sent_at` + `before_ids`；CFD1 过滤旧邮件 Date，加快 poll |
 | Sentinel dual-header | `openai-sentinel-token` + `openai-sentinel-so-token`；`oai-sc=0{c}` cookie |
-| SO collect | `oauth_create_account` / `create_account` 前默认等待 ~5s（对齐官方 SDK 采集） |
+| SO collect | **默认关闭**（0ms）。现网 `create_account` 的 VM 求解不需要等待；`OPENAI_SO_COLLECT_MS=5000` 可恢复旧行为（§6.7.1 有实测对比） |
 | VM so-token | 优先 VM 求解 `t`/`so`（日志 `src=vm_t`），失败再回退 |
 | 浏览器画像 | 每号独立 profile：TLS impersonate / UA / sec-ch-ua / 硬件一致；Windows 权重默认 70% |
 | CFD1 邮箱 | CFD1 建号/收信**不走** OpenAI 代理，避免 SOCKS 超时拖垮 OTP |
@@ -506,7 +523,7 @@ curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
 | continue_url | 兼容 `continueUrl`/`redirect_url`；无 `code=` 时跟随 redirect / workspace/select |
 | 死号 | validate 返回 `account_deactivated`/`deleted`/`banned` 立即失败，不补发 OTP |
 | OTP Subject | 主题里唯一 6 位数字优先（仍过滤 `493682`）；关键词含日/韩 |
-| 代理池并发 | 并发数钳到代理条数，避免多 worker 同出口 |
+| 并发与出口 | `concurrency` **不再**被代理池大小钳制（1.8.13 起）。要限制每个出口的并发数用 `max_per_proxy`（0=不限）；钳制按 `pool_size × max_per_proxy`。详见 §6.8 |
 
 #### 推荐协议流（当前默认）
 
@@ -518,7 +535,7 @@ chatgpt.com warmup（种植 oai-did；失败则不建邮箱）
   → 若 final_url=/email-verification：跳过 continue，passwordless
   → 信任 auto-OTP；显式发码时 auto-OTP 只 resend（避免新 challenge 废码）
   → email-otp/validate (+ sentinel)；401 则 resend 等新码再验一次
-  → about_you → create_account (+ dual sentinel, SO collect 5s)
+  → about_you → create_account (+ dual sentinel, SO collect 默认 0ms)
   → chatgpt.com callback → /api/auth/session
 ```
 
@@ -527,7 +544,6 @@ chatgpt.com warmup（种植 oai-did；失败则不建邮箱）
 ```text
 passwordless 注册 OTP 流程: mode=passwordless_signup (auto-otp skip continue; yukkcat-aligned)
 Sentinel so-token ready: flow=authorize_continue so_len=... src=vm_t
-Sentinel SO collect wait: 5.0s flow=oauth_create_account
 create_account so-token attached: len=... src=full
 验证码校验状态: 200
 NextAuth session 获取成功
@@ -636,6 +652,18 @@ Web：设置 → GPT注册 →「跳过 Codex 二次 OTP（推荐）」/「关�
 > 2. 后端对同一邮箱再跑 Codex OTP（`POST /api/accounts/codex-upgrade`），无需浏览器粘贴 callback  
 > 3. 成功写入带 `refresh_token` 的新凭证并删除旧 session 行；`add_phone` 等失败会提示原因，号仍保留  
 > 4. 备用：导入对话框里的浏览器 OAuth 粘贴 callback（`/api/accounts/oauth/*`）仍可用
+>
+> **1.8.13 修了两个让该链路必失败的问题**：`authorize/continue` 体此前误用
+> `"screen_hint": "signup"`，但该路径针对**已存在**账号（注册流程自己的 Codex 步骤用的是
+> `"login"`），对已存在地址请求注册会让 auth session 看起来失效并返回
+> `409 invalid_state`；改为 `"login"` 后同一调用变成 `200 + page_type: email_otp_verification`。
+> 另外该路径的 `resolve_proxy()` 也会加 sticky 后缀而死在 `curl: (97)`，
+> 已由 §6.7.3 的通用回退覆盖。
+>
+> **为什么 `session_only` 值得补 refresh**：`access_token` 硬性 10 天过期，
+> 无 `refresh_token` 时唯一的续期路径是 `/api/auth/session`，而该端点在授权被吊销后
+> **返回同一个已死的 JWT**（实测 `new == old`），于是报
+> `session_refresh_stale_token_revoked`。补上 refresh 是唯一的根治办法。
 
 ### 6.7.2 粘性出口（轮换代理）
 
@@ -675,6 +703,65 @@ REGISTER_PROXY_DEFAULT=socks5h://USER:PASSWORD@proxy.example:2260
 > 实测（自建 Resin 网关，`proxy.example:2260` 占位）：裸凭据下每连接换 IP；加 `.会话ID` 后
 > 8 条并发连接 + 6 次跨主机请求全部命中同一 IP。Resin 池以机房 IP 为主，
 > 混有少量住宅段，出口质量参差，故自动换出口很重要。
+
+#### 6.7.3 粘性后缀被网关拒绝时自动回退
+
+不是所有轮换网关都接受 `user.<session_id>` 后缀。本部署实测的池**只接受裸用户名**：
+
+| 用户名 | 结果 |
+| --- | --- |
+| `ob` | 每次连通 |
+| `ob.<任意后缀>` | 一律 `curl: (97) User was rejected by the SOCKS5 server` |
+| `ob-session-<id>` / `ob.session-<id>` | 同上 |
+
+后缀把一个**可用代理变成死代理**，warmup 拿不到 `oai-did`，注册在花邮箱前就报
+`初始化会话失败: oai_did_missing`；更糟的是「换出口」只会铸出另一个同样被拒的后缀。
+
+1.8.13 起三层防护：
+
+1. **失败回退**：warmup 捕获 `curl: (97) … rejected by the SOCKS5 server` 后去掉后缀、
+   重建会话并重试一次；换出口循环同样回退并在回退后停止旋转。
+   注意只匹配「凭据被拒」，**不**匹配 `(35) TLS`（那是被挑战的出口，应当继续旋转）。
+2. **网关记忆**：`note_sticky_rejected()` 记录被拒网关，之后 `apply_sticky_session`
+   对其不再加后缀 —— 注册 warmup、Codex 补 refresh、CLI runner 全部自动受益。
+3. **冷启动探测**：`sticky_suffix_accepted()` 用真实 SOCKS5 握手（只做 greeting+auth，
+   不 CONNECT 不 TLS）探测凭据是否被接受，按 `user@host:port` 缓存。
+   探测不确定时返回 `True` —— **网络抖动绝不触发降级**。
+
+#### 6.7.4 耗时与并发实测
+
+分阶段计时（3 次采样，`.verify/probe_register_hotspots.py`）：
+
+| 阶段 | 耗时 | 占比 |
+| --- | --- | --- |
+| `_get_verification_code`（邮箱轮询） | 2.4s / 39.4s / 42.3s | **59–61%** |
+| `_create_user_account`（含网络） | 4.6–5.7s | 8% |
+| `warmup` | 2.4–5.2s | 4–9% |
+| `_validate_verification_code` | 1.7–1.8s | 3% |
+| `_check_sentinel` ×2 | 1.2s | 2% |
+| **Turnstile VM solve** ×2 | **0.01s** | **0.0%** |
+| **PoW generate_token** ×2 | **0.00s** | **0.0%** |
+
+**本地计算几乎不耗时**。总耗时 26.9–69.0s 的差异**全部**来自 OTP 投递等待 ——
+首次投递失败率约 67%（需要重发才收到），重发间隔调优（12/20/30 秒）未显示差异。
+`callback` 跟随 4.6s 与 `create_account` 4.2s 是服务端处理时间，无本地优化空间。
+
+**并发**（1.8.13 修复钳制后）：
+
+| 条件 | 并发 | 墙钟 | 单号均摊 | 成功 |
+| --- | --- | --- | --- | --- |
+| 串行 count=3 | 1 | 250.9s | 83.6s | 3/3 |
+| 批次并发（钳制前，实际=1） | 3→1 | 226.3s | 75.4s | 3/3 |
+| 直接 3 线程（绕开服务层） | 3 | 70.5s | 23.5s | 3/3 |
+| **批次并发（修复后）** | **3** | **132.8s** | **44.3s** | **3/3** |
+
+旧逻辑把并发钳到**代理池大小**，单代理部署下 `concurrency` 设置完全失效
+（批次日志恒为 `size=1`）。现在 `max_per_proxy` 才是显式的「每出口并发数」开关
+（0=不限），钳制按 `pool_size × max_per_proxy`。
+
+> 并发轮询会让 tempmail 偶发 `Read timed out`。1.8.13 起传输层错误重试 3 次
+> （0.4/0.8 秒退避），4xx 不重试（那是真实应答）—— 此前一次读超时会直接打断
+> 等待循环并烧掉整个 OTP 窗口（实测 3 并发中 1 个因此失败，同账号串行时成功）。
 
 ### 6.8 完成日志与排障输出
 

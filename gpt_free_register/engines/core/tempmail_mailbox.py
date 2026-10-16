@@ -105,7 +105,10 @@ class TempMailMailbox(BaseMailbox):
     MIN_REMAINING_TTL_SECS = 180
     # multi 模式默认自己生成 17 级子域名（abc@mail2.mx1.smtp3.….example.com）。
     # 0 = 交给 tempmail 生成：它会拼 10~14 级 gmail/yahoo/proton… 单词，地址又长又像伪装。
-    DEFAULT_SUBDOMAIN_DEPTH = 17
+    # 10 层：每层约 32,112 个标签，单域名可用地址约 10^63，地址空间远非瓶颈，
+    # 同时把地址长度控制在 ~102 字符（RFC 5321 上限 254）。实测 1-17 层投递表现一致，
+    # 深度不是投递的决定因素 —— 域名才是（见 docs/gpt-register.md §3.2.1）。
+    DEFAULT_SUBDOMAIN_DEPTH = 10
     # 24 级实测可用（地址仍在上限内）；再深地址会逼近 RFC 5321 的 254 字符上限。
     # 改这里要同步 services/gpt_register_service.py 的 TEMPMAIL_MAX_SUBDOMAIN_DEPTH。
     MAX_SUBDOMAIN_DEPTH = 24

@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
-  <a href="./CHANGELOG.md">v1.8.9</a> ·
+  <a href="./CHANGELOG.md">v1.8.13</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/waifu2x.md">waifu2x</a> ·
@@ -33,6 +33,7 @@
 | 文本接口 | 已关闭：`/v1/grok/chat/completions`、纯文本 `/v1/chat/completions` 返回 400；只保留生图兼容接口 |
 | GPT Free 批量注册 | 设置页「GPT注册」：内置 `gpt_free_register` 纯协议注册 free 号并入库 ChatGPT 号池；入库后自动刷新额度；无 refresh 的号标 `session_only`（**可生图**） |
 | 账号出口隔离 | 绑定了 `proxy` 的号只走该出口，不回落 runtime / 全局 / 直连；注册浏览器指纹写入号池。一号一 IP 需要注册代理池 |
+| 协议逆向对齐 | `docs/openai-protocol-reverse.md` 记录 `/f/conversation` 全链路逆向结论（sentinel 头名映射、PoW 算法、`OAI-Echo-Logs`/`OAI-Telemetry`、octane prepare 头、Turnstile VM 指令集）；客户端按 TLS 目标派生自洽的 UA + 客户端提示 |
 | 导入脚本 | `scripts/import_grok_cliproxy_auth.py` 批量导入 `type=xai` cliproxy JSON |
 | waifu2x 超分 | 非官方封装 [www.waifu2x.net](https://www.waifu2x.net/)：`POST /v1/waifu2x` / `/v1/images/upscale`，见 [docs/waifu2x.md](./docs/waifu2x.md) |
 | 豆包网页生图 | 非官方封装 www.doubao.com `/chat/completion`（ImageGeneration）：`POST /v1/doubao`，见 [docs/doubao.md](./docs/doubao.md) |
@@ -270,10 +271,12 @@ environment:
   - **Codex 补 refresh**：入库后不再自动跑；号池行上钥匙图标可手动补（`POST /api/accounts/codex-upgrade`）。手动补是二次登录，可能踢掉当前 session
   - **已有 session 号补 refresh**：号池管理 → ChatGPT → 行上钥匙图标 / 工具栏「Codex 补 refresh」（`POST /api/accounts/codex-upgrade`，无需浏览器粘贴 callback）
 - 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填；默认自动补号，保持号池至少 1 个可生图账号
+- **并发**：`concurrency` 不再被代理池大小钳制（1.8.13 起）。单代理部署下 3 并发实测 132.8 秒完成 3 号（44.3 秒/号），串行需 250.9 秒。要限制每个出口的并发数用 `max_per_proxy`（0=不限）
+- **收信域名**：`tempmail_domains` 是逐号轮换的域名池（1.8.13 起真正生效）。投递能力是**域名级**的 —— 实测 `5122331.xyz` 在 depth 1/10/12/17 全部可投递，而 `233159.xyz`、`awa91.cyou` 建号 API 返回 200 但邮件永远不到，`cyt233.dpdns.org` 命中 DBL 黑名单。`tempmail_subdomain_depth` 默认 10（单域名可用地址约 10^63，地址空间不是瓶颈）
 - 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`、`/cancel`
 - 成功账号进入 **ChatGPT 号池**（不进 Grok）；默认 `push_mode=local` 进程内入库
 - 密钥放 `data/gpt_register.env` 或环境变量；SOCKS 需 `PySocks`
-- 文档：[docs/gpt-register.md](./docs/gpt-register.md)（§6.7 / §6.7.1 耗时优化与 Codex 补 refresh）· 运维：[docs/operations.md](./docs/operations.md)
+- 文档：[docs/gpt-register.md](./docs/gpt-register.md)（§6.7 稳定性优化、§6.8 耗时与并发）· 运维：[docs/operations.md](./docs/operations.md)
 
 ### 实验性 / 规划中
 
