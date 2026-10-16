@@ -18,6 +18,7 @@ auth.openai.com 打 30+ 个请求，出口中途变化会被 Cloudflare 判成�
 from __future__ import annotations
 
 import os
+import threading
 import re
 import uuid
 from pathlib import Path
@@ -127,6 +128,104 @@ def _split_proxy_url(value: str):
     return match.group("user"), match.group("password") or "", host
 
 
+# Gateways measured to refuse a ``user.<session_id>`` suffix. Learned at runtime
+# from the first ``curl: (97)`` rejection so every later call site skips the
+# suffix instead of each one rediscovering it. Keyed by host:port, since the
+# credential shape is a property of the gateway, not of one call path.
+_STICKY_REJECTED_GATEWAYS: set[str] = set()
+_STICKY_REJECTED_LOCK = threading.Lock()
+
+
+def note_sticky_rejected(proxy: Optional[str]) -> None:
+    """Remember that this gateway refused a suffixed username.
+
+    Called after a ``curl: (97)`` on a suffixed proxy. ``apply_sticky_session``
+    then stops adding the suffix for that gateway, which fixes every call site
+    at once — the register warmup, the Codex upgrade and the CLI runner all
+    resolve their proxy through here.
+    """
+    value = normalize_proxy_url(proxy)
+    if not value:
+        return
+    split = _split_proxy_url(value)
+    if not split:
+        return
+    with _STICKY_REJECTED_LOCK:
+        _STICKY_REJECTED_GATEWAYS.add(split[2])
+
+
+def sticky_rejected_gateways() -> set[str]:
+    """Gateways known to refuse a sticky suffix (test/introspection hook)."""
+    with _STICKY_REJECTED_LOCK:
+        return set(_STICKY_REJECTED_GATEWAYS)
+
+
+_STICKY_PROBE_CACHE: dict[str, bool] = {}
+_STICKY_PROBE_LOCK = threading.Lock()
+
+
+def sticky_suffix_accepted(proxy: Optional[str], *, timeout: float = 6.0) -> bool:
+    """Does this gateway accept the username as given? Cached per gateway+user.
+
+    Performs only the SOCKS5 greeting/auth exchange — no CONNECT, no TLS — so it
+    costs one round trip and answers exactly the question that matters: will the
+    proxy refuse this credential? A ``curl: (97)`` rejection happens at auth
+    time, so a greeting-level probe reproduces it faithfully.
+
+    Returns True when the credential is accepted or the probe is inconclusive
+    (never turn a network hiccup into a downgrade). Cached per ``user@host:port``
+    because the answer is a property of the credential, not of one request.
+    """
+    value = normalize_proxy_url(proxy)
+    if not value:
+        return True
+    split = _split_proxy_url(value)
+    if not split:
+        return True
+    user, password, host = split
+    cache_key = f"{user}@{host}"
+    with _STICKY_PROBE_LOCK:
+        cached = _STICKY_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    accepted = True
+    try:
+        import socket
+
+        hostname, _, port_text = host.rpartition(":")
+        port = int(port_text or "1080")
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(bytes([0x05, 0x01, 0x02]))
+            reply = sock.recv(2)
+            if len(reply) == 2 and reply[1] == 0x02:
+                ub, pb = user.encode("utf-8"), password.encode("utf-8")
+                sock.sendall(bytes([0x01, len(ub)]) + ub + bytes([len(pb)]) + pb)
+                status = sock.recv(2)
+                accepted = len(status) == 2 and status[1] == 0x00
+            elif len(reply) == 2 and reply[1] == 0x00:
+                accepted = True
+            else:
+                accepted = True
+    except Exception:  # noqa: BLE001 — inconclusive must not downgrade
+        return True
+
+    with _STICKY_PROBE_LOCK:
+        _STICKY_PROBE_CACHE[cache_key] = accepted
+    if not accepted:
+        note_sticky_rejected(value)
+    return accepted
+
+
+def reset_sticky_probe_cache() -> None:
+    """Forget probe results (tests, or after a deliberate credential change)."""
+    with _STICKY_PROBE_LOCK:
+        _STICKY_PROBE_CACHE.clear()
+    with _STICKY_REJECTED_LOCK:
+        _STICKY_REJECTED_GATEWAYS.clear()
+
+
 def apply_sticky_session(proxy: Optional[str], session_id: Optional[str] = None) -> Optional[str]:
     """Pin a rotating proxy to one exit IP by suffixing the username.
 
@@ -142,6 +241,8 @@ def apply_sticky_session(proxy: Optional[str], session_id: Optional[str] = None)
       · the username already carries a session suffix (contains ".")
       · the proxy has no credentials to suffix
       · REGISTER_PROXY_STICKY is explicitly disabled
+      · this gateway already refused a suffixed username (see
+        ``note_sticky_rejected``)
     """
     value = normalize_proxy_url(proxy)
     if not value:
@@ -162,6 +263,10 @@ def apply_sticky_session(proxy: Optional[str], session_id: Optional[str] = None)
     user, password, host = split
     if "." in user:
         # Already sticky.
+        return value
+    if host in sticky_rejected_gateways():
+        # This gateway refuses suffixes outright; adding one would turn a
+        # working proxy into a dead one.
         return value
 
     sid = str(session_id or "").strip() or sticky_session_id()

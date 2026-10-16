@@ -42,6 +42,42 @@ class AutoCodexUpgradeSettingsTest(unittest.TestCase):
             pass
 
 
+class CodexAuthorizeHintTest(unittest.TestCase):
+    """The Codex OTP request must ask to *log in*, not to sign up.
+
+    ``codex_upgrade`` targets an address that already has an account, but it
+    copied ``screen_hint: "signup"`` from the registration body. Asking to sign
+    up an existing address makes the auth session look stale and
+    ``authorize/continue`` answers
+
+        409 {"code": {"value": "invalid_state"},
+             "message": "Your sign-in session is no longer valid. ..."}
+
+    Registration's own Codex step uses ``login`` for exactly this reason
+    (``register.py::_acquire_codex_callback``). Measured 2026-10-16: flipping
+    the hint took the same call from 409 to 200 + ``email_otp_verification``.
+    """
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        return (root / "gpt_free_register" / "codex_upgrade.py").read_text(encoding="utf-8")
+
+    def test_the_continue_body_asks_to_log_in(self):
+        source = self._source()
+        self.assertIn('"screen_hint": "login"', source)
+        self.assertNotIn('"screen_hint": "signup"', source)
+
+    def test_the_register_codex_step_also_uses_login(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        register = (root / "gpt_free_register" / "engines" / "platforms" / "chatgpt"
+                    / "register.py").read_text(encoding="utf-8")
+        self.assertIn('"screen_hint":"login"', register)
+
+
 class CodexUpgradeServiceTest(unittest.TestCase):
     def test_apply_tokens_replaces_old_session_row(self):
         from services.codex_upgrade_service import apply_codex_tokens_to_pool

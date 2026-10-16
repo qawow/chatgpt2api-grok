@@ -615,6 +615,72 @@ class StickySuffixRejectionTest(unittest.TestCase):
         self.assertFalse(is_socks5_user_rejected(None))
 
 
+class StickyGatewayMemoTest(unittest.TestCase):
+    """A gateway that refused a suffix once must never be suffixed again.
+
+    The register warmup, the Codex upgrade and the CLI runner each resolve their
+    proxy independently. Fixing only one call site left the Codex upgrade dying
+    with ``curl: (97)`` on ``ob.oa488dae5820ef`` even though registration had
+    already learned the pool refuses suffixes. The memo makes the fix global.
+    """
+
+    def setUp(self):
+        from core.proxy_env import reset_sticky_probe_cache
+
+        reset_sticky_probe_cache()
+        self.addCleanup(reset_sticky_probe_cache)
+
+    def test_note_marks_the_gateway_and_stops_the_suffix(self):
+        from core.proxy_env import (
+            apply_sticky_session,
+            note_sticky_rejected,
+            sticky_rejected_gateways,
+        )
+
+        bare = "socks5h://fixture-user:fixture-pass@proxy.invalid:2260"
+        self.assertEqual(
+            apply_sticky_session(bare, "s1"),
+            "socks5h://fixture-user.s1:fixture-pass@proxy.invalid:2260",
+        )
+        note_sticky_rejected("socks5h://fixture-user.s1:fixture-pass@proxy.invalid:2260")
+        self.assertIn("proxy.invalid:2260", sticky_rejected_gateways())
+        # Every later call site now gets the bare credential.
+        self.assertEqual(apply_sticky_session(bare, "s2"), bare)
+
+    def test_the_memo_is_scoped_to_one_gateway(self):
+        from core.proxy_env import apply_sticky_session, note_sticky_rejected
+
+        note_sticky_rejected("socks5h://u.s1:p@rejecting.invalid:2260")
+        # A different gateway must keep its sticky behaviour.
+        self.assertEqual(
+            apply_sticky_session("socks5h://u:p@other.invalid:2260", "s1"),
+            "socks5h://u.s1:p@other.invalid:2260",
+        )
+
+    def test_a_credentialless_proxy_is_ignored(self):
+        from core.proxy_env import note_sticky_rejected, sticky_rejected_gateways
+
+        note_sticky_rejected("socks5h://host.invalid:1080")
+        note_sticky_rejected("")
+        note_sticky_rejected(None)
+        self.assertNotIn("host.invalid:1080", sticky_rejected_gateways())
+
+    def test_the_probe_is_inconclusive_on_a_dead_gateway(self):
+        """A network hiccup must never downgrade a working credential."""
+        from core.proxy_env import sticky_rejected_gateways, sticky_suffix_accepted
+
+        # Port 1 on loopback refuses instantly; the probe must answer True
+        # (undetermined) rather than declaring the credential rejected.
+        self.assertTrue(sticky_suffix_accepted("socks5h://u:p@127.0.0.1:1", timeout=0.5))
+        self.assertEqual(sticky_rejected_gateways(), set())
+
+    def test_the_probe_ignores_a_proxy_without_credentials(self):
+        from core.proxy_env import sticky_suffix_accepted
+
+        self.assertTrue(sticky_suffix_accepted("socks5h://host.invalid:1080"))
+        self.assertTrue(sticky_suffix_accepted(None))
+
+
 class WarmupStickyFallbackTest(unittest.TestCase):
     """warmup must drop the suffix and retry instead of dying with oai_did_missing."""
 

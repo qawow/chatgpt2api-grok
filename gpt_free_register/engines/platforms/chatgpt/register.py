@@ -1042,7 +1042,7 @@ class RegistrationEngine:
         ``初始化会话失败: oai_did_missing``. Returns True when the session was
         rebound and the caller should retry once.
         """
-        from core.proxy_env import is_socks5_user_rejected, strip_sticky_session
+        from core.proxy_env import is_socks5_user_rejected, note_sticky_rejected, strip_sticky_session
 
         if not is_socks5_user_rejected(exc):
             return False
@@ -1050,6 +1050,10 @@ class RegistrationEngine:
         bare = strip_sticky_session(current)
         if not bare or bare == current:
             return False
+        # Teach the pool that this gateway refuses suffixes, so the Codex
+        # upgrade and the CLI runner skip the suffix too instead of each one
+        # rediscovering the rejection.
+        note_sticky_rejected(current)
         try:
             self._rebind_session(bare)
         except Exception as rebind_exc:

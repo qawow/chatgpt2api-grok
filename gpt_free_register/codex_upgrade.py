@@ -179,9 +179,24 @@ def obtain_codex_tokens_for_email(
         _bootstrap(engines_dir)
         _apply_env_overrides(cfg)
 
-        from core.proxy_env import mask_proxy, resolve_proxy
+        from core.proxy_env import (
+            mask_proxy,
+            resolve_proxy,
+            sticky_suffix_accepted,
+            strip_sticky_session,
+        )
 
         proxy = resolve_proxy(cfg.get("proxy") if _clean(cfg.get("proxy")) else None)
+        # A gateway that already refused a suffixed username in this process is
+        # handled by apply_sticky_session, but a cold start has no such memory.
+        # Probe the credential once (SOCKS5 auth only, cached) and fall back to
+        # the bare form, so this path never dies on curl (97) just because
+        # registration has not run yet in this process.
+        if proxy and not sticky_suffix_accepted(proxy):
+            bare = strip_sticky_session(proxy)
+            if bare and bare != proxy:
+                _append(f"SOCKS5 拒绝 sticky 用户名，回退到裸凭据: {mask_proxy(bare)}")
+                proxy = bare
         _ensure_runtime_deps(proxy)
         _append(f"[codex-upgrade] email={addr} proxy={mask_proxy(proxy) if proxy else '(none)'}")
 
@@ -313,8 +328,16 @@ def obtain_codex_tokens_for_email(
                 separators=(",", ":"),
             )
 
+        # ``screen_hint`` must be ``login``: this path targets an account that
+        # already exists. Registration's own Codex step uses ``login`` for the
+        # same reason (register.py::_acquire_codex_callback), but this module
+        # copied the *signup* hint from the registration body. Asking to sign
+        # up an existing address makes the auth session look stale, and the
+        # endpoint answers 409 invalid_state ("Your sign-in session is no
+        # longer valid. Please start over to continue.") instead of the
+        # expected email_otp_verification page.
         signup_body = json.dumps(
-            {"username": {"value": addr, "kind": "email"}, "screen_hint": "signup"}
+            {"username": {"value": addr, "kind": "email"}, "screen_hint": "login"}
         )
         signup_resp = login_session.post(
             OPENAI_API_ENDPOINTS["signup"], headers=signup_headers, data=signup_body
