@@ -21,7 +21,42 @@ from services.log_service import (
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 from utils.log import logger
-from utils.network_diagnostics import error_details, proxy_identity
+from utils.network_diagnostics import error_details, proxy_identity, response_diagnostics
+
+
+def _auth_dead_verdict(response: Any) -> bool | None:
+    """Did ``/backend-api/me`` confirm the Bearer is dead?
+
+    Returns ``True`` only for a real auth denial, ``False`` for a response that
+    is explicitly *not* an auth decision (a challenge or a rate limit), and
+    ``None`` when the status carries no verdict either way.
+
+    The distinction matters because a 403 is ambiguous on chatgpt.com: the edge
+    answers a challenged or rate-limited client with 403 plus an HTML or
+    "Unusual activity" body, while a revoked Bearer also answers 403. Only the
+    latter may park an account. ``response_diagnostics`` already classifies the
+    body and headers, so the verdict is derived from one shared definition
+    instead of a second, drifting copy of the challenge markers.
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status == 401:
+        return True
+    if status != 403:
+        return None
+    try:
+        diagnostics = response_diagnostics(
+            status,
+            str(getattr(response, "text", "") or ""),
+            dict(getattr(response, "headers", {}) or {}),
+        )
+    except Exception:  # noqa: BLE001 — diagnostics must never kill an account
+        return None
+    kind = str(diagnostics.get("failure_kind") or "")
+    if kind == "http_forbidden":
+        return True
+    if kind in {"challenge", "rate_limit"}:
+        return False
+    return None
 
 
 class AccountService:
@@ -865,9 +900,20 @@ class AccountService:
                 )
                 if resp.status_code == 200:
                     return True
-                if resp.status_code in {401, 403}:
+                # A 403 is NOT proof of a revoke. chatgpt.com answers a
+                # challenged or rate-limited client with 403 + an HTML/"Unusual
+                # activity" body, and with one egress shared by a whole pool
+                # that happens routinely. Treating it as "confirmed dead"
+                # permanently parks a healthy account (measured: 19 of 50
+                # accounts were marked 异常 without ever serving a request).
+                # Only a real auth denial may return False.
+                verdict = _auth_dead_verdict(resp)
+                if verdict is True:
                     saw_auth_dead = True
                     return False
+                # verdict False (challenge / rate limit) and None (no verdict)
+                # both leave the token undetermined, so the caller must not
+                # treat it as dead.
                 return None
             except Exception as exc:
                 if _is_egress_connect_error(str(exc)):

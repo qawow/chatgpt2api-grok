@@ -12,7 +12,14 @@ _HTTP_STATUS = re.compile(
     r"status(?:_code)?[\"']?[\s_:=]+)([1-5]\d{2})(?!\d)", re.I,
 )
 _CURL_CODE = re.compile(r"\bcurl\s*:\s*\((\d+)\)", re.I)
-_CHALLENGE_MARKERS = ("cf-chl-", "cf_chl_", "/cdn-cgi/challenge-platform/", "just a moment", "cf-mitigated")
+_CHALLENGE_MARKERS = (
+    "cf-chl-", "cf_chl_", "/cdn-cgi/challenge-platform/", "just a moment", "cf-mitigated",
+    # chatgpt.com answers a device/sentinel-level rejection with this body and a
+    # JSON content-type, so a content-type check alone classifies it as a plain
+    # 403. It is a challenge, not an auth decision: a revoked Bearer never
+    # carries this text.
+    "unusual activity",
+)
 
 
 def proxy_identity(proxy: object) -> dict[str, str]:
