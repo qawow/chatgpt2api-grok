@@ -80,6 +80,8 @@ def _create_cfd1(extra: dict, proxy: str | None) -> 'BaseMailbox':
 
 def _create_tempmail(extra: dict, proxy: str | None) -> 'BaseMailbox':
     import os
+    import random
+    import re
     from core.proxy_env import load_dotenv
     from core.tempmail_mailbox import TempMailMailbox
 
@@ -101,10 +103,25 @@ def _create_tempmail(extra: dict, proxy: str | None) -> 'BaseMailbox':
     if not proxy:
         proxy = str(os.getenv("TEMPMAIL_PROXY") or "").strip() or None
 
+    # ``tempmail_domains`` is the pool field the service rotates per registration
+    # (see GptRegisterService.mail_domain_setting_keys). This factory used to read
+    # only the singular ``tempmail_domain``, so a pool configured in the UI never
+    # reached the mailbox: the server then picked a domain at random and could
+    # land on one that does not deliver (measured: awa91.cyou and 233159.xyz
+    # accept the API call but no mail ever arrives, while 5122331.xyz delivers in
+    # 0.5-5s). Honour the pool when the singular field is empty.
+    pool = _pick("tempmail_domains", "TEMPMAIL_DOMAINS")
+    domain = _pick("tempmail_domain", "TEMPMAIL_DOMAIN")
+    if not domain and pool:
+        candidates = [item.strip().lstrip("@").lower() for item in re.split(r"[\s,;]+", pool)]
+        candidates = [item for item in candidates if item and "." in item]
+        if candidates:
+            domain = random.choice(candidates)
+
     return TempMailMailbox(
         base_url=_pick("tempmail_base_url", "TEMPMAIL_BASE_URL"),
         api_key=_pick("tempmail_api_key", "TEMPMAIL_API_KEY"),
-        domain=_pick("tempmail_domain", "TEMPMAIL_DOMAIN"),
+        domain=domain,
         mode=_pick("tempmail_mode", "TEMPMAIL_MODE"),
         subdomain_depth=_pick("tempmail_subdomain_depth", "TEMPMAIL_SUBDOMAIN_DEPTH",
                               default=str(TempMailMailbox.DEFAULT_SUBDOMAIN_DEPTH)),

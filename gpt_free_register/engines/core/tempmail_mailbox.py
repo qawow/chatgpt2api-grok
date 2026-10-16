@@ -216,13 +216,30 @@ class TempMailMailbox(BaseMailbox):
         if remaining > 0:
             raise TempMailError(f"tempmail 限流静默中，还剩 {remaining:.0f}s", status=429)
         url = f"{self.base_url}/api/{path.lstrip('/')}"
-        try:
-            resp = self._http().request(
-                method, url, json=json_body, params=params,
-                proxies=self.proxy, timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
-            raise TempMailError(f"tempmail 请求失败 {method} /api/{path}: {exc}") from exc
+        # A single read timeout used to abort the whole call. Under concurrent
+        # registration the poll loop hits this endpoint several times a second
+        # and the self-hosted service occasionally answers slower than the 15s
+        # read budget; one dropped poll then burned the OTP window and the
+        # account was lost (measured 2026-10-16: 1 of 3 concurrent registrations
+        # died on `Read timed out` while the same account succeeded serially).
+        # Retry transient transport errors only — a 4xx is a real answer.
+        attempts = 3
+        resp = None
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = self._http().request(
+                    method, url, json=json_body, params=params,
+                    proxies=self.proxy, timeout=self.timeout,
+                )
+                break
+            except requests.RequestException as exc:
+                if attempt >= attempts:
+                    raise TempMailError(
+                        f"tempmail 请求失败 {method} /api/{path}: {exc}"
+                    ) from exc
+                time.sleep(0.4 * attempt)
+        if resp is None:  # pragma: no cover — the loop breaks or raises
+            raise TempMailError(f"tempmail 请求失败 {method} /api/{path}: no response")
         self._note_server_clock(resp)
         try:
             data = resp.json() if (resp.text or "").strip() else {}

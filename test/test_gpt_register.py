@@ -841,3 +841,89 @@ class RegisterJobRobustnessTests(unittest.TestCase):
             self.assertIn("old-3.json", names)
             self.assertNotIn("old-2.json", names)
             self.assertNotIn("old-0.json", names)
+
+
+class ConcurrencyClampTest(unittest.TestCase):
+    """单代理不得把并发钳成 1。
+
+    旧逻辑把并发钳到**代理池大小**，于是单代理部署下 concurrency 设置完全
+    失效（批次恒为 size=1）。实测 2026-10-16：同一出口 3 并发注册 70.5s
+    完成 3/3，串行需 251s —— 钳制白丢约 3.5 倍吞吐。
+
+    ``max_per_proxy`` 才是显式的「每个出口允许几个并发」开关（0=不限）。
+    """
+
+    def _service(self):
+        import tempfile
+        from pathlib import Path
+
+        from services.gpt_register_service import GptRegisterConfig, GptRegisterService
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return GptRegisterService(
+            config_store=GptRegisterConfig(path=Path(tmp.name) / "cfg.json")
+        )
+
+    def _run(self, settings_over: dict) -> tuple[int, list[str]]:
+        """Start a job and capture the effective concurrency from its logs."""
+        from services.gpt_register_service import normalize_settings
+
+        svc = self._service()
+        settings = normalize_settings({
+            "count": 3, "run_mode": "inprocess", "push_enabled": False,
+            "executor": "protocol", "mail_provider": "tempmail",
+            "tempmail_base_url": "https://mail.example.com",
+            "tempmail_api_key": "tm_fixture_key",
+            "proxy": "socks5h://u:p@h:1080",
+            **settings_over,
+        })
+        logs: list[str] = []
+        with mock.patch.object(svc, "_register_once", side_effect=lambda s: {
+            "ok": True, "email": "x@y.z", "has_token": True, "added": 0,
+            "push": {"ok": True}, "error": None, "logs": [], "mode": "inprocess",
+        }):
+            with mock.patch.object(svc, "_append_log",
+                                   side_effect=lambda jid, m, level="info": logs.append(str(m))):
+                job = svc.start_job(settings)
+                import time as _t
+                for _ in range(200):
+                    cur = svc.get_job(job["job_id"])
+                    if cur and cur.get("status") in {"done", "failed", "cancelled"}:
+                        break
+                    _t.sleep(0.05)
+        effective = 0
+        for line in logs:
+            m = __import__("re").search(r"批次 indexes=\d+-\d+ size=(\d+)", line)
+            if m:
+                effective = max(effective, int(m.group(1)))
+        return effective, logs
+
+    def test_a_single_proxy_does_not_force_serial(self):
+        effective, logs = self._run({"concurrency": 3, "max_per_proxy": 0})
+        self.assertEqual(effective, 3, msg="\n".join(logs))
+        self.assertTrue(any("每个出口约承载" in l for l in logs), msg="\n".join(logs))
+
+    def test_max_per_proxy_is_the_explicit_limit(self):
+        effective, logs = self._run({"concurrency": 3, "max_per_proxy": 1})
+        self.assertEqual(effective, 1, msg="\n".join(logs))
+        self.assertTrue(any("钳到" in l for l in logs), msg="\n".join(logs))
+
+    def test_a_multi_proxy_pool_multiplies_the_budget(self):
+        pool = "socks5h://u:p@a:1080\nsocks5h://u:p@b:1080"
+        effective, logs = self._run({"count": 4, "concurrency": 4,
+                                     "max_per_proxy": 2, "proxy": pool})
+        self.assertEqual(effective, 4, msg="\n".join(logs))
+
+    def test_a_multi_proxy_pool_without_a_limit_keeps_the_request(self):
+        pool = "socks5h://u:p@a:1080\nsocks5h://u:p@b:1080"
+        effective, logs = self._run({"count": 4, "concurrency": 4,
+                                     "max_per_proxy": 0, "proxy": pool})
+        self.assertEqual(effective, 4, msg="\n".join(logs))
+
+    def test_a_multi_proxy_pool_still_clamps_below_the_budget(self):
+        pool = "socks5h://u:p@a:1080\nsocks5h://u:p@b:1080"
+        effective, logs = self._run({"count": 4, "concurrency": 4,
+                                     "max_per_proxy": 1, "proxy": pool})
+        self.assertEqual(effective, 2, msg="\n".join(logs))
+        self.assertTrue(any("钳到 2" in l for l in logs), msg="\n".join(logs))

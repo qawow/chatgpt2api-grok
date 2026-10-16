@@ -716,3 +716,104 @@ class RunnerWiringTests(unittest.TestCase):
         self.assertEqual(TempMailMailbox(subdomain_depth=TEMPMAIL_MAX_SUBDOMAIN_DEPTH,
                                         base_url="https://m", api_key="k").subdomain_depth,
                          TEMPMAIL_MAX_SUBDOMAIN_DEPTH)
+
+
+class DomainPoolTests(TempmailTestCase):
+    """``tempmail_domains`` 必须真的到达 mailbox。
+
+    该字段是服务层按次注册轮换的域名池（见
+    ``GptRegisterService.mail_domain_setting_keys``），但工厂只读了单数的
+    ``tempmail_domain``，于是 UI 里配的域名池从未生效：服务端随机挑域名，
+    可能挑到不投递的那个。实测 2026-10-16：``awa91.cyou`` 与 ``233159.xyz``
+    建号 API 返回 200 但邮件永远不到（0 封），而 ``5122331.xyz`` 0.5-5s 到达。
+    """
+
+    def _extra(self, **over):
+        base = {"tempmail_base_url": self.base_url, "tempmail_api_key": GOOD_KEY,
+                "tempmail_mode": "multi"}
+        base.update(over)
+        return base
+
+    def test_pool_is_honoured_when_the_singular_field_is_empty(self):
+        box = create_mailbox("tempmail", extra=self._extra(
+            tempmail_domains="5122331.xyz", tempmail_domain=""))
+        self.addCleanup(box.close)
+        self.assertEqual(box.domain, "5122331.xyz")
+
+    def test_singular_field_wins(self):
+        box = create_mailbox("tempmail", extra=self._extra(
+            tempmail_domains="5122331.xyz", tempmail_domain="awa91.cyou"))
+        self.addCleanup(box.close)
+        self.assertEqual(box.domain, "awa91.cyou")
+
+    def test_a_multi_domain_pool_is_sampled(self):
+        seen = set()
+        for _ in range(30):
+            box = create_mailbox("tempmail", extra=self._extra(
+                tempmail_domains="5122331.xyz, awa91.cyou", tempmail_domain=""))
+            self.addCleanup(box.close)
+            seen.add(box.domain)
+        self.assertEqual(seen, {"5122331.xyz", "awa91.cyou"})
+
+    def test_an_empty_pool_falls_back_to_server_choice(self):
+        box = create_mailbox("tempmail", extra=self._extra(
+            tempmail_domains="", tempmail_domain=""))
+        self.addCleanup(box.close)
+        self.assertEqual(box.domain, "")
+
+    def test_leading_at_and_whitespace_are_normalised(self):
+        box = create_mailbox("tempmail", extra=self._extra(
+            tempmail_domains=" @5122331.xyz ", tempmail_domain=""))
+        self.addCleanup(box.close)
+        self.assertEqual(box.domain, "5122331.xyz")
+
+
+class RequestRetryTests(TempmailTestCase):
+    """瞬时传输错误必须重试，否则一次读超时会烧掉整个 OTP 窗口。
+
+    实测 2026-10-16：3 并发注册中 1 个死在
+    ``Read timed out. (read timeout=15.0)``，而同一账号串行时成功。
+    """
+
+    def test_a_transient_transport_error_is_retried(self):
+        import requests
+
+        box = TempMailMailbox(base_url=self.base_url, api_key=GOOD_KEY)
+        self.addCleanup(box.close)
+        calls = {"n": 0}
+        good = mock.Mock(status_code=200, text='{"ok": true}')
+        good.json.return_value = {"ok": True}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise requests.ConnectionError("Read timed out. (read timeout=15.0)")
+            return good
+
+        with mock.patch.object(box, "_http") as http:
+            http.return_value.request.side_effect = flaky
+            data = box._request("GET", "domains")
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(calls["n"], 2)
+
+    def test_a_persistent_transport_error_still_raises(self):
+        import requests
+
+        box = TempMailMailbox(base_url=self.base_url, api_key=GOOD_KEY)
+        self.addCleanup(box.close)
+        with mock.patch.object(box, "_http") as http:
+            http.return_value.request.side_effect = requests.ConnectionError("down")
+            with self.assertRaises(TempMailError):
+                box._request("GET", "domains")
+            self.assertEqual(http.return_value.request.call_count, 3)
+
+    def test_a_client_error_is_not_retried(self):
+        box = TempMailMailbox(base_url=self.base_url, api_key=GOOD_KEY)
+        self.addCleanup(box.close)
+        bad = mock.Mock(status_code=401, text='{"error": "bad key"}')
+        bad.json.return_value = {"error": "bad key"}
+        with mock.patch.object(box, "_http") as http:
+            http.return_value.request.return_value = bad
+            with self.assertRaises(TempMailError):
+                box._request("GET", "domains")
+            self.assertEqual(http.return_value.request.call_count, 1)

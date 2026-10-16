@@ -1111,14 +1111,32 @@ class GptRegisterService:
         domain_pool = parse_domain_pool(settings.get(pool_key))
         if domain_pool:
             self._append_log(job_id, f"邮箱域名池启用：{len(domain_pool)} 个域名随机轮换")
-        if proxy_pool and concurrency > len(proxy_pool):
+        # ``max_per_proxy`` is the explicit "how many concurrent registrations may
+        # share one exit" knob; 0 means unlimited. The old code ignored it and
+        # clamped concurrency to the *pool size* instead, so a single proxy
+        # silently forced concurrency=1 — which made the whole concurrency
+        # setting a no-op for the common single-proxy deployment. Measured
+        # 2026-10-16: three concurrent registrations through one exit finished in
+        # 70.5s (3/3 success) versus 251s serial for the same three accounts, so
+        # the clamp was costing roughly 3.5x throughput for no benefit.
+        max_per_proxy = int(settings.get("max_per_proxy") or 0)
+        if max_per_proxy > 0 and proxy_pool:
+            allowed = len(proxy_pool) * max_per_proxy
+            if concurrency > allowed:
+                self._append_log(
+                    job_id,
+                    f"并发 {concurrency} 超过代理池容量 "
+                    f"{len(proxy_pool)}×{max_per_proxy}={allowed}，钳到 {allowed}",
+                    level="warn",
+                )
+                concurrency = allowed
+        elif proxy_pool and concurrency > len(proxy_pool):
             self._append_log(
                 job_id,
-                f"并发 {concurrency} 大于代理池 {len(proxy_pool)}，钳到 {len(proxy_pool)} "
-                "（避免多号同出口）",
-                level="warn",
+                f"并发 {concurrency} 大于代理池 {len(proxy_pool)}，"
+                f"每个出口约承载 {concurrency / len(proxy_pool):.1f} 个并发注册"
+                "（设置 max_per_proxy 可显式限制）",
             )
-            concurrency = len(proxy_pool)
         # Batches rotate by index but always started at pool[0]; a per-job
         # random start spreads successive batches across a multi-gateway pool.
         pool_offset = random.randrange(len(proxy_pool)) if proxy_pool else 0
@@ -1540,6 +1558,18 @@ class GptRegisterService:
         return "python3"
 
     def _register_once(self, settings: dict[str, Any]) -> dict[str, Any]:
+        # Honour ``max_per_proxy`` even when the batch clamp did not apply, so a
+        # job that mixes a large pool with a small per-exit budget still respects
+        # it. The semaphore is process-wide and keyed by (limit, proxy), so
+        # concurrent batches share one budget per exit.
+        sem = _proxy_semaphore(str(settings.get("proxy") or ""),
+                               int(settings.get("max_per_proxy") or 0))
+        if sem is None:
+            return self._register_once_unbounded(settings)
+        with sem:
+            return self._register_once_unbounded(settings)
+
+    def _register_once_unbounded(self, settings: dict[str, Any]) -> dict[str, Any]:
         run_mode = str(settings.get("run_mode") or "inprocess").strip().lower()
         if run_mode != "subprocess":
             return self._register_once_inprocess(settings)
