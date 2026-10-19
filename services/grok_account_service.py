@@ -34,9 +34,13 @@ def _clean(value: object) -> str:
 
 
 _AUTH_ERROR_RE = re.compile(
-    r"\bauth_40[13]\b|\brefresh_40[13]\b|\bhttp 40[13]\b|\bunauthorized\b|\bforbidden\b|\binvalid_token\b",
+    r"\bauth_40[13]\b|\brefresh_40[13]\b|\bhttp 40[13]\b|\bunauthorized\b|\bforbidden\b"
+    r"|\binvalid_token\b|\binvalid_grant\b",
     re.IGNORECASE,
 )
+# OAuth 2.0 error code for a dead refresh token (RFC 6749 §5.2). Authoritative
+# regardless of the HTTP status that carries it.
+_INVALID_GRANT_RE = re.compile(r"\binvalid_grant\b", re.IGNORECASE)
 _RATE_LIMIT_ERROR_RE = re.compile(r"\bhttp 429\b|\brate[_ ]limit(?:ed)?\b", re.IGNORECASE)
 
 
@@ -46,14 +50,33 @@ def _classify_failure(status: int | None, error: str) -> str:
     A known HTTP status wins. The text fallback only matches explicit markers:
     a bare "401"/"403" substring appeared in attempt logs, IDs and body excerpts
     of perfectly healthy responses.
+
+    ``invalid_grant`` counts as "auth" even though the token endpoint answers
+    HTTP 400: per RFC 6749 §5.2 it means the refresh token is invalid, expired
+    or revoked — a permanent state that retrying cannot fix. Measured
+    2026-10-19: a pool account whose access_token expired 85 days earlier got
+    ``HTTP 400 invalid_grant`` on every refresh, yet stayed 「正常」 and kept
+    being selected because only 401/403 were treated as auth failures.
     """
     if status in {401, 403}:
         return "auth"
     if status == 429:
         return "rate_limited"
+    text = str(error or "")
+    # ``invalid_grant`` is checked *before* the generic status fallback, and only
+    # it: it is an OAuth 2.0 error code (RFC 6749 §5.2), not a stray substring,
+    # and the token endpoint reports a dead refresh token as HTTP 400 +
+    # invalid_grant. Letting the 400 downgrade that to "other" left a permanently
+    # dead account looking 「正常」 (measured 2026-10-19: access_token expired 85
+    # days earlier, every refresh rejected, row still selectable).
+    #
+    # The broader ``_AUTH_ERROR_RE`` stays *after* the status check on purpose:
+    # ``_classify_failure(502, "HTTP 403 somewhere in attempts")`` must remain
+    # "other" — a real status is authoritative over incidental text.
+    if _INVALID_GRANT_RE.search(text):
+        return "auth"
     if status is not None:
         return "other"
-    text = str(error or "")
     if _AUTH_ERROR_RE.search(text):
         return "auth"
     if _RATE_LIMIT_ERROR_RE.search(text):
@@ -364,13 +387,17 @@ class GrokAccountService:
                 proxy=_clean(account.get("proxy")) or None,
             )
         except GrokBackendError as exc:
-            # If the refresh_token itself is revoked (401/403), the account is
-            # permanently dead — mark 异常 so _is_available excludes it and the
-            # watcher can attempt recovery on the next probe cycle. Previously
-            # this silently returned the old account, causing every subsequent
-            # request to fail with 401 without any status change.
-            if getattr(exc, "status", None) in {401, 403}:
-                self.mark_result(token, False, error=f"refresh_{exc.status}", status=exc.status)
+            # A dead refresh_token is permanent — mark 异常 so _is_available
+            # excludes it and the watcher can attempt recovery on the next probe
+            # cycle. Previously this silently returned the old account, causing
+            # every subsequent request to fail with 401 without any status
+            # change. Classification goes through _classify_failure rather than a
+            # bare {401, 403} set because xAI's token endpoint reports a dead
+            # refresh token as ``HTTP 400 invalid_grant``, which the old check
+            # missed entirely.
+            if _classify_failure(getattr(exc, "status", None), str(exc)) == "auth":
+                self.mark_result(token, False, error=str(exc)[:300],
+                                 status=getattr(exc, "status", None))
             return dict(account)
         except Exception as exc:
             # Non-auth errors (network, JSON parse) — record but don't mark 异常
@@ -591,12 +618,24 @@ class GrokAccountService:
                         self._save()
             except GrokBackendError as exc:
                 errors.append({"access_token": token[:16] + "...", "error": str(exc)[:200]})
+                # A permanent auth failure must flip the row to 异常, not just
+                # record last_error: the pool would otherwise keep selecting a
+                # credential whose refresh token is dead. Measured 2026-10-19 —
+                # an account whose access_token expired 85 days earlier kept
+                # reporting 「正常」 after every refresh returned
+                # ``HTTP 400 invalid_grant``, because this branch only wrote
+                # last_error. Transient failures (network blips) stay 正常.
+                verdict = _classify_failure(getattr(exc, "status", None), str(exc))
                 with self._lock:
                     current = self._accounts.get(token)
                     if current:
                         current = dict(current)
                         current["last_error"] = str(exc)[:300]
                         current["last_error_at"] = _now_iso()
+                        if verdict == "auth":
+                            current["status"] = "异常"
+                        elif verdict == "rate_limited":
+                            current["status"] = "限流"
                         self._accounts[token] = current
                         self._save()
             except Exception as exc:

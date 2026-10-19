@@ -140,6 +140,11 @@ def _proxies(proxy: str | None, *, explicit: bool = False) -> dict[str, str] | N
     return {"http": value, "https": value}
 
 
+# Same-egress retries for a transient TLS/EOF blip before the egress is written
+# off. See ``proxy_service.is_transient_tls_error`` for the measured rationale.
+_EGRESS_TLS_ATTEMPTS = 3
+
+
 def _request(
     method: str,
     url: str,
@@ -148,34 +153,62 @@ def _request(
     timeout: float = 30.0,
     **kwargs: Any,
 ):
-    """POST/GET grok.com walking account → runtime → global → direct egress."""
-    from services.proxy_service import _is_egress_connect_error, proxy_settings
+    """POST/GET grok.com walking account → runtime → global → direct egress.
+
+    A transient TLS/EOF blip is retried on the *same* egress before falling
+    back. Without this, one dropped handshake was reported as a dead proxy: the
+    request blacklisted a healthy egress and fell through to ``direct``, which
+    has no route here, so the caller saw a 30s ``Read timed out`` that hid the
+    real cause (measured on the remote 2026-10-19 — Grok refresh failed with
+    ``refresh network error: HTTPSConnectionPool(host='auth.x.ai' ...) Read
+    timed out`` while the proxy itself answered in 0.4s).
+    """
+    from services.proxy_service import (
+        _is_egress_connect_error,
+        is_transient_tls_error,
+        proxy_settings,
+    )
 
     last_error: Exception | None = None
+    primary_error: Exception | None = None
     profile = proxy_settings.get_profile(account=account or {}, upstream=True)
     kwargs.setdefault("verify", not (profile.runtime_enabled and profile.skip_ssl_verify))
     deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
-    for _source, proxy_url in proxy_settings.list_egress_candidates(
-        account=account or {}, upstream=True
+    for index, (_source, proxy_url) in enumerate(
+        proxy_settings.list_egress_candidates(account=account or {}, upstream=True)
     ):
-        remaining = deadline - time.monotonic() if deadline is not None else timeout
-        if deadline is not None and remaining <= 0:
-            raise requests.Timeout("Grok egress timeout budget exhausted") from last_error
-        try:
-            resp = getattr(_http(), method)(
-                url,
-                timeout=remaining,
-                proxies=_proxies(proxy_url, explicit=True),
-                **kwargs,
-            )
-            return resp
-        except requests.RequestException as exc:
-            last_error = exc
-            if not _is_egress_connect_error(str(exc)):
-                raise
-            from services.proxy_service import mark_egress_unusable
+        # Only a real proxy gets retries; ``direct`` (empty url) is a single shot
+        # so a blocked direct route cannot eat the whole budget in retries.
+        attempts = _EGRESS_TLS_ATTEMPTS if (proxy_url and index == 0) else 1
+        for attempt in range(1, attempts + 1):
+            remaining = deadline - time.monotonic() if deadline is not None else timeout
+            if deadline is not None and remaining <= 0:
+                raise requests.Timeout("Grok egress timeout budget exhausted") from last_error
+            try:
+                resp = getattr(_http(), method)(
+                    url,
+                    timeout=remaining,
+                    proxies=_proxies(proxy_url, explicit=True),
+                    **kwargs,
+                )
+                return resp
+            except requests.RequestException as exc:
+                last_error = exc
+                if primary_error is None:
+                    primary_error = exc
+                if attempt < attempts and is_transient_tls_error(str(exc), method=method):
+                    time.sleep(0.3 * attempt)
+                    continue
+                if not _is_egress_connect_error(str(exc)):
+                    raise
+                from services.proxy_service import mark_egress_unusable
 
-            mark_egress_unusable(proxy_url, str(exc))
+                mark_egress_unusable(proxy_url, str(exc))
+                break
+    # Prefer the primary (proxy) failure: the fallback's error is normally a
+    # direct-egress timeout that hides the real cause.
+    if primary_error is not None:
+        raise primary_error
     if last_error is not None:
         raise last_error
     raise requests.RequestException("no grok egress candidate")

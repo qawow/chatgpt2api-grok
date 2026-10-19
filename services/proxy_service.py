@@ -130,6 +130,63 @@ def _is_egress_connect_error(message: str) -> bool:
     )
 
 
+# A TLS handshake that dies mid-flight is a *transient* blip, not evidence of a
+# dead egress. The pool in front of this deployment drops roughly 25-50% of
+# *new* TLS handshakes with `UNEXPECTED_EOF_WHILE_READING` while reusing a
+# keep-alive connection succeeded 8/8 (measured 2026-10-19). urllib3 wraps that
+# blip as "Max retries exceeded", which ``_is_egress_connect_error`` matches, so
+# the old code wrote a one-packet blip off as a dead proxy: it blacklisted a
+# healthy egress and fell through to ``direct``, which has no route here and
+# hangs for the whole budget. Retrying the *same* egress is what converts.
+#
+# Split in two tiers because retrying a non-idempotent request is only safe when
+# the request provably never left the client:
+#
+#   * ``_HANDSHAKE_EOF_MARKERS`` — the TLS handshake failed, so no HTTP request
+#     was written. Safe to retry any method, including POST.
+#   * ``_AMBIGUOUS_IO_MARKERS`` — the socket died at an unknown stage; the
+#     server may have processed the request. Retried only for idempotent
+#     methods, so a POST that rotated a single-use credential cannot be replayed
+#     with the now-stale value.
+_HANDSHAKE_EOF_MARKERS = (
+    "unexpected_eof_while_reading",
+    "unexpected_eof",
+    "eof occurred in violation of protocol",
+    "ssleoferror",
+)
+_AMBIGUOUS_IO_MARKERS = (
+    "connection reset",
+    "connectionreset",
+    "connection aborted",
+    "remotedisconnected",
+    "remote end closed connection",
+    "bad record mac",
+    "tlsv1 alert",
+)
+
+_IDEMPOTENT_METHODS = frozenset({"get", "head", "options", "put", "delete", "trace"})
+
+
+def is_transient_tls_error(message: str, *, method: str = "", idempotent: bool = False) -> bool:
+    """True when a failure is a retryable blip on an otherwise live egress.
+
+    Deliberately narrower than ``_is_egress_connect_error``: this only covers
+    handshakes that *started* and then died, so callers can retry the same egress
+    instead of treating it as dead. Genuine connect failures (refused, unknown
+    host, tunnel failed) are excluded — those really do mean the egress is gone.
+
+    A handshake EOF is always retryable: the request never reached the server.
+    Ambiguous socket deaths are retryable only when the caller says the call is
+    idempotent (``idempotent=True``, or a method in ``_IDEMPOTENT_METHODS``).
+    """
+    text = str(message or "").lower()
+    if any(token in text for token in _HANDSHAKE_EOF_MARKERS):
+        return True
+    if not (idempotent or str(method or "").strip().lower() in _IDEMPOTENT_METHODS):
+        return False
+    return any(token in text for token in _AMBIGUOUS_IO_MARKERS)
+
+
 @dataclass(frozen=True)
 class FetchedResponse:
     content: bytes

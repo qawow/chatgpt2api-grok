@@ -587,3 +587,161 @@ class GrokImageRoutingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeadRefreshTokenTest(unittest.TestCase):
+    """A dead refresh_token must mark the account 异常, not leave it 「正常」.
+
+    Measured 2026-10-19 on the remote pool: the only account's access_token had
+    expired 85 days earlier and every refresh returned
+
+        HTTP 400 {"error":"invalid_grant","error_description":"Invalid or
+        unknown refresh token"}
+
+    yet the row stayed 「正常」 and kept being selected, because only 401/403
+    were treated as auth failures and ``_classify_failure`` returned "other" for
+    any other explicit status before it ever looked at the error text.
+
+    Per RFC 6749 §5.2 ``invalid_grant`` means the refresh token is invalid,
+    expired or revoked — permanent, so retrying cannot fix it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.svc = GrokAccountService(path=Path(self.tmp.name) / "grok_accounts.json")
+
+    def test_invalid_grant_is_classified_as_auth(self):
+        from services.grok_account_service import _classify_failure
+
+        self.assertEqual(
+            _classify_failure(
+                400,
+                'refresh failed: HTTP 400: {"error":"invalid_grant",'
+                '"error_description":"Invalid or unknown refresh token"}',
+            ),
+            "auth",
+        )
+
+    def test_mark_result_marks_abnormal_on_invalid_grant(self):
+        self.svc.add_account_items([{
+            "type": "xai", "email": "dead@example.com",
+            "access_token": "at-dead", "refresh_token": "rt-dead", "status": "正常",
+        }])
+        self.svc.mark_result(
+            "at-dead", False,
+            error='refresh failed: HTTP 400: {"error":"invalid_grant"}',
+            status=400,
+        )
+        self.assertEqual(self.svc.list_accounts()[0]["status"], "异常")
+
+    def test_a_bare_status_number_still_does_not_mark_abnormal(self):
+        """The stray-digit protection must survive the reordering."""
+        from services.grok_account_service import _classify_failure
+
+        self.assertEqual(
+            _classify_failure(400, "generate_image failed attempts=3 ids=[401,403]"),
+            "other",
+        )
+        self.assertEqual(_classify_failure(None, "random error 401 403"), "other")
+
+    def test_ensure_fresh_marks_the_account_abnormal(self):
+        """The refresh path must not silently return the old account."""
+        from services import grok_backend_api as grok
+
+        self.svc.add_account_items([{
+            "type": "xai", "email": "dead@example.com",
+            "access_token": "at-dead", "refresh_token": "rt-dead", "status": "正常",
+            "expired": "2020-01-01T00:00:00Z",
+        }])
+        account = self.svc.list_accounts()[0]
+
+        def boom(*args, **kwargs):
+            raise grok.GrokBackendError(
+                'refresh failed: HTTP 400: {"error":"invalid_grant"}', status=400
+            )
+
+        with mock.patch.object(grok, "refresh_access_token", side_effect=boom):
+            with mock.patch(
+                "services.grok_account_service.refresh_access_token",
+                side_effect=boom, create=True,
+            ):
+                self.svc.ensure_fresh_account(account, force=True)
+
+        self.assertEqual(self.svc.list_accounts()[0]["status"], "异常")
+
+    def test_a_transient_network_failure_does_not_mark_abnormal(self):
+        """A blip must not retire a healthy account."""
+        from services import grok_backend_api as grok
+
+        self.svc.add_account_items([{
+            "type": "xai", "email": "ok@example.com",
+            "access_token": "at-ok", "refresh_token": "rt-ok", "status": "正常",
+            "expired": "2020-01-01T00:00:00Z",
+        }])
+        account = self.svc.list_accounts()[0]
+
+        def boom(*args, **kwargs):
+            raise grok.GrokBackendError(
+                "refresh network error: Read timed out.", status=None
+            )
+
+        with mock.patch(
+            "services.grok_account_service.refresh_access_token",
+            side_effect=boom, create=True,
+        ):
+            self.svc.ensure_fresh_account(account, force=True)
+
+        self.assertEqual(self.svc.list_accounts()[0]["status"], "正常")
+
+    def test_refresh_accounts_marks_abnormal_on_invalid_grant(self):
+        """The bulk-refresh path must flip the row, not only record last_error.
+
+        This is the path behind ``POST /api/grok/accounts/refresh``. It used to
+        write last_error and leave status untouched, so a permanently dead
+        credential kept reporting 「正常」 and kept being selected.
+        """
+        from services import grok_backend_api as grok
+
+        self.svc.add_account_items([{
+            "type": "xai", "email": "dead@example.com",
+            "access_token": "at-dead", "refresh_token": "rt-dead", "status": "正常",
+        }])
+
+        def boom(*args, **kwargs):
+            raise grok.GrokBackendError(
+                'refresh failed: HTTP 400: {"error":"invalid_grant",'
+                '"error_description":"Invalid or unknown refresh token"}',
+                status=400,
+            )
+
+        with mock.patch(
+            "services.grok_account_service.refresh_access_token",
+            side_effect=boom, create=True,
+        ):
+            result = self.svc.refresh_accounts()
+
+        self.assertEqual(result["refreshed"], 0)
+        self.assertEqual(len(result["errors"]), 1)
+        row = self.svc.list_accounts()[0]
+        self.assertEqual(row["status"], "异常")
+        self.assertIn("invalid_grant", row["last_error"])
+
+    def test_refresh_accounts_keeps_a_network_blip_healthy(self):
+        from services import grok_backend_api as grok
+
+        self.svc.add_account_items([{
+            "type": "xai", "email": "ok@example.com",
+            "access_token": "at-ok", "refresh_token": "rt-ok", "status": "正常",
+        }])
+
+        def boom(*args, **kwargs):
+            raise grok.GrokBackendError("refresh network error: Read timed out.")
+
+        with mock.patch(
+            "services.grok_account_service.refresh_access_token",
+            side_effect=boom, create=True,
+        ):
+            self.svc.refresh_accounts()
+
+        self.assertEqual(self.svc.list_accounts()[0]["status"], "正常")
