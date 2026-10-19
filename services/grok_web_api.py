@@ -757,6 +757,215 @@ def search(query: str, *, cookies: Any = None, bearer: str | None = None,
     }
 
 
+# --------------------------------------------------------------------------
+# 额度 / 限流
+# --------------------------------------------------------------------------
+
+# 生图额度的**真实端点**是 `POST /rest/media/imagine/quota_info`（body `{}`），
+# 返回 5 个类别，每类 23 字段（bundle 提取，见 docs/grok-web-protocol.md §1.7）：
+#
+#   {estimate: {remainingImageGenFast1k, remainingImageGenFast2k,
+#               remainingImageGenQuality1k, remainingImageGenQuality2k,
+#               remainingImageEditQuality1k, remainingImageEditQuality2k,
+#               remainingT2v{480,720,1080}pSeconds,
+#               remainingI2v{480,720,1080}pSeconds,
+#               remainingR2v{480,720,1080}pSeconds,
+#               remainingExtension{480,720,1080}pSeconds},
+#    shouldShow, imagineFreeCreditActive,
+#    imagineFreeCreditAllowance, imagineFreeCreditRemaining}
+#
+# **实测该端点对 OAuth2 token 用户返回 403**
+# （`WKE=unauthorized:oauth2-auth-forbidden`），但生图本身可用 ——
+# 即额度是服务端强制、OAuth2 用户不可查询。可查的替代见
+# :func:`free_usage_gates` 与 :func:`cli_rate_limits`。
+QUOTA_INFO_PATH = "/rest/media/imagine/quota_info"
+FREE_USAGE_GATES_PATH = "/rest/usage/free-usage-gates"
+
+# CLI 路径（cli-chat-proxy）返回的真实限流头。
+CLI_BASE = "https://cli-chat-proxy.grok.com/v1"
+CLI_RATELIMIT_HEADERS = (
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+)
+
+# 生图额度类别（quota_info 的顶层键）
+QUOTA_CATEGORIES = ("image", "imagePro", "imageEdit", "video", "video720p")
+
+# 单个类别的 estimate 字段全集
+QUOTA_ESTIMATE_FIELDS = (
+    "remainingImageGenFast1k", "remainingImageGenFast2k",
+    "remainingImageGenQuality1k", "remainingImageGenQuality2k",
+    "remainingImageEditQuality1k", "remainingImageEditQuality2k",
+    "remainingT2v480pSeconds", "remainingT2v720pSeconds", "remainingT2v1080pSeconds",
+    "remainingI2v480pSeconds", "remainingI2v720pSeconds", "remainingI2v1080pSeconds",
+    "remainingR2v480pSeconds", "remainingR2v720pSeconds", "remainingR2v1080pSeconds",
+    "remainingExtension480pSeconds", "remainingExtension720pSeconds",
+    "remainingExtension1080pSeconds",
+)
+
+
+def _as_int(value: Any) -> int:
+    """把额度字段转成 int —— 服务端会给**字符串**（`"0"`）与数字两种形态。"""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def free_usage_gates(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """`GET /rest/usage/free-usage-gates` —— 免费层用量闸门。
+
+    返回 `{"chat": {...}, "imagine": {...}, "voice": {...}, "build": {...}}`，
+    每个是 `{allowance, remaining}`（客户端语义，见 bundle 的
+    `function o(e){return {allowance:n(e.allowance), remaining:n(e.remaining)}}`）。
+
+    **实测（2026-10-19）**：三个 OAuth2 凭证全部返回 `0/0`，**但生图可用** ——
+    说明这个闸门只对免费网页用户生效，OAuth2 token 用户走另一条额度路径。
+    不要用它判断能否生图。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    resp = _stream_get(
+        f"{WEB_BASE}{FREE_USAGE_GATES_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            raise GrokWebError(f"用量闸门 HTTP {resp.status_code}", status=resp.status_code)
+        data = resp.json()
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for gate in ("chat", "imagine", "voice", "build"):
+        value = data.get(gate)
+        if isinstance(value, dict):
+            out[gate] = {
+                "allowance": _as_int(value.get("allowance")),
+                "remaining": _as_int(value.get("remaining")),
+            }
+        else:
+            out[gate] = {"allowance": 0, "remaining": 0}
+    return out
+
+
+def imagine_quota(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """`POST /rest/media/imagine/quota_info` —— 生图额度（权威端点）。
+
+    返回 5 个类别（见 :data:`QUOTA_CATEGORIES`），每类含
+    `estimate`（19 个 `remaining*` 字段）、`shouldShow`、
+    `imagineFreeCreditActive/Allowance/Remaining`，顶层另有
+    `maxVideoDurationSeconds`。
+
+    **实测对 OAuth2 token 用户返回 403**（`oauth2-auth-forbidden`）。
+    这不是代码问题 —— 服务端策略把该端点限定给网页会话。
+    调用方应捕获 :class:`GrokWebError` 并回退到
+    :func:`free_usage_gates` 或 :func:`cli_rate_limits`。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    try:
+        resp = _stream_post(
+            f"{WEB_BASE}{QUOTA_INFO_PATH}",
+            headers=build_headers(bearer=token, referer=f"{WEB_BASE}/imagine"),
+            cookies=jar,
+            body={},
+            proxy=proxy,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise GrokWebError(f"额度查询失败: {exc}") from exc
+    with resp:
+        if resp.status_code == 403:
+            raise GrokWebError(
+                "生图额度端点对 OAuth2 token 用户不可用（oauth2-auth-forbidden）",
+                status=403,
+                body=(resp.text or "")[:300],
+            )
+        if resp.status_code != 200:
+            raise GrokWebError(f"额度查询 HTTP {resp.status_code}",
+                               status=resp.status_code, body=(resp.text or "")[:300])
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def cli_rate_limits(
+    bearer: str,
+    *,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+    probe: bool = True,
+    probe_model: str = "grok-4.7",
+) -> dict[str, Any]:
+    """CLI 路径（`cli-chat-proxy`）的真实限流额度，从响应头读。
+
+    **这是 OAuth2 用户唯一可用的额度接口。** 实测（2026-10-19）：
+
+        x-ratelimit-limit-requests: 21
+        x-ratelimit-limit-tokens: 1000000
+        x-ratelimit-remaining-requests: 21
+        x-ratelimit-remaining-tokens: 1000000
+
+    窗口内会递减（实测连发时出现过 `16/21`），窗口重置后回到满值。
+
+    **只有 `POST /responses` 带这些头** —— `/models` 不带（实测确认）。
+    所以探测会真的发一次最小对话（`max_output_tokens` 压到最小）。
+    `probe=False` 时只读 `/models`（不消耗额度，但通常拿不到头）。
+    """
+    token = str(bearer or "").strip()
+    if not token:
+        raise GrokWebError("缺少 bearer")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "grok-cli/1.0.62",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": "1.0.62",
+        "x-grok-client-identifier": "grok-shell",
+        "Accept": "application/json",
+    }
+    if probe:
+        resp = _stream_post(
+            f"{CLI_BASE}/responses",
+            headers=headers,
+            cookies=None,
+            body={"model": probe_model, "input": [{"role": "user", "content": "hi"}],
+                  "max_output_tokens": 1},
+            proxy=proxy,
+            timeout=timeout,
+        )
+    else:
+        resp = _stream_get(f"{CLI_BASE}/models", headers=headers, cookies=None,
+                           proxy=proxy, timeout=timeout)
+    with resp:
+        if resp.status_code != 200:
+            raise GrokWebError(f"限流探测 HTTP {resp.status_code}", status=resp.status_code)
+        raw_headers = resp.headers
+    out: dict[str, Any] = {}
+    for name in CLI_RATELIMIT_HEADERS:
+        raw = raw_headers.get(name)
+        out[name.replace("x-ratelimit-", "")] = _as_int(raw) if raw is not None else None
+    return out
+
+
 def download_image(
     key: str,
     *,

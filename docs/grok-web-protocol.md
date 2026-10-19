@@ -175,22 +175,111 @@ collections_search, file_search, code_execution, code_interpreter, mcp, shell, t
 **但生图是例外** —— 用 `modelName: "build"` 就能出图（见 §1.6）。
 即：OAuth2 token 用户在网页路径上**没有可用的对话模型，但有可用的生图模型**。
 
-### 1.5 权限是端点级的
+### 1.5 生图额度接口（2026-10-19 实测）
 
-同一凭证在网页路径上：
+**三个额度端点，只有 CLI 那个对 OAuth2 用户可用。**
+
+#### 权威端点：`POST /rest/media/imagine/quota_info`
+
+bundle 提取（`js/29p4h4iryyz76.js`，`mediaGetImagineQuotaInfoRaw`）：
+
+```js
+// 请求
+{path:"/rest/media/imagine/quota_info", method:"POST", body:{}}   // body 为空对象
+
+// 响应 transformer
+{image: et(t.image), imagePro: et(t.imagePro), imageEdit: et(t.imageEdit),
+ video: et(t.video), video720p: et(t.video720p),
+ maxVideoDurationSeconds: t.maxVideoDurationSeconds}
+```
+
+每个类别 **23 字段**（`et()` 原文提取）：
+
+```jsonc
+{
+  "estimate": {
+    "remainingImageGenFast1k": 0,      "remainingImageGenFast2k": 0,
+    "remainingImageGenQuality1k": 0,   "remainingImageGenQuality2k": 0,
+    "remainingImageEditQuality1k": 0,  "remainingImageEditQuality2k": 0,
+    "remainingT2v480pSeconds": 0,      "remainingT2v720pSeconds": 0,
+    "remainingT2v1080pSeconds": 0,
+    "remainingI2v480pSeconds": 0,      "remainingI2v720pSeconds": 0,
+    "remainingI2v1080pSeconds": 0,
+    "remainingR2v480pSeconds": 0,      "remainingR2v720pSeconds": 0,
+    "remainingR2v1080pSeconds": 0,
+    "remainingExtension480pSeconds": 0, "remainingExtension720pSeconds": 0,
+    "remainingExtension1080pSeconds": 0
+  },
+  "shouldShow": true,
+  "imagineFreeCreditActive": true,
+  "imagineFreeCreditAllowance": 10,
+  "imagineFreeCreditRemaining": 7
+}
+```
+
+字段语义：`ImageGen` = 文生图，`ImageEdit` = 图生图/编辑，
+`Fast`/`Quality` = 速度档，`1k`/`2k` = 分辨率档；
+`T2v`/`I2v`/`R2v` = text/image/reference-to-video；
+`Extension` = 视频续接。视频类单位是**秒**。
+
+客户端轮询逻辑（`js/2bbm9n6clh3_p.js` `fetchQuotas`）：
+- 只在页面 visible 时轮询，间隔 **≥5 秒**（`lastFetchedAt` 节流）
+- 生图完成后立即重取（`generationSeq` 变化触发）
+- `LOW_GENERATION_THRESHOLD = 3` —— 剩余 ≤3 时弹低额度提示
+- 401/403 时置 `authBlocked` 并停止轮询
+
+**实测：403 `oauth2-auth-forbidden`** —— 该端点被服务端策略限定给网页会话，
+OAuth2 token 用户查不到。但**生图本身可用**（§1.6）→ 额度是服务端强制、客户端不可查。
+
+#### 免费层闸门：`GET /rest/usage/free-usage-gates`
+
+```js
+// 客户端解析（js/1nina2n46pgtw.js）
+function o(e){ return void 0===e ? {allowance:0,remaining:0}
+                : {allowance:n(e.allowance), remaining:n(e.remaining)} }
+async function i(){ return {
+  chat:    o((await rateLimitsApi.rateLimitsGetFreeUsageGates()).chat),
+  imagine: o(e.imagine), voice: o(e.voice), build: o(e.build) } }
+```
+
+**实测：三个凭证全部 `0/0`，但生图可用** —— 这个闸门只对免费网页用户生效，
+**不要用它判断能否生图**。
+
+#### 唯一可用的：CLI 路径的限流响应头
+
+```
+POST https://cli-chat-proxy.grok.com/v1/responses
+  → x-ratelimit-limit-requests: 21
+    x-ratelimit-limit-tokens: 1000000
+    x-ratelimit-remaining-requests: 21
+    x-ratelimit-remaining-tokens: 1000000
+```
+
+**只有 `/responses` 带这些头** —— `/models` 不带（实测确认）。
+窗口内会递减（连发时观察到 `16/21`），窗口重置后回到满值。
+
+#### 其它额度相关端点（实测）
 
 | 端点 | 结果 |
 |---|---|
-| `GET /rest/app-chat/conversations` | ✅ 200 `{"conversations":[],"textSearchMatches":[]}` |
-| `GET /rest/app-chat/conversations-many` | ✅ 200 |
-| `GET /rest/app-chat/conversation-starters` | ❌ 403 `Action cannot be performed by OAuth2 token users` |
-| `GET /rest/app-chat/image-generations` | ❌ 403 同上 |
-| `GET /rest/app-chat/suggestions` | ❌ 403 同上 |
-| `POST /rest/app-chat/quick-answer` | ❌ 403 同上 |
+| `GET /rest/tasks/usage` | ✅ 200 `{"frequentUsage":0,"frequentLimit":2,"occasionalUsage":0,"occasionalLimit":10}` |
+| `GET /rest/assets/storage-usage` | ✅ 200 `{"totalStorageBytes":"1073741824","usedStorageBytes":"0",...}`（1 GiB） |
+| `GET /rest/subscriptions` | ✅ 200 `{"subscriptions":[]}` ← **无订阅** |
+| `POST /rest/rate-limits` | ❌ 403 oauth2-forbidden（body `{requestKind, modelName}`） |
+| `GET /rest/media/imagine/generation_estimate` | ❌ 403（POST 返回 501，是 GET 端点） |
+| `GET /rest/products` | ❌ 403 |
+| `GET /rest/usage/limits`、`/rest/credits`、`/rest/entitlements`、`/rest/billing/usage` | ❌ 404 不存在 |
 
-即：**只读会话列表可用，其余一律被 OAuth2 策略挡住**（`WKE=unauthorized:oauth2-auth-forbidden`）。
+`POST /rest/rate-limits` 的响应结构（bundle 提取，虽不可用但记下）：
 
----
+```jsonc
+{"windowSizeSeconds": 0, "remainingQueries": 0, "waitTimeSeconds": 0,
+ "totalQueries": 0, "remainingTokens": 0, "totalTokens": 0,
+ "lowEffortRateLimits":  {"provider","triggerType","dimensions","providerEnum",
+                          "triggerTypeEnum","dimensionEntries"},
+ "highEffortRateLimits": { /* 同上 */ },
+ "preGenerationDelayMs": 0}
+```
 
 ### 1.6 网页生图已打通（2026-10-19 实测）
 
@@ -286,6 +375,23 @@ Authorization: Bearer <access_token>      → 200, image/jpeg, 351,813 B, 784×1
 **只看 `progress` 会把失败帧误判成完成。** 必须同时检查
 `imageUrl` 是否存在与 `systemErrCode` / `renderToolRateLimited`。
 换凭证可绕过（实测第一个凭证限流后，第二个立即成功）。
+
+### 1.7 权限是端点级的
+
+同一凭证在网页路径上：
+
+| 端点 | 结果 |
+|---|---|
+| `GET /rest/app-chat/conversations` | ✅ 200 `{"conversations":[],"textSearchMatches":[]}` |
+| `GET /rest/app-chat/conversations-many` | ✅ 200 |
+| `GET /rest/app-chat/conversation-starters` | ❌ 403 `Action cannot be performed by OAuth2 token users` |
+| `GET /rest/app-chat/image-generations` | ❌ 403 同上 |
+| `GET /rest/app-chat/suggestions` | ❌ 403 同上 |
+| `POST /rest/app-chat/quick-answer` | ❌ 403 同上 |
+
+即：**只读会话列表可用，其余一律被 OAuth2 策略挡住**（`WKE=unauthorized:oauth2-auth-forbidden`）。
+
+---
 
 ## 2. 主对话端点
 
@@ -945,6 +1051,71 @@ grep -ohE 'async [a-zA-Z]+Raw\(' js_all/0a18uk1xp-t5a.js | sed 's/async //;s/($/
 要把网页对话当搜索用，需要新增一条 cookie 认证的客户端，不能复用现有 CLI 链路。
 
 ---
+
+## 12. 包结构分析（全量 1367 chunk）
+
+| 项 | 数量 |
+|---|---|
+| chunk（JS） | **1367** |
+| 总大小 | **56.2 MB** |
+| Turbopack 模块 | **2983** |
+| API 方法（`*Raw`） | **427** |
+| `/rest/` 路径 | **353** |
+| CSS | 6 |
+
+### 12.1 API 方法按域分布
+
+| 域 | 方法数 |
+|---|---|
+| `media*` | 90 |
+| `chat*` | 85 |
+| `workspace*` | 33 |
+| `grok*` | 33 |
+| `voice*` | 26 |
+| `build*` | 25 |
+| `auth*` | 25 |
+| `user*` | 20 |
+| `subscriptions*` | 18 |
+| `asset*` | 16 |
+| `automations*` | 13 |
+| `verified*` | 13 |
+| 其它（settings / files / system / notifications / models / sharing / suggestion / rate / skills） | 30 |
+
+### 12.2 `/rest/` 路径按域分布
+
+| 域 | 路径数 |
+|---|---|
+| `media` | 89 |
+| `app-chat` | 42 |
+| `auth` | 34 |
+| `connectors` | 23 |
+| `subscriptions` | 16 |
+| `grok-business` | 14 |
+| `grok-for-teams` | 13 |
+| `voice` | 10 |
+| `github` | 9 |
+| `agent-sandbox` | 6 |
+| `user-skills` | 6 |
+| `tasks` | 5 |
+| 其它 40 个域 | 86 |
+
+### 12.3 关键发现：入口 chunk 只占 8%
+
+`index.html` 只引用 **111** 个 chunk，但 bundle 内部还引用 **1257** 个懒加载 chunk。
+**流解析器 `processChunks`（模块 `180418`）就在懒加载里** —— 只看入口会得出
+「流格式未知」的错误结论。全量下载后 56.2 MB / 1367 个文件。
+
+### 12.4 客户端架构要点
+
+- **构建器**：Turbopack（存在 `turbopack-*.js`），chunk 名是 base36 短名
+- **无 `__NEXT_DATA__`**：改用 RSC flight（`self.__next_f`）
+- **API 客户端**：OpenAPI 生成（`DefaultApi` + `Configuration`），
+  方法名保留（`chatCreateConversationAndRespondRaw` 等），可直接检索
+- **认证**：`credentials:"include"`（Cookie）+ 服务端同时接受 `Authorization: Bearer`
+- **中间件**：`pre: tG`（注入 `x-xai-request-id`）+ `post: tk`（4xx/5xx 记录）
+- **反爬**：`fetchAndRecord4xx5xx` 检测 `403 + cf-mitigated: challenge` → 弹
+  Turnstile（sitekey `0x4AAAAAABSXp6OOe7EVGPnR`）→ `POST /api/verify-turnstile`
+  → 原样重放原请求
 
 ## 附：分析素材位置
 

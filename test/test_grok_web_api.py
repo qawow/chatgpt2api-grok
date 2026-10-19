@@ -796,3 +796,152 @@ class GenerateImageDedupeTest(unittest.TestCase):
         self.assertNotIn("-part-0", out["images"][0]["image_url"])
         self.assertEqual(len(out["failed"]), 1, "失败帧单独收集")
         self.assertEqual(out["failed"][0]["system_err_code"], 1006)
+
+
+class QuotaEndpointTest(unittest.TestCase):
+    """额度接口 —— 三个端点，只有 CLI 那个对 OAuth2 用户可用。
+
+    实测 2026-10-19：
+
+      GET  /rest/usage/free-usage-gates   ✅ 200，但三个凭证全是 0/0
+                                             （**生图却可用** ⇒ 别用它判断能否生图）
+      POST /rest/media/imagine/quota_info ❌ 403 oauth2-auth-forbidden
+      POST cli-chat-proxy/v1/responses    ✅ 带真实限流头
+                                             x-ratelimit-limit-requests: 21
+                                             x-ratelimit-limit-tokens: 1000000
+    """
+
+    def test_free_usage_gates_parses_all_four_gates(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "chat": {"allowance": "10", "remaining": "3"},
+            "imagine": {"allowance": "20", "remaining": "0"},
+            "voice": {"allowance": "5", "remaining": "5"},
+            "build": {"allowance": "0", "remaining": "0"},
+        }
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_get", return_value=resp):
+            out = g.free_usage_gates(bearer="tok")
+        self.assertEqual(out["chat"], {"allowance": 10, "remaining": 3})
+        self.assertEqual(out["imagine"], {"allowance": 20, "remaining": 0})
+        self.assertEqual(out["voice"]["remaining"], 5)
+        self.assertEqual(out["build"]["allowance"], 0)
+
+    def test_free_usage_gates_tolerates_missing_gates(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"chat": {"allowance": 1, "remaining": 1}}
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_get", return_value=resp):
+            out = g.free_usage_gates(bearer="tok")
+        self.assertEqual(out["imagine"], {"allowance": 0, "remaining": 0})
+
+    def test_quota_info_403_is_reported_as_auth_forbidden(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 403
+        resp.text = '{"code":7,"message":"Action cannot be performed by OAuth2 token users."}'
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_post", return_value=resp):
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.imagine_quota(bearer="tok")
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertIn("OAuth2", str(ctx.exception))
+
+    def test_quota_info_returns_the_payload_when_allowed(self):
+        from unittest import mock
+
+        payload = {
+            "image": {"estimate": {"remainingImageGenFast1k": 5,
+                                   "remainingImageGenQuality2k": 2},
+                      "shouldShow": True,
+                      "imagineFreeCreditActive": True,
+                      "imagineFreeCreditAllowance": 10,
+                      "imagineFreeCreditRemaining": 7},
+            "maxVideoDurationSeconds": 6,
+        }
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_post", return_value=resp):
+            out = g.imagine_quota(bearer="tok")
+        self.assertEqual(out["image"]["estimate"]["remainingImageGenFast1k"], 5)
+        self.assertEqual(out["maxVideoDurationSeconds"], 6)
+
+    def test_quota_categories_and_fields_match_the_bundle(self):
+        self.assertEqual(g.QUOTA_CATEGORIES,
+                         ("image", "imagePro", "imageEdit", "video", "video720p"))
+        self.assertEqual(len(g.QUOTA_ESTIMATE_FIELDS), 18)
+        for name in ("remainingImageGenFast1k", "remainingImageGenFast2k",
+                     "remainingImageGenQuality1k", "remainingImageGenQuality2k",
+                     "remainingImageEditQuality1k", "remainingImageEditQuality2k",
+                     "remainingT2v1080pSeconds", "remainingI2v1080pSeconds",
+                     "remainingR2v1080pSeconds", "remainingExtension1080pSeconds"):
+            self.assertIn(name, g.QUOTA_ESTIMATE_FIELDS)
+
+    def test_cli_rate_limits_reads_the_four_headers(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {
+            "x-ratelimit-limit-requests": "21",
+            "x-ratelimit-limit-tokens": "1000000",
+            "x-ratelimit-remaining-requests": "16",
+            "x-ratelimit-remaining-tokens": "999000",
+        }
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_post", return_value=resp):
+            out = g.cli_rate_limits("tok")
+        self.assertEqual(out["limit-requests"], 21)
+        self.assertEqual(out["remaining-requests"], 16)
+        self.assertEqual(out["limit-tokens"], 1000000)
+        self.assertEqual(out["remaining-tokens"], 999000)
+
+    def test_cli_rate_limits_probes_responses_not_models(self):
+        """`/models` 不带限流头 —— 必须打 `/responses`。"""
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_post", return_value=resp) as sp:
+            g.cli_rate_limits("tok")
+        self.assertIn("/responses", sp.call_args[0][0])
+
+    def test_cli_rate_limits_can_skip_the_probe(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_get", return_value=resp) as sg:
+            g.cli_rate_limits("tok", probe=False)
+        self.assertIn("/models", sg.call_args[0][0])
+
+    def test_cli_rate_limits_requires_a_bearer(self):
+        with self.assertRaises(g.GrokWebError):
+            g.cli_rate_limits("")
+
+    def test_as_int_handles_strings_and_garbage(self):
+        self.assertEqual(g._as_int("42"), 42)
+        self.assertEqual(g._as_int(42), 42)
+        self.assertEqual(g._as_int(None), 0)
+        self.assertEqual(g._as_int(""), 0)
+        self.assertEqual(g._as_int("abc"), 0)
