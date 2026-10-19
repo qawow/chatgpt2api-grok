@@ -490,3 +490,88 @@ class EndToEndAggregationTest(unittest.TestCase):
         body = post.call_args.kwargs["json"]
         self.assertEqual(body["kind"], "CONVERSATION_KIND_IMAGINE")
         self.assertEqual(body["mediaGenInput"]["textToImage"]["numOfImages"], 3)
+
+
+class ModelUnavailableTest(unittest.TestCase):
+    """`"Invalid request. Please update your client."` 是兜底文案，不是版本问题。
+
+    实测 2026-10-19：`grok-3` 在网页路径返回 200，会话被创建、用户消息被回显，
+    然后流里给这两条：
+
+        {"token":"Invalid request. Please update your client.","messageTag":"final"}
+        {"error":{"message":"This model is temporarily unavailable. ...",
+                  "modelNotAvailable":{},"severity":"STREAM_ERROR_SEVERITY_NORMAL"}}
+
+    只看 `token` 字段会误判成「客户端版本太旧」而去改请求头 —— 实测所有头变体
+    （octane / oai-device-id / Sec-Fetch / Accept-Language）都停在同一个错误。
+    """
+
+    def test_model_not_available_error_is_surfaced(self):
+        response = {"error": {"message": "This model is temporarily unavailable. "
+                                         "Please try a different model.",
+                              "modelNotAvailable": {},
+                              "severity": "STREAM_ERROR_SEVERITY_NORMAL"}}
+        reason = g.model_unavailable(response)
+        self.assertIsNotNone(reason)
+        self.assertIn("temporarily unavailable", reason)
+
+    def test_the_fallback_token_is_recognised(self):
+        response = {"token": "Invalid request. Please update your client.",
+                    "messageTag": "final"}
+        self.assertEqual(g.model_unavailable(response), g.CLIENT_UPDATE_NOTICE)
+
+    def test_a_normal_response_is_not_flagged(self):
+        for response in ({}, {"message": "hello"}, {"token": ""},
+                         {"error": None}, {"error": "not a dict"}):
+            self.assertIsNone(g.model_unavailable(response))
+
+    def test_a_generic_error_message_is_still_surfaced(self):
+        self.assertEqual(g.model_unavailable({"error": {"message": "boom"}}), "boom")
+
+    def test_the_two_chunks_of_a_real_failure_both_report(self):
+        """真实失败会先后给这两条，两条都要能识别。"""
+        first = {"token": "Invalid request. Please update your client.",
+                 "messageTag": "final", "responseId": "r1"}
+        second = {"error": {"message": "This model is temporarily unavailable.",
+                            "modelNotAvailable": {}}, "responseId": "r1"}
+        self.assertIsNotNone(g.model_unavailable(first))
+        self.assertIsNotNone(g.model_unavailable(second))
+
+
+class BearerAuthTest(unittest.TestCase):
+    """实况修正：网页路径接受 `Authorization: Bearer`，不是 Cookie。
+
+    实测：`GET /rest/app-chat/conversations` + Bearer → 200；
+    所有 cookie 名变体（sso / sso-rw / token / access_token /
+    __Secure-next-auth.session-token）全部 401。
+    """
+
+    def test_bearer_is_emitted_when_given(self):
+        headers = g.build_headers(bearer="tok-fixture")
+        self.assertEqual(headers["Authorization"], "Bearer tok-fixture")
+
+    def test_no_authorization_header_without_a_token(self):
+        self.assertNotIn("Authorization", g.build_headers())
+        self.assertNotIn("Authorization", g.build_headers(bearer=""))
+        self.assertNotIn("Authorization", g.build_headers(bearer="   "))
+
+    def test_stream_accepts_bearer_alone(self):
+        from unittest import mock
+
+        lines = ['{"result":{"response":{"message":"ok"}}}']
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.text = "\n".join(lines)
+        resp.iter_lines.return_value = [line.encode() for line in lines]
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g.requests, "post", return_value=resp) as post:
+            out = list(g.stream_conversation("hi", bearer="tok-fixture"))
+        self.assertEqual(len(out), 1)
+        sent = post.call_args.kwargs["headers"]
+        self.assertEqual(sent["Authorization"], "Bearer tok-fixture")
+
+    def test_no_auth_at_all_is_rejected_before_any_request(self):
+        with self.assertRaises(g.GrokWebError):
+            list(g.stream_conversation("hi"))

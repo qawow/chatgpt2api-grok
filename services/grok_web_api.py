@@ -235,6 +235,37 @@ def asset_url(key: Any) -> str | None:
     return f"{ASSET_SERVER_URL}/{key.lstrip('/')}"
 
 
+# 服务端在「模型不可用」时发的兜底文案。实测 2026-10-19：`grok-3` 通过名称
+# 校验但模型不可用，流里先给这句，再给真正的 `modelNotAvailable` 错误。
+CLIENT_UPDATE_NOTICE = "Invalid request. Please update your client."
+
+
+def model_unavailable(response: dict[str, Any]) -> str | None:
+    """模型不可用时返回原因，否则 None。
+
+    实测：`grok-3` 在网页路径返回 200，会话被创建、用户消息被回显，然后
+
+        {"token":"Invalid request. Please update your client.","messageTag":"final"}
+        {"error":{"message":"This model is temporarily unavailable. ...",
+                  "modelNotAvailable":{},"severity":"STREAM_ERROR_SEVERITY_NORMAL"}}
+
+    **`"Invalid request. Please update your client."` 是兜底文案**，真实原因是
+    `modelNotAvailable`。只看 `token` 字段会误判成「客户端版本太旧」而去改请求头，
+    那是一条死路（所有头变体都停在同一个错误）。
+    """
+    error = response.get("error")
+    if isinstance(error, dict):
+        if error.get("modelNotAvailable") is not None:
+            return str(error.get("message") or "model not available")
+        message = str(error.get("message") or "")
+        if message:
+            return message
+    token = response.get("token")
+    if isinstance(token, str) and CLIENT_UPDATE_NOTICE in token:
+        return CLIENT_UPDATE_NOTICE
+    return None
+
+
 def is_rejected(response: dict[str, Any]) -> str | None:
     """生图被拒时返回原因，否则 None。
 
@@ -329,24 +360,48 @@ def default_device_env() -> dict[str, Any]:
     }
 
 
-def build_headers(*, referer: str = f"{WEB_BASE}/") -> dict[str, str]:
+def build_headers(
+    *,
+    referer: str = f"{WEB_BASE}/",
+    bearer: str | None = None,
+) -> dict[str, str]:
     """必需请求头。
 
     前端显式设置的只有 `Content-Type` 与 `x-xai-request-id`；其余靠浏览器
     自动带（`credentials:"include"` 负责 Cookie）。
+
+    **实况修正（2026-10-19）**：静态逆向得出「网页路径用 Cookie」，但实测
+    `Authorization: Bearer <access_token>` **可用** ——
+    `GET /rest/app-chat/conversations` → 200；而所有 cookie 名变体
+    （`sso` / `sso-rw` / `token` / `access_token` /
+    `__Secure-next-auth.session-token`）全部 401。所以 `bearer` 是首选路径。
 
     常见误判：`x-statsig-id` 在 1367 个 chunk 里**无此字符串**；
     `x-app-version` / `x-device-model` / `x-device-vendor` 只存在于一个
     **无调用点**的遥测方法里；`x-app-language` / `x-app-timezone` 是
     WebSocket query 参数，不是 HTTP 头。
     """
-    return {
+    headers = {
         "Content-Type": "application/json",
         "x-xai-request-id": str(uuid.uuid4()),
         "Accept": "*/*",
         "Origin": WEB_BASE,
         "Referer": referer,
     }
+    token = str(bearer or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _auth(cookies: Any = None, bearer: str | None = None) -> tuple[dict[str, str] | None, str | None]:
+    """解析认证材料。返回 (cookie jar, bearer)。
+
+    两者都给时优先 Bearer（实测可用），Cookie 作为兜底。
+    """
+    token = str(bearer or "").strip() or None
+    jar = _cookies(cookies)
+    return jar, token
 
 
 # --------------------------------------------------------------------------
@@ -372,7 +427,8 @@ def _cookies(raw: Any) -> dict[str, str] | None:
 def stream_conversation(
     message: str,
     *,
-    cookies: Any,
+    cookies: Any = None,
+    bearer: str | None = None,
     proxy: str | None = None,
     conversation_id: str | None = None,
     timeout: float = 300.0,
@@ -384,11 +440,16 @@ def stream_conversation(
     否则走 `/conversations/{id}/responses`（续话）。两个端点的**信封不同**，
     :func:`unwrap` 都处理。
 
-    **未经实况验证** —— 需要有效的 grok.com 会话 cookie。
+    认证优先 Bearer（实测可用），Cookie 兜底。
+
+    **已知阻断（2026-10-19 实测）**：OAuth2 token 用户的网页路径**没有可用
+    的对话模型** —— 唯一通过名称校验的 `grok-3` 返回 `modelNotAvailable`，
+    表现为 `{"token":"Invalid request. Please update your client."}`。
+    本函数仍会正常返回该响应，调用方需自行判断。
     """
-    jar = _cookies(cookies)
-    if not jar:
-        raise GrokWebError("缺少 grok.com 会话 cookie")
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
 
     body = build_body(message, **body_kwargs)
     if conversation_id:
@@ -401,8 +462,10 @@ def stream_conversation(
         resp = requests.post(
             url,
             json=body,
-            headers=build_headers(referer=f"{WEB_BASE}/c/{conversation_id}"
-                                  if conversation_id else f"{WEB_BASE}/"),
+            headers=build_headers(
+                referer=f"{WEB_BASE}/c/{conversation_id}" if conversation_id else f"{WEB_BASE}/",
+                bearer=token,
+            ),
             cookies=jar,
             proxies=proxies,
             stream=True,
@@ -438,7 +501,8 @@ def stream_conversation(
 def ask(
     message: str,
     *,
-    cookies: Any,
+    cookies: Any = None,
+    bearer: str | None = None,
     proxy: str | None = None,
     timeout: float = 300.0,
     **body_kwargs: Any,
@@ -457,7 +521,8 @@ def ask(
     conversation_id = None
 
     for response in stream_conversation(
-        message, cookies=cookies, proxy=proxy, timeout=timeout, **body_kwargs
+        message, cookies=cookies, bearer=bearer, proxy=proxy,
+        timeout=timeout, **body_kwargs
     ):
         text_parts.append(extract_text(response))
         citations.extend(extract_citations(response))
@@ -492,8 +557,8 @@ def _dedupe(items: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     return out
 
 
-def search(query: str, *, cookies: Any, proxy: str | None = None,
-           timeout: float = 300.0) -> dict[str, Any]:
+def search(query: str, *, cookies: Any = None, bearer: str | None = None,
+           proxy: str | None = None, timeout: float = 300.0) -> dict[str, Any]:
     """把网页对话当搜索用：开搜索、关其余工具。
 
     `sources` 与 `citations` 语义不同，**都返回**：
@@ -503,7 +568,8 @@ def search(query: str, *, cookies: Any, proxy: str | None = None,
       没有富字段时回退到 `citations`。
     * `citations` —— 被正文**实际引用**的子集（`citedWebSearchResults`）。
     """
-    result = ask(query, cookies=cookies, proxy=proxy, timeout=timeout, search=True)
+    result = ask(query, cookies=cookies, bearer=bearer, proxy=proxy,
+                 timeout=timeout, search=True)
     return {
         "answer": result["text"],
         "sources": result["pages"] or result["citations"],
@@ -516,7 +582,8 @@ def search(query: str, *, cookies: Any, proxy: str | None = None,
 def generate_image(
     prompt: str,
     *,
-    cookies: Any,
+    cookies: Any = None,
+    bearer: str | None = None,
     proxy: str | None = None,
     count: int = 2,
     aspect_ratio: str | None = None,
@@ -526,9 +593,9 @@ def generate_image(
 ) -> dict[str, Any]:
     """调用网页 Imagine 生图。"""
     result = ask(
-        prompt, cookies=cookies, proxy=proxy, timeout=timeout, image=True,
-        image_count=count, aspect_ratio=aspect_ratio, resolution=resolution,
-        image_mode=mode,
+        prompt, cookies=cookies, bearer=bearer, proxy=proxy, timeout=timeout,
+        image=True, image_count=count, aspect_ratio=aspect_ratio,
+        resolution=resolution, image_mode=mode,
     )
     # 只保留最终态：有 url 且无 rejection
     images = [img for img in result["images"] if img.get("image_url")]
@@ -541,15 +608,16 @@ def generate_image(
     }
 
 
-def reconnect(response_id: str, *, cookies: Any, proxy: str | None = None,
+def reconnect(response_id: str, *, cookies: Any = None, bearer: str | None = None,
+              proxy: str | None = None,
               timeout: float = 300.0) -> Iterator[dict[str, Any]]:
     """断流后重新挂上同一条流（不会重复生成）。"""
-    jar = _cookies(cookies)
-    if not jar:
-        raise GrokWebError("缺少 grok.com 会话 cookie")
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
     url = f"{WEB_BASE}{RECONNECT_PATH.format(response_id=response_id)}"
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    resp = requests.get(url, headers=build_headers(), cookies=jar,
+    resp = requests.get(url, headers=build_headers(bearer=token), cookies=jar,
                         proxies=proxies, stream=True, timeout=timeout)
     with resp:
         if resp.status_code >= 400:

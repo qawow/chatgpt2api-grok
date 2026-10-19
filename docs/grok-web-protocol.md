@@ -16,6 +16,24 @@
 
 ## 1. 三条最容易踩错的结论
 
+### 1.0 实况验证结果（2026-10-19，三个真实凭证）
+
+用三个有效 xAI 凭证做了端到端实测，**推翻/确认了静态逆向的几处结论**：
+
+| 结论 | 状态 |
+|---|---|
+| 网页路径用 **Cookie** 认证 | ❌ **错** —— 实测 `Authorization: Bearer <access_token>` **可用**（`GET /rest/app-chat/conversations` → 200）；所有 cookie 名变体（`sso`/`sso-rw`/`token`/`access_token`/`__Secure-next-auth.session-token`）全部 401 |
+| 流是 NDJSON 不是 SSE | ✅ 确认（网页路径） |
+| 网页路径可发消息 | ❌ **被模型可用性挡住** —— 见 §1.4 |
+| CLI 路径工具（搜索/画图）可用 | ❌ **被拒** —— 见 §1.3 |
+
+**凭证形态**（三个都有效，scope 含 `conversations:read conversations:write`）：
+
+```
+openid profile email offline_access grok-cli:access api:access
+conversations:read conversations:write
+```
+
 ### 1.1 流是 NDJSON，不是 SSE
 
 这是实现时第一个会踩的坑。`js/0__nwepjsaz6y.js`（模块 `180418`）原文：
@@ -67,10 +85,105 @@ e.s(["processChunks", 0, i])
 
 ### 1.3 认证是纯 Cookie，对话路径没有 `Authorization`
 
+> ⚠️ **这一条被实况验证推翻了** —— 见 §1.0。网页路径**接受 OAuth Bearer**。
+> 下面的静态逆向结论保留作为对照（前端确实只靠 `credentials:"include"` 带 Cookie，
+> 但服务端同时接受标准 Bearer 头）。
+
 bundle 里的 `Bearer` 只属 next-axiom 日志库、`Basic` 属 Mixpanel、
 `DPoP` 只挂 `auth_mgmt.*` 的 10 个 ConnectRPC 方法（flag `grok_dpop_enforce_enabled`，默认空集）。
 
 `x-statsig-id` **全 bundle 无此字符串**（`rg -ci statsig` 只命中 survey 名与 Sentry `denyUrls`）。
+
+### 1.4 实况：三条路径的可用性矩阵
+
+| 路径 | 端点 | 认证 | 文本 | 搜索 | 画图 |
+|---|---|---|---|---|---|
+| **CLI/Build** | `cli-chat-proxy.grok.com/v1` | Bearer ✅ | ✅ 200 | ❌ 工具被接受但不执行 | ❌ 同上 |
+| **官方 API** | `api.x.ai/v1` | Bearer ✅ | ❌ 429 配额 0/0 | ❌ 同 | ❌ 同 |
+| **网页** | `grok.com/rest/app-chat/*` | Bearer ✅ | ❌ 模型不可用 | ❌ | ❌ |
+
+#### CLI 路径：工具「被接受但不执行」
+
+`POST /v1/responses` + `tools:[{"type":"web_search"}]` → **200**，但服务端权威报告：
+
+```json
+"num_sources_used": 0,
+"num_server_side_tools_used": 0
+```
+
+模型回复「I don't have real-time web access in this context」/「I can't draw images directly」，
+`output` 里只有 `reasoning` + `message`，**没有 `web_search_call` / `image_generation_call`**。
+`image_generation` 同理 —— 仓库自己的 `generate_image()` 也返回
+`Grok 未生成图片（账号正常，模型没有调用图片工具）`。
+
+工具类型全集（来自 422 报错的枚举提示）：
+
+```
+function, web_search, x_search, image_generation,
+collections_search, file_search, code_execution, code_interpreter, mcp, shell, tool_search
+```
+
+`search_parameters` 返回 **410 Gone**：
+
+```json
+{"error":"Live search is deprecated. Please switch to the Agent Tools API:
+ https://docs.x.ai/docs/guides/tools/overview"}
+```
+
+**结论：工具执行是订阅/团队级能力，这三个凭证没有。**
+
+#### 官方 API：认证通过但零配额
+
+`api.x.ai/v1/models` → 200，目录 14 个模型（`grok-4.20-*` / `grok-4.7` / `grok-imagine-image*` / …）。
+但任何 `POST` 都返回：
+
+```json
+{"code":"resource-exhausted",
+ "error":"Too many requests for team <id> and model grok-4.7.
+          Your team's rate limit is — Requests per Minute (actual/limit): 0/0."}
+```
+
+`0/0` = 团队无官方 API 配额。**这不是限流，是没有订阅。**
+
+#### 网页路径：认证通过，模型不可用
+
+`POST /rest/app-chat/conversations/new` + Bearer → **200**，会话真的被创建
+（返回 `conversationId`），用户消息被回显，然后：
+
+```json
+{"result":{"response":{"token":"Invalid request. Please update your client.",
+                       "messageTag":"final","responseId":"..."}}}
+{"result":{"response":{"error":{"message":"This model is temporarily unavailable.
+                       Please try a different model.","modelNotAvailable":{},
+                       "severity":"STREAM_ERROR_SEVERITY_NORMAL"}}}}
+```
+
+**`"Invalid request. Please update your client."` 是兜底文案**，真实原因是
+`modelNotAvailable`。模型名分级实测：
+
+| modelName | 结果 | 含义 |
+|---|---|---|
+| `grok-3` | 200 + `modelNotAvailable` | **通过名称校验**，但模型不可用 |
+| `grok-420` | 429 `heavy usage` | 通过校验，被限流 |
+| 其它 12 个（`grok-4.7` / `grok-4.5` / `grok-4.20-*` / `grok-build-0.1` / …） | 403 `Model is not found` | 名称无效 |
+
+试过的所有变体（body 形态 10 种、额外头 6 种、两步 add-response 路径）都停在同一个
+`modelNotAvailable`。**OAuth2 token 用户在网页路径上没有可用的对话模型。**
+
+### 1.5 权限是端点级的
+
+同一凭证在网页路径上：
+
+| 端点 | 结果 |
+|---|---|
+| `GET /rest/app-chat/conversations` | ✅ 200 `{"conversations":[],"textSearchMatches":[]}` |
+| `GET /rest/app-chat/conversations-many` | ✅ 200 |
+| `GET /rest/app-chat/conversation-starters` | ❌ 403 `Action cannot be performed by OAuth2 token users` |
+| `GET /rest/app-chat/image-generations` | ❌ 403 同上 |
+| `GET /rest/app-chat/suggestions` | ❌ 403 同上 |
+| `POST /rest/app-chat/quick-answer` | ❌ 403 同上 |
+
+即：**只读会话列表可用，其余一律被 OAuth2 策略挡住**（`WKE=unauthorized:oauth2-auth-forbidden`）。
 
 ---
 
