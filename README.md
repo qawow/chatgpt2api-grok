@@ -9,6 +9,7 @@
   <a href="https://github.com/qawow/chatgpt2api-grok">GitHub（本仓库）</a> ·
   <a href="./CHANGELOG.md">v1.8.13</a> ·
   <a href="./docs/grok-pool.md">Grok 号池</a> ·
+  <a href="./docs/grok-web-protocol.md">Grok 网页协议</a> ·
   <a href="./docs/gpt-register.md">GPT 批量注册</a> ·
   <a href="./docs/waifu2x.md">waifu2x</a> ·
   <a href="./docs/doubao.md">豆包</a> ·
@@ -260,6 +261,23 @@ environment:
 - 文本：已关闭（`POST /v1/grok/chat/completions` 返回 400）
 - 模型列表：`GET /v1/grok/models` 仅生图 id；本地池非空时注入总 `GET /v1/models`
 - 文档：[docs/grok-pool.md](./docs/grok-pool.md)
+
+### Grok 网页协议（搜索 + 画图）
+
+`grok.com` 网页路径的逆向结论与客户端，**与上面的 CLI 号池是两套凭证、两套端点**：
+
+- 逆向素材：`index.html` + **1367 个前端 chunk（60 MB）**，静态分析
+- 端点：`POST https://grok.com/rest/app-chat/conversations/new`
+- 认证：**会话 Cookie**（不是 `Authorization: Bearer`）
+- 流格式：**NDJSON**（逐行 `JSON.parse`，**不是 SSE** —— 用 SSE 解析器会吃掉 JSON 首字符）
+- 搜索：**没有独立端点**，内嵌在对话流里；来源在
+  `outputChunks[].toolResult.webSearch.webpages[]`（20 字段富版本）
+- 画图：`kind: "CONVERSATION_KIND_IMAGINE"` + `mediaGenInput.textToImage`
+- 客户端：`services/grok_web_api.py`（`search()` / `generate_image()`）
+- 文档：[docs/grok-web-protocol.md](./docs/grok-web-protocol.md)
+
+> **未实况验证**：本环境没有可用的 grok.com 会话 cookie，全部结论来自 bundle 静态逆向。
+> 解析层有 62 项单测覆盖，网络与认证需真实 cookie 才能确认。
 
 ### GPT Free 批量注册
 
