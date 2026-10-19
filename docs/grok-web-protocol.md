@@ -521,6 +521,135 @@ Authorization: Bearer <access_token>      → 200, image/jpeg, 351,813 B, 784×1
 
 ---
 
+### 1.9 CLI 控制面：套餐 / 额度 / 策略（2026-10-19 实测）
+
+> 线索来自 [codex2api](https://github.com/james-6-23/codex2api) 的
+> `grok-build-main/docs/GROK_BUILD_INFERENCE_API_REVERSE.md` §9。
+> 该仓库**没有**用网页路径（`grok.com/rest/*`），走的是 CLI 网关 + `api.x.ai`。
+
+公共请求头（各端点有差异，不要无条件全加）：
+
+```http
+Authorization: Bearer <oauth-access-token>
+X-XAI-Token-Auth: xai-grok-cli
+x-grok-client-version: 1.0.13
+x-grok-client-mode: headless
+x-userid: <user-id>          # billing / auto-topup 用，/user 不用
+```
+
+#### `GET /billing?format=credits` —— 账期与用量
+
+实测（三个凭证）：
+
+```jsonc
+{"config": {
+  "creditUsagePercent": 1.0,          // ← 缺失表示字段未返回，**不是 0%**
+  "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-10-19T05:23:41.035+00:00",
+                    "end":   "2026-10-26T05:23:41.035+00:00"},
+  "prepaidBalance": {"val": 0},
+  "isUnifiedBillingUser": true,
+  "productUsage": [{"product": "GrokBuild", "usagePercent": 1.0}],
+  "topUpMethod": null,
+  "billingPeriodStart": "...", "billingPeriodEnd": "..."}}
+```
+
+| 凭证 | `creditUsagePercent` | 周期 | 网页生图观察到的拒绝形态 |
+|---|---|---|---|
+| `c4zc82bzvk` | **缺失** | 周 | ① 429 |
+| `pd1jt9qjfa` | **1.0** | 周 | ③ 静默降级（约 15 分钟后恢复） |
+| `stjeh3gnvk` | **缺失** | 周 | ② `renderToolRateLimited` |
+
+语义要点：
+
+- `creditUsagePercent` **缺失 ≠ 0%** —— 保留「字段缺失」这一事实。
+- 周期是 **WEEKLY（7 天）**，`currentPeriod.end` 是 reset 时间。**没有 30D 窗口**。
+- `productUsage` 的产品字符串是**开放枚举**（实测见过 `GrokBuild` / `GrokChat` /
+  `GrokImagine`），**不是模型 ID**。
+- `{}` 要解析成 `val=0`（proto3 把零值 cents 编码成空对象）。
+- `monthlyLimit` / `used` / `onDemandCap` 是**旧版字段**，实测三个凭证都没有。
+
+#### **决定性实验：网页生图不计入 billing**
+
+```
+生图前: creditUsagePercent=1.0  productUsage=[{"product":"GrokBuild","usagePercent":1.0}]
+生图后: creditUsagePercent=1.0  productUsage=[{"product":"GrokBuild","usagePercent":1.0}]
+        ↑ 完全不变，GrokImagine 从未出现
+```
+
+**网页生图额度是独立账本，billing 看不到。** 这解释了为什么上一轮
+`quota_info` 返回 403 却仍能生图 —— 两条额度路径互不相通。
+
+#### 其它控制面端点
+
+| 端点 | 实测 |
+|---|---|
+| `GET /user?include=subscription` | ✅ 200，24 字段；`subscriptionTier: null`（缺失 ≠ Free） |
+| `GET /settings` | ✅ 200 `min_client_version: "1.0.13"`、`force_update: true`、`allow_access: true` |
+| `GET /auto-topup-rule` | ✅ 200 `{}`（无规则） |
+
+`/user` **不发 `x-userid`**；`/settings` 与 `/models` 在认证资料含邮箱时可发 `x-email`。
+
+#### 版本门控：426
+
+**实测**（2026-10-19，同一凭证同一请求）：
+
+```
+x-grok-client-version: 1.0.1   → 426 {"error":"Your Grok CLI version (1.0.1) is
+                                        outdated. Please update to version 1.0.13
+                                        or later via `grok update` ..."}
+x-grok-client-version: 1.0.13  → 200
+x-grok-client-version: 1.0.62  → 200
+x-grok-client-version: 0.0.1   → 426
+```
+
+**控制面端点不做版本门控**（`1.0.1` 也能拿 billing），**只有生成端点做**。
+所以客户端版本要跟着 `GET /settings` 的 `min_client_version` 走，不要硬编码。
+
+#### 上游错误 → 冷却映射（对齐 codex2api `applyGrokCooldown`）
+
+| 错误 | 判定依据 | 冷却 |
+|---|---|---|
+| 免费额度耗尽 | 错误体含 `used all the included free usage` / `subscription:free-usage-exhausted` | **24h**（free 账号整号；付费账号模型级） |
+| 超支 / 余额耗尽 | 含 `spending-limit` / `balance_exhausted` / `usage balance exhausted` 等，且 402 或 429 | **24h** |
+| 裸 402 | 无上述标记 | **不硬隔离**（证据不足） |
+| 429 | 状态码 | `Retry-After` 或 60s，**上限 900s** |
+| 401 | 状态码 | 60s + 异步刷新 token |
+| 403 | 状态码 | 300s，**绝不刷新 token** |
+| 426 | 状态码 | 60s（`version_required`） |
+
+**判定顺序：先看错误体，再看状态码** —— 免费额度耗尽可能以 429 或 402 出现。
+
+免费额度耗尽的错误体带**权威用量**，可正则提取：
+
+```
+tokens (actual/limit): 1003617/1000000
+```
+
+免费层是**滚动 24 小时窗口**（`Usage resets over a rolling 24-hour window`）。
+
+#### SSO → OAuth 自动转换（codex2api 的做法）
+
+输入是 grok.com 网页登录的 `sso` cookie，程序化跑完 RFC 8628 Device Code 授权
+（无需人工点授权页），产出 `access_token` + `refresh_token`：
+
+```
+1) GET  https://accounts.x.ai/                       Cookie: sso=<token>; sso-rw=<token>
+   → 弱校验：401 或跳 sign-in/sign-up 判失效
+2) POST https://auth.x.ai/oauth2/device/code         client_id + scope
+   → {device_code, user_code, verification_uri_complete, interval, expires_in}
+3) GET  <verification_uri_complete>                  打开验证页
+   POST https://auth.x.ai/oauth2/device/verify       user_code=<code>
+   → 跳转须含 "consent"
+4) POST https://auth.x.ai/oauth2/device/approve      user_code + action=allow
+                                                     + principal_type=User
+   → 跳转须含 "done"
+```
+
+`client_id` = `b1a00492-073a-47ea-816f-4c329264a828`（官方 Grok CLI 公开 id），
+scope = `openid profile email offline_access grok-cli:access api:access`。
+用**浏览器 UA**（OAuth 端点对非浏览器 UA 更易触发风控）。
+
 ## 2. 主对话端点
 
 ```

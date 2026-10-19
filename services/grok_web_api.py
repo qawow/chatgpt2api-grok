@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any, Iterable, Iterator
@@ -821,6 +822,7 @@ FREE_USAGE_GATES_PATH = "/rest/usage/free-usage-gates"
 
 # CLI 路径（cli-chat-proxy）返回的真实限流头。
 CLI_BASE = "https://cli-chat-proxy.grok.com/v1"
+CLI_USER_AGENT = "grok-cli/1.0.62"
 CLI_RATELIMIT_HEADERS = (
     "x-ratelimit-limit-requests",
     "x-ratelimit-limit-tokens",
@@ -974,9 +976,9 @@ def cli_rate_limits(
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "User-Agent": "grok-cli/1.0.62",
+        "User-Agent": CLI_USER_AGENT,
         "X-XAI-Token-Auth": "xai-grok-cli",
-        "x-grok-client-version": "1.0.62",
+        "x-grok-client-version": CONTROL_CLIENT_VERSION,
         "x-grok-client-identifier": "grok-shell",
         "Accept": "application/json",
     }
@@ -1002,6 +1004,325 @@ def cli_rate_limits(
         raw = raw_headers.get(name)
         out[name.replace("x-ratelimit-", "")] = _as_int(raw) if raw is not None else None
     return out
+
+
+# --------------------------------------------------------------------------
+# CLI 控制面（套餐 / 额度 / 策略）
+# --------------------------------------------------------------------------
+#
+# 来源：codex2api 的 `grok-build-main/docs/GROK_BUILD_INFERENCE_API_REVERSE.md`
+# §9「账号控制面」，本仓库 2026-10-19 实测全部可用。
+#
+# 公共请求头（各端点有差异，见各函数）：
+#   Authorization: Bearer <oauth-access-token>
+#   X-XAI-Token-Auth: xai-grok-cli
+#   x-grok-client-version: 1.0.1
+#   x-grok-client-mode: headless
+#   x-userid: <user-id>          （billing/auto-topup 用，/user 不用）
+#
+# **关键实测结论（2026-10-19）**：网页路径生图**不改变** billing ——
+# `creditUsagePercent` 生图前后都是 1.0，`productUsage` 始终只有 `GrokBuild`，
+# `GrokImagine` 从未出现。即**生图额度是独立账本，billing 看不到**。
+CONTROL_BASE = CLI_BASE  # cli-chat-proxy.grok.com/v1
+
+# 控制面版本头。上游 `GET /settings` 返回 `min_client_version`，
+# 低于它生成请求会被 426 拒绝。
+#
+# **实测 2026-10-19：上游要求 `1.0.13`，而早先硬编码的是 `1.0.1`。**
+# 这很可能就是 `CLIENT_UPDATE_NOTICE`（"Invalid request. Please update your
+# client."）的根源 —— 用 :func:`client_settings` 读到的值覆盖它。
+CONTROL_CLIENT_VERSION = "1.0.13"
+CONTROL_CLIENT_MODE = "headless"
+
+# 免费层额度耗尽（模型级，滚动 24 小时窗口）。错误体形如：
+#   {"code":"subscription:free-usage-exhausted",
+#    "error":"You've used all the included free usage for model
+#             grok-4.5-build-free for now. Usage resets over a rolling
+#             24-hour window — tokens (actual/limit): 1003617/1000000."}
+FREE_QUOTA_MARKERS = ("used all the included free usage",
+                      "subscription:free-usage-exhausted")
+
+# 超支 / 余额耗尽（账号级）
+SPENDING_LIMIT_MARKERS = ("spending-limit", "spending limit",
+                          "usage balance exhausted", "balance_exhausted",
+                          "balance-exhausted", "credit balance is too low",
+                          "ran out of credits")
+
+# 上游错误 → 冷却时长（对齐 codex2api `applyGrokCooldown` 的映射）：
+#   免费额度耗尽       → free 账号整号 24h / 付费账号模型级 24h
+#   超支（402/429）    → 账号 24h
+#   裸 402             → 不硬隔离（证据不足）
+#   429                → Retry-After 或 1 分钟，**上限 15 分钟**
+#   401                → 1 分钟 + 异步刷新
+#   403                → 5 分钟（绝不刷新 token）
+#   426                → 1 分钟（version_required）
+COOLDOWN_BY_STATUS = {
+    401: 60.0,
+    402: 0.0,        # 裸 402 不硬隔离
+    403: 300.0,
+    426: 60.0,
+}
+RATE_LIMIT_DEFAULT_COOLDOWN = 60.0
+RATE_LIMIT_MAX_COOLDOWN = 900.0      # 429 冷却上限 15 分钟
+FREE_QUOTA_COOLDOWN = 86400.0        # 24 小时
+SPENDING_LIMIT_COOLDOWN = 86400.0
+
+
+def _control_headers(token: str, *, user_id: str | None = None,
+                     email: str | None = None,
+                     identifier: str | None = None) -> dict[str, str]:
+    """控制面公共头。各端点差异用参数控制，不要无条件全加。"""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": CONTROL_CLIENT_VERSION,
+        "x-grok-client-mode": CONTROL_CLIENT_MODE,
+        "Accept": "application/json",
+    }
+    if user_id:
+        headers["x-userid"] = user_id
+    if email:
+        headers["x-email"] = email
+    if identifier:
+        headers["x-grok-client-identifier"] = identifier
+    return headers
+
+
+def _control_get(path: str, token: str, *, proxy: str | None,
+                 timeout: float, **header_kw: Any) -> requests.Response:
+    resp = _stream_get(
+        f"{CONTROL_BASE}{path}",
+        headers=_control_headers(token, **header_kw),
+        cookies=None,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    return resp
+
+
+def billing(
+    bearer: str,
+    *,
+    proxy: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """`GET /billing?format=credits` —— 套餐额度与账期（**权威端点**）。
+
+    实测响应（2026-10-19，三个凭证）：
+
+        {"config": {
+           "creditUsagePercent": 1.0,          // ← 缺失表示字段未返回，**不是 0%**
+           "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY",
+                             "start": "2026-10-19T05:23:41.035+00:00",
+                             "end":   "2026-10-26T05:23:41.035+00:00"},
+           "prepaidBalance": {"val": 0},
+           "isUnifiedBillingUser": true,
+           "productUsage": [{"product": "GrokBuild", "usagePercent": 1.0}],
+           "topUpMethod": null,
+           "billingPeriodStart": "...", "billingPeriodEnd": "..."}}
+
+    **重要语义**：
+
+    * `creditUsagePercent` **缺失 ≠ 0%** —— 要保留「字段缺失」这一事实，
+      不要当成明确 0%（codex2api 文档 §9.5 明确要求 `usage_pct_raw=null`）。
+    * 周期是 **WEEKLY（7 天）**，`currentPeriod.end` 是 reset 时间。
+    * `productUsage` 的产品字符串是**开放枚举**，实测见过 `GrokBuild`、
+      `GrokChat`、`GrokImagine` —— 不是模型 ID。
+    * **网页生图不计入这里**（实测：生图前后 `creditUsagePercent` 与
+      `productUsage` 完全不变）。生图额度是独立账本。
+    * `{}` 要解析成 `val=0`（proto3 把零值 cents 编码成空对象）。
+    """
+    token = str(bearer or "").strip()
+    if not token:
+        raise GrokWebError("缺少 bearer")
+    resp = _control_get("/billing?format=credits", token, proxy=proxy,
+                        timeout=timeout)
+    with resp:
+        if resp.status_code != 200:
+            raise GrokWebError(f"billing HTTP {resp.status_code}",
+                               status=resp.status_code, body=(resp.text or "")[:300])
+        data = resp.json()
+    if not isinstance(data, dict):
+        return {}
+    return data.get("config") if isinstance(data.get("config"), dict) else data
+
+
+def subscription(
+    bearer: str,
+    *,
+    proxy: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """`GET /user?include=subscription` —— 实时套餐。
+
+    **这个端点不发送 `x-userid`**（与 billing 的差异）。
+
+    返回 `{"userId": "...", "subscriptionTier": "GrokPro"}`。
+    `subscriptionTier` 可选；判定规则是「非空且不等于 `Free`」才算付费。
+
+    不要把 `GrokPro` / `SuperGrok` / `SuperGrokPro` 过早压成固定枚举 ——
+    实测出现过 `/user = GrokPro` 而 `/settings.subscription_tier_display = SuperGrok`
+    的不一致。缺失/`null`/空串都应是 `unknown`，**不要粗暴写成 `Free`**。
+    """
+    token = str(bearer or "").strip()
+    if not token:
+        raise GrokWebError("缺少 bearer")
+    resp = _control_get("/user?include=subscription", token, proxy=proxy,
+                        timeout=timeout)
+    with resp:
+        if resp.status_code != 200:
+            raise GrokWebError(f"user HTTP {resp.status_code}",
+                               status=resp.status_code, body=(resp.text or "")[:300])
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def client_settings(
+    bearer: str,
+    *,
+    proxy: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """`GET /settings` —— 远程策略与最低客户端版本。
+
+    实测（2026-10-19）：`min_client_version` 已是 **`1.0.13`**，
+    `force_update: true`。**低于它的生成请求会被 426 拒绝** ——
+    所以客户端版本要能跟着上游走，不要写死。
+
+    另含 `allow_access`（Grok Build 门控）、`max_upload_file_bytes`、
+    `memory_v2` 等。
+    """
+    token = str(bearer or "").strip()
+    if not token:
+        raise GrokWebError("缺少 bearer")
+    resp = _control_get("/settings", token, proxy=proxy, timeout=timeout)
+    with resp:
+        if resp.status_code != 200:
+            raise GrokWebError(f"settings HTTP {resp.status_code}",
+                               status=resp.status_code, body=(resp.text or "")[:300])
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def auto_topup_rule(
+    bearer: str,
+    *,
+    proxy: str | None = None,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """`GET /auto-topup-rule` —— 自动充值规则。
+
+    实测三个凭证都返回 `{}`（无规则）。`rule` 缺失表示没有规则；
+    proto3 会省略 `enabled: false`，所以缺失按 false；各 cents `{}` 按 0。
+    """
+    token = str(bearer or "").strip()
+    if not token:
+        raise GrokWebError("缺少 bearer")
+    resp = _control_get("/auto-topup-rule", token, proxy=proxy, timeout=timeout)
+    with resp:
+        if resp.status_code != 200:
+            raise GrokWebError(f"auto-topup HTTP {resp.status_code}",
+                               status=resp.status_code, body=(resp.text or "")[:300])
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def classify_upstream_error(
+    status: int,
+    body: str = "",
+) -> dict[str, Any]:
+    """把上游错误映射成冷却建议（对齐 codex2api `applyGrokCooldown`）。
+
+    返回 `{"kind": ..., "cooldown_seconds": ..., "retryable": ...}`。
+
+    kind 取值：
+
+    * `free_quota_exhausted` —— 免费额度耗尽（滚动 24h 窗口），冷却 24h
+    * `spending_limit` —— 超支/余额耗尽，冷却 24h
+    * `payment_required_unknown` —— 裸 402，**证据不足，不硬隔离**
+    * `rate_limited` —— 429，Retry-After 或 60s，**上限 900s**
+    * `unauthorized` —— 401，60s + 刷新 token
+    * `forbidden` —— 403，300s，**绝不刷新 token**
+    * `version_required` —— 426，60s
+    * `ok` / `unknown`
+
+    判定顺序很重要：**先看错误体**（免费额度 / 超支），再看状态码 ——
+    因为免费额度耗尽可能以 429 或 402 出现。
+    """
+    lowered = (body or "").lower()
+    if any(m in lowered for m in FREE_QUOTA_MARKERS):
+        return {"kind": "free_quota_exhausted",
+                "cooldown_seconds": FREE_QUOTA_COOLDOWN,
+                "retryable": False}
+    if any(m in lowered for m in SPENDING_LIMIT_MARKERS):
+        return {"kind": "spending_limit",
+                "cooldown_seconds": SPENDING_LIMIT_COOLDOWN,
+                "retryable": False}
+    if status == 402:
+        return {"kind": "payment_required_unknown",
+                "cooldown_seconds": 0.0, "retryable": False}
+    if status == 429:
+        return {"kind": "rate_limited",
+                "cooldown_seconds": RATE_LIMIT_DEFAULT_COOLDOWN,
+                "retryable": True}
+    if status == 401:
+        return {"kind": "unauthorized", "cooldown_seconds": 60.0,
+                "retryable": False}
+    if status == 403:
+        return {"kind": "forbidden", "cooldown_seconds": 300.0,
+                "retryable": False}
+    if status == 426:
+        return {"kind": "version_required", "cooldown_seconds": 60.0,
+                "retryable": False}
+    if status == 200:
+        return {"kind": "ok", "cooldown_seconds": 0.0, "retryable": False}
+    if 500 <= status < 600:
+        return {"kind": "upstream_error", "cooldown_seconds": 0.0,
+                "retryable": True}
+    return {"kind": "unknown", "cooldown_seconds": 0.0, "retryable": False}
+
+
+# 版本门控：CLI 路径对过低的 `x-grok-client-version` 直接 426。
+# 实测（2026-10-19）：
+#   version=1.0.1  → 426 {"error":"Your Grok CLI version (1.0.1) is outdated.
+#                          Please update to version 1.0.13 or later ..."}
+#   version=1.0.13 → 200
+#   version=1.0.62 → 200
+# **控制面端点不做版本门控**（1.0.1 也能拿 billing），只有生成端点做。
+VERSION_OUTDATED_MARKER = "is outdated"
+
+
+def version_outdated(response_or_body: Any) -> str | None:
+    """识别版本门控（HTTP 426），返回上游的原文提示。
+
+    上游会同时给出**要求的最低版本**，形如
+    `Please update to version 1.0.13 or later` —— 调用方应据此更新
+    :data:`CONTROL_CLIENT_VERSION` 而不是硬编码。
+    """
+    if isinstance(response_or_body, dict):
+        err = response_or_body.get("error")
+        text = err if isinstance(err, str) else str(err or "")
+    else:
+        text = str(response_or_body or "")
+    if VERSION_OUTDATED_MARKER not in text.lower():
+        return None
+    return text.strip() or None
+
+
+def required_client_version(text: str) -> str | None:
+    """从 426 提示里提取要求的最低版本号。"""
+    match = re.search(r"version\s+(\d+\.\d+\.\d+)\s+or later", text or "")
+    return match.group(1) if match else None
+
+
+def clamp_rate_limit_cooldown(seconds: float) -> float:
+    """429 冷却钳制 —— 有 Retry-After 用它，但**上限 15 分钟**。
+
+    实测依据：三个凭证被 429 后约 15 分钟内恢复。
+    """
+    if seconds <= 0:
+        return RATE_LIMIT_DEFAULT_COOLDOWN
+    return min(float(seconds), RATE_LIMIT_MAX_COOLDOWN)
 
 
 def download_image(

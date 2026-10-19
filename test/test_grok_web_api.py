@@ -1035,3 +1035,207 @@ class SilentDegradeTest(unittest.TestCase):
         self.assertIsNone(g.model_unavailable(limited))
         self.assertIsNone(g.is_rejected(limited))
         # 形态 3 的判定不在单帧上，而在聚合结果（见上面的用例）
+
+
+class ControlPlaneTest(unittest.TestCase):
+    """CLI 控制面：套餐 / 额度 / 策略。
+
+    来源：codex2api 的 `grok-build-main/docs/GROK_BUILD_INFERENCE_API_REVERSE.md` §9，
+    本仓库 2026-10-19 实测全部可用。
+
+      GET /billing?format=credits       → 账期与用量百分比
+      GET /user?include=subscription    → 实时套餐（**不发 x-userid**）
+      GET /settings                     → min_client_version / allow_access
+      GET /auto-topup-rule              → 自动充值规则（实测三个凭证都是 {}）
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_billing_unwraps_the_config_envelope(self):
+        from unittest import mock
+
+        payload = {"config": {
+            "creditUsagePercent": 1.0,
+            "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY",
+                              "start": "2026-10-19T05:23:41.035+00:00",
+                              "end": "2026-10-26T05:23:41.035+00:00"},
+            "prepaidBalance": {"val": 0},
+            "isUnifiedBillingUser": True,
+            "productUsage": [{"product": "GrokBuild", "usagePercent": 1.0}],
+        }}
+        with mock.patch.object(g, "_stream_get", return_value=self._resp(payload)):
+            out = g.billing("tok")
+        self.assertEqual(out["creditUsagePercent"], 1.0)
+        self.assertEqual(out["currentPeriod"]["type"], "USAGE_PERIOD_TYPE_WEEKLY")
+        self.assertEqual(out["productUsage"][0]["product"], "GrokBuild")
+
+    def test_billing_missing_percent_stays_missing(self):
+        """**缺失 ≠ 0%** —— 不能把字段缺失当成明确 0%。"""
+        from unittest import mock
+
+        payload = {"config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"},
+                              "prepaidBalance": {"val": 0}}}
+        with mock.patch.object(g, "_stream_get", return_value=self._resp(payload)):
+            out = g.billing("tok")
+        self.assertNotIn("creditUsagePercent", out)
+        self.assertIsNone(out.get("creditUsagePercent"))
+
+    def test_billing_requires_a_bearer(self):
+        with self.assertRaises(g.GrokWebError):
+            g.billing("")
+
+    def test_subscription_does_not_send_x_userid(self):
+        """`/user` 与 billing 的头差异：**不发 `x-userid`**。"""
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_get",
+                               return_value=self._resp({"userId": "u1"})) as sg:
+            g.subscription("tok")
+        sent = sg.call_args.kwargs["headers"]
+        self.assertNotIn("x-userid", sent)
+        self.assertEqual(sent["X-XAI-Token-Auth"], "xai-grok-cli")
+
+    def test_settings_reports_min_client_version(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_get",
+                               return_value=self._resp({
+                                   "min_client_version": "1.0.13",
+                                   "force_update": True,
+                                   "allow_access": True})) as sg:
+            out = g.client_settings("tok")
+        self.assertEqual(out["min_client_version"], "1.0.13")
+        self.assertTrue(out["force_update"])
+        self.assertIn("/settings", sg.call_args[0][0])
+
+    def test_auto_topup_rule_returns_empty_when_absent(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_get", return_value=self._resp({})):
+            self.assertEqual(g.auto_topup_rule("tok"), {})
+
+    def test_control_headers_carry_the_required_set(self):
+        h = g._control_headers("tok", user_id="u1")
+        self.assertEqual(h["Authorization"], "Bearer tok")
+        self.assertEqual(h["X-XAI-Token-Auth"], "xai-grok-cli")
+        self.assertEqual(h["x-grok-client-version"], g.CONTROL_CLIENT_VERSION)
+        self.assertEqual(h["x-grok-client-mode"], "headless")
+        self.assertEqual(h["x-userid"], "u1")
+
+    def test_control_headers_omit_optional_fields_by_default(self):
+        h = g._control_headers("tok")
+        for key in ("x-userid", "x-email", "x-grok-client-identifier"):
+            self.assertNotIn(key, h)
+
+
+class VersionGateTest(unittest.TestCase):
+    """版本门控 —— 实测 2026-10-19。
+
+    早先硬编码 `x-grok-client-version: 1.0.1`，而上游要求 **1.0.13**：
+
+      version=1.0.1  → 426 {"error":"Your Grok CLI version (1.0.1) is outdated.
+                             Please update to version 1.0.13 or later ..."}
+      version=1.0.13 → 200
+      version=1.0.62 → 200
+
+    **控制面端点不做版本门控**（1.0.1 也能拿 billing），只有生成端点做。
+    """
+
+    OUTDATED = ('{"error":"Your Grok CLI version (1.0.1) is outdated. '
+                'Please update to version 1.0.13 or later via `grok update` '
+                'or the installation documentation."}')
+
+    def test_the_outdated_body_is_detected(self):
+        self.assertIsNotNone(g.version_outdated(self.OUTDATED))
+
+    def test_the_required_version_is_extracted(self):
+        self.assertEqual(g.required_client_version(self.OUTDATED), "1.0.13")
+
+    def test_a_normal_response_is_not_flagged(self):
+        for body in ('{"id":"x","object":"response"}', "", "{}", None):
+            self.assertIsNone(g.version_outdated(body))
+
+    def test_a_dict_error_is_handled(self):
+        self.assertIsNotNone(g.version_outdated(
+            {"error": "Your Grok CLI version (1.0.1) is outdated."}))
+
+    def test_the_constant_is_at_least_the_required_version(self):
+        """常量必须 ≥ 上游要求，否则生成请求会被 426。"""
+        parts = [int(x) for x in g.CONTROL_CLIENT_VERSION.split(".")]
+        self.assertGreaterEqual(parts, [1, 0, 13])
+
+    def test_426_maps_to_version_required(self):
+        r = g.classify_upstream_error(426, self.OUTDATED)
+        self.assertEqual(r["kind"], "version_required")
+        self.assertEqual(r["cooldown_seconds"], 60.0)
+        self.assertFalse(r["retryable"])
+
+
+class UpstreamErrorClassificationTest(unittest.TestCase):
+    """上游错误 → 冷却建议（对齐 codex2api `applyGrokCooldown`）。"""
+
+    def test_free_quota_exhausted_cools_24h(self):
+        body = ('{"code":"subscription:free-usage-exhausted","error":"You\'ve used '
+                'all the included free usage for model grok-4.5-build-free for now. '
+                'Usage resets over a rolling 24-hour window — tokens (actual/limit): '
+                '1003617/1000000."}')
+        r = g.classify_upstream_error(429, body)
+        self.assertEqual(r["kind"], "free_quota_exhausted")
+        self.assertEqual(r["cooldown_seconds"], 86400.0)
+        self.assertFalse(r["retryable"])
+
+    def test_spending_limit_cools_24h(self):
+        r = g.classify_upstream_error(
+            402, '{"error":{"code":"balance_exhausted","message":"usage balance exhausted"}}')
+        self.assertEqual(r["kind"], "spending_limit")
+        self.assertEqual(r["cooldown_seconds"], 86400.0)
+
+    def test_a_bare_402_is_not_hard_isolated(self):
+        """裸 402 证据不足 —— 不能硬隔离账号。"""
+        r = g.classify_upstream_error(402, '{"error":{"message":"payment required"}}')
+        self.assertEqual(r["kind"], "payment_required_unknown")
+        self.assertEqual(r["cooldown_seconds"], 0.0)
+
+    def test_body_markers_win_over_the_status_code(self):
+        """免费额度耗尽可能以 429 或 402 出现 —— 先看错误体。"""
+        body = '{"code":"subscription:free-usage-exhausted"}'
+        for status in (402, 429):
+            self.assertEqual(g.classify_upstream_error(status, body)["kind"],
+                             "free_quota_exhausted")
+
+    def test_429_is_retryable_with_a_short_cooldown(self):
+        r = g.classify_upstream_error(429, '{"error":{"code":8}}')
+        self.assertEqual(r["kind"], "rate_limited")
+        self.assertTrue(r["retryable"])
+
+    def test_403_never_triggers_a_token_refresh(self):
+        r = g.classify_upstream_error(403, '{"code":7,"message":"oauth2-auth-forbidden"}')
+        self.assertEqual(r["kind"], "forbidden")
+        self.assertEqual(r["cooldown_seconds"], 300.0)
+        self.assertFalse(r["retryable"])
+
+    def test_5xx_is_retryable(self):
+        for status in (500, 502, 503):
+            self.assertTrue(g.classify_upstream_error(status, "")["retryable"])
+
+    def test_429_cooldown_is_clamped_to_15_minutes(self):
+        self.assertEqual(g.clamp_rate_limit_cooldown(30), 30.0)
+        self.assertEqual(g.clamp_rate_limit_cooldown(3600), 900.0)
+        self.assertEqual(g.clamp_rate_limit_cooldown(0), 60.0)
+        self.assertEqual(g.clamp_rate_limit_cooldown(-5), 60.0)
+
+    def test_the_cooldown_table_matches_the_documented_values(self):
+        self.assertEqual(g.RATE_LIMIT_MAX_COOLDOWN, 900.0)
+        self.assertEqual(g.FREE_QUOTA_COOLDOWN, 86400.0)
+        self.assertEqual(g.SPENDING_LIMIT_COOLDOWN, 86400.0)
+        self.assertEqual(g.COOLDOWN_BY_STATUS[403], 300.0)
+        self.assertEqual(g.COOLDOWN_BY_STATUS[402], 0.0)
