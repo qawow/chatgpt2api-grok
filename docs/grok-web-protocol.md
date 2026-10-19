@@ -96,11 +96,13 @@ bundle 里的 `Bearer` 只属 next-axiom 日志库、`Basic` 属 Mixpanel、
 
 ### 1.4 实况：三条路径的可用性矩阵
 
+> **2026-10-19 更新：网页生图已打通** —— 见 §1.6。模型名必须是 `build`。
+
 | 路径 | 端点 | 认证 | 文本 | 搜索 | 画图 |
 |---|---|---|---|---|---|
 | **CLI/Build** | `cli-chat-proxy.grok.com/v1` | Bearer ✅ | ✅ 200 | ❌ 工具被接受但不执行 | ❌ 同上 |
 | **官方 API** | `api.x.ai/v1` | Bearer ✅ | ❌ 429 配额 0/0 | ❌ 同 | ❌ 同 |
-| **网页** | `grok.com/rest/app-chat/*` | Bearer ✅ | ❌ 模型不可用 | ❌ | ❌ |
+| **网页** | `grok.com/rest/app-chat/*` | Bearer ✅ | ⚠️ 仅特定模型 | ⚠️ 待验证 | ✅ **可用**（`build`） |
 
 #### CLI 路径：工具「被接受但不执行」
 
@@ -168,7 +170,10 @@ collections_search, file_search, code_execution, code_interpreter, mcp, shell, t
 | 其它 12 个（`grok-4.7` / `grok-4.5` / `grok-4.20-*` / `grok-build-0.1` / …） | 403 `Model is not found` | 名称无效 |
 
 试过的所有变体（body 形态 10 种、额外头 6 种、两步 add-response 路径）都停在同一个
-`modelNotAvailable`。**OAuth2 token 用户在网页路径上没有可用的对话模型。**
+`modelNotAvailable`。
+
+**但生图是例外** —— 用 `modelName: "build"` 就能出图（见 §1.6）。
+即：OAuth2 token 用户在网页路径上**没有可用的对话模型，但有可用的生图模型**。
 
 ### 1.5 权限是端点级的
 
@@ -186,6 +191,101 @@ collections_search, file_search, code_execution, code_interpreter, mcp, shell, t
 即：**只读会话列表可用，其余一律被 OAuth2 策略挡住**（`WKE=unauthorized:oauth2-auth-forbidden`）。
 
 ---
+
+### 1.6 网页生图已打通（2026-10-19 实测）
+
+**模型名是 `build`** —— 这是整件事的关键。实测分级：
+
+| modelName | 结果 |
+|---|---|
+| **`build`** | ✅ **200 + 真实出图** |
+| `imagine-agent-mode` | ✅ 出图，但走 MCP 工具 `imagine_text_to_image`，慢且额度受限 |
+| `imagine-agent-mode-grok-4-5` | ⚠️ 报 "You've reached the image generation limit" |
+| `grok-3` | ❌ 通过名称校验但 `modelNotAvailable` |
+| `grok-420` | ❌ 429 heavy usage |
+| `grok-4.7` / `grok-4.5` / `grok-4.20-*` / `grok-build-0.1` | ❌ 403 `Model is not found` |
+
+这些名字来自 **`POST /rest/models`**（不是 GET —— GET 返回 501）：
+33 个模型，含 `build`、`grok-3`、`grok-420`、`imagine-agent-mode*`、
+`grok-plugins-4p{5,6,7}-*`。默认值 `defaultFreeModel: grok-3`、
+`defaultProModel: grok-4`、`unavailableModels: []`。
+
+#### 请求形态
+
+```jsonc
+POST https://grok.com/rest/app-chat/conversations/new
+Authorization: Bearer <access_token>
+
+{
+  "message": "A serene mountain lake at sunrise, photorealistic",
+  "modelName": "build",                        // ← 关键
+  "temporary": true,
+  "deviceEnvInfo": { /* 6 字段 */ },
+  "kind": "CONVERSATION_KIND_IMAGINE",
+  "enableImageGeneration": true,
+  "enableImageStreaming": true,
+  "mediaGenInput": {"textToImage": {"prompt": "<prompt>", "numOfImages": 1}},
+  "responseMetadata": {"modelConfigOverride": {"modelMap": {"imageEditModel": "imagine"}}}
+}
+```
+
+实测耗时 **10–19 秒**（`temporary: true`，不落历史）。
+
+#### 图片在 `cardAttachment` 里 —— 不是 `streamingImageGenerationResponse`
+
+这是实现时最容易踩的坑。真实响应流（按序）：
+
+```jsonc
+// 1) 卡片声明（还没有图）
+{"cardAttachment": {"jsonData": "{\"id\":\"gi6r5\",
+  \"type\":\"render_generated_image\",\"cardType\":\"generated_image_card\",
+  \"prompt\":\"A realistic red apple...\",\"orientation\":\"portrait\",
+  \"image_chunk\":null}"}}
+
+// 2) 第一帧：progress=50，路径带 -part-0
+{"cardAttachment": {"jsonData": "{...\"image_chunk\":{
+  \"imageUuid\":\"15ccde3c-...\",
+  \"imageUrl\":\"users/<uid>/generated/15ccde3c-...-part-0/image.jpg\",
+  \"mimeType\":\"image/jpeg\",\"seq\":0,\"progress\":50,\"imageModel\":\"imagine_x_1\"}}"}}
+
+// 3) 最终帧：progress=100，路径去掉 -part-0
+{"cardAttachment": {"jsonData": "{...\"resolution\":{\"width\":784,\"height\":1176,
+  \"aspect_ratio\":\"2:3\"},\"image_chunk\":{
+  \"imageUrl\":\"users/<uid>/generated/15ccde3c-.../image.jpg\",
+  \"seq\":1,\"progress\":100,\"moderated\":false}}"}}
+```
+
+**`jsonData` 是字符串化的 JSON，要二次解析。**
+`ModelResponse` 里另有 `<grok:render card_id="gi6r5" card_type="generated_image_card">`
+的 XML 标记，但**图片 URL 只在 `cardAttachment` 里**。
+
+#### 图片下载需要 Bearer
+
+```
+GET https://assets.grok.com/<imageUrl>
+Authorization: Bearer <access_token>      → 200, image/jpeg, 351,813 B, 784×1168
+
+（无认证 → 403，0 字节）
+```
+
+实测下载验证：**65,930 字节 → 784×1168 RGB JPEG**，内容与 prompt 完全相符。
+
+#### 限流：`progress=100` 也可能没有图
+
+连续生图会触发限流，此时**失败帧的 `progress` 仍是 100**：
+
+```jsonc
+{"cardAttachment": {"jsonData": "{...\"image_chunk\":{
+  \"imageUuid\":\"a461724a-...\",\"seq\":0,\"progress\":100,
+  \"systemErrCode\":1006}}"}}          // ← 没有 imageUrl
+{"error": {"message": "You've hit your image rate limit. Please try again later.",
+           "renderToolRateLimited": {"rateLimitedCount": 1},
+           "severity": "STREAM_ERROR_SEVERITY_NORMAL"}}
+```
+
+**只看 `progress` 会把失败帧误判成完成。** 必须同时检查
+`imageUrl` 是否存在与 `systemErrCode` / `renderToolRateLimited`。
+换凭证可绕过（实测第一个凭证限流后，第二个立即成功）。
 
 ## 2. 主对话端点
 

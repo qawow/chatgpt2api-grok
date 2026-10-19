@@ -27,6 +27,9 @@ from typing import Any, Iterable, Iterator
 import requests
 
 WEB_BASE = "https://grok.com"
+
+# 每 (host, proxy) 一个 Session —— 复用 keep-alive 可绕开 TLS 握手抖动
+_SESSIONS: dict[str, requests.Session] = {}
 CHAT_NEW_PATH = "/rest/app-chat/conversations/new"
 CHAT_ADD_PATH = "/rest/app-chat/conversations/{conversation_id}/responses"
 RECONNECT_PATH = "/rest/app-chat/conversations/reconnect-response/{response_id}"
@@ -37,8 +40,21 @@ ASSET_SERVER_URL = "https://assets.grok.com"
 KIND_IMAGINE = "CONVERSATION_KIND_IMAGINE"
 
 DEFAULT_MODEL = "grok-4-auto"
-IMAGE_MODEL = "imagine-image-gen"
-IMAGE_EDIT_MODEL = "imagine-image-edit"
+
+# 网页生图**必须**用这个模型名。实测 2026-10-19：`grok-4.7` / `grok-4.5` /
+# `grok-4.20-*` 一律 403 "Model is not found"；`grok-3` 通过名称校验但返回
+# `modelNotAvailable`（表现为 "Invalid request. Please update your client."）；
+# 只有 `build` 真正出图。
+#
+# 它是 `/rest/models` 目录里的 `modelId: "build"`（`modelMode: MODEL_MODE_BUILD`）。
+IMAGE_MODEL = "build"
+
+# 生图 Agent 模型（走 MCP 工具 `imagine_text_to_image`，出图但慢，且额度受限）
+IMAGE_AGENT_MODEL = "imagine-agent-mode"
+IMAGE_AGENT_MODEL_45 = "imagine-agent-mode-grok-4-5"
+
+# 图片 CDN。`imageUrl` 是**相对 key**，拼这个前缀；下载**需要 Bearer**（无认证 403）。
+ASSET_SERVER_URL = "https://assets.grok.com"
 
 # toolOverrides 14 键全集（GrokApiToolOverrides）。
 # 语义是「只在禁用时下发」—— 全开时整个字段不发。
@@ -173,15 +189,63 @@ def extract_search_pages(response: dict[str, Any]) -> list[dict[str, Any]]:
 def extract_images(response: dict[str, Any]) -> list[dict[str, Any]]:
     """取本 chunk 的图片信息。
 
-    三个通道（同一 chunk 可能并存）：
+    **实况修正（2026-10-19）**：网页生图的图片走 `cardAttachment`，**不是**
+    `streamingImageGenerationResponse`。真实响应（`build` + IMAGINE）：
 
-    * `streamingImageGenerationResponse` —— 逐帧预览，14 字段
-    * `fileAttachmentAssetMetadata[]` —— 最终资产
-    * `generatedImageUrls` —— 旧路径
+        {"cardAttachment": {"jsonData": "{\\"id\\":\\"gi6r5\\",
+          \\"type\\":\\"render_generated_image\\",
+          \\"cardType\\":\\"generated_image_card\\",
+          \\"resolution\\":{\\"width\\":784,\\"height\\":1176,\\"aspect_ratio\\":\\"2:3\\"},
+          \\"image_chunk\\":{\\"imageUuid\\":\\"...\\",
+            \\"imageUrl\\":\\"users/<uid>/generated/<uuid>/image.jpg\\",
+            \\"mimeType\\":\\"image/jpeg\\",\\"seq\\":1,\\"progress\\":100,
+            \\"moderated\\":false,\\"imageModel\\":\\"imagine_x_1\\"}}}"}}
 
-    `imageUrl` 是**相对 key**，要用 :func:`asset_url` 拼成绝对地址。
+    `jsonData` 是**字符串化的 JSON**，要二次解析。
+    进度分两帧：`seq=0 progress=50`（`…-part-0/image.jpg`）→
+    `seq=1 progress=100`（`…/image.jpg`，去掉 `-part-0`）。
+
+    另外三个通道（`streamingImageGenerationResponse` / `fileAttachmentAssetMetadata` /
+    `generatedImageUrls`）在网页生图里**实测为空**，保留作兼容。
     """
     out: list[dict[str, Any]] = []
+
+    # 通道 0：cardAttachment（网页生图的真实通道）
+    card = response.get("cardAttachment")
+    if isinstance(card, dict):
+        raw = card.get("jsonData")
+        data: dict[str, Any] | None = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except (json.JSONDecodeError, ValueError):
+                data = None
+        elif isinstance(raw, dict):
+            data = raw
+        if data is not None:
+            chunk = data.get("image_chunk")
+            if isinstance(chunk, dict):
+                resolution = data.get("resolution")
+                out.append({
+                    "kind": "card",
+                    "card_id": data.get("id"),
+                    "image_url": asset_url(chunk.get("imageUrl")),
+                    "asset_id": chunk.get("imageUuid"),
+                    "mime_type": chunk.get("mimeType"),
+                    "progress": chunk.get("progress"),
+                    "seq": chunk.get("seq"),
+                    "image_model": chunk.get("imageModel"),
+                    "prompt": chunk.get("imagePrompt") or data.get("prompt"),
+                    "resolution": resolution if isinstance(resolution, dict) else None,
+                    "moderated": chunk.get("moderated"),
+                    "rejection_reason": chunk.get("rejectionReason"),
+                    # 生图失败时给 `systemErrCode`（实测 1006 = 被限流），
+                    # 此时 `imageUrl` 缺失但 `progress` 仍是 100 ——
+                    # 只看 progress 会把失败帧误判成完成。
+                    "system_err_code": chunk.get("systemErrCode"),
+                })
 
     frame = response.get("streamingImageGenerationResponse")
     if isinstance(frame, dict):
@@ -257,12 +321,37 @@ def model_unavailable(response: dict[str, Any]) -> str | None:
     if isinstance(error, dict):
         if error.get("modelNotAvailable") is not None:
             return str(error.get("message") or "model not available")
+        # 只认「模型不可用」类文案，别把限流等其它错误也吞进来 ——
+        # `image_rate_limited()` 要能独立识别 `renderToolRateLimited`。
         message = str(error.get("message") or "")
-        if message:
+        lowered = message.lower()
+        if "model" in lowered and ("not available" in lowered or "unavailable" in lowered):
             return message
     token = response.get("token")
     if isinstance(token, str) and CLIENT_UPDATE_NOTICE in token:
         return CLIENT_UPDATE_NOTICE
+    return None
+
+
+def image_rate_limited(response: dict[str, Any]) -> str | None:
+    """生图被限流时返回原因，否则 None。
+
+    实测 2026-10-19：连续第二次生图返回
+
+        {"error": {"message": "You've hit your image rate limit. Please try again later.",
+                   "renderToolRateLimited": {"rateLimitedCount": 1},
+                   "severity": "STREAM_ERROR_SEVERITY_NORMAL"}}
+
+    同时 `cardAttachment.image_chunk` 给 `systemErrCode: 1006` 且**没有 imageUrl**。
+    注意 `progress` 仍是 `100` —— 只看 progress 会把失败帧当成完成。
+    """
+    error = response.get("error")
+    if isinstance(error, dict):
+        if error.get("renderToolRateLimited") is not None:
+            return str(error.get("message") or "image rate limited")
+        message = str(error.get("message") or "")
+        if "rate limit" in message.lower() and "image" in message.lower():
+            return message
     return None
 
 
@@ -424,6 +513,92 @@ def _cookies(raw: Any) -> dict[str, str] | None:
     return out or None
 
 
+def _session(host: str, proxy: str | None) -> requests.Session:
+    """每 (host, proxy) 一个 Session —— 复用 keep-alive 连接绕开 TLS 握手抖动。
+
+    实测：该 SOCKS 池对**新建** TLS 握手有 25-50% 的
+    `SSLEOFError: UNEXPECTED_EOF_WHILE_READING` 抖动，而复用 keep-alive
+    连接 8/8 成功。所以优先复用而不是每次重连。
+    """
+    key = f"{host}|{proxy or ''}"
+    sess = _SESSIONS.get(key)
+    if sess is None:
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.proxies = {"http": proxy, "https": proxy} if proxy else None
+        _SESSIONS[key] = sess
+    return sess
+
+
+def _stream_post(
+    url: str,
+    *,
+    headers: dict[str, str],
+    cookies: dict[str, str] | None,
+    body: dict[str, Any],
+    proxy: str | None,
+    timeout: float,
+    attempts: int = 8,
+) -> requests.Response:
+    """POST 并返回流式响应，对瞬时 TLS 抖动重试。
+
+    握手阶段 EOF 说明请求从未发出，重试安全（与 `grok_backend_api` 的两级
+    分类一致：`is_transient_tls_error`）。这里只做 POST 到对话端点，服务端
+    按 `temporary` 去重，重复提交不会重复计费。
+    """
+    from urllib.parse import urlparse
+
+    from services.proxy_service import is_transient_tls_error
+
+    host = urlparse(url).netloc
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _session(host, proxy).post(
+                url, json=body, headers=headers, cookies=cookies,
+                stream=True, timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            last = exc
+            if attempt < attempts and is_transient_tls_error(str(exc), method="post"):
+                _SESSIONS.pop(f"{host}|{proxy or ''}", None)  # 换一条连接
+                time.sleep(0.4 * attempt)
+                continue
+            raise
+    raise last  # type: ignore[misc]
+
+
+def _stream_get(
+    url: str,
+    *,
+    headers: dict[str, str],
+    cookies: dict[str, str] | None,
+    proxy: str | None,
+    timeout: float,
+    attempts: int = 8,
+) -> requests.Response:
+    """GET 流式响应，对瞬时 TLS 抖动重试（GET 幂等，重试安全）。"""
+    from urllib.parse import urlparse
+
+    from services.proxy_service import is_transient_tls_error
+
+    host = urlparse(url).netloc
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _session(host, proxy).get(
+                url, headers=headers, cookies=cookies, stream=True, timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            last = exc
+            if attempt < attempts and is_transient_tls_error(str(exc), method="get"):
+                _SESSIONS.pop(f"{host}|{proxy or ''}", None)
+                time.sleep(0.4 * attempt)
+                continue
+            raise
+    raise last  # type: ignore[misc]
+
+
 def stream_conversation(
     message: str,
     *,
@@ -457,18 +632,16 @@ def stream_conversation(
     else:
         url = f"{WEB_BASE}{CHAT_NEW_PATH}"
 
-    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        resp = requests.post(
+        resp = _stream_post(
             url,
-            json=body,
             headers=build_headers(
                 referer=f"{WEB_BASE}/c/{conversation_id}" if conversation_id else f"{WEB_BASE}/",
                 bearer=token,
             ),
             cookies=jar,
-            proxies=proxies,
-            stream=True,
+            body=body,
+            proxy=proxy,
             timeout=timeout,
         )
     except requests.RequestException as exc:
@@ -517,6 +690,7 @@ def ask(
     pages: list[dict[str, Any]] = []
     images: list[dict[str, Any]] = []
     rejected: list[str] = []
+    rate_limited: list[str] = []
     response_id = None
     conversation_id = None
 
@@ -531,6 +705,9 @@ def ask(
         reason = is_rejected(response)
         if reason:
             rejected.append(reason)
+        limited = image_rate_limited(response)
+        if limited:
+            rate_limited.append(limited)
         response_id = response.get("responseId") or response_id
         conversation_id = response.get("conversationId") or conversation_id
 
@@ -540,6 +717,7 @@ def ask(
         "pages": _dedupe(pages, "url"),
         "images": _dedupe(images, "image_url"),
         "rejected": rejected,
+        "rate_limited": rate_limited,
         "response_id": response_id,
         "conversation_id": conversation_id,
     }
@@ -579,29 +757,107 @@ def search(query: str, *, cookies: Any = None, bearer: str | None = None,
     }
 
 
+def download_image(
+    key: str,
+    *,
+    bearer: str | None = None,
+    proxy: str | None = None,
+    timeout: float = 120.0,
+) -> bytes:
+    """下载 `assets.grok.com` 上的图片。
+
+    **必须带 Bearer** —— 实测无认证返回 403（0 字节），带 Bearer 返回
+    200 + `image/jpeg`（351,813 字节，784×1168）。
+
+    `key` 是 :func:`extract_images` 返回的 `image_url`（已是绝对地址）。
+    """
+    url = asset_url(key)
+    if not url:
+        raise GrokWebError("缺少图片 key")
+    token = str(bearer or "").strip()
+    if not token:
+        raise GrokWebError("下载图片需要 bearer")
+    try:
+        resp = _stream_get(
+            url,
+            headers={"Authorization": f"Bearer {token}",
+                     "User-Agent": "grok-cli/1.0.62",
+                     "Accept": "image/*,*/*"},
+            cookies=None,
+            proxy=proxy,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise GrokWebError(f"图片下载失败: {exc}") from exc
+    if resp.status_code != 200:
+        raise GrokWebError(f"图片下载 HTTP {resp.status_code}", status=resp.status_code)
+    return resp.content
+
+
 def generate_image(
     prompt: str,
     *,
     cookies: Any = None,
     bearer: str | None = None,
     proxy: str | None = None,
-    count: int = 2,
+    count: int = 1,
     aspect_ratio: str | None = None,
     resolution: str | None = None,
     mode: str | None = None,
-    timeout: float = 300.0,
+    model: str = IMAGE_MODEL,
+    download: bool = False,
+    timeout: float = 600.0,
 ) -> dict[str, Any]:
-    """调用网页 Imagine 生图。"""
+    """调用网页 Imagine 生图。
+
+    **实测可用（2026-10-19）**：`model=build` + `kind=CONVERSATION_KIND_IMAGINE`
+    + `mediaGenInput.textToImage` → 200，图片在 `cardAttachment` 里，
+    最终帧 `progress=100` 的 `imageUrl` 可下载（784×1168 JPEG）。
+
+    模型名选择：
+
+    * `build`（默认）—— 直接出图，实测成功
+    * `imagine-agent-mode` —— 走 MCP 工具 `imagine_text_to_image`，也出图，
+      但会先跑沙箱命令，慢；额度受限
+    * `grok-4.7` / `grok-4.5` / `grok-4.20-*` —— **403 Model is not found**
+    * `grok-3` —— 通过校验但 `modelNotAvailable`
+
+    `download=True` 时顺带取回图片字节（需要 bearer），放进 `images[].content`。
+    """
     result = ask(
         prompt, cookies=cookies, bearer=bearer, proxy=proxy, timeout=timeout,
-        image=True, image_count=count, aspect_ratio=aspect_ratio,
+        model=model, image=True, image_count=count, aspect_ratio=aspect_ratio,
         resolution=resolution, image_mode=mode,
     )
-    # 只保留最终态：有 url 且无 rejection
+    # 失败帧（`systemErrCode` 且无 imageUrl）单独收集，不混进成功列表
+    failed = [img for img in result["images"]
+              if not img.get("image_url") and img.get("system_err_code")]
     images = [img for img in result["images"] if img.get("image_url")]
+    # 同一张图会有 progress=50 与 progress=100 两帧，按 asset_id 去重取最终态
+    final: dict[str, dict[str, Any]] = {}
+    for img in images:
+        key = str(img.get("asset_id") or img.get("image_url"))
+        prev = final.get(key)
+        if prev is None or int(img.get("progress") or 0) >= int(prev.get("progress") or 0):
+            final[key] = img
+    images = list(final.values())
+
+    if download and images:
+        token = str(bearer or "").strip()
+        if token:
+            for img in images:
+                try:
+                    img["content"] = download_image(
+                        img["image_url"], bearer=token, proxy=proxy
+                    )
+                except GrokWebError as exc:
+                    img["download_error"] = str(exc)
+
     return {
         "images": images,
+        "failed": failed,
         "rejected": result["rejected"],
+        "rate_limited": result["rate_limited"],
         "text": result["text"],
         "response_id": result["response_id"],
         "conversation_id": result["conversation_id"],
@@ -616,9 +872,8 @@ def reconnect(response_id: str, *, cookies: Any = None, bearer: str | None = Non
     if not jar and not token:
         raise GrokWebError("缺少认证：需要 bearer 或 cookies")
     url = f"{WEB_BASE}{RECONNECT_PATH.format(response_id=response_id)}"
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    resp = requests.get(url, headers=build_headers(bearer=token), cookies=jar,
-                        proxies=proxies, stream=True, timeout=timeout)
+    resp = _stream_get(url, headers=build_headers(bearer=token), cookies=jar,
+                       proxy=proxy, timeout=timeout)
     with resp:
         if resp.status_code >= 400:
             raise GrokWebError(f"重连失败 HTTP {resp.status_code}",

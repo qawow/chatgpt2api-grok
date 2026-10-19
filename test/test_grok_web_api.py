@@ -380,7 +380,7 @@ class EndToEndAggregationTest(unittest.TestCase):
     def _patch_post(self, resp):
         from unittest import mock
 
-        return mock.patch.object(g.requests, "post", return_value=resp)
+        return mock.patch.object(g, "_stream_post", return_value=resp)
 
     def test_search_flow_aggregates_text_and_sources(self):
         lines = [
@@ -487,7 +487,7 @@ class EndToEndAggregationTest(unittest.TestCase):
         with self._patch_post(self._fake_response(lines)) as post:
             list(g.stream_conversation("a cat", cookies={"s": "1"},
                                        image=True, image_count=3))
-        body = post.call_args.kwargs["json"]
+        body = post.call_args.kwargs["body"]
         self.assertEqual(body["kind"], "CONVERSATION_KIND_IMAGINE")
         self.assertEqual(body["mediaGenInput"]["textToImage"]["numOfImages"], 3)
 
@@ -525,8 +525,16 @@ class ModelUnavailableTest(unittest.TestCase):
                          {"error": None}, {"error": "not a dict"}):
             self.assertIsNone(g.model_unavailable(response))
 
-    def test_a_generic_error_message_is_still_surfaced(self):
-        self.assertEqual(g.model_unavailable({"error": {"message": "boom"}}), "boom")
+    def test_a_generic_error_message_is_not_claimed_as_model_unavailable(self):
+        """`model_unavailable` 只认「模型不可用」，不吞其它错误。
+
+        否则 `image_rate_limited()` 的 `renderToolRateLimited` 会被误判成模型问题。
+        """
+        self.assertIsNone(g.model_unavailable({"error": {"message": "boom"}}))
+        self.assertEqual(
+            g.model_unavailable({"error": {"message": "The model is unavailable."}}),
+            "The model is unavailable.",
+        )
 
     def test_the_two_chunks_of_a_real_failure_both_report(self):
         """真实失败会先后给这两条，两条都要能识别。"""
@@ -566,7 +574,7 @@ class BearerAuthTest(unittest.TestCase):
         resp.iter_lines.return_value = [line.encode() for line in lines]
         resp.__enter__ = lambda s: s
         resp.__exit__ = lambda *a: None
-        with mock.patch.object(g.requests, "post", return_value=resp) as post:
+        with mock.patch.object(g, "_stream_post", return_value=resp) as post:
             out = list(g.stream_conversation("hi", bearer="tok-fixture"))
         self.assertEqual(len(out), 1)
         sent = post.call_args.kwargs["headers"]
@@ -575,3 +583,216 @@ class BearerAuthTest(unittest.TestCase):
     def test_no_auth_at_all_is_rejected_before_any_request(self):
         with self.assertRaises(g.GrokWebError):
             list(g.stream_conversation("hi"))
+
+
+class CardAttachmentImageTest(unittest.TestCase):
+    """网页生图的图片走 `cardAttachment`，不是 `streamingImageGenerationResponse`。
+
+    实测 2026-10-19（`model=build` + `CONVERSATION_KIND_IMAGINE`）：
+
+        {"cardAttachment": {"jsonData": "{\\"id\\":\\"gi6r5\\",
+          \\"type\\":\\"render_generated_image\\",
+          \\"cardType\\":\\"generated_image_card\\",
+          \\"resolution\\":{\\"width\\":784,\\"height\\":1176,
+                          \\"aspect_ratio\\":\\"2:3\\"},
+          \\"image_chunk\\":{\\"imageUuid\\":\\"...\\",
+            \\"imageUrl\\":\\"users/<uid>/generated/<uuid>/image.jpg\\",
+            \\"mimeType\\":\\"image/jpeg\\",\\"seq\\":1,\\"progress\\":100,
+            \\"moderated\\":false,\\"imageModel\\":\\"imagine_x_1\\"}}}"}}
+
+    `jsonData` 是**字符串化的 JSON**，要二次解析 —— 这是最容易漏的一步。
+    """
+
+    def _card(self, payload: dict) -> dict:
+        return {"cardAttachment": {"jsonData": json.dumps(payload)}}
+
+    def test_final_frame_yields_a_downloadable_url(self):
+        response = self._card({
+            "id": "gi6r5", "type": "render_generated_image",
+            "cardType": "generated_image_card",
+            "resolution": {"width": 784, "height": 1176, "aspect_ratio": "2:3"},
+            "image_chunk": {
+                "imageUuid": "15ccde3c-6622-4667-a308-0093f4928548",
+                "imageUrl": "users/79e28854/generated/15ccde3c/image.jpg",
+                "mimeType": "image/jpeg", "seq": 1, "progress": 100,
+                "moderated": False, "imageModel": "imagine_x_1",
+            },
+        })
+        out = g.extract_images(response)
+        self.assertEqual(len(out), 1)
+        img = out[0]
+        self.assertEqual(img["kind"], "card")
+        self.assertEqual(img["card_id"], "gi6r5")
+        self.assertEqual(img["asset_id"], "15ccde3c-6622-4667-a308-0093f4928548")
+        self.assertEqual(img["image_url"],
+                         "https://assets.grok.com/users/79e28854/generated/15ccde3c/image.jpg")
+        self.assertEqual(img["progress"], 100)
+        self.assertEqual(img["image_model"], "imagine_x_1")
+        self.assertEqual(img["resolution"]["aspect_ratio"], "2:3")
+        self.assertFalse(img["moderated"])
+
+    def test_the_progress_50_frame_has_no_url(self):
+        """第一帧 `seq=0 progress=50` 带 `-part-0` 路径，第二帧才是最终图。"""
+        first = self._card({
+            "id": "gi6r5", "image_chunk": {
+                "imageUuid": "u1", "progress": 50, "seq": 0,
+                "imageUrl": "users/x/generated/u1-part-0/image.jpg",
+            },
+        })
+        out = g.extract_images(first)
+        self.assertEqual(out[0]["progress"], 50)
+        self.assertIn("-part-0", out[0]["image_url"])
+
+    def test_a_failed_frame_carries_system_err_code(self):
+        """限流帧 `progress=100` 但**没有 imageUrl**，只有 `systemErrCode`。"""
+        response = self._card({
+            "id": "0AmCB", "image_chunk": {
+                "imageUuid": "a461724a-e33b-4b9d-a2e2-8f98ca9fe9ce",
+                "seq": 0, "progress": 100, "systemErrCode": 1006,
+            },
+        })
+        out = g.extract_images(response)
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["image_url"])
+        self.assertEqual(out[0]["system_err_code"], 1006)
+
+    def test_json_data_may_already_be_a_dict(self):
+        response = {"cardAttachment": {"jsonData": {
+            "id": "c1", "image_chunk": {"imageUrl": "a/b.jpg", "progress": 100},
+        }}}
+        out = g.extract_images(response)
+        self.assertEqual(out[0]["image_url"], "https://assets.grok.com/a/b.jpg")
+
+    def test_malformed_json_data_does_not_raise(self):
+        for raw in ("{not json", "", None, 42):
+            response = {"cardAttachment": {"jsonData": raw}}
+            self.assertEqual(g.extract_images(response), [])
+
+    def test_a_card_without_image_chunk_is_ignored(self):
+        """生图请求刚发出时 `image_chunk` 是 null。"""
+        response = self._card({"id": "gi6r5", "type": "render_generated_image",
+                               "prompt": "a red apple", "image_chunk": None})
+        self.assertEqual(g.extract_images(response), [])
+
+
+class ImageRateLimitTest(unittest.TestCase):
+    """连续生图会触发限流，且**失败帧的 progress 仍是 100**。"""
+
+    def test_render_tool_rate_limited_is_detected(self):
+        response = {"error": {
+            "message": "You've hit your image rate limit. Please try again later.",
+            "renderToolRateLimited": {"rateLimitedCount": 1},
+            "severity": "STREAM_ERROR_SEVERITY_NORMAL",
+        }}
+        reason = g.image_rate_limited(response)
+        self.assertIsNotNone(reason)
+        self.assertIn("rate limit", reason.lower())
+
+    def test_a_message_only_rate_limit_is_detected(self):
+        response = {"error": {"message": "You've hit your image rate limit."}}
+        self.assertIsNotNone(g.image_rate_limited(response))
+
+    def test_a_normal_response_is_not_flagged(self):
+        for response in ({}, {"message": "hi"}, {"error": None},
+                         {"error": {"message": "model not available"}}):
+            self.assertIsNone(g.image_rate_limited(response))
+
+    def test_model_unavailable_and_rate_limit_are_distinct(self):
+        """两个错误不能互相误判。"""
+        unavailable = {"error": {"message": "This model is temporarily unavailable.",
+                                 "modelNotAvailable": {}}}
+        limited = {"error": {"message": "You've hit your image rate limit.",
+                             "renderToolRateLimited": {"rateLimitedCount": 1}}}
+        self.assertIsNotNone(g.model_unavailable(unavailable))
+        self.assertIsNone(g.image_rate_limited(unavailable))
+        self.assertIsNotNone(g.image_rate_limited(limited))
+        self.assertIsNone(g.model_unavailable(limited))
+
+
+class ImageModelConstantsTest(unittest.TestCase):
+    """模型名是实测出来的，不能随意改。"""
+
+    def test_the_working_model_is_build(self):
+        self.assertEqual(g.IMAGE_MODEL, "build")
+
+    def test_asset_server_is_the_cdn(self):
+        self.assertEqual(g.ASSET_SERVER_URL, "https://assets.grok.com")
+
+    def test_imagine_kind_literal(self):
+        self.assertEqual(g.KIND_IMAGINE, "CONVERSATION_KIND_IMAGINE")
+
+    def test_image_body_uses_the_working_model(self):
+        body = g.build_body("x", image=True, model=g.IMAGE_MODEL)
+        self.assertEqual(body["modelName"], "build")
+        self.assertEqual(body["kind"], "CONVERSATION_KIND_IMAGINE")
+
+
+class DownloadImageTest(unittest.TestCase):
+    """下载需要 Bearer —— 实测无认证 403。"""
+
+    def test_missing_bearer_raises_before_any_request(self):
+        with self.assertRaises(g.GrokWebError):
+            g.download_image("users/x/generated/u/image.jpg")
+
+    def test_empty_key_raises(self):
+        with self.assertRaises(g.GrokWebError):
+            g.download_image("", bearer="tok")
+
+    def test_the_request_carries_the_bearer_header(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.content = b"\xff\xd8\xff" + b"x" * 2000
+        with mock.patch.object(g, "_stream_get", return_value=resp) as sg:
+            data = g.download_image("users/x/generated/u/image.jpg", bearer="tok-fixture")
+        self.assertEqual(len(data), 2003)
+        sent = sg.call_args.kwargs["headers"]
+        self.assertEqual(sent["Authorization"], "Bearer tok-fixture")
+
+    def test_a_non_200_raises_with_status(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 403
+        with mock.patch.object(g, "_stream_get", return_value=resp):
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.download_image("users/x/image.jpg", bearer="tok")
+        self.assertEqual(ctx.exception.status, 403)
+
+
+class GenerateImageDedupeTest(unittest.TestCase):
+    """同一张图的 progress=50 / progress=100 两帧要合成一个最终态。"""
+
+    def test_failed_frames_are_separated_from_successful_ones(self):
+        from unittest import mock
+
+        frames = [
+            {"result": {"response": {"cardAttachment": {"jsonData": json.dumps({
+                "id": "c1", "image_chunk": {"imageUuid": "u1", "progress": 50,
+                                            "imageUrl": "a/u1-part-0/image.jpg"}})}}}},
+            {"result": {"response": {"cardAttachment": {"jsonData": json.dumps({
+                "id": "c1", "image_chunk": {"imageUuid": "u1", "progress": 100,
+                                            "imageModel": "imagine_x_1",
+                                            "imageUrl": "a/u1/image.jpg"}})}}}},
+            {"result": {"response": {"cardAttachment": {"jsonData": json.dumps({
+                "id": "c2", "image_chunk": {"imageUuid": "u2", "progress": 100,
+                                            "systemErrCode": 1006}})}}}},
+        ]
+        lines = [json.dumps(f).encode() for f in frames]
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.text = "\n".join(json.dumps(f) for f in frames)
+        resp.iter_lines.return_value = lines
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+
+        with mock.patch.object(g, "_stream_post", return_value=resp):
+            out = g.generate_image("x", bearer="tok")
+
+        self.assertEqual(len(out["images"]), 1, "两帧同一张图应合成一个")
+        self.assertEqual(out["images"][0]["progress"], 100)
+        self.assertNotIn("-part-0", out["images"][0]["image_url"])
+        self.assertEqual(len(out["failed"]), 1, "失败帧单独收集")
+        self.assertEqual(out["failed"][0]["system_err_code"], 1006)
