@@ -96,7 +96,7 @@ bundle 里的 `Bearer` 只属 next-axiom 日志库、`Basic` 属 Mixpanel、
 
 ### 1.4 实况：三条路径的可用性矩阵
 
-> **2026-10-19 更新：网页生图已打通** —— 见 §1.6。模型名必须是 `build`。
+> **2026-10-19 更新：网页生图已打通** —— 见 §1.7。模型名必须是 `build`。
 
 | 路径 | 端点 | 认证 | 文本 | 搜索 | 画图 |
 |---|---|---|---|---|---|
@@ -172,7 +172,7 @@ collections_search, file_search, code_execution, code_interpreter, mcp, shell, t
 试过的所有变体（body 形态 10 种、额外头 6 种、两步 add-response 路径）都停在同一个
 `modelNotAvailable`。
 
-**但生图是例外** —— 用 `modelName: "build"` 就能出图（见 §1.6）。
+**但生图是例外** —— 用 `modelName: "build"` 就能出图（见 §1.7）。
 即：OAuth2 token 用户在网页路径上**没有可用的对话模型，但有可用的生图模型**。
 
 ### 1.5 生图额度接口（2026-10-19 实测）
@@ -229,7 +229,7 @@ bundle 提取（`js/29p4h4iryyz76.js`，`mediaGetImagineQuotaInfoRaw`）：
 - 401/403 时置 `authBlocked` 并停止轮询
 
 **实测：403 `oauth2-auth-forbidden`** —— 该端点被服务端策略限定给网页会话，
-OAuth2 token 用户查不到。但**生图本身可用**（§1.6）→ 额度是服务端强制、客户端不可查。
+OAuth2 token 用户查不到。但**生图本身可用**（§1.7）→ 额度是服务端强制、客户端不可查。
 
 #### 免费层闸门：`GET /rest/usage/free-usage-gates`
 
@@ -281,7 +281,135 @@ POST https://cli-chat-proxy.grok.com/v1/responses
  "preGenerationDelayMs": 0}
 ```
 
-### 1.6 网页生图已打通（2026-10-19 实测）
+### 1.6 生图被拒的三种形态（2026-10-19 实测，三个凭证各命中一种）
+
+**这是本次逆向最重要的发现** —— 限流不止一种形态，且第三种会伪装成成功。
+
+#### 形态 1：请求层 429（整个账号被限流）
+
+```
+HTTP 429  0.7s
+{"error":{"code":8,"message":"Too many requests","details":[]}}
+```
+
+流开始前就被拒，**连普通对话都发不出**。凭证 `c4zc82bzvk` 命中。
+
+#### 形态 2：流内 `renderToolRateLimited`（生图被拒，对话正常）
+
+```jsonc
+{"cardAttachment": {"jsonData": "{..."image_chunk":{
+  "imageUuid":"...","seq":0,"progress":100,"systemErrCode":1006}}"}}
+{"error": {"message": "You've hit your image rate limit. Please try again later.",
+           "renderToolRateLimited": {"rateLimitedCount": 1},
+           "severity": "STREAM_ERROR_SEVERITY_NORMAL"}}
+```
+
+**`progress` 仍是 100 但没有 `imageUrl`** —— 只看 progress 会误判成完成。
+凭证 `stjeh3gnvk` 命中。
+
+#### 形态 3：静默降级（最隐蔽）
+
+```
+HTTP 200  4.1s  len=6817
+无 error、无 cardAttachment、无 systemErrCode
+modelResponse.message = "Got it — test received. How can I help?"
+```
+
+**额度耗尽后服务端不再报错，而是把生图请求当普通对话回。**
+只看 `error` 字段会把它**误判成成功**。凭证 `pd1jt9qjfa` 命中。
+
+> 实测序列：同一凭证连发 8 次生图**全部成功**（每次 9–14 秒、19–20 帧、2 个图片帧），
+> 紧接着下一轮第 1 次就变成形态 3。即额度是**按次数**计，用完后静默降级。
+
+#### 客户端的判定链（bundle 提取）
+
+`js/0lm06h5jbq2j6.js`：
+
+```js
+let v = "usage_pool_exhausted", y = "usage_limit_reached";
+function C(e) {                          // getUsageLimitKind
+  let {errCode: t, failureReason: n} = e;
+  if (t === v) return "pool_exhausted";
+  if (t === y) return "limit_reached";
+  if (n === "PIPELINE_FAILURE_REASON_USAGE_POOL_EXHAUSTED") return "pool_exhausted";
+  if (n === "PIPELINE_FAILURE_REASON_USAGE_LIMIT_REACHED") return "limit_reached";
+  let i = e.typedError;
+  if (i) {
+    if (i.usagePoolExhausted !== undefined || i.usage_pool_exhausted !== undefined) return "pool_exhausted";
+    if (i.usageLimitReached   !== undefined || i.usage_limit_reached   !== undefined) return "limit_reached";
+  }
+  let r = e.message;
+  if (typeof r === "string") {
+    if (r.startsWith(v)) return "pool_exhausted";
+    if (r.startsWith(y)) return "limit_reached";
+  }
+}
+```
+
+`js/1nina2n46pgtw.js`：
+
+```js
+function n(e, t, s) { return void 0 !== e[t] || void 0 !== e[s] }
+
+function o(e) {                          // accountRateLimitKindFromStreamErrors
+  let t = e ?? [];
+  return t.some(x => n(x, "globalRateLimit", "global_rate_limit")) ? "global"
+       : (!!t.some(x => n(x, "usageLimitReached", "usage_limit_reached")) && "user");
+}
+
+// 抑制反馈的流错误（不弹「有帮助吗」）
+function (e) {
+  return false !== o(e) || (e ?? []).some(x =>
+    n(x, "usagePoolExhausted", "usage_pool_exhausted") ||
+    void 0 !== x.renderToolRateLimited);
+}
+```
+
+`js/05thxs9prvmlu.js` 的完整 kind 映射：
+
+```js
+switch (kind) {
+  case "beyondContextLength": case "userPromptTooLong":
+  case "attachmentFileTooLarge": case "attachmentImageTooLarge":
+  case "attachmentTooManyPages":            return "content_too_large";
+  case "modelNotAvailable":
+    return t.modelNotAvailable?.reason === "rate_limited" ? "model_rate_limited" : null;
+  case "globalRateLimit":   return "global_rate_limit";
+  case "concurrencyLimit":  return "concurrency_limit";
+  case "systemKillSwitch":  return "system_kill_switch";
+  case "usagePoolExhausted":return "pool_exhausted";
+  case "usageLimitReached": return "limit_reached";
+  case "connectorAuthFailed": case "attachmentModerated":
+  case "attachmentLoadFailed": case "renderToolFailed":
+  case "renderToolRateLimited": case "renderPerMessageLimitExceeded":
+    return null;                            // 这些不算「用量限制」
+  default: return kind;
+}
+```
+
+#### `StreamError` 结构（50 字段，bundle 提取）
+
+`js/0a18uk1xp-t5a.js`。按用途分组：
+
+| 组 | 字段 |
+|---|---|
+| 限流 | `globalRateLimit`、`usagePoolExhausted`、`usageLimitReached{midTurn}`、`concurrencyLimit`、`renderToolRateLimited{rateLimitedCount}`、`renderPerMessageLimitExceeded{droppedCount}` |
+| 模型 | `modelNotAvailable`（`reason` ∈ `entitlement` / `rate_limited`） |
+| 系统 | `systemKillSwitch{featureName}`、`internalError`、`requestCancelled` |
+| 内容 | `beyondContextLength`、`userPromptTooLong`、`contentModerated{conversationClosed}` |
+| 附件 | `attachmentModerated`、`attachmentImageTooLarge{maxSizeBytes,fileName}`、`attachmentFileTooLarge{fileName}`、`attachmentTooManyPages{maxPages,pageCount}`、`attachmentLoadFailed` |
+| 工具 | `renderToolFailed{failedCount}`、`toolCallFailed{toolUsageCardId,toolName}` |
+| 通用 | `message`、`severity`、`internalDebug{summary,workspace,cause,detail}` |
+
+`modelNotAvailable.reason` 的两个取值对应两条不同文案：
+
+```js
+"entitlement" === reason
+  ? "This model isn't available with your current plan. If you just upgraded, try again."
+  : "This model is temporarily unavailable. Please try a different model."
+```
+
+### 1.7 网页生图已打通（2026-10-19 实测）
 
 **模型名是 `build`** —— 这是整件事的关键。实测分级：
 
@@ -376,7 +504,7 @@ Authorization: Bearer <access_token>      → 200, image/jpeg, 351,813 B, 784×1
 `imageUrl` 是否存在与 `systemErrCode` / `renderToolRateLimited`。
 换凭证可绕过（实测第一个凭证限流后，第二个立即成功）。
 
-### 1.7 权限是端点级的
+### 1.8 权限是端点级的
 
 同一凭证在网页路径上：
 

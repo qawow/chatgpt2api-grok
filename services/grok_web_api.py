@@ -131,10 +131,27 @@ def unwrap(chunk: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None
 def extract_text(response: dict[str, Any]) -> str:
     """取本 chunk 的正文增量。
 
-    前端只在 `messageTag` 为 `UNSET`/`FINAL` 时把文本累加进 `message`；
-    其余标签（thinking / summary / tool_usage_card …）走不同的渲染通道。
-    服务端已经把该给的部分放进 `message`，所以这里直接取。
+    **实况修正（2026-10-19）**：流式分块里正文在 **`token`** 字段，
+    不是 `message` —— 实测响应：
+
+        {"messageTag":"final","token":"Got"}   ← 逐词增量
+        {"messageTag":"final","token":" it"}
+
+    只有**最终帧**的 `modelResponse.message` 才是完整正文。
+    早先只读 `message` 会完全收不到流式文本（`ask()` 返回空串）。
+
+    另外 `messageTag` 决定这块文本属于哪个通道：`thinking` 走思考区、
+    `tool_usage_card` 走工具卡片、`final`/`UNSET` 才是正文。
+    这里只取正文通道，避免把思考内容混进结果。
     """
+    tag = str(response.get("messageTag") or "").strip().lower()
+    if tag and tag not in ("final", "unset", ""):
+        # 最终帧的 modelResponse 没有 messageTag，走下面的分支
+        if not isinstance(response.get("modelResponse"), dict):
+            return ""
+    value = response.get("token")
+    if isinstance(value, str) and value:
+        return value
     value = response.get("message")
     return value if isinstance(value, str) else ""
 
@@ -331,6 +348,27 @@ def model_unavailable(response: dict[str, Any]) -> str | None:
     if isinstance(token, str) and CLIENT_UPDATE_NOTICE in token:
         return CLIENT_UPDATE_NOTICE
     return None
+
+
+# 生图被拒的**三种形态**（实测 2026-10-19，三个凭证各命中一种）：
+#
+#   1. 请求层 429 —— 流开始前就被拒
+#      HTTP 429  {"error":{"code":8,"message":"Too many requests","details":[]}}
+#      整个账号被限流，连对话都发不出
+#
+#   2. 流内 renderToolRateLimited —— 请求成功但生图被拒
+#      {"error":{"message":"You've hit your image rate limit...",
+#                "renderToolRateLimited":{"rateLimitedCount":1}}}
+#      同时 cardAttachment.image_chunk 给 systemErrCode: 1006 且无 imageUrl
+#
+#   3. **静默降级** —— 最隐蔽的一种
+#      HTTP 200，无 error，无 cardAttachment，模型只回文字
+#      （"Got it — test received. How can I help?"）
+#      即生图额度耗尽后，服务端不再报错，而是当成普通对话处理。
+#      **只看 error 字段会把它误判成成功。**
+IMAGE_SILENT_DEGRADE_HINT = (
+    "生图请求未产生 cardAttachment —— 可能是额度耗尽后的静默降级"
+)
 
 
 def image_rate_limited(response: dict[str, Any]) -> str | None:
@@ -1062,11 +1100,18 @@ def generate_image(
                 except GrokWebError as exc:
                     img["download_error"] = str(exc)
 
+    # 静默降级：HTTP 200、无 error、无图、只有文字。
+    # 实测额度耗尽后服务端不再报错，而是把生图请求当普通对话回。
+    silent = not images and not failed and not result["rejected"] \
+        and not result["rate_limited"] and bool(result["text"].strip())
+
     return {
         "images": images,
         "failed": failed,
         "rejected": result["rejected"],
         "rate_limited": result["rate_limited"],
+        "silent_degrade": silent,
+        "warning": IMAGE_SILENT_DEGRADE_HINT if silent else None,
         "text": result["text"],
         "response_id": result["response_id"],
         "conversation_id": result["conversation_id"],

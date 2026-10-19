@@ -945,3 +945,93 @@ class QuotaEndpointTest(unittest.TestCase):
         self.assertEqual(g._as_int(None), 0)
         self.assertEqual(g._as_int(""), 0)
         self.assertEqual(g._as_int("abc"), 0)
+
+
+class SilentDegradeTest(unittest.TestCase):
+    """生图被拒的**第三种形态**：静默降级。
+
+    实测 2026-10-19，三个凭证各命中一种：
+
+      1. HTTP 429 `{"error":{"code":8,"message":"Too many requests"}}`（请求层）
+      2. 流内 `renderToolRateLimited` + `systemErrCode: 1006`（生图层）
+      3. **HTTP 200、无 error、无 cardAttachment、只有文字**（额度耗尽后
+         服务端把生图请求当普通对话回）
+
+    第 3 种最隐蔽 —— 只看 `error` 字段会把它误判成成功。
+    """
+
+    def _stream(self, frames):
+        from unittest import mock
+
+        lines = [json.dumps(f).encode() for f in frames]
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.text = "\n".join(json.dumps(f) for f in frames)
+        resp.iter_lines.return_value = lines
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return mock.patch.object(g, "_stream_post", return_value=resp)
+
+    def test_text_only_response_is_flagged_as_silent_degrade(self):
+        frames = [
+            {"result": {"response": {"messageTag": "final", "token": "Got it"}}},
+            {"result": {"response": {"messageTag": "final", "token": " — test received."}}},
+            {"result": {"response": {"modelResponse": {
+                "message": "Got it — test received. How can I help?"}}}},
+        ]
+        with self._stream(frames):
+            out = g.generate_image("a dot", bearer="tok")
+        self.assertEqual(out["images"], [])
+        self.assertTrue(out["silent_degrade"], "只有文字时必须标记为静默降级")
+        self.assertIsNotNone(out["warning"])
+
+    def test_a_real_image_is_not_flagged(self):
+        frames = [
+            {"result": {"response": {"cardAttachment": {"jsonData": json.dumps({
+                "id": "c1", "image_chunk": {"imageUuid": "u1", "progress": 100,
+                                            "imageUrl": "a/u1/image.jpg"}})}}}},
+        ]
+        with self._stream(frames):
+            out = g.generate_image("a dot", bearer="tok")
+        self.assertEqual(len(out["images"]), 1)
+        self.assertFalse(out["silent_degrade"])
+
+    def test_an_explicit_rate_limit_is_not_flagged_as_silent(self):
+        frames = [
+            {"result": {"response": {"error": {
+                "message": "You've hit your image rate limit.",
+                "renderToolRateLimited": {"rateLimitedCount": 1}}}}},
+        ]
+        with self._stream(frames):
+            out = g.generate_image("a dot", bearer="tok")
+        self.assertTrue(out["rate_limited"])
+        self.assertFalse(out["silent_degrade"], "显式限流不应算静默降级")
+
+    def test_a_failed_frame_is_not_flagged_as_silent(self):
+        frames = [
+            {"result": {"response": {"cardAttachment": {"jsonData": json.dumps({
+                "id": "c1", "image_chunk": {"imageUuid": "u1", "progress": 100,
+                                            "systemErrCode": 1006}})}}}},
+        ]
+        with self._stream(frames):
+            out = g.generate_image("a dot", bearer="tok")
+        self.assertEqual(len(out["failed"]), 1)
+        self.assertFalse(out["silent_degrade"])
+
+    def test_an_empty_response_is_not_flagged_as_silent(self):
+        """完全没有正文时不算静默降级（那是另一种故障）。"""
+        with self._stream([{"result": {"response": {"messageTag": "final",
+                                                    "token": ""}}}]):
+            out = g.generate_image("a dot", bearer="tok")
+        self.assertFalse(out["silent_degrade"])
+
+    def test_three_rejection_forms_are_distinguishable(self):
+        """三种形态必须能被分别识别，不能互相误判。"""
+        # 形态 2：流内限流
+        limited = {"error": {"message": "You've hit your image rate limit.",
+                             "renderToolRateLimited": {"rateLimitedCount": 1}}}
+        self.assertIsNotNone(g.image_rate_limited(limited))
+        self.assertIsNone(g.model_unavailable(limited))
+        self.assertIsNone(g.is_rejected(limited))
+        # 形态 3 的判定不在单帧上，而在聚合结果（见上面的用例）
