@@ -1398,12 +1398,17 @@ USAGE_POLL_MID_MS = 60_000       # ≥50%
 USAGE_POLL_FAR_MS = 180_000      # <50%
 
 
+# 额度端点的上游瞬时故障标记 —— 实测 `503 code:14 "cursor billing: snapshot failed"`。
+CREDITS_TRANSIENT_MARKERS = ("cursor billing", "snapshot failed")
+
+
 def web_credits(
     *,
     bearer: str | None = None,
     cookies: Any = None,
     proxy: str | None = None,
     timeout: float = 60.0,
+    retries: int = 3,
 ) -> dict[str, Any]:
     """`GET /rest/grok/credits` —— **网页 UI 真正使用的额度端点**。
 
@@ -1420,38 +1425,57 @@ def web_credits(
         Cookie sso      → 401 code:16 "Bad credentials."
         无认证           → 401 code:16 "No credentials presented."
 
-    原因在 JWT 里：`aud` 与 `client_id` 都是 `b1a00492-...`（**Grok CLI 客户端**），
-    而该端点只认 **grok.com 网页应用**的 OAuth 客户端。即：
+    **但实测（2026-10-20）这条不是绝对的 —— 取决于账号**：
 
-    * 同一 token 在 `/rest/app-chat/*` 上可用（那套走 `conversations:read/write`）
-    * 在 `/rest/grok/credits` 上被判 `bad-credentials`
+    * `Cookie: sso=<token>`（网页会话）→ **200**，稳定可用
+    * `Authorization: Bearer <CLI oauth-at>` → **4 个凭证里 1 个成功、3 个 403**
+      （`e578i2gj1l` / team `fa960e03` ✅；其余三个 team ❌ `bad-credentials`）
 
-    所以**用 CLI 凭证拿不到网页的生图额度**。可观测的替代只有：
-    :func:`free_usage_gates`（实测全 0/0）、:func:`billing`（CLI 账本，
-    **不含生图**）、或直接看生图响应的 `renderToolRateLimited` / 静默降级。
+    四者的 JWT `aud` / `client_id` **完全相同**（都是 `b1a00492-...`），
+    只有 `team_id` 不同 —— 所以拒绝**不是 token 形态问题，是团队/账号级策略**。
+    调用方应把 403 当作「该账号读不到」而不是「端点不可用」。
+
+    **生图是否计入这个账本：不计入**（实测 2026-10-20，8 张图后
+    `creditUsagePercent` 恒 0、`productUsage` 恒 `[]`）。所以即便能读，
+    它反映的也是文本额度，不是生图配额。生图配额只能靠实际请求的
+    三种拒绝形态判断（见 :func:`generate_image` 的 `silent_degrade`）。
+
+    `503 code:14 "cursor billing: snapshot failed"` 是上游瞬时故障 ——
+    `retries` 控制重试次数（默认 3）。
     """
     jar, token = _auth(cookies, bearer)
     if not jar and not token:
         raise GrokWebError("缺少认证：需要 bearer 或 cookies")
-    resp = _stream_get(
-        f"{WEB_BASE}{CREDITS_PATH}",
-        headers=build_headers(bearer=token),
-        cookies=jar,
-        proxy=proxy,
-        timeout=timeout,
-    )
-    with resp:
-        if resp.status_code != 200:
+    last: GrokWebError | None = None
+    for attempt in range(1, max(1, retries) + 1):
+        resp = _stream_get(
+            f"{WEB_BASE}{CREDITS_PATH}",
+            headers=build_headers(bearer=token),
+            cookies=jar,
+            proxy=proxy,
+            timeout=timeout,
+        )
+        with resp:
+            if resp.status_code == 200:
+                data = resp.json()
+                if not isinstance(data, dict):
+                    return {}
+                return (data.get("config") if isinstance(data.get("config"), dict)
+                        else data)
             detail = (resp.text or "")[:300]
-            raise GrokWebError(
+            error = GrokWebError(
                 f"网页额度端点拒绝（{resp.status_code}）：{detail}",
                 status=resp.status_code,
                 body=detail,
             )
-        data = resp.json()
-    if not isinstance(data, dict):
-        return {}
-    return data.get("config") if isinstance(data.get("config"), dict) else data
+            # 503 "cursor billing: snapshot failed" 是上游瞬时故障，可重试
+            transient = resp.status_code >= 500 or any(
+                m in detail.lower() for m in CREDITS_TRANSIENT_MARKERS)
+            last = error
+            if not transient or attempt >= retries:
+                raise error
+        time.sleep(min(2.0 * attempt, 6.0))
+    raise last or GrokWebError("网页额度端点无响应")
 
 
 def product_name(value: Any) -> str | None:

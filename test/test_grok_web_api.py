@@ -1362,3 +1362,67 @@ class UsagePollingPolicyTest(unittest.TestCase):
     def test_crossed_threshold_ignores_missing_values(self):
         self.assertIsNone(g.crossed_usage_threshold(None, 95))
         self.assertIsNone(g.crossed_usage_threshold(50, None))
+
+
+class WebCreditsTransientRetryTest(unittest.TestCase):
+    """额度端点的上游瞬时故障。
+
+    实测 2026-10-20：`503 {"code":14,"message":"cursor billing: snapshot failed"}` ——
+    同一请求重试即恢复，所以必须重试而不是当成永久拒绝。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_a_snapshot_failure_is_retried(self):
+        from unittest import mock
+
+        bad = self._resp({"code": 14, "message": "cursor billing: snapshot failed"}, 503)
+        good = self._resp({"config": {"creditUsagePercent": 12.5}})
+        with mock.patch.object(g, "_stream_get", side_effect=[bad, good]) as sg:
+            out = g.web_credits(bearer="tok", retries=3)
+        self.assertEqual(out["creditUsagePercent"], 12.5)
+        self.assertEqual(sg.call_count, 2)
+
+    def test_a_persistent_503_raises_after_the_budget(self):
+        from unittest import mock
+
+        bad = self._resp({"code": 14, "message": "cursor billing: snapshot failed"}, 503)
+        with mock.patch.object(g, "_stream_get", return_value=bad) as sg:
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.web_credits(bearer="tok", retries=2)
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(sg.call_count, 2)
+
+    def test_a_403_is_not_retried(self):
+        """403 是账号级策略拒绝 —— 重试没有意义。"""
+        from unittest import mock
+
+        forbidden = self._resp({"code": 7, "message": "bad-credentials"}, 403)
+        with mock.patch.object(g, "_stream_get", return_value=forbidden) as sg:
+            with self.assertRaises(g.GrokWebError):
+                g.web_credits(bearer="tok", retries=3)
+        self.assertEqual(sg.call_count, 1)
+
+    def test_the_transient_markers_are_documented(self):
+        self.assertIn("cursor billing", g.CREDITS_TRANSIENT_MARKERS)
+        self.assertIn("snapshot failed", g.CREDITS_TRANSIENT_MARKERS)
+
+    def test_sso_cookie_authentication_is_used(self):
+        """`Cookie: sso=` 是网页会话路径（实测 200）。"""
+        from unittest import mock
+
+        good = self._resp({"config": {"creditUsagePercent": 0,
+                                      "productUsage": []}})
+        with mock.patch.object(g, "_stream_get", return_value=good) as sg:
+            out = g.web_credits(cookies={"sso": "fixture-sso"})
+        self.assertEqual(out["productUsage"], [])
+        self.assertEqual(sg.call_args.kwargs["cookies"], {"sso": "fixture-sso"})

@@ -772,17 +772,83 @@ refetchInterval = pct >= 90 ? 30000 : pct >= 50 ? 60000 : 180000
 * 同一 token 在 `/rest/app-chat/*` 上**可用**（那套走 `conversations:read/write`）
 * 在 `/rest/grok/credits` 上被判 **`bad-credentials`**
 
+#### 2026-10-20 更新：拿到真实 SSO 会话后的实测
+
+有了真实 `sso` cookie（HS256 JWT，payload 只有 `session_id`）后重测：
+
+**`Cookie: sso=<token>` → 200**（`sso` 单发即可，`sso-rw` 非必需）
+
+```jsonc
+{"config": {
+  "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-10-20T04:58:53.937Z",
+                    "end":   "2026-10-27T04:58:53.937Z"},
+  "creditUsagePercent": 0,
+  "onDemandCap": null, "onDemandUsed": null,
+  "productUsage": [],                                  // 空
+  "history": [],
+  "isUnifiedBillingUser": true,
+  "prepaidBalance": {"val": "0"},                       // 字符串，Cent
+  "topUpMethod": "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
+  "billingPeriodStart": "2026-10-20T04:58:53.937Z",
+  "billingPeriodEnd":   "2026-10-27T04:58:53.937Z"}}
+```
+
+注意 `prepaidBalance.val` 是**字符串** `"0"`（proto3 JSON 对 64 位整数的表示），
+`onDemandCap`/`onDemandUsed` 是 `null`（未开按量付费）。
+
+**CLI token 的拒绝是账号级的，不是普遍规律**：
+
+| 凭证 | team_id | `GET /rest/grok/credits` |
+|---|---|---|
+| `e578i2gj1l` | `fa960e03-…` | ✅ **200** |
+| `c4zc82bzvk` | `71e8548a-…` | ❌ 403 `bad-credentials` |
+| `pd1jt9qjfa` | `bc331b91-…` | ❌ 403 `bad-credentials` |
+| `stjeh3gnvk` | `3b3d0b2d-…` | ❌ 403 `bad-credentials` |
+
+四者的 JWT `aud` / `client_id` **完全相同**（都是 `b1a00492-…`），
+`scope` 也相同 —— 只有 `team_id` 不同。所以**拒绝是团队/账号级策略**，
+不是 token 形态问题。调用方应把 403 当「该账号读不到」而非「端点不可用」。
+
+#### ★ 决定性实验：生图**完全不计入**这个账本
+
+用可读的账号（`e578i2gj1l`）连发生图，每次同时查 credits：
+
+| # | 耗时 | 结果 | `creditUsagePercent` | `productUsage` |
+|---|---|---|---|---|
+| 1–7 | 8.9–15.3s | ✅ 出图 | **0** | **`[]`** |
+| 8 | 3.7s | ❌ `renderToolRateLimited` | 0 | `[]` |
+
+（此前同一账号已生成 1 张，故窗口内共 **8 张**，第 9 次被拒。）
+
+**`creditUsagePercent` 全程恒 0、`productUsage` 全程恒 `[]`。**
+
+即：`PRODUCT_GROK_IMAGINE` 虽然在 protobuf 枚举里存在，但**免费层网页生图
+不写这个账本** —— 生图走的是**纯速率限制**（约 8 张/窗口），不是 credit 计量。
+
+对照：CLI 账本（`/billing?format=credits`）对该账号也是 `pct=None`、
+`productUsage=null`，同样不含生图。
+
+#### 顺带发现的上游瞬时故障
+
+```
+503 {"code":14, "message":"cursor billing: snapshot failed"}
+```
+
+同一请求重试即恢复 —— 必须重试，不能当成永久拒绝（`web_credits(retries=3)`）。
+
 #### 结论：网页生图额度对我们不可观测
 
 三条额度路径互不相通：
 
 | 路径 | 端点 | 含生图? | 我们能查? |
 |---|---|---|---|
-| 网页账本 | `GET /rest/grok/credits` | ✅ `PRODUCT_GROK_IMAGINE` | ❌ 403（client_id 不匹配） |
+| 网页账本 | `GET /rest/grok/credits` | ❌ 实测生图后仍 `[]` | ✅ SSO cookie 可读；CLI token 看账号 |
 | CLI 账本 | `GET cli-chat-proxy/v1/billing?format=credits` | ❌ 只有 `GrokBuild` | ✅ 200 |
 | 免费层闸门 | `GET /rest/usage/free-usage-gates` | ⚠️ 有 `imagine` 但恒 0/0 | ✅ 200（无信息量） |
 
-**所以判定生图是否还有额度，只能靠实际请求的三种拒绝形态（§1.6）。**
+**三条路径都不记生图用量。** 生图配额是**纯速率限制**（实测约 8 张/窗口），
+判定是否还有额度只能靠实际请求的三种拒绝形态（§1.6）。
 
 ### 1.11 89 个 media 端点的权限分布（2026-10-19 实测）
 
