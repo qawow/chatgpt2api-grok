@@ -1096,12 +1096,41 @@ if (hasInputImages) {
 }
 ```
 
-| 模型名 | 用途 | 验证状态 |
-|---|---|---|
-| `imagine-video-gen` | 视频 | ✅ **200 + video id** |
-| `imagine-image-gen` | 文生图 | 解出，**未验证**（两次都 429） |
-| `imagine-image-edit` | 图生图 | 解出，**未验证** |
-| `build` | 文生图（§1.7 用的） | ✅ 已证实出图 |
+| 模型名 | 用途 | 验证状态 | 实测耗时 |
+|---|---|---|---|
+| `imagine-image-gen` `mode=fast` | 文生图 | ✅ **200 出图** | **6.5s** |
+| `imagine-image-gen` `mode=quality` `2k` | 文生图（高质量） | ✅ **200 出图** | **5.9s** |
+| `imagine-video-gen` | 视频 | ✅ **200 + video id** | 26.6s |
+| `build` | 文生图（§1.7 用的） | ✅ 200 `imagine_x_1` 784×1176 | 12.5s |
+| `imagine-image-edit` | 图生图 | 解出，未完成验证（配额耗尽） | — |
+
+**`imagine-image-gen` 比 `build` 快一倍**（6.5s vs 12.5s），且支持 `quality`+`2k` 档。
+
+#### `upload-file` 是 JSON + base64，不是 multipart
+
+bundle（`chatUploadFileRaw`）：
+
+```js
+body: {fileName, fileMimeType, content, makePublic,
+       fileSource, thirdPartyFileId, workspaceId}
+```
+
+`content` 是 **base64 字符串**，`Content-Type: application/json`。
+用 `files=` 做 multipart 会 **400**（空 body）。
+
+#### 图生图链路
+
+```
+1) 生成/准备源图          → users/<uid>/generated/<uuid>/image.jpg
+2) GET https://assets.grok.com/<key>  + Bearer   → 图片字节
+3) POST /rest/app-chat/upload-file  {fileName, fileMimeType,
+                                     content: base64, makePublic: false}
+   → {fileMetadataId, fileUri, ...}
+4) POST /rest/app-chat/conversations/new
+   modelName: "imagine-image-edit"
+   mediaGenInput: {imageToImage: {inputAssets: [fileUri], prompt: "..."}}
+   imageEditModelConfig: {imageReferences: [fileUri], aspectRatio?: "1:1"}
+```
 
 #### 视频是异步任务，轮询端点未找到
 
@@ -1112,6 +1141,38 @@ if (hasInputImages) {
 
 实测：一次 `textToVideo` 成功后，紧接着发图片立刻 **429 `Too many requests`**。
 所以 §1.6 测出的「约 8 张/窗口」是**媒体总配额**，不是纯图片配额。
+
+新账号实测序列（`yqrpwedp6e`，2026-10-21）：
+
+```
+imagine-image-gen fast     ✅ 6.5s
+imagine-image-gen q/2k     ✅ 5.9s
+build                      ✅ 12.5s
+imagine-video-gen          ✅ 26.6s
+────────────────────────────────
+之后第 5 次 → 静默降级（200、无图、无 error）
+```
+
+即 **3 图 + 1 视频** 就吃满了这一窗口 —— 视频占用的配额明显多于单张图。
+
+#### ★ 重试会**加剧**限流（静默降级 → 429）
+
+实测同一账号在配额耗尽后按 **3 分钟间隔**重试：
+
+```
+[尝试 1] 200  静默降级（无图无错）
+[尝试 2] 200  静默降级
+[尝试 3] 200  静默降级
+[尝试 4] 200  静默降级
+[尝试 5] 429  Too many requests      ← 升级
+[尝试 6] 429
+[尝试 7] 429
+[尝试 8] 429
+```
+
+**每次重试都计入速率窗口**，所以密集重试会把自己锁死。
+静默降级后应**等待足够长的静默期**（实测 ≥15 分钟）再试，
+而不是周期性探测。
 
 ## 2. 主对话端点
 

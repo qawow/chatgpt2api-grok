@@ -1808,3 +1808,85 @@ class GenerateVideoTest(unittest.TestCase):
         self.assertIn("useFirstFrame", g.VIDEO_VARIANT_FIELDS["imageToVideo"])
         self.assertIn("firstFrameAsset",
                       g.VIDEO_VARIANT_FIELDS["referenceToVideo"])
+
+
+class UploadFileTest(unittest.TestCase):
+    """`POST /rest/app-chat/upload-file` —— 图生图的前置步骤。
+
+    **请求体是 JSON，`content` 是 base64**（bundle `chatUploadFileRaw`）：
+
+        {fileName, fileMimeType, content, makePublic, fileSource, ...}
+
+    实测用 multipart（`files=`）会 **400** —— 服务端读不到 body。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_bytes_are_base64_encoded_into_a_json_body(self):
+        import base64
+        from unittest import mock
+
+        payload = {"fileMetadataId": "m1", "fileUri": "users/u/src.jpg"}
+        with mock.patch.object(g, "_stream_post", return_value=self._resp(payload)) as sp:
+            out = g.upload_file(b"\xff\xd8\xffJPEGDATA", file_name="a.jpg",
+                                mime_type="image/jpeg", cookies={"sso": "x"})
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(body["fileName"], "a.jpg")
+        self.assertEqual(body["fileMimeType"], "image/jpeg")
+        self.assertEqual(base64.b64decode(body["content"]), b"\xff\xd8\xffJPEGDATA")
+        self.assertFalse(body["makePublic"])
+        self.assertEqual(out["fileUri"], "users/u/src.jpg")
+
+    def test_str_content_is_encoded_as_utf8_then_base64(self):
+        import base64
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp({})) as sp:
+            g.upload_file("hello", cookies={"sso": "x"})
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(base64.b64decode(body["content"]), b"hello")
+
+    def test_make_public_is_passed_through(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp({})) as sp:
+            g.upload_file(b"x", make_public=True, cookies={"sso": "x"})
+        self.assertTrue(sp.call_args.kwargs["body"]["makePublic"])
+
+    def test_empty_content_raises_before_any_request(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            with self.assertRaises(g.GrokWebError):
+                g.upload_file(b"", cookies={"sso": "x"})
+            sp.assert_not_called()
+
+    def test_it_requires_authentication(self):
+        with self.assertRaises(g.GrokWebError):
+            g.upload_file(b"x")
+
+    def test_a_400_is_surfaced(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp({"code": 3}, 400)):
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.upload_file(b"x", cookies={"sso": "x"})
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_the_field_list_matches_the_bundle(self):
+        self.assertEqual(g.UPLOAD_FILE_FIELDS,
+                         ("fileName", "fileMimeType", "content", "makePublic",
+                          "fileSource", "thirdPartyFileId", "workspaceId"))
+        self.assertEqual(g.UPLOAD_FILE_PATH, "/rest/app-chat/upload-file")

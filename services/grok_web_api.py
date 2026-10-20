@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -1980,6 +1981,68 @@ def _extract_video_ids(response: dict[str, Any]) -> list[str]:
                 out.append(value)
 
     return out
+
+
+UPLOAD_FILE_PATH = "/rest/app-chat/upload-file"
+
+# `chatUploadFileRaw` 的真实请求体（bundle 提取）—— **JSON + base64**，
+# 不是 multipart。用 `files=` 会 400。
+#
+#   {fileName, fileMimeType, content, makePublic,
+#    fileSource, thirdPartyFileId, workspaceId}
+UPLOAD_FILE_FIELDS = ("fileName", "fileMimeType", "content", "makePublic",
+                      "fileSource", "thirdPartyFileId", "workspaceId")
+
+
+def upload_file(
+    content: bytes | str,
+    *,
+    file_name: str = "upload.bin",
+    mime_type: str = "application/octet-stream",
+    make_public: bool = False,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 300.0,
+) -> dict[str, Any]:
+    """上传文件，返回 `fileMetadataId` / `fileUri`（图生图的前置步骤）。
+
+    **请求体是 JSON，`content` 是 base64 字符串** —— 不是 multipart。
+    实测用 `files=` 会得到 **400**（服务端读不到 body）。
+
+    返回的 `fileUri` 用作 `mediaGenInput.imageToImage.inputAssets` 与
+    `imageEditModelConfig.imageReferences` 的元素。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    if isinstance(content, str):
+        raw = content.encode("utf-8")
+    else:
+        raw = bytes(content)
+    if not raw:
+        raise GrokWebError("上传内容为空")
+    payload = {
+        "fileName": file_name,
+        "fileMimeType": mime_type,
+        "content": base64.b64encode(raw).decode("ascii"),
+        "makePublic": bool(make_public),
+    }
+    resp = _stream_post(
+        f"{WEB_BASE}{UPLOAD_FILE_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body=payload,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"上传失败 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
 
 
 def download_image(
