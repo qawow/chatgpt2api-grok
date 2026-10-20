@@ -430,12 +430,26 @@ def build_body(
     reasoning: bool = False,
     disable_tools: Iterable[str] | None = None,
     device_env: dict[str, Any] | None = None,
+    video: bool = False,
+    video_duration: int = 6,
+    video_resolution: str = "480p",
+    video_skip_audio: bool = False,
+    media_gen: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 `/rest/app-chat/conversations/new` 的请求体。
 
     `search=False` 走 `toolOverrides.webSearch = False` —— **不是** `disableSearch`。
     bundle 里 `disableSearch` 恒为 `false`，从未置 `true`；`buildToolOverrides`
     只在开关关闭时下发 `{webSearch:false}`。
+
+    三条媒体路径（**`media_gen` 优先级最高**，可覆盖前两条）：
+
+    * `image=True` → `modelName: "build"` + `mediaGenInput.textToImage`
+      （已证实出图，见 §1.7）
+    * `video=True` → `modelName: "imagine-video-gen"` + `textToVideo`
+      （已证实 200 返回 video id）
+    * `media_gen={...}` → 原样作为 `mediaGenInput`，配合调用方自选的 `model`
+      （六种变体见 :data:`MEDIA_GEN_VARIANTS`）
     """
     body: dict[str, Any] = {
         "message": message,
@@ -455,6 +469,39 @@ def build_body(
         if unknown:
             raise ValueError(f"未知的 toolOverrides 键: {sorted(unknown)}")
         body["toolOverrides"] = {key: False for key in sorted(disabled)}
+
+    if media_gen is not None:
+        kind = media_gen_kind(media_gen)
+        if kind is None:
+            raise ValueError(
+                f"mediaGenInput 必须含六种变体之一: {list(MEDIA_GEN_VARIANTS)}")
+        body.update({
+            "kind": KIND_IMAGINE,
+            "enableImageGeneration": True,
+            "enableImageStreaming": True,
+            "mediaGenInput": media_gen,
+        })
+        if kind in ("textToImage", "imageToImage") and "responseMetadata" not in body:
+            body["responseMetadata"] = {
+                "modelConfigOverride": {"modelMap": {"imageEditModel": "imagine"}}
+            }
+        return body
+
+    if video:
+        body["modelName"] = model if model != DEFAULT_MODEL else VIDEO_GEN_MODEL
+        body.update({
+            "kind": KIND_IMAGINE,
+            "enableImageGeneration": True,
+            "enableImageStreaming": True,
+            "mediaGenInput": build_text_to_video(
+                message,
+                aspect_ratio=aspect_ratio or "16:9",
+                duration=video_duration,
+                resolution=video_resolution,
+                skip_audio=video_skip_audio,
+            ),
+        })
+        return body
 
     if image:
         gen: dict[str, Any] = {"prompt": message, "numOfImages": image_count}
@@ -1660,6 +1707,279 @@ def image_generations(
         return []
     gens = data.get("generations")
     return gens if isinstance(gens, list) else []
+
+
+# --------------------------------------------------------------------------
+# mediaGenInput 的六种变体与直连模型名（bundle 逆向）
+# --------------------------------------------------------------------------
+#
+# `mediaGenInput` 是一个 **oneof**，六选一（`js/00pmbps1j6es_.js` 的 `d()`）：
+#
+#   if (e.textToImage)      return {kind:"textToImage",      params:e.textToImage};
+#   if (e.imageToImage)     return {kind:"imageToImage",     params:e.imageToImage};
+#   if (e.textToVideo)      return {kind:"textToVideo",      params:e.textToVideo};
+#   if (e.imageToVideo)     return {kind:"imageToVideo",     params:e.imageToVideo};
+#   if (e.referenceToVideo) return {kind:"referenceToVideo", params:e.referenceToVideo};
+#   if (e.videoExtension)   return {kind:"videoExtension",   params:e.videoExtension};
+#
+# 各变体的字段（`js/0a18uk1xp-t5a.js` / `29p4h4iryyz76.js`）：
+#
+#   textToImage      {prompt, numOfImages, aspectRatio, resolutionName, modelName}
+#   imageToImage     {inputAssets[], prompt, extractSubject, draw{styleId,regionIntent},
+#                     mediaReferences[]}
+#   textToVideo      {prompt, aspectRatio, duration, resolutionName, modelName, skipAudio}
+#   imageToVideo     {prompt, inputAssets[], aspectRatio, duration, resolutionName,
+#                     modelName, mode, skipAudio, useFirstFrame}
+#   referenceToVideo {inputAssets[], audioAssets[], mediaReferences[],
+#                     firstFrameAsset, lastFrameAsset, aspectRatio, duration,
+#                     resolutionName, modelName, skipAudio}
+#   videoExtension   {prompt, inputAssets[], duration, videoExtensionStartTime, skipAudio}
+#
+# 构造器（`js/2bbm9n6clh3_p.js`）：
+#   buildTextToImageInput / buildTextToVideoInput / buildImageToVideoInput /
+#   buildReferenceToVideoInput / buildVideoExtensionInput
+#
+# 直连模型名（`js/0oottrppfxt08.js` 的构造分支）：
+#
+#   if (hasInputImages) {
+#     modelName = "imagine-image-edit";
+#     body.imageEditModelConfig = {
+#       imageReferences: [...],        // 必需
+#       aspectRatio: "w:h",           // 仅 1 张图且显式设置
+#       selectionRegions: [...],      // 可选，局部重绘
+#     };
+#   } else {
+#     modelName = "imagine-image-gen";
+#     body.imageGenModelConfig = {
+#       aspectRatio: "w:h",
+#       mode: "quality" | "fast",      // pro 档 → quality，否则 fast
+#       resolutionName: "2k",          // 仅 quality + 2k + 开关打开
+#     };
+#   }
+#
+# **验证状态（2026-10-20）**：
+#   * `imagine-video-gen` + `textToVideo` → **200，返回 video id** ✅ 已证实
+#   * `imagine-video` → 403 `Model is not found`（错名）
+#   * `imagine-image-gen` / `imagine-image-edit` → 解出但**未验证**（两次都被 429）
+#   * `build` + `textToImage` → 已证实出图（§1.7）
+#
+# **图片与视频共享同一个速率限制桶** —— 一次视频成功后再发图片立刻 429。
+MEDIA_GEN_VARIANTS = (
+    "textToImage", "imageToImage", "textToVideo",
+    "imageToVideo", "referenceToVideo", "videoExtension",
+)
+
+IMAGE_GEN_MODEL = "imagine-image-gen"       # 解出，未验证
+IMAGE_EDIT_MODEL = "imagine-image-edit"     # 解出，未验证
+VIDEO_GEN_MODEL = "imagine-video-gen"       # ✅ 已证实 200
+
+IMAGE_GEN_MODES = ("fast", "quality")
+IMAGE_RESOLUTIONS = ("1k", "2k")
+VIDEO_RESOLUTIONS = ("480p", "720p", "1080p")
+
+# 视频变体的字段集（供构造与校验）
+VIDEO_VARIANT_FIELDS = {
+    "textToVideo": ("prompt", "aspectRatio", "duration", "resolutionName",
+                    "modelName", "skipAudio"),
+    "imageToVideo": ("prompt", "inputAssets", "aspectRatio", "duration",
+                     "resolutionName", "modelName", "mode", "skipAudio",
+                     "useFirstFrame"),
+    "referenceToVideo": ("inputAssets", "audioAssets", "mediaReferences",
+                         "firstFrameAsset", "lastFrameAsset", "aspectRatio",
+                         "duration", "resolutionName", "modelName", "skipAudio"),
+    "videoExtension": ("prompt", "inputAssets", "duration",
+                       "videoExtensionStartTime", "skipAudio"),
+}
+
+
+def media_gen_kind(media_gen_input: Any) -> str | None:
+    """判定 `mediaGenInput` 属于哪个变体（对齐 bundle 的 `d()`）。
+
+    六选一，按 `textToImage → imageToImage → textToVideo → imageToVideo →
+    referenceToVideo → videoExtension` 的顺序取第一个存在的键。
+    """
+    if not isinstance(media_gen_input, dict):
+        return None
+    for kind in MEDIA_GEN_VARIANTS:
+        if media_gen_input.get(kind) is not None:
+            return kind
+    return None
+
+
+def build_text_to_video(
+    prompt: str,
+    *,
+    aspect_ratio: str = "16:9",
+    duration: int = 6,
+    resolution: str = "480p",
+    skip_audio: bool = False,
+    model: str = VIDEO_GEN_MODEL,
+) -> dict[str, Any]:
+    """构造 `textToVideo` 的 `mediaGenInput` 片段（对齐 `buildTextToVideoInput`）。
+
+    ```js
+    function({prompt, aspectRatio, duration, resolutionName, skipAudio}) {
+      return {textToVideo: {prompt,
+        ...void 0 !== aspectRatio ? {aspectRatio} : {},
+        ...void 0 !== duration    ? {duration}    : {},
+        ...void 0 !== resolutionName ? {resolutionName} : {},
+        ...skipAudio ? {skipAudio} : {}}};
+    }
+    ```
+
+    `duration` 是**秒**；`resolution` 取 :data:`VIDEO_RESOLUTIONS`。
+    """
+    payload: dict[str, Any] = {"prompt": prompt}
+    if aspect_ratio:
+        payload["aspectRatio"] = aspect_ratio
+    if duration:
+        payload["duration"] = int(duration)
+    if resolution:
+        payload["resolutionName"] = resolution
+    if skip_audio:
+        payload["skipAudio"] = True
+    return {"textToVideo": payload}
+
+
+def build_image_gen_config(
+    *,
+    aspect_ratio: str = "1:1",
+    mode: str = "fast",
+    resolution: str | None = None,
+) -> dict[str, Any]:
+    """构造 `imageGenModelConfig`（配 `modelName="imagine-image-gen"`）。
+
+    `mode` 取 :data:`IMAGE_GEN_MODES`；`resolution` 仅在 `quality` 档下有意义
+    （`1k` 默认、`2k` 需开关）。
+    """
+    config: dict[str, Any] = {"aspectRatio": aspect_ratio, "mode": mode}
+    if resolution and mode == "quality":
+        config["resolutionName"] = resolution
+    return config
+
+
+def build_image_edit_config(
+    image_references: list[str],
+    *,
+    aspect_ratio: str | None = None,
+    selection_regions: list[Any] | None = None,
+) -> dict[str, Any]:
+    """构造 `imageEditModelConfig`（配 `modelName="imagine-image-edit"`）。
+
+    `image_references` 是图片引用列表（bundle 里由 `E(assetServerUrl, mediaUrl)`
+    生成）。`aspect_ratio` **仅单图且显式设置**时才发；`selection_regions`
+    用于局部重绘。
+    """
+    if not image_references:
+        raise GrokWebError("图片编辑至少需要 1 张参考图")
+    config: dict[str, Any] = {"imageReferences": list(image_references)}
+    if aspect_ratio and len(image_references) == 1:
+        config["aspectRatio"] = aspect_ratio
+    if selection_regions:
+        config["selectionRegions"] = list(selection_regions)
+    return config
+
+
+def generate_video(
+    prompt: str,
+    *,
+    cookies: Any = None,
+    bearer: str | None = None,
+    proxy: str | None = None,
+    aspect_ratio: str = "16:9",
+    duration: int = 6,
+    resolution: str = "480p",
+    skip_audio: bool = False,
+    model: str = VIDEO_GEN_MODEL,
+    timeout: float = 900.0,
+) -> dict[str, Any]:
+    """调用网页路径生成视频。
+
+    **实测（2026-10-20）**：`modelName: "imagine-video-gen"` +
+    `mediaGenInput.textToVideo` → **200**，响应里出现
+    `d1b9572a-348c-4a25-8b01-a912c09c2284` 形式的 **video id**。
+
+    模型名必须精确：`imagine-video` → **403 `Model is not found`**。
+
+    视频是**异步任务** —— 本次只拿到 id，未确认轮询端点
+    （`/rest/media/video/*` 只有 `music`/`caption`/`upscale`/`video-sequence`，
+    都不是状态查询）。所以本函数返回 id 与原始帧，由调用方自行处理产物。
+
+    **注意：图片与视频共享同一个速率限制桶** —— 实测一次视频成功后再发图片
+    立刻 `429 Too many requests`。视频额度未单独测出。
+    """
+    frames: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    video_ids: list[str] = []
+    errors: list[str] = []
+    response_id = None
+    conversation_id = None
+
+    for response in stream_conversation(
+        prompt, cookies=cookies, bearer=bearer, proxy=proxy, timeout=timeout,
+        model=model, temporary=True, video=True,
+        aspect_ratio=aspect_ratio, video_duration=duration,
+        video_resolution=resolution, video_skip_audio=skip_audio,
+    ):
+        frames.append(response)
+        if response_id is None and isinstance(response.get("responseId"), str):
+            response_id = response["responseId"]
+        if conversation_id is None and isinstance(response.get("conversationId"), str):
+            conversation_id = response["conversationId"]
+        text_parts.append(extract_text(response))
+        for vid in _extract_video_ids(response):
+            if vid not in video_ids:
+                video_ids.append(vid)
+        limited = image_rate_limited(response)
+        if limited:
+            errors.append(limited)
+        unavailable = model_unavailable(response)
+        if unavailable:
+            errors.append(unavailable)
+
+    return {
+        "video_ids": video_ids,
+        "text": "".join(text_parts),
+        "errors": errors,
+        "response_id": response_id,
+        "conversation_id": conversation_id,
+        "frames": len(frames),
+    }
+
+
+def _extract_video_ids(response: dict[str, Any]) -> list[str]:
+    """从一帧里取视频 id（`video_chunk` / `streamingVideoGenerationResponse`）。"""
+    out: list[str] = []
+
+    card = response.get("cardAttachment")
+    if isinstance(card, dict):
+        raw = card.get("jsonData")
+        data: dict[str, Any] | None = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except (json.JSONDecodeError, ValueError):
+                data = None
+        elif isinstance(raw, dict):
+            data = raw
+        if isinstance(data, dict):
+            chunk = data.get("video_chunk")
+            if isinstance(chunk, dict):
+                for key in ("videoUuid", "videoUrl", "videoId"):
+                    value = chunk.get(key)
+                    if isinstance(value, str) and value:
+                        out.append(value)
+
+    frame = response.get("streamingVideoGenerationResponse")
+    if isinstance(frame, dict):
+        for key in ("videoId", "videoUrl", "assetId"):
+            value = frame.get(key)
+            if isinstance(value, str) and value:
+                out.append(value)
+
+    return out
 
 
 def download_image(

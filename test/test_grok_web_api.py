@@ -1577,3 +1577,234 @@ class ImageGenerationsTest(unittest.TestCase):
             with self.assertRaises(g.GrokWebError) as ctx:
                 g.image_generations(cookies={"sso": "x"})
         self.assertEqual(ctx.exception.status, 403)
+
+
+class MediaGenVariantsTest(unittest.TestCase):
+    """`mediaGenInput` 是六选一的 oneof（bundle `d()` 提取）。
+
+        textToImage / imageToImage / textToVideo
+        imageToVideo / referenceToVideo / videoExtension
+
+    直连模型名（`0oottrppfxt08.js` 的构造分支）：
+        imagine-image-gen   + imageGenModelConfig  {aspectRatio, mode, resolutionName?}
+        imagine-image-edit  + imageEditModelConfig {imageReferences[], aspectRatio?, selectionRegions?}
+        imagine-video-gen   + textToVideo
+    """
+
+    def test_the_six_variants_match_the_bundle(self):
+        self.assertEqual(g.MEDIA_GEN_VARIANTS,
+                         ("textToImage", "imageToImage", "textToVideo",
+                          "imageToVideo", "referenceToVideo", "videoExtension"))
+
+    def test_kind_detection_follows_the_bundle_order(self):
+        self.assertEqual(g.media_gen_kind({"textToImage": {}}), "textToImage")
+        self.assertEqual(g.media_gen_kind({"imageToImage": {}}), "imageToImage")
+        self.assertEqual(g.media_gen_kind({"textToVideo": {}}), "textToVideo")
+        self.assertEqual(g.media_gen_kind({"imageToVideo": {}}), "imageToVideo")
+        self.assertEqual(g.media_gen_kind({"referenceToVideo": {}}), "referenceToVideo")
+        self.assertEqual(g.media_gen_kind({"videoExtension": {}}), "videoExtension")
+
+    def test_kind_detection_is_first_match(self):
+        """同时出现多个键时按固定顺序取第一个。"""
+        both = {"videoExtension": {}, "textToImage": {}}
+        self.assertEqual(g.media_gen_kind(both), "textToImage")
+
+    def test_kind_detection_rejects_empty_and_non_dict(self):
+        for value in ({}, None, [], "x", {"unknown": {}}):
+            self.assertIsNone(g.media_gen_kind(value))
+
+    def test_the_proven_video_model_name(self):
+        """`imagine-video-gen` 实测 200；`imagine-video` 是错名（403 Model is not found）。"""
+        self.assertEqual(g.VIDEO_GEN_MODEL, "imagine-video-gen")
+
+    def test_the_image_model_names_are_recorded(self):
+        self.assertEqual(g.IMAGE_GEN_MODEL, "imagine-image-gen")
+        self.assertEqual(g.IMAGE_EDIT_MODEL, "imagine-image-edit")
+
+    def test_video_resolutions(self):
+        self.assertEqual(g.VIDEO_RESOLUTIONS, ("480p", "720p", "1080p"))
+
+    def test_build_text_to_video_shape(self):
+        out = g.build_text_to_video("a cat", aspect_ratio="16:9", duration=6,
+                                    resolution="480p")
+        self.assertEqual(out["textToVideo"], {
+            "prompt": "a cat", "aspectRatio": "16:9",
+            "duration": 6, "resolutionName": "480p"})
+
+    def test_build_text_to_video_omits_optional_fields(self):
+        out = g.build_text_to_video("a cat", aspect_ratio="", duration=0,
+                                    resolution="")
+        self.assertEqual(out["textToVideo"], {"prompt": "a cat"})
+
+    def test_build_text_to_video_skip_audio(self):
+        out = g.build_text_to_video("a cat", skip_audio=True)
+        self.assertTrue(out["textToVideo"]["skipAudio"])
+
+    def test_image_gen_config_quality_2k(self):
+        cfg = g.build_image_gen_config(aspect_ratio="2:3", mode="quality",
+                                       resolution="2k")
+        self.assertEqual(cfg, {"aspectRatio": "2:3", "mode": "quality",
+                               "resolutionName": "2k"})
+
+    def test_image_gen_config_fast_drops_resolution(self):
+        """`resolutionName` 只在 quality 档下发。"""
+        cfg = g.build_image_gen_config(mode="fast", resolution="2k")
+        self.assertNotIn("resolutionName", cfg)
+
+    def test_image_edit_config_requires_references(self):
+        with self.assertRaises(g.GrokWebError):
+            g.build_image_edit_config([])
+
+    def test_image_edit_config_single_image_keeps_aspect_ratio(self):
+        cfg = g.build_image_edit_config(["a/1.jpg"], aspect_ratio="1:1")
+        self.assertEqual(cfg["imageReferences"], ["a/1.jpg"])
+        self.assertEqual(cfg["aspectRatio"], "1:1")
+
+    def test_image_edit_config_multi_image_drops_aspect_ratio(self):
+        """多图时 bundle 不发 `aspectRatio`。"""
+        cfg = g.build_image_edit_config(["a/1.jpg", "a/2.jpg"], aspect_ratio="1:1")
+        self.assertNotIn("aspectRatio", cfg)
+        self.assertEqual(len(cfg["imageReferences"]), 2)
+
+    def test_image_edit_config_selection_regions(self):
+        regions = [{"x": 0, "y": 0, "w": 10, "h": 10}]
+        cfg = g.build_image_edit_config(["a/1.jpg"], selection_regions=regions)
+        self.assertEqual(cfg["selectionRegions"], regions)
+
+
+class VideoBodyTest(unittest.TestCase):
+    """`build_body(video=True)` —— 走 `imagine-video-gen` + `textToVideo`。"""
+
+    def test_video_body_uses_the_proven_model(self):
+        body = g.build_body("a cat walking", video=True, aspect_ratio="16:9",
+                            video_duration=6, video_resolution="480p")
+        self.assertEqual(body["modelName"], "imagine-video-gen")
+        self.assertEqual(body["kind"], g.KIND_IMAGINE)
+        self.assertTrue(body["enableImageGeneration"])
+        self.assertEqual(body["mediaGenInput"]["textToVideo"]["duration"], 6)
+
+    def test_an_explicit_model_overrides_the_video_default(self):
+        body = g.build_body("a cat", video=True, model="some-model")
+        self.assertEqual(body["modelName"], "some-model")
+
+    def test_media_gen_overrides_both_image_and_video(self):
+        """`media_gen` 优先级最高。"""
+        body = g.build_body("x", image=True, video=True, model=g.IMAGE_EDIT_MODEL,
+                            media_gen={"imageToImage": {"inputAssets": ["a1"]}})
+        self.assertEqual(body["mediaGenInput"], {"imageToImage": {"inputAssets": ["a1"]}})
+        self.assertEqual(body["modelName"], g.IMAGE_EDIT_MODEL)
+
+    def test_an_invalid_media_gen_raises(self):
+        with self.assertRaises(ValueError):
+            g.build_body("x", media_gen={"bogus": {}})
+
+    def test_the_image_path_is_unchanged(self):
+        """回归：`image=True` 仍走 `textToImage` + `imageEditModel: imagine`。"""
+        body = g.build_body("a cat", image=True, model=g.IMAGE_MODEL,
+                            image_count=1)
+        self.assertEqual(body["modelName"], "build")
+        self.assertEqual(body["mediaGenInput"]["textToImage"]["numOfImages"], 1)
+        self.assertEqual(
+            body["responseMetadata"]["modelConfigOverride"]["modelMap"]["imageEditModel"],
+            "imagine")
+
+    def test_media_gen_adds_the_imagine_override_for_image_kinds(self):
+        body = g.build_body("x", media_gen={"textToImage": {"prompt": "x"}})
+        self.assertEqual(
+            body["responseMetadata"]["modelConfigOverride"]["modelMap"]["imageEditModel"],
+            "imagine")
+
+    def test_media_gen_does_not_add_the_override_for_video_kinds(self):
+        body = g.build_body("x", media_gen={"textToVideo": {"prompt": "x"}})
+        self.assertNotIn("responseMetadata", body)
+
+
+class GenerateVideoTest(unittest.TestCase):
+    """`generate_video()` —— 实测 `imagine-video-gen` 返回 200 + video id。
+
+    视频是**异步任务**：本次只拿到 id，未确认轮询端点
+    （`/rest/media/video/*` 只有 `music`/`caption`/`upscale`/`video-sequence`）。
+    **图片与视频共享同一个速率限制桶。**
+    """
+
+    def _stream(self, frames):
+        from unittest import mock
+
+        lines = [json.dumps(f).encode() for f in frames]
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.text = "\n".join(json.dumps(f) for f in frames)
+        resp.iter_lines.return_value = lines
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return mock.patch.object(g, "_stream_post", return_value=resp)
+
+    def test_a_video_id_is_collected(self):
+        frames = [
+            {"result": {"response": {
+                "streamingVideoGenerationResponse": {"videoId": "d1b9572a"}}}},
+        ]
+        with self._stream(frames):
+            out = g.generate_video("a cat walking", bearer="tok")
+        self.assertEqual(out["video_ids"], ["d1b9572a"])
+        self.assertEqual(out["errors"], [])
+
+    def test_ids_are_deduped(self):
+        frames = [
+            {"result": {"response": {
+                "streamingVideoGenerationResponse": {"videoId": "v1"}}}},
+            {"result": {"response": {
+                "streamingVideoGenerationResponse": {"videoId": "v1"}}}},
+        ]
+        with self._stream(frames):
+            out = g.generate_video("x", bearer="tok")
+        self.assertEqual(out["video_ids"], ["v1"])
+
+    def test_the_request_uses_the_proven_model(self):
+        from unittest import mock
+
+        with self._stream([]) as sp:
+            g.generate_video("a cat", bearer="tok")
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(body["modelName"], "imagine-video-gen")
+        self.assertIn("textToVideo", body["mediaGenInput"])
+
+    def test_skip_audio_is_passed_through(self):
+        from unittest import mock
+
+        with self._stream([]) as sp:
+            g.generate_video("a cat", bearer="tok", skip_audio=True)
+        body = sp.call_args.kwargs["body"]
+        self.assertTrue(body["mediaGenInput"]["textToVideo"]["skipAudio"])
+
+    def test_a_rate_limit_is_reported(self):
+        frames = [
+            {"result": {"response": {"error": {
+                "message": "You've hit your image rate limit.",
+                "renderToolRateLimited": {"rateLimitedCount": 1}}}}},
+        ]
+        with self._stream(frames):
+            out = g.generate_video("x", bearer="tok")
+        self.assertTrue(out["errors"])
+        self.assertEqual(out["video_ids"], [])
+
+    def test_video_id_extraction_from_card_attachment(self):
+        payload = {"cardAttachment": {"jsonData": json.dumps(
+            {"video_chunk": {"videoUuid": "u1", "videoUrl": "a/v.mp4"}})}}
+        self.assertEqual(g._extract_video_ids(payload), ["u1", "a/v.mp4"])
+
+    def test_video_id_extraction_tolerates_garbage(self):
+        for payload in ({}, {"cardAttachment": {"jsonData": "{bad"}},
+                        {"cardAttachment": {"jsonData": None}},
+                        {"streamingVideoGenerationResponse": None}):
+            self.assertEqual(g._extract_video_ids(payload), [])
+
+    def test_video_variant_fields_are_documented(self):
+        self.assertEqual(
+            g.VIDEO_VARIANT_FIELDS["textToVideo"],
+            ("prompt", "aspectRatio", "duration", "resolutionName",
+             "modelName", "skipAudio"))
+        self.assertIn("useFirstFrame", g.VIDEO_VARIANT_FIELDS["imageToVideo"])
+        self.assertIn("firstFrameAsset",
+                      g.VIDEO_VARIANT_FIELDS["referenceToVideo"])

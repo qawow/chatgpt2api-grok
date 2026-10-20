@@ -1039,6 +1039,80 @@ POST /rest/app-chat/upload-file                  {"fileMetadataId":...,"fileUri"
 **所以它不能用来统计生图用量。** 至此四条路径（`/rest/grok/credits`、
 CLI `/billing`、`free-usage-gates`、`image-generations`）**都不记生图**。
 
+### 1.15 ★ 视频生成与直连模型名（2026-10-20 实测）
+
+**`textToVideo` + `modelName: "imagine-video-gen"` → 200，返回 video id。**
+
+```
+modelName: "imagine-video-gen"   ✅ 200  → d1b9572a-348c-4a25-8b01-a912c09c2284
+modelName: "imagine-video"       ❌ 403  Model is not found（错名）
+modelName: "build" + textToVideo ❌ 429（build 不是视频模型）
+```
+
+#### `mediaGenInput` 是**六选一**的 oneof
+
+bundle（`js/00pmbps1j6es_.js` 的 `d()`）按固定顺序取第一个存在的键：
+
+```js
+if (e.textToImage)      return {kind:"textToImage",      params:e.textToImage};
+if (e.imageToImage)     return {kind:"imageToImage",     params:e.imageToImage};
+if (e.textToVideo)      return {kind:"textToVideo",      params:e.textToVideo};
+if (e.imageToVideo)     return {kind:"imageToVideo",     params:e.imageToVideo};
+if (e.referenceToVideo) return {kind:"referenceToVideo", params:e.referenceToVideo};
+if (e.videoExtension)   return {kind:"videoExtension",   params:e.videoExtension};
+```
+
+各变体字段（`js/0a18uk1xp-t5a.js` / `29p4h4iryyz76.js`）：
+
+| 变体 | 字段 |
+|---|---|
+| `textToImage` | `prompt, numOfImages, aspectRatio, resolutionName, modelName` |
+| `imageToImage` | `inputAssets[], prompt, extractSubject, draw{styleId,regionIntent}, mediaReferences[]` |
+| `textToVideo` | `prompt, aspectRatio, duration, resolutionName, modelName, skipAudio` |
+| `imageToVideo` | `prompt, inputAssets[], aspectRatio, duration, resolutionName, modelName, mode, skipAudio, useFirstFrame` |
+| `referenceToVideo` | `inputAssets[], audioAssets[], mediaReferences[], firstFrameAsset, lastFrameAsset, aspectRatio, duration, resolutionName, modelName, skipAudio` |
+| `videoExtension` | `prompt, inputAssets[], duration, videoExtensionStartTime, skipAudio` |
+
+构造器（`js/2bbm9n6clh3_p.js`）：`buildTextToImageInput`、`buildTextToVideoInput`、
+`buildImageToVideoInput`、`buildReferenceToVideoInput`、`buildVideoExtensionInput`。
+
+#### 直连模型名（`js/0oottrppfxt08.js` 的构造分支）
+
+```js
+if (hasInputImages) {
+  modelName = "imagine-image-edit";
+  body.imageEditModelConfig = {
+    imageReferences: [...],        // 必需
+    aspectRatio: "w:h",           // **仅 1 张图且显式设置时**
+    selectionRegions: [...],      // 可选，局部重绘
+  };
+} else {
+  modelName = "imagine-image-gen";
+  body.imageGenModelConfig = {
+    aspectRatio: "w:h",
+    mode: "quality" | "fast",      // pro 档 → quality，否则 fast
+    resolutionName: "2k",          // 仅 quality + 2k + 开关打开
+  };
+}
+```
+
+| 模型名 | 用途 | 验证状态 |
+|---|---|---|
+| `imagine-video-gen` | 视频 | ✅ **200 + video id** |
+| `imagine-image-gen` | 文生图 | 解出，**未验证**（两次都 429） |
+| `imagine-image-edit` | 图生图 | 解出，**未验证** |
+| `build` | 文生图（§1.7 用的） | ✅ 已证实出图 |
+
+#### 视频是异步任务，轮询端点未找到
+
+`/rest/media/video/*` 只有 `music`、`caption`、`upscale`、`video-sequence/create`，
+**都不是状态查询**。所以目前只能拿到 video id，产物获取方式未确认。
+
+#### ★ 图片与视频共享同一个速率限制桶
+
+实测：一次 `textToVideo` 成功后，紧接着发图片立刻 **429 `Too many requests`**。
+所以 §1.6 测出的「约 8 张/窗口」是**媒体总配额**，不是纯图片配额。
+
 ## 2. 主对话端点
 
 ```
