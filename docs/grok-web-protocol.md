@@ -922,6 +922,123 @@ e.progress < 100 && e.moderated !== true && (e.systemErrCode ?? 0) === 0
 即 **`progress`、`moderated`、`systemErrCode` 三者必须同时满足** ——
 只看 `progress` 会把失败帧（`progress=100` 但 `systemErrCode=1006`）当成完成。
 
+### 1.13 ★ 代码执行：`POST /rest/app-chat/run-code`（2026-10-20 实测）
+
+**网页路径真的执行代码并返回 stdout/stderr。** 这是本轮最有价值的发现。
+
+```jsonc
+// 请求
+{"code": "import numpy, sys; print(sys.version)", "language": "python"}
+// 响应
+{"success": true, "stdout": "3.12.3\n", "stderr": "", "outputFiles": {}}
+```
+
+#### `language` 只认四个值
+
+| 值 | 实际执行 |
+|---|---|
+| `python` / `python3` | CPython **3.12.3** |
+| `bash` | bash |
+| `javascript` | **Node v24.15.0**（源码写到 `/home/workdir/temp.js`） |
+| `sh` / `node` / `sql` / `ruby` / 其它 | ❌ 内部错误 |
+
+**省略 `language` 或只传 `code` 会失败**，返回通用文案
+`An unexpected error occurred while executing your code. Please try again or check your code for errors.`
+—— 这不是语法错，是**缺语言字段**。
+
+#### 沙箱刻画
+
+```
+python     3.12.3
+platform   Linux-4.19.0-gvisor-x86_64-with-glibc2.39    ← gVisor 用户态内核
+cwd        /home/workdir
+uid        0                                             ← root
+cpu        2
+DNS        通（example.com → 172.66.147.243）
+TCP        **拒绝**（ConnectionRefusedError）—— 无网络出口
+```
+
+文件系统：
+
+```
+/              → .hades-container-tools, .package-cache-mutate, README.xai,
+                 app, bin, boot, dev, etc, home, lib, ...
+/home/workdir  → .grok, artifacts
+/root          → .bashrc, .cache, .config, .local, .npm, .profile, .ssh
+```
+
+可用库（实测 `importlib.util.find_spec`）：
+
+```
+numpy pandas requests PIL bs4 lxml scipy matplotlib torch httpx yaml
+```
+
+缺失：`sklearn` `aiohttp` `regex`。
+
+性能参考：2 秒 CPU 密集循环约 **8,439,930** 次迭代。20KB 输出可正常返回。
+
+#### 错误语义的坑
+
+`success: false` 时 `stderr` 可能是**通用文案**而不是真实异常：
+
+* 语言缺失 / `sh` / `node` / `sql` / `ruby` → 通用文案
+* 真实语法/运行错误 → 带堆栈（例如 Node 的
+  `SyntaxError: Unexpected identifier 'ok'` + `at wrapSafe (node:internal/...)`）
+
+所以**不能只看 `success`** —— 要区分「通用文案」与「真堆栈」。
+
+### 1.14 42 个 `/rest/app-chat/*` 端点的权限分布
+
+用真实 SSO 会话穷举（比 CLI token 宽松得多）：
+
+| 结果 | 数量 |
+|---|---|
+| ✅ 200 | **14** |
+| ⚠️ 400/500（授权通过，参数或内部错） | **27** |
+| ❌ 403 | **1** |
+
+**14 个可用的（200）**：
+
+```
+GET  /rest/app-chat/app-builder-conversations    {"items":[]}
+GET  /rest/app-chat/conversations                真实对话列表
+GET  /rest/app-chat/conversations-many           {"conversations":[]}
+GET  /rest/app-chat/conversations/deleted        {"conversations":[]}
+GET  /rest/app-chat/image-generations            {"generations":[]}   ← 见下
+GET  /rest/app-chat/import-memory                {"content":""}
+GET  /rest/app-chat/import-memory/status         {"status":"IMPORTED_MEMORY_STATUS_NONE"}
+GET  /rest/app-chat/template-prompt              {"prompt":"","scriptedGreeting":false}
+GET  /rest/app-chat/tts-voices                   {"voices":[{"voiceId":"altair",...}]}
+GET  /rest/app-chat/user-memory-blurb            {"memoryContent":""}
+POST /rest/app-chat/migrate-conversations        {}
+POST /rest/app-chat/run-code                     ★ 代码执行
+POST /rest/app-chat/template-chat                {"conversation":null,"settled":false}
+POST /rest/app-chat/upload-file                  {"fileMetadataId":...,"fileUri":...}
+```
+
+值得注意的 400/500（**授权通过**，补参数即可）：
+
+* `POST /rest/app-chat/conversations/new` → 400 `Cannot generate response to empty conversation.`
+* `POST /rest/app-chat/fetch-suggestions` / `suggestions` → 400 `Count must be greater than 0 and less than 10`
+* `POST /rest/app-chat/text-to-speech` → 400 `Field text must not be empty`
+* `POST /rest/app-chat/upload-file-v2/init` → 400 `size_bytes must be positive`
+* `GET /rest/app-chat/app-deployments` → 400 `exactly one of deployment_id or latest_by_conversation_id must be specified`
+* `GET /rest/app-chat/google-drive/files` → **501** `Google Drive browsing has moved to connector tools`
+
+**唯一 403**：`GET /rest/app-chat/conversation-starters` 系列（500 内部错误，非权限）。
+`POST /rest/app-chat/voice/share` → **401** `No OAuth access token present. Please log in again.`
+—— 这个端点**要求 OAuth token 而非 cookie**（与其它端点相反）。
+
+#### `image-generations` 也不能计数
+
+`GET /rest/app-chat/image-generations` + SSO cookie → 200，但：
+
+* 生图**成功后仍为 `[]`**
+* 被限流时也不记录
+
+**所以它不能用来统计生图用量。** 至此四条路径（`/rest/grok/credits`、
+CLI `/billing`、`free-usage-gates`、`image-generations`）**都不记生图**。
+
 ## 2. 主对话端点
 
 ```

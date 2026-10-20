@@ -1527,6 +1527,141 @@ def crossed_usage_threshold(
     return None
 
 
+# --------------------------------------------------------------------------
+# 代码执行（网页路径）
+# --------------------------------------------------------------------------
+#
+# `POST /rest/app-chat/run-code` —— **真的执行代码**，返回 stdout/stderr。
+#
+# 实测（2026-10-20，SSO 会话）沙箱刻画：
+#
+#   python 3.12.3
+#   platform  Linux-4.19.0-gvisor-x86_64-with-glibc2.39   ← gVisor 用户态内核
+#   cwd       /home/workdir        uid 0        cpu 2
+#   DNS       通（example.com → 172.66.147.243）
+#   TCP       拒绝（ConnectionRefused）—— **无网络出口**
+#   文件系统   /home/workdir/{.grok,artifacts}；/root/{.bashrc,.cache,.config,.local,.npm,.profile,.ssh}
+#   可用库     numpy pandas requests PIL bs4 lxml scipy matplotlib torch httpx yaml
+#   缺失       sklearn aiohttp regex
+#
+# `language` 取值（实测，其余一律内部错误）：
+#
+#   python / python3  → CPython 3.12.3
+#   bash              → bash
+#   javascript        → Node（源码写到 `/home/workdir/temp.js`）
+#
+# **`sh` / `node` / `sql` / `ruby` 都不支持** —— 必须用 `bash` 与 `javascript`。
+# 省略 `language` 或只传 `code` 会得到
+# `An unexpected error occurred while executing your code.`（不是语法错，是缺语言）。
+RUN_CODE_PATH = "/rest/app-chat/run-code"
+RUN_CODE_LANGUAGES = ("python", "python3", "bash", "javascript")
+RUN_CODE_DEFAULT_LANGUAGE = "python"
+
+# 沙箱事实（写死供调用方判断可行性，实测值）
+RUN_CODE_SANDBOX = {
+    "python": "3.12.3",
+    "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.39",
+    "cwd": "/home/workdir",
+    "uid": 0,
+    "cpu": 2,
+    "dns": True,
+    "tcp_egress": False,
+    "libraries": ("numpy", "pandas", "requests", "PIL", "bs4", "lxml",
+                  "scipy", "matplotlib", "torch", "httpx", "yaml"),
+    "missing_libraries": ("sklearn", "aiohttp", "regex"),
+}
+
+
+def run_code(
+    code: str,
+    *,
+    language: str = RUN_CODE_DEFAULT_LANGUAGE,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 300.0,
+) -> dict[str, Any]:
+    """在 Grok 网页沙箱里执行代码。
+
+    返回 `{"success": bool, "stdout": str, "stderr": str, "outputFiles": dict}`。
+
+    **注意**：`success=False` 时 `stderr` 可能是**通用错误文案**
+    （`An unexpected error occurred while executing your code.`）而不是真实
+    异常 —— 实测语言缺失、`sh`/`node`/`sql`/`ruby`、以及部分运行时失败
+    都返回这句。真正的语法/运行错误会带堆栈（如 Node 的 `SyntaxError`）。
+
+    沙箱是 **gVisor**、`uid 0`、2 CPU、**无 TCP 出口**（DNS 可用）。
+    见 :data:`RUN_CODE_SANDBOX`。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    lang = str(language or RUN_CODE_DEFAULT_LANGUAGE).strip().lower()
+    if lang not in RUN_CODE_LANGUAGES:
+        raise GrokWebError(
+            f"不支持的语言 {lang!r}；实测可用：{', '.join(RUN_CODE_LANGUAGES)}")
+    resp = _stream_post(
+        f"{WEB_BASE}{RUN_CODE_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body={"code": code, "language": lang},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"代码执行 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    if not isinstance(data, dict):
+        return {"success": False, "stdout": "", "stderr": "", "outputFiles": {}}
+    return {
+        "success": bool(data.get("success")),
+        "stdout": str(data.get("stdout") or ""),
+        "stderr": str(data.get("stderr") or ""),
+        "outputFiles": data.get("outputFiles") if isinstance(
+            data.get("outputFiles"), dict) else {},
+    }
+
+
+def image_generations(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> list[dict[str, Any]]:
+    """`GET /rest/app-chat/image-generations` —— 生图历史。
+
+    **实测（2026-10-20）**：SSO 会话下 → 200 `{"generations": []}`；
+    但生成图片后仍为 `[]`（生图未计入），且被限流时也不记录。
+    所以**不能用来计数生图用量** —— 保留作可用性记录。
+
+    CLI OAuth token 在部分账号上是 403（`oauth2-auth-forbidden`）。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    resp = _stream_get(
+        f"{WEB_BASE}/rest/app-chat/image-generations",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"生图历史 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    if not isinstance(data, dict):
+        return []
+    gens = data.get("generations")
+    return gens if isinstance(gens, list) else []
+
+
 def download_image(
     key: str,
     *,

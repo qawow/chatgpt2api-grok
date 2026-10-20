@@ -1426,3 +1426,154 @@ class WebCreditsTransientRetryTest(unittest.TestCase):
             out = g.web_credits(cookies={"sso": "fixture-sso"})
         self.assertEqual(out["productUsage"], [])
         self.assertEqual(sg.call_args.kwargs["cookies"], {"sso": "fixture-sso"})
+
+
+class RunCodeTest(unittest.TestCase):
+    """`POST /rest/app-chat/run-code` —— 网页沙箱**真的执行代码**。
+
+    实测 2026-10-20（SSO 会话）：
+
+        python 3.12.3  /  Node v24.15.0  /  bash
+        platform Linux-4.19.0-gvisor-x86_64-with-glibc2.39   ← gVisor
+        cwd /home/workdir   uid 0   cpu 2
+        DNS 通，**TCP 拒绝**（无网络出口）
+
+    `language` 只认 `python` / `python3` / `bash` / `javascript`；
+    `sh` / `node` / `sql` / `ruby` 一律内部错误。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_stdout_is_returned(self):
+        from unittest import mock
+
+        payload = {"success": True, "stdout": "hello from sandbox\n",
+                   "stderr": "", "outputFiles": {}}
+        with mock.patch.object(g, "_stream_post", return_value=self._resp(payload)) as sp:
+            out = g.run_code("print('hello from sandbox')", cookies={"sso": "x"})
+        self.assertTrue(out["success"])
+        self.assertEqual(out["stdout"], "hello from sandbox\n")
+        self.assertEqual(sp.call_args.kwargs["body"]["language"], "python")
+
+    def test_the_language_enum_matches_the_probe(self):
+        self.assertEqual(g.RUN_CODE_LANGUAGES,
+                         ("python", "python3", "bash", "javascript"))
+        self.assertEqual(g.RUN_CODE_DEFAULT_LANGUAGE, "python")
+
+    def test_an_unsupported_language_fails_before_any_request(self):
+        """`ruby` / `sql` / `sh` / `node` 都不支持 —— 本地就挡掉。"""
+        from unittest import mock
+
+        for lang in ("ruby", "sql", "sh", "node", "go"):
+            with mock.patch.object(g, "_stream_post") as sp:
+                with self.assertRaises(g.GrokWebError):
+                    g.run_code("x", language=lang, cookies={"sso": "x"})
+                sp.assert_not_called()
+
+    def test_an_empty_language_falls_back_to_the_default(self):
+        """空串回落 `python` —— 不是错误。"""
+        from unittest import mock
+
+        payload = {"success": True, "stdout": "", "stderr": "", "outputFiles": {}}
+        with mock.patch.object(g, "_stream_post", return_value=self._resp(payload)) as sp:
+            g.run_code("print(1)", language="", cookies={"sso": "x"})
+        self.assertEqual(sp.call_args.kwargs["body"]["language"], "python")
+
+    def test_javascript_is_accepted(self):
+        from unittest import mock
+
+        payload = {"success": True, "stdout": "js ok\n", "stderr": "",
+                   "outputFiles": {}}
+        with mock.patch.object(g, "_stream_post", return_value=self._resp(payload)) as sp:
+            out = g.run_code("console.log('js ok')", language="javascript",
+                             cookies={"sso": "x"})
+        self.assertTrue(out["success"])
+        self.assertEqual(sp.call_args.kwargs["body"]["language"], "javascript")
+
+    def test_the_language_is_lowercased(self):
+        from unittest import mock
+
+        payload = {"success": True, "stdout": "", "stderr": "", "outputFiles": {}}
+        with mock.patch.object(g, "_stream_post", return_value=self._resp(payload)) as sp:
+            g.run_code("echo x", language="BASH", cookies={"sso": "x"})
+        self.assertEqual(sp.call_args.kwargs["body"]["language"], "bash")
+
+    def test_a_failure_keeps_the_stderr(self):
+        from unittest import mock
+
+        payload = {"success": False, "stdout": "",
+                   "stderr": "SyntaxError: Unexpected identifier", "outputFiles": {}}
+        with mock.patch.object(g, "_stream_post", return_value=self._resp(payload)):
+            out = g.run_code("echo ok", language="javascript", cookies={"sso": "x"})
+        self.assertFalse(out["success"])
+        self.assertIn("SyntaxError", out["stderr"])
+
+    def test_the_sandbox_facts_are_recorded(self):
+        self.assertEqual(g.RUN_CODE_SANDBOX["python"], "3.12.3")
+        self.assertIn("gvisor", g.RUN_CODE_SANDBOX["platform"])
+        self.assertEqual(g.RUN_CODE_SANDBOX["uid"], 0)
+        self.assertTrue(g.RUN_CODE_SANDBOX["dns"])
+        self.assertFalse(g.RUN_CODE_SANDBOX["tcp_egress"])
+        self.assertIn("numpy", g.RUN_CODE_SANDBOX["libraries"])
+        self.assertIn("torch", g.RUN_CODE_SANDBOX["libraries"])
+
+    def test_it_requires_authentication(self):
+        with self.assertRaises(g.GrokWebError):
+            g.run_code("print(1)")
+
+
+class ImageGenerationsTest(unittest.TestCase):
+    """`GET /rest/app-chat/image-generations` —— 生图历史。
+
+    **实测：生成图片后仍为 `[]`** —— 不能用来计数生图用量。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_an_empty_history_is_a_list(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_get",
+                               return_value=self._resp({"generations": []})):
+            self.assertEqual(g.image_generations(cookies={"sso": "x"}), [])
+
+    def test_a_populated_history_is_passed_through(self):
+        from unittest import mock
+
+        gens = [{"id": "g1", "imageUrl": "a/b.jpg"}]
+        with mock.patch.object(g, "_stream_get",
+                               return_value=self._resp({"generations": gens})):
+            self.assertEqual(g.image_generations(cookies={"sso": "x"}), gens)
+
+    def test_a_missing_field_yields_an_empty_list(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_get", return_value=self._resp({})):
+            self.assertEqual(g.image_generations(cookies={"sso": "x"}), [])
+
+    def test_a_403_is_surfaced(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_get", return_value=self._resp(
+                {"code": 7, "message": "oauth2-auth-forbidden"}, 403)):
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.image_generations(cookies={"sso": "x"})
+        self.assertEqual(ctx.exception.status, 403)
