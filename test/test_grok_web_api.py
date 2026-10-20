@@ -1239,3 +1239,126 @@ class UpstreamErrorClassificationTest(unittest.TestCase):
         self.assertEqual(g.SPENDING_LIMIT_COOLDOWN, 86400.0)
         self.assertEqual(g.COOLDOWN_BY_STATUS[403], 300.0)
         self.assertEqual(g.COOLDOWN_BY_STATUS[402], 0.0)
+
+
+class WebCreditsEndpointTest(unittest.TestCase):
+    """`GET /rest/grok/credits` —— 网页 UI 真正使用的额度端点。
+
+    来自 bundle 模块 `9096207` 的 protobuf `fileDesc` 解码：
+
+        rpc GetGrokCreditsConfig -> GET /rest/grok/credits
+
+    返回 `GrokCreditsConfig`，其中 `product_usage[]` 按 `billing_product.Product`
+    分项，**含 `PRODUCT_GROK_IMAGINE = 5`（生图独立产品位）**。
+
+    **实测 CLI 签发的 OAuth token 被拒**（403 `bad-credentials`）：
+    JWT 的 `aud`/`client_id` 是 `b1a00492-...`（Grok CLI 客户端），
+    而该端点只认 grok.com 网页应用的 OAuth 客户端。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_the_path_matches_the_protobuf_annotation(self):
+        self.assertEqual(g.CREDITS_PATH, "/rest/grok/credits")
+        self.assertEqual(g.BUILD_BILLING_PATH, "/rest/grok-build/billing")
+
+    def test_config_is_unwrapped(self):
+        from unittest import mock
+
+        payload = {"config": {
+            "credit_usage_percent": 42.5,
+            "current_period": {"type": "USAGE_PERIOD_TYPE_WEEKLY"},
+            "product_usage": [{"product": "PRODUCT_GROK_IMAGINE",
+                               "usage_percent": 60.0}],
+            "is_unified_billing_user": True,
+        }}
+        with mock.patch.object(g, "_stream_get", return_value=self._resp(payload)):
+            out = g.web_credits(bearer="tok")
+        self.assertEqual(out["credit_usage_percent"], 42.5)
+        self.assertEqual(out["product_usage"][0]["product"], "PRODUCT_GROK_IMAGINE")
+
+    def test_a_403_is_surfaced_with_the_upstream_message(self):
+        from unittest import mock
+
+        body = ('{"code":7,"message":"The OAuth2 access token could not be '
+                'validated. [WKE=unauthenticated:bad-credentials]","details":[]}')
+        with mock.patch.object(g, "_stream_get", return_value=self._resp(body, 403)):
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.web_credits(bearer="tok")
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertIn("bad-credentials", str(ctx.exception))
+
+    def test_it_requires_authentication(self):
+        with self.assertRaises(g.GrokWebError):
+            g.web_credits()
+
+    def test_the_product_enum_has_imagine_at_five(self):
+        self.assertEqual(g.PRODUCT_ENUM[5], "PRODUCT_GROK_IMAGINE")
+        self.assertEqual(g.PRODUCT_GROK_IMAGINE, 5)
+        self.assertEqual(g.PRODUCT_ENUM[2], "PRODUCT_GROK_BUILD")
+        self.assertEqual(g.PRODUCT_ENUM[4], "PRODUCT_GROK_CHAT")
+        self.assertEqual(len(g.PRODUCT_ENUM), 12)
+
+    def test_product_name_accepts_both_string_and_int(self):
+        self.assertEqual(g.product_name("PRODUCT_GROK_IMAGINE"), "PRODUCT_GROK_IMAGINE")
+        self.assertEqual(g.product_name(5), "PRODUCT_GROK_IMAGINE")
+        self.assertIsNone(g.product_name("GROK_IMAGINE"))
+        self.assertIsNone(g.product_name(None))
+        self.assertIsNone(g.product_name(99))
+
+    def test_usage_period_types(self):
+        self.assertEqual(g.USAGE_PERIOD_TYPES[1], "USAGE_PERIOD_TYPE_MONTHLY")
+        self.assertEqual(g.USAGE_PERIOD_TYPES[2], "USAGE_PERIOD_TYPE_WEEKLY")
+
+    def test_the_config_field_list_matches_the_proto(self):
+        self.assertEqual(len(g.CREDITS_CONFIG_FIELDS), 11)
+        for name in ("credit_usage_percent", "product_usage", "current_period",
+                     "is_unified_billing_user", "prepaid_balance"):
+            self.assertIn(name, g.CREDITS_CONFIG_FIELDS)
+
+
+class UsagePollingPolicyTest(unittest.TestCase):
+    """前端轮询策略（bundle 提取）。
+
+    ```js
+    let f = [90, 75, 50, 25];
+    function crossedThreshold(e,t){ return f.find(n => e<n && t>=n) ?? null }
+    refetchInterval = pct>=90 ? 30000 : pct>=50 ? 60000 : 180000
+    ```
+    """
+
+    def test_thresholds_match_the_bundle(self):
+        self.assertEqual(g.USAGE_TOAST_THRESHOLDS, (90, 75, 50, 25))
+
+    def test_poll_intervals_match_the_bundle(self):
+        self.assertEqual(g.usage_poll_interval_ms(95), 30_000)
+        self.assertEqual(g.usage_poll_interval_ms(90), 30_000)
+        self.assertEqual(g.usage_poll_interval_ms(89.9), 60_000)
+        self.assertEqual(g.usage_poll_interval_ms(50), 60_000)
+        self.assertEqual(g.usage_poll_interval_ms(49.9), 180_000)
+        self.assertEqual(g.usage_poll_interval_ms(0), 180_000)
+
+    def test_a_missing_percent_does_not_poll(self):
+        """缺失 ≠ 0% —— 不能当成「用量 0%」去走最慢档。"""
+        self.assertIsNone(g.usage_poll_interval_ms(None))
+        self.assertIsNone(g.usage_poll_interval_ms("abc"))
+
+    def test_crossed_threshold_finds_the_first_crossing(self):
+        self.assertEqual(g.crossed_usage_threshold(80, 92), 90)
+        self.assertEqual(g.crossed_usage_threshold(20, 30), 25)
+        self.assertEqual(g.crossed_usage_threshold(10, 80), 75)
+        self.assertIsNone(g.crossed_usage_threshold(95, 99))
+        self.assertIsNone(g.crossed_usage_threshold(10, 20))
+
+    def test_crossed_threshold_ignores_missing_values(self):
+        self.assertIsNone(g.crossed_usage_threshold(None, 95))
+        self.assertIsNone(g.crossed_usage_threshold(50, None))

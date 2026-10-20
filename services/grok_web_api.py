@@ -1325,6 +1325,184 @@ def clamp_rate_limit_cooldown(seconds: float) -> float:
     return min(float(seconds), RATE_LIMIT_MAX_COOLDOWN)
 
 
+# --------------------------------------------------------------------------
+# 网页额度端点（protobuf 逆向）
+# --------------------------------------------------------------------------
+#
+# 从 bundle 模块 `9096207` 的 `fileDesc` base64 解码出的 **完整 protobuf 定义**
+# （`prod/grok/backend/proto/grok_build_billing.proto` + `billing_product`）。
+#
+# 服务 `GrokBuildBilling` 的全部 RPC（含 HTTP 注解）：
+#
+#   GetGrokBuildBillingConfig          GET  /rest/grok-build/billing
+#   SetGrokBuildOnDemandConfig         POST /rest/grok-build/billing/on-demand
+#   GetGrokCreditsConfig               GET  /rest/grok/credits          ← 网页额度
+#   ListPaymentMethods                 GET  /rest/grok/payment-methods
+#   CheckPaymentSetupFinalized         GET  /rest/grok/payment-setup-finalized
+#   TopUpOrGetExistingPendingChange    POST /rest/grok/top-up
+#   TopUpUsingInlinePaymentMethod      POST /rest/grok/top-up-inline
+#   SetDefaultPaymentMethod            POST /rest/grok/set-default-payment-method
+#   ListPrepaidBalanceChanges          GET  /rest/grok/prepaid-balance-changes
+#   GetAutoTopupRule                   GET  /rest/grok/auto-topup-rule
+#   SetAutoTopupRule                   POST /rest/grok/auto-topup-rule
+#   GetAutoTopupStats                  GET  /rest/grok/auto-topup-stats
+#   GetInvoice                         GET  /rest/grok/invoice
+#   ListInvoices                       GET  /rest/grok/invoices
+CREDITS_PATH = "/rest/grok/credits"
+BUILD_BILLING_PATH = "/rest/grok-build/billing"
+
+# `billing_product.Product` 枚举 —— **`PRODUCT_GROK_IMAGINE = 5` 是生图独立产品位**。
+PRODUCT_ENUM = {
+    0: "PRODUCT_UNSPECIFIED",
+    1: "PRODUCT_API",
+    2: "PRODUCT_GROK_BUILD",
+    3: "PRODUCT_GROK_PLUGINS",
+    4: "PRODUCT_GROK_CHAT",
+    5: "PRODUCT_GROK_IMAGINE",
+    6: "PRODUCT_GROK_VOICE",
+    7: "PRODUCT_GROK_APP_BUILDER",
+    8: "PRODUCT_GROK_TASKS",
+    9: "PRODUCT_GROK_BOT",
+    10: "PRODUCT_CURSOR",
+    11: "PRODUCT_BUGBOT",
+}
+PRODUCT_GROK_IMAGINE = 5
+
+# `UsagePeriodType` —— 实测三个凭证都是 WEEKLY。
+USAGE_PERIOD_TYPES = {
+    0: "USAGE_PERIOD_TYPE_UNSPECIFIED",
+    1: "USAGE_PERIOD_TYPE_MONTHLY",
+    2: "USAGE_PERIOD_TYPE_WEEKLY",
+}
+
+# `GrokCreditsConfig` 字段（proto 编号）：
+#   credit_usage_percent=1  on_demand_cap=2  on_demand_used=3
+#   billing_period_start=4  billing_period_end=5  history=6
+#   product_usage=7  current_period=8  is_unified_billing_user=11
+#   prepaid_balance=12  top_up_method=13
+CREDITS_CONFIG_FIELDS = (
+    "credit_usage_percent", "on_demand_cap", "on_demand_used",
+    "billing_period_start", "billing_period_end", "history",
+    "product_usage", "current_period", "is_unified_billing_user",
+    "prepaid_balance", "top_up_method",
+)
+
+# 前端 `useChatUsageLimit` 的阈值与轮询策略（bundle 提取）：
+#   let f = [90, 75, 50, 25];                      // 提示阈值
+#   function crossedThreshold(e,t){ return f.find(n => e<n && t>=n) ?? null }
+#   refetchInterval = pct>=90 ? 30000 : pct>=50 ? 60000 : 180000
+#   if (config.isUnifiedBillingUser === false) -> 整条额度链关闭
+USAGE_TOAST_THRESHOLDS = (90, 75, 50, 25)
+USAGE_POLL_NEAR_MS = 30_000      # ≥90%
+USAGE_POLL_MID_MS = 60_000       # ≥50%
+USAGE_POLL_FAR_MS = 180_000      # <50%
+
+
+def web_credits(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """`GET /rest/grok/credits` —— **网页 UI 真正使用的额度端点**。
+
+    这是 `useChatUsageLimit` → `getGrokCreditsConfig` 背后的 RPC
+    （proto `GetGrokCreditsConfig`）。返回 `GrokCreditsConfig`，
+    其中 `product_usage[]` 按 `billing_product.Product` 分项，
+    **含 `PRODUCT_GROK_IMAGINE = 5`（生图独立产品位）**。
+
+    **实测 2026-10-19：CLI 签发的 OAuth token 被拒**：
+
+        Bearer          → 403 code:7  "The OAuth2 access token could not
+                                       be validated. [WKE=unauthenticated:bad-credentials]"
+        x-api-key       → 400 code:3  "Cannot authenticate with API key."
+        Cookie sso      → 401 code:16 "Bad credentials."
+        无认证           → 401 code:16 "No credentials presented."
+
+    原因在 JWT 里：`aud` 与 `client_id` 都是 `b1a00492-...`（**Grok CLI 客户端**），
+    而该端点只认 **grok.com 网页应用**的 OAuth 客户端。即：
+
+    * 同一 token 在 `/rest/app-chat/*` 上可用（那套走 `conversations:read/write`）
+    * 在 `/rest/grok/credits` 上被判 `bad-credentials`
+
+    所以**用 CLI 凭证拿不到网页的生图额度**。可观测的替代只有：
+    :func:`free_usage_gates`（实测全 0/0）、:func:`billing`（CLI 账本，
+    **不含生图**）、或直接看生图响应的 `renderToolRateLimited` / 静默降级。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    resp = _stream_get(
+        f"{WEB_BASE}{CREDITS_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(
+                f"网页额度端点拒绝（{resp.status_code}）：{detail}",
+                status=resp.status_code,
+                body=detail,
+            )
+        data = resp.json()
+    if not isinstance(data, dict):
+        return {}
+    return data.get("config") if isinstance(data.get("config"), dict) else data
+
+
+def product_name(value: Any) -> str | None:
+    """把 `product_usage[].product` 归一成可读名。
+
+    proto3 JSON 可能给**枚举字符串**（`"PRODUCT_GROK_IMAGINE"`）或**数字**（`5`）。
+    """
+    if isinstance(value, str):
+        return value if value.startswith("PRODUCT_") else None
+    if isinstance(value, int):
+        return PRODUCT_ENUM.get(value)
+    return None
+
+
+def usage_poll_interval_ms(percent: float | None) -> int | None:
+    """按前端策略给出下次轮询间隔（毫秒）。
+
+    `percent` 为 `None`（字段缺失）或 `isUnifiedBillingUser === false` 时返回
+    `None` —— **不要轮询**。缺失 ≠ 0%，所以不能当成「用量 0%」去走最慢档。
+    """
+    if percent is None:
+        return None
+    try:
+        value = float(percent)
+    except (TypeError, ValueError):
+        return None
+    if value >= 90:
+        return USAGE_POLL_NEAR_MS
+    if value >= 50:
+        return USAGE_POLL_MID_MS
+    return USAGE_POLL_FAR_MS
+
+
+def crossed_usage_threshold(
+    before: float | None, after: float | None
+) -> int | None:
+    """前端 `crossedThreshold` 的等价实现 —— 返回本次跨过的阈值。
+
+    ```js
+    let f = [90, 75, 50, 25];
+    function crossedThreshold(e,t){ return f.find(n => e<n && t>=n) ?? null }
+    ```
+    """
+    if before is None or after is None:
+        return None
+    for threshold in USAGE_TOAST_THRESHOLDS:
+        if before < threshold <= after:
+            return threshold
+    return None
+
+
 def download_image(
     key: str,
     *,

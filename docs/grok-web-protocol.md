@@ -650,6 +650,212 @@ tokens (actual/limit): 1003617/1000000
 scope = `openid profile email offline_access grok-cli:access api:access`。
 用**浏览器 UA**（OAuth 端点对非浏览器 UA 更易触发风控）。
 
+### 1.10 网页额度端点：`GET /rest/grok/credits`（protobuf 逆向）
+
+**这是网页 UI 真正使用的额度端点**，不是 `/rest/media/imagine/quota_info`。
+
+#### 怎么找到的：解码 bundle 里的 protobuf `fileDesc`
+
+`js/00pmbps1j6es_.js` 的模块 `9096207` 内嵌了 base64 编码的 `.proto` 描述符
+（`(0,s.fileDesc)("...")`）。解码后得到完整 schema：
+
+`prod/grok/backend/proto/grok_build_billing.proto`（包 `grok_api_v2`）：
+
+```protobuf
+service GrokBuildBilling {
+  rpc GetGrokBuildBillingConfig          -> GET  /rest/grok-build/billing
+  rpc SetGrokBuildOnDemandConfig         -> POST /rest/grok-build/billing/on-demand
+  rpc GetGrokCreditsConfig               -> GET  /rest/grok/credits          // ← 网页额度
+  rpc ListPaymentMethods                 -> GET  /rest/grok/payment-methods
+  rpc CheckPaymentSetupFinalized         -> GET  /rest/grok/payment-setup-finalized
+  rpc TopUpOrGetExistingPendingChange    -> POST /rest/grok/top-up
+  rpc TopUpUsingInlinePaymentMethod      -> POST /rest/grok/top-up-inline
+  rpc SetDefaultPaymentMethod            -> POST /rest/grok/set-default-payment-method
+  rpc ListPrepaidBalanceChanges          -> GET  /rest/grok/prepaid-balance-changes
+  rpc GetAutoTopupRule                   -> GET  /rest/grok/auto-topup-rule
+  rpc SetAutoTopupRule                   -> POST /rest/grok/auto-topup-rule
+  rpc GetAutoTopupStats                  -> GET  /rest/grok/auto-topup-stats
+  rpc GetInvoice                         -> GET  /rest/grok/invoice
+  rpc ListInvoices                       -> GET  /rest/grok/invoices
+}
+
+message GrokCreditsConfig {
+  UsagePeriod  current_period        = 8;
+  float        credit_usage_percent  = 1;
+  Cent         on_demand_cap         = 2;
+  Cent         on_demand_used        = 3;
+  ProductUsage product_usage[]       = 7;   // ← 按产品分项
+  PeriodUsage  history[]             = 6;
+  bool         is_unified_billing_user = 11;
+  Cent         prepaid_balance       = 12;
+  TopUpMethod  top_up_method         = 13;
+  // 4/5 billing_period_start/end 已标 deprecated（`B02 `）
+}
+
+message ProductUsage {
+  billing_product.Product product = 1;
+  float                   usage_percent = 2;
+}
+
+enum UsagePeriodType {
+  USAGE_PERIOD_TYPE_UNSPECIFIED = 0;
+  USAGE_PERIOD_TYPE_MONTHLY     = 1;
+  USAGE_PERIOD_TYPE_WEEKLY      = 2;
+}
+```
+
+`prod/billing-pub/proto/product.proto` 的 `Product` 枚举 ——
+**`PRODUCT_GROK_IMAGINE = 5` 是生图独立产品位**：
+
+```protobuf
+enum Product {
+  PRODUCT_UNSPECIFIED = 0;  PRODUCT_API = 1;
+  PRODUCT_GROK_BUILD = 2;   PRODUCT_GROK_PLUGINS = 3;
+  PRODUCT_GROK_CHAT = 4;    PRODUCT_GROK_IMAGINE = 5;
+  PRODUCT_GROK_VOICE = 6;   PRODUCT_GROK_APP_BUILDER = 7;
+  PRODUCT_GROK_TASKS = 8;   PRODUCT_GROK_BOT = 9;
+  PRODUCT_CURSOR = 10;      PRODUCT_BUGBOT = 11;
+}
+```
+
+`GetGrokCreditsConfigRequest` 只有一个字段
+`exclude_legacy_monthly_usage`（bool），对应 query
+`?exclude_legacy_monthly_usage=true`。
+
+#### 前端怎么用它
+
+`useChatUsageLimit`（`js/00pmbps1j6es_.js`）→ `getGrokCreditsConfig`：
+
+```js
+let f = [90, 75, 50, 25];                        // 提示阈值
+function g(e){ return Number.isFinite(e) ? Math.max(0, e) : 0 }
+function h(e){ return e?.isUnifiedBillingUser === false }   // 额度链关闭条件
+function V(e){ let t = e.config; return h(t) ? void 0 : g(t?.creditUsagePercent) }
+function crossedThreshold(e,t){ return f.find(n => e < n && t >= n) ?? null }
+
+refetchInterval = pct >= 90 ? 30000 : pct >= 50 ? 60000 : 180000
+// isUnifiedBillingUser === false  → 整条额度链关闭，不轮询
+```
+
+即：**网页的额度判定就是 `creditUsagePercent` + `[90,75,50,25]` 阈值 + 分档轮询**。
+`js/00cd1bc6g3tng.js` 里 `creditUsagePercent >= 99` 时再叠一个 30 秒刷新。
+
+#### 实测：CLI 签发的 token 拿不到
+
+| 认证 | 结果 |
+|---|---|
+| `Authorization: Bearer <oauth-at>` | **403** `code:7` `The OAuth2 access token could not be validated. [WKE=unauthenticated:bad-credentials]` |
+| `x-api-key: <token>` | **400** `code:3` `Cannot authenticate with API key. [WKE=unauthenticated:invalid-credentials]` |
+| `Cookie: sso=<token>` | **401** `code:16` `Bad credentials.` |
+| 无认证 | **401** `code:16` `No credentials presented.` |
+
+加上 `X-XAI-Token-Auth` / `x-grok-client-version` / `x-grok-client-mode` 全套 CLI 头
+**仍然 403**。`grok.com/rest/grok-build/billing` 与 `/rest/grok/auto-topup-rule`
+在 `grok.com` 上是 **404**（只在别的主机/路径下有效）。
+
+**原因在 JWT 里**（解码 `access_token` 的 payload）：
+
+```jsonc
+{"iss":"https://auth.x.ai",
+ "sub":"79e28854-d70a-4c57-9a4d-535f2adb4e60",
+ "aud":"b1a00492-073a-47ea-816f-4c329264a828",   // ← Grok CLI 客户端
+ "client_id":"b1a00492-073a-47ea-816f-4c329264a828",
+ "scope":"openid profile email offline_access grok-cli:access api:access
+          conversations:read conversations:write",
+ "principal_type":"User",
+ "team_id":"71e8548a-7d36-430f-8e25-71be0b2734c2"}
+```
+
+`aud` 与 `client_id` 都是 **Grok CLI 客户端**，而 `/rest/grok/credits`
+只认 **grok.com 网页应用**的 OAuth 客户端。所以：
+
+* 同一 token 在 `/rest/app-chat/*` 上**可用**（那套走 `conversations:read/write`）
+* 在 `/rest/grok/credits` 上被判 **`bad-credentials`**
+
+#### 结论：网页生图额度对我们不可观测
+
+三条额度路径互不相通：
+
+| 路径 | 端点 | 含生图? | 我们能查? |
+|---|---|---|---|
+| 网页账本 | `GET /rest/grok/credits` | ✅ `PRODUCT_GROK_IMAGINE` | ❌ 403（client_id 不匹配） |
+| CLI 账本 | `GET cli-chat-proxy/v1/billing?format=credits` | ❌ 只有 `GrokBuild` | ✅ 200 |
+| 免费层闸门 | `GET /rest/usage/free-usage-gates` | ⚠️ 有 `imagine` 但恒 0/0 | ✅ 200（无信息量） |
+
+**所以判定生图是否还有额度，只能靠实际请求的三种拒绝形态（§1.6）。**
+
+### 1.11 89 个 media 端点的权限分布（2026-10-19 实测）
+
+穷举 `/rest/media/*` 全部 89 个端点：
+
+| 结果 | 数量 | 含义 |
+|---|---|---|
+| ✅ 200 | 9 | 可用 |
+| ⚠️ 400 | 20 | **授权通过，只是参数不对** —— 同样可用 |
+| ❌ 403 | 60 | `oauth2-auth-forbidden` |
+
+**400 不等于 403** —— 这是本轮最容易误判的地方。400 说明端点对我们开放。
+
+可用的 9 个（200）：
+
+```
+POST /rest/media/canvas/assets              {"assets":[]}
+POST /rest/media/canvas/create              创建画布
+POST /rest/media/canvas/list                列出画布
+POST /rest/media/canvas/node/bulk-get       {"canvases":[]}
+POST /rest/media/canvas/node/remove-from-group  {}
+POST /rest/media/pipeline/template-folder/list  模板分类
+POST /rest/media/pipeline/template/list         模板列表
+POST /rest/media/post/delete-all            {}
+POST /rest/media/post/list                  公共 feed（见下）
+```
+
+可用的 20 个（400，补参数即可）：`canvas/{delete,get,update,ensure-conversation,
+node/{create,list,delete,patch,restore,update},set-thumbnail}`、
+`conversation/{create,get}`、`pipeline/template/get`、`post/get`、
+`segment`、`video/{caption,music,upscale}`。
+
+#### `/rest/media/post/list` 是公共 feed，不能用来数自己的生图
+
+请求体 schema（bundle 提取）：
+
+```js
+{limit, cursor, filter, isKidsMode, isNsfwEnabled,
+ withContainerOnly, includeCanvas}
+```
+
+实测：返回的 `userId` 是 `e8d36c9a-...`，而**本账号**是 `95c42eb3-...`
+（`canvas/create` 与生图 URL 都证实）。穷举 18 种 `filter` 形态
+（`{userId}`、`{owner}`、`{isMine}`、`{kind:"MINE"}` …）**全部返回同一个公共 feed**
+—— `filter` 被服务端忽略。`post/get` 的 `requestUserId` 同样无效。
+
+**所以不能靠它统计自己的生图次数。**
+
+### 1.12 生图请求体的完整字段（补充）
+
+除 §1.7 已记录的 `mediaGenInput.textToImage{prompt,numOfImages}` 外，
+`ModelResponse` 里还有这些与图片相关的通道（bundle 提取，实测多数为空）：
+
+| 字段 | 用途 |
+|---|---|
+| `cardAttachment.jsonData` | **实际出图的通道**（§1.7） |
+| `imageAttachmentInfo.imageAttachmentCount` | 附件图片数（不是生成数） |
+| `imageDimensions` | `{width, height}` |
+| `streamingImageGenerationResponse` | 逐帧预览（实测空） |
+| `cachedImageGenerationResponse` | 缓存命中（实测空） |
+| `streamingVideoGenerationResponse` | 视频帧 |
+| `generatedImageUrls` | 旧路径（实测空） |
+| `progressReport` | `{category, state, message, percentage}` |
+
+客户端的"图片仍在生成中"判定是：
+
+```js
+e.progress < 100 && e.moderated !== true && (e.systemErrCode ?? 0) === 0
+```
+
+即 **`progress`、`moderated`、`systemErrCode` 三者必须同时满足** ——
+只看 `progress` 会把失败帧（`progress=100` 但 `systemErrCode=1006`）当成完成。
+
 ## 2. 主对话端点
 
 ```
