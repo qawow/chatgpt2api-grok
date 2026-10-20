@@ -1890,3 +1890,65 @@ class UploadFileTest(unittest.TestCase):
                          ("fileName", "fileMimeType", "content", "makePublic",
                           "fileSource", "thirdPartyFileId", "workspaceId"))
         self.assertEqual(g.UPLOAD_FILE_PATH, "/rest/app-chat/upload-file")
+
+
+class MediaLimitDiagnosisTest(unittest.TestCase):
+    """媒体限流是 **IP 级**的（2026-10-21 决定性实验）。
+
+    四个账号的 `allow_access` / `subscriptionTier` / `creditUsagePercent` /
+    `productUsage` **完全相同**，其中三个从未生成过任何东西 —— 但三个全新账号
+    **首次调用就失败**，而曾成功的账号现在也失败。
+
+    两种失败形态对应 IP 预算耗尽：
+
+        本窗口内已有用量 → 429 `Too many requests`
+        本窗口内尚无用量 → **静默降级**（200、无图、无 error）
+
+    **加账号不增加生图产能** —— 必须换出口 IP。
+    """
+
+    def test_all_success_means_ip_has_budget(self):
+        out = g.diagnose_media_limit([
+            {"images": ["a"]}, {"images": ["b"]}])
+        self.assertEqual(out["verdict"], "ok")
+        self.assertEqual(out["ok_count"], 2)
+        self.assertEqual(out["limited_count"], 0)
+
+    def test_all_failure_means_ip_exhausted(self):
+        """账号级限制不会让所有账号同时失败。"""
+        out = g.diagnose_media_limit([
+            {"images": [], "rate_limited": ["hit limit"]},
+            {"images": [], "silent_degrade": True},
+            {"images": [], "failed": [{"system_err_code": 1006}]},
+        ])
+        self.assertEqual(out["verdict"], "ip_exhausted")
+        self.assertEqual(out["ok_count"], 0)
+        self.assertEqual(out["limited_count"], 3)
+        self.assertIn("IP", out["reason"])
+
+    def test_mixed_means_account_level(self):
+        """成功的那批证明 IP 有预算。"""
+        out = g.diagnose_media_limit([
+            {"images": ["a"]},
+            {"images": [], "silent_degrade": True},
+        ])
+        self.assertEqual(out["verdict"], "account_limited")
+        self.assertEqual(out["ok_count"], 1)
+        self.assertEqual(out["limited_count"], 1)
+
+    def test_no_results_is_unknown(self):
+        for value in ([], [None, "x", {}]):
+            self.assertEqual(g.diagnose_media_limit(value)["verdict"], "unknown")
+
+    def test_the_verdict_table_is_complete(self):
+        self.assertEqual(set(g.MEDIA_LIMIT_VERDICTS),
+                         {"ok", "ip_exhausted", "account_limited", "unknown"})
+
+    def test_a_result_with_images_but_also_errors_counts_as_success(self):
+        """只要出图就算成功 —— 部分失败帧不改变判定。"""
+        out = g.diagnose_media_limit([
+            {"images": ["a"], "rate_limited": ["x"],
+             "failed": [{"system_err_code": 1006}]},
+        ])
+        self.assertEqual(out["ok_count"], 1)
+        self.assertEqual(out["verdict"], "ok")

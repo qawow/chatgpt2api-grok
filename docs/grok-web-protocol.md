@@ -1174,6 +1174,66 @@ imagine-video-gen          ✅ 26.6s
 静默降级后应**等待足够长的静默期**（实测 ≥15 分钟）再试，
 而不是周期性探测。
 
+### 1.16 ★★ 媒体限流是 **IP 级**的，不是账号级（2026-10-21 决定性实验）
+
+这是本轮最重要的发现 —— 它决定性地影响**扩容策略**。
+
+#### 实验设计
+
+四个账号，`allow_access` / `subscriptionTier` / `creditUsagePercent` /
+`productUsage` **完全相同**：
+
+| 账号 | allow_access | tier | pct | productUsage | 历史 |
+|---|---|---|---|---|---|
+| `28hwsf4ag4` | True | None | 0 | `[]` | **从未用过** |
+| `2q7vuj955a` | True | None | 0 | `[]` | **从未用过** |
+| `cn9mka1e2q` | True | None | 0 | `[]` | **从未用过** |
+| `yqrpwedp6e` | True | None | 0 | `[]` | 曾成功 **3 图 + 1 视频** |
+
+#### 结果
+
+```
+三个全新账号（首次生图）  → HTTP 200 静默降级（无图、无 error）
+yqrpwedp6e（曾成功的）    → HTTP 429 Too many requests
+```
+
+**三个从未生成过任何东西的账号，第一次调用就失败。** 而曾经成功的账号
+现在也失败 —— 期间它的账号状态没有任何变化。
+
+#### 结论
+
+**媒体配额按出口 IP 计量，同一 IP 上的所有账号共享同一个预算。**
+
+两种失败形态对应 IP 预算耗尽的两种表现：
+
+| 账号状态 | 表现 |
+|---|---|
+| 本窗口内**已有**用量 | **429 `Too many requests`** |
+| 本窗口内**尚无**用量（全新账号） | **静默降级**（200、无图、无 error） |
+
+**这解释了一个此前无法解释的现象**：为什么 `pd1jt9qjfa` 曾连出 8 张，
+后来同一账号静默降级；为什么新账号一上来就不能用。
+
+#### 对扩容的直接含义
+
+1. **加账号不增加生图产能** —— 它们共享同一 IP 预算。三个全新账号同时失败就是证据。
+2. 要扩容**必须换出口 IP**。codex2api 的 `POST /proxies/auto-balance`
+   （"spread accounts across enabled, reachable proxies least-bound-first"）
+   正是为此而存在，其 CHANGELOG 也写明
+   *"Too many Grok accounts egressing from one IP triggers upstream 402s"*。
+3. 本仓库的代理只接受固定用户名 `ob` —— 实测 `ob-session-<id>` / `ob-<id>` /
+   `ob_country_jp` 等 7 种变体**全部认证失败**（`curl: (97)`），
+   所以**当前无法在同一代理内换 IP**。
+4. 出口 IP 实测为 `45.192.199.151`（IPv4），另有 IPv6
+   `2a13:9500:15c:0:cafe::2a`。
+
+#### 诊断脚本
+
+判断当前 IP 是否还有媒体预算，最快的办法是看**两个不同账号**的表现：
+
+* 若两个账号都静默降级/429 → IP 预算耗尽
+* 若一个成功一个失败 → 才可能是账号级差异
+
 ## 2. 主对话端点
 
 ```

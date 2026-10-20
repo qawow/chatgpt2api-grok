@@ -2045,6 +2045,74 @@ def upload_file(
     return data if isinstance(data, dict) else {}
 
 
+# --------------------------------------------------------------------------
+# 媒体限流诊断
+# --------------------------------------------------------------------------
+#
+# **实测（2026-10-21）：媒体配额按出口 IP 计量，同一 IP 上所有账号共享预算。**
+#
+# 决定性证据：四个账号的 `allow_access` / `subscriptionTier` /
+# `creditUsagePercent` / `productUsage` **完全相同**，其中三个从未生成过任何
+# 东西 —— 但三个全新账号**首次调用就失败**，而曾成功的账号现在也失败。
+#
+# 两种失败形态对应 IP 预算耗尽的两种表现：
+#
+#   本窗口内已有用量   → 429 `Too many requests`
+#   本窗口内尚无用量   → **静默降级**（200、无图、无 error）
+#
+# 对扩容的直接含义：**加账号不增加生图产能**，必须换出口 IP。
+# codex2api 的 `POST /proxies/auto-balance` 正是为此而存在，其 CHANGELOG 写明
+# "Too many Grok accounts egressing from one IP triggers upstream 402s"。
+MEDIA_LIMIT_VERDICTS = {
+    "ok": "本 IP 仍有媒体预算",
+    "ip_exhausted": "IP 媒体预算耗尽（429 或静默降级）",
+    "account_limited": "疑似账号级限制（其它账号可用而此账号不可用）",
+    "unknown": "无法判定",
+}
+
+
+def diagnose_media_limit(
+    results: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """根据多个账号的 `generate_image()` 结果判定限流层级。
+
+    传入每个账号的结果（:func:`generate_image` 的返回值即可），返回::
+
+        {"verdict": "ok" | "ip_exhausted" | "account_limited" | "unknown",
+         "ok_count": int, "limited_count": int, "reason": str}
+
+    判定逻辑：
+
+    * 有任一成功 → ``ok``（本 IP 有预算）
+    * **全部**失败 → ``ip_exhausted``（因为账号级限制不会让所有账号同时失败）
+    * 部分成功部分失败 → ``account_limited``（成功的那批证明 IP 有预算）
+    """
+    ok = 0
+    limited = 0
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("images"):
+            ok += 1
+            continue
+        if (result.get("rate_limited") or result.get("silent_degrade")
+                or result.get("failed")):
+            limited += 1
+    if ok and not limited:
+        verdict, reason = "ok", "全部成功"
+    elif ok and limited:
+        verdict, reason = ("account_limited",
+                           "部分账号成功 —— IP 有预算，失败是账号级差异")
+    elif limited and not ok:
+        verdict, reason = ("ip_exhausted",
+                           "全部账号失败 —— 账号级限制不会让所有账号同时失败，"
+                           "指向 IP 级预算耗尽")
+    else:
+        verdict, reason = "unknown", "无有效结果"
+    return {"verdict": verdict, "ok_count": ok, "limited_count": limited,
+            "reason": reason}
+
+
 def download_image(
     key: str,
     *,
