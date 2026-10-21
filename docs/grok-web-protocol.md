@@ -1174,104 +1174,134 @@ imagine-video-gen          ✅ 26.6s
 静默降级后应**等待足够长的静默期**（实测 ≥15 分钟）再试，
 而不是周期性探测。
 
-### 1.16 媒体配额：实测数字与仍未确定的边界（2026-10-21 修订三版）
+### 1.16 ★★★ 媒体配额：完整模型（2026-10-21 最终版）
 
-> 本节经历了三次修订，每次都被新证据推翻一半。这里只写**实测数字**和
-> **明确标注的推断**，不再给单一结论。
+> 本节改了四版。前三次都在猜，这次找到了**真正的配额端点**，
+> 所有观察都有了统一解释。
 
-#### 已确证：`silent_degrade` 有两个成因
+#### 配额端点
 
-同一账号、同一 prompt，只改请求体：
+```
+POST /rest/media/imagine/quota_info
+Cookie: sso=<token>            ← 必须用 SSO cookie
+Content-Type: application/json
+{}
+```
 
-| 请求体 | 结果 |
+**CLI 签发的 Bearer 一律 403** —— 这是之前一直读不到配额的原因。
+
+实测响应：
+
+```json
+{"image": null,
+ "imagePro": {"available": true, "remainingQueries": 4,
+              "windowSizeSeconds": 86400},
+ "imageEdit": null,
+ "video": null,
+ "video720p": {"available": true, "remainingQueries": 1,
+               "windowSizeSeconds": 86400}}
+```
+
+#### ★ 窗口是 24 小时
+
+`windowSizeSeconds: 86400` = **24 小时**。
+
+这一条解释了此前所有矛盾：
+
+| 此前的困惑 | 真正原因 |
 |---|---|
-| `build_body` 的**完整** body | **出图** ✅ |
-| **精简** body（缺 `disableSearch` / `isReasoning` / `modelMode`，缺 `x-xai-request-id` 头） | 200 + **无图**，正文却说 `"I generated an image with the prompt: ..."` ❌ |
+| 「3.5 小时后仍未恢复」 | 窗口是 24h，3.5h 当然不够 |
+| 「bundle 里 `formatAvailableAt` 是 +30 分钟」 | 那是 **credit-quota** 的显示逻辑，不是 media quota |
+| 「30 分钟后三账号仍 429」 | 同上 |
+| 「8 次请求后 429」 | 每次请求消耗 1 个 `remainingQueries`，4 个桶各不同 |
 
-**① 请求体不完整** = 调用方 bug；**② 真配额耗尽** = 完整 body 连发后出现。
-排查必须先确认走的是 `build_body`。
+#### 桶的划分
 
-#### 实测配额数字（完整 body，`imagine-image-gen`）
+`image` / `imagePro` / `imageEdit` / `video` / `video720p` 五个桶。
 
-| 账号 | 起始状态 | 成功请求数 | 产出图片 | 之后 |
-|---|---|---|---|---|
-| `28hwsf4ag4` | 干净（>3.5h 无活动） | **8 次** | 16 张（每次返 2 张） | 429 |
-| `2q7vuj955a` | 紧接着上一行 | **3 次** | 6 张 | 429 |
-| `d781n9ynmc` | 被密集重试过 | ~4 次 | — | 5 小时后仍 429 |
+实测 `image` / `imageEdit` / `video` 为 **null**，只有 `imagePro` 与
+`video720p` 有数据 —— 当前账号走的是 **Pro 桶**，普通 `image` 桶未启用。
 
-**注意 `numOfImages: 1` 时服务端仍返回 2 张** —— 两次请求共 16 张。
+**`imageEdit` 是 null 说明图生图不单独计费** —— 它消耗 `imagePro`。
 
-#### ★ 决定性实验：配额**按账号**，不是按 IP（2026-10-21 晚）
+实测消耗轨迹：`imagePro` 从 **4 → 1**（3 次生图请求），窗口 24h。
 
-用**轮换出口 IP 的住宅代理**做对照。该代理实测每次请求换一个 IP
-（观察到 `107.173.10.110` / `193.176.84.35` / `198.2.214.3` / `64.118.136.68` /
-`23.95.84.106` / `62.210.124.132` / `67.159.48.146` 等，且**请求头无法固定** ——
-`X-Proxy-Session` / `Proxy-Session` / `X-Sticky-Session` / `X-Session` /
+#### 配额是按账号的（决定性实验）
+
+用**轮换出口 IP 的住宅代理**对照。该代理每次请求换一个 IP（观察到
+`107.173.10.110` / `193.176.84.35` / `198.2.214.3` / `64.118.136.68` /
+`23.95.84.106` / `62.210.124.132` / `67.159.48.146` 等），且**请求头无法固定**
+（`X-Proxy-Session` / `Proxy-Session` / `X-Sticky-Session` / `X-Session` /
 `X-Rotate` / `X-Exit-Country` / `X-Proxy-Url` / `Proxy-Url` / `X-Proxy`
-共 9 种头全部被忽略，每次仍换 IP）。
+共 9 种头全部被忽略）。
 
-**实验**：账号 `d781n9ynmc` 在旧 IP 上已 429 锁死 5 小时以上。换轮换代理后
-连发 10 次（**每次都是不同出口 IP**）：
+已 429 的账号换该代理连发 10 次（每次不同出口 IP）→ **0 张图**
+（7×429、2×Cloudflare challenge、1×TLS 抖动）。
 
-```
-#1  403 cf-mitigated=challenge
-#2  429
-#3  TLS 抖动
-#4  429
-#5  429
-#6  429
-#7  403 cf-mitigated=challenge
-#8  429
-#9  429
-#10 429
-```
+**结论：配额按账号计量，与出口 IP 无关。换 IP 不能绕过。**
 
-**10 个不同 IP，0 张图。**
+#### `silent_degrade` 有两个成因（务必先排除 ①）
 
-**结论：媒体配额按账号计量，与出口 IP 无关。** 换 IP 不能绕过。
+| 成因 | 判别 |
+|---|---|
+| **① 请求体不完整** | 缺 `disableSearch` / `isReasoning` / `modelMode` 任一，或缺 `x-xai-request-id` 头 → 200 + 无图 + 正文声称"已生成"；**换完整 body 立刻成功** |
+| **② 真配额耗尽** | 完整 body 连发后，`remainingQueries` 归零 |
 
-#### 那「8 次 → 3 次」怎么解释
+**排查顺序：先看 `quota_info` 的 `remainingQueries`，再看请求体。**
 
-`28hwsf4ag4` 拿到 8 次、`2q7vuj955a` 紧接着只拿 3 次 —— 这**不是** IP 共享，
-而是两个账号**自身剩余额度不同**（`2q7vuj955a` 此前已被部分消耗）。
+#### 账号级惩罚
 
-#### 账号级惩罚确实存在
+被按 3 分钟间隔重试 8 次（第 5 次起转 429）的账号，**5 小时后仍未恢复**，
+而同期从未被密集重试的账号能拿满额度。
 
-`d781n9ynmc` 被按 3 分钟间隔重试 8 次（第 5 次起转 429）后，**5 小时仍未恢复**，
-而同期从未被密集重试的 `28hwsf4ag4` 能拿满 8 次。所以除了配额，还有一层
-**因密集重试触发的惩罚期**，时长 > 5 小时。
-
-**建议**：命中 429 后**不要周期重试** —— 会触发更长的惩罚。应把账号标为
-冷却并静默足够久。
-
-**未验证**：正常配额的重置窗口时长。bundle 的 `formatAvailableAt` 是
-`nextAvailableAt + 30 分钟`（`18e5` ms），但实测 3.5 小时未恢复，
-所以**不能确认是 30 分钟**（可能被惩罚期掩盖）。
+**命中 429 后不要周期重试** —— 会触发更长的惩罚期。
 
 #### 已排除的旁路
 
 | 路径 | 结果 |
 |---|---|
-| `POST /rest/app-chat/template-chat`（`{template, requested(bool), locale}`） | **403 `oauth2-auth-forbidden`** |
+| `POST /rest/app-chat/template-chat` | **403 `oauth2-auth-forbidden`** |
 | `POST /rest/media/pipeline/run` | **403 `oauth2-auth-forbidden`** |
-| `POST /rest/media/pipeline/template/get` | 200，但**只返回 summary，不含提示词** |
-| 刷新 access token | 不重置配额（刷新后仍受同一预算约束） |
+| `POST /rest/rate-limits` | GET 501 / POST 404 —— **不是配额端点** |
+| 刷新 access token | **不重置**配额 |
 | 换生图模型 | 无效 —— 所有生图模型共享同一桶 |
-| 429 响应头 | **无 `Retry-After` / 无任何限流头** |
+| 换出口 IP | 无效（已用轮换代理证明） |
+| 429 响应头 | **无 `Retry-After`** |
 
-#### 不消耗媒体配额的路径（已确认）
+#### 其它已打通的配额/用量端点（均需 SSO cookie）
 
-| 路径 | 说明 |
-|---|---|
-| `imagine-video-prompt-enhance` | 纯文本，所有生图模型 429 时仍可用 |
-| `POST /rest/app-chat/run-code` | 代码执行，走独立预算 |
-| `POST /rest/app-chat/text-to-speech` | 语音合成，走独立预算 |
-| 模板列表 / 分类 / 详情 | 只读，免费 |
+```jsonc
+// GET /rest/media/imagine/generation_estimate
+{"estimate": null, "shouldShow": false, "imagineFreeCreditActive": false,
+ "imagineFreeCreditAllowance": "0", "imagineFreeCreditRemaining": "0"}
 
-#### 教训
+// POST /rest/models/imagine/overrides
+{"modelMapOverrides": []}
 
-**「模型说它生成了」不等于「真的生成了」** —— 判定必须看
-`cardAttachment.image_chunk.imageUrl`，不能看 HTTP 200 或正文。
+// GET /rest/usage/free-usage-gates
+{"chat": {"allowance": "0", "remaining": "0"},
+ "imagine": {"allowance": "0", "remaining": "0"},
+ "voice": {"allowance": "0", "remaining": "0"},
+ "build": {"allowance": "0", "remaining": "0"}}
+
+// GET /rest/tasks/usage
+{"frequentUsage": 0, "frequentLimit": 2,
+ "occasionalUsage": 0, "occasionalLimit": 10}
+
+// GET /rest/assets/storage-usage
+{"totalStorageBytes": "1073741824", "usedStorageBytes": "0",
+ "totalGeneratedVideoStorageBytes": "0", "usedGeneratedVideoStorageBytes": "0"}
+
+// POST /rest/media/reference/list
+{"references": []}
+```
+
+存储配额是 **1 GiB**。
+
+#### 不消耗媒体配额的路径
+
+`imagine-video-prompt-enhance`（提示词增强）、`run-code`、`text-to-speech`、
+模板只读接口、`/rest/models`、`/rest/modes`、`/rest/products`。
 
 ### 1.17 语音合成：`POST /rest/app-chat/text-to-speech`（2026-10-21 实测）
 
@@ -1431,6 +1461,667 @@ POST /rest/media/pipeline/template/get           → {summary, isSaved}
 
 1. **`template/get` 只返回 `summary`，不含实际提示词** —— 提示词与流水线定义在服务端，客户端拿不到。
 2. **`POST /rest/media/pipeline/run` 实测 403 `oauth2-auth-forbidden`** —— 模板**能列、能读，但不能用 API 跑**，只能从网页 UI 用。
+
+### 1.20 完整 API 表面：250 个端点（2026-10-21 全量探测）
+
+从 1367 个 Turbopack chunk（60 MB）静态提取，再用真实凭证全量探测。
+
+#### 探测结果分布
+
+| 状态 | 数量 | 含义 |
+|---|---|---|
+| `403` | 178 | OAuth2 token 策略拒绝 |
+| `400` | 11 | **授权通过**，参数不对 |
+| `200` | 8 | 可用 |
+| `404` | 5 | 端点未部署 |
+| `401` | 4 | 需要另一种凭证（SSO cookie） |
+
+**400 ≠ 403**：400 说明授权通过、只是参数不对，同样可用。
+
+#### 分组清单
+
+**`/rest/add-mobile-device-notification-token`**（1）
+
+- `POST` `/rest/add-mobile-device-notification-token` → 403
+
+**`/rest/app-chat/app-builder-conversations`**（1）
+
+- `GET` `/rest/app-chat/app-builder-conversations` → 403 `{responseIds}`
+
+**`/rest/app-chat/app-deployments`**（1）
+
+- `GET` `/rest/app-chat/app-deployments` → 403
+
+**`/rest/app-chat/bot-chat-attachment`**（1）
+
+- `GET` `/rest/app-chat/bot-chat-attachment` → 403
+
+**`/rest/app-chat/choose_sbs_response`**（1）
+
+- `POST` `/rest/app-chat/choose_sbs_response` → 403 `{conversationId,responseId}`
+
+**`/rest/app-chat/conversation-starters`**（1）
+
+- `GET` `/rest/app-chat/conversation-starters` → 403
+
+**`/rest/app-chat/conversations`**（7）
+
+- `DELETE` `/rest/app-chat/conversations` → 403
+- `GET` `/rest/app-chat/conversations` → 403
+- `POST` `/rest/app-chat/conversations` → 403 `{systemPromptName,temporary,addResponseRequest,workspaceIds,taskResultId,templateId,kind}`
+- `GET` `/rest/app-chat/conversations/deleted` → ?
+- `POST` `/rest/app-chat/conversations/from-ai-overview` → 403 `{overviewId,query,language,deferred,firstUserMessage}`
+- `POST` `/rest/app-chat/conversations/new` → 403
+- `POST` `/rest/app-chat/conversations/restore` → 403 `{conversationId}`
+
+**`/rest/app-chat/conversations-many`**（1）
+
+- `GET` `/rest/app-chat/conversations-many` → 403
+
+**`/rest/app-chat/fetch-suggestions`**（1）
+
+- `POST` `/rest/app-chat/fetch-suggestions` → 403 `{query,count,includeAnswers,conversation,conversationHistory}`
+
+**`/rest/app-chat/google-drive`**（1）
+
+- `GET` `/rest/app-chat/google-drive/files` → 403 `{provider,gifId}`
+
+**`/rest/app-chat/image-generations`**（1）
+
+- `GET` `/rest/app-chat/image-generations` → 403
+
+**`/rest/app-chat/import-memory`**（3）
+
+- `GET` `/rest/app-chat/import-memory` → 403 `{conversationIds}`
+- `POST` `/rest/app-chat/import-memory` → 403 `{content}`
+- `GET` `/rest/app-chat/import-memory/status` → 403 `{conversationIds}`
+
+**`/rest/app-chat/memory`**（2）
+
+- `DELETE` `/rest/app-chat/memory` → 403
+- `POST` `/rest/app-chat/memory` → 403 `{conversationIds}`
+
+**`/rest/app-chat/migrate-conversations`**（1）
+
+- `POST` `/rest/app-chat/migrate-conversations` → 403 `{conversations}`
+
+**`/rest/app-chat/migrate-file`**（1）
+
+- `POST` `/rest/app-chat/migrate-file` → 403 `{fileName,fileMimeType,content,isModelGenerated}`
+
+**`/rest/app-chat/migrate-memory`**（1）
+
+- `POST` `/rest/app-chat/migrate-memory` → 403 `{memoryKeyMappings}`
+
+**`/rest/app-chat/migrate-responses`**（1）
+
+- `POST` `/rest/app-chat/migrate-responses` → 403 `{responses}`
+
+**`/rest/app-chat/onboarding-events`**（1）
+
+- `POST` `/rest/app-chat/onboarding-events` → 403 `{conversationId,started,n=!1){return null==e?e}`
+
+**`/rest/app-chat/quick-answer`**（1）
+
+- `POST` `/rest/app-chat/quick-answer` → 403 `{query}`
+
+**`/rest/app-chat/run-code`**（1）
+
+- `POST` `/rest/app-chat/run-code` → 403 `{language,code}`
+
+**`/rest/app-chat/share_links`**（2）
+
+- `GET` `/rest/app-chat/share_links` → 403
+- `GET` `/rest/app-chat/share_links/summaries` → 403
+
+**`/rest/app-chat/suggestions`**（1）
+
+- `GET` `/rest/app-chat/suggestions` → 403
+
+**`/rest/app-chat/template-chat`**（1）
+
+- `POST` `/rest/app-chat/template-chat` → 403 `{template,requested,locale}`
+
+**`/rest/app-chat/template-prompt`**（1）
+
+- `GET` `/rest/app-chat/template-prompt` → 403
+
+**`/rest/app-chat/text-to-speech`**（1）
+
+- `POST` `/rest/app-chat/text-to-speech` → 403 `{text,voiceId,language,codec,sampleRate,bitRate,optimizeStreamingLatency,textNormalization,speed}`
+
+**`/rest/app-chat/tool-responses`**（1）
+
+- `POST` `/rest/app-chat/tool-responses` → 403 `{responseId,toolResponse}`
+
+**`/rest/app-chat/tts-voices`**（1）
+
+- `GET` `/rest/app-chat/tts-voices` → 403
+
+**`/rest/app-chat/upload-file`**（1）
+
+- `POST` `/rest/app-chat/upload-file` → 403 `{fileName,fileMimeType,content,makePublic,fileSource,thirdPartyFileId,workspaceId}`
+
+**`/rest/app-chat/upload-file-v2`**（6）
+
+- `POST` `/rest/app-chat/upload-file-v2/abort` → ? `{uploadId}`
+- `POST` `/rest/app-chat/upload-file-v2/complete` → 400 `{presigned,n=!1){return null==e?e,completedParts}`
+- `POST` `/rest/app-chat/upload-file-v2/import-gif` → 403 `{provider,gifId}`
+- `POST` `/rest/app-chat/upload-file-v2/init` → 403 `{fileName,fileMimeType,fileSource,thirdPartyFileId,sizeBytes,resumableSupported,multipartSupported}`
+- `PATCH` `/rest/app-chat/upload-file-v2/patch` → ? `{uploadId,completedParts}`
+- `GET` `/rest/app-chat/upload-file-v2/status` → 403
+
+**`/rest/app-chat/user-memory-blurb`**（3）
+
+- `DELETE` `/rest/app-chat/user-memory-blurb` → 403 `{projectDir,projectName,idempotencyKey,allowForking,accessVisibility,shareUserIds,shareEmails,shareTeamIds,shareOrganizationIds}`
+- `GET` `/rest/app-chat/user-memory-blurb` → 403
+- `PUT` `/rest/app-chat/user-memory-blurb` → 403 `{memoryContent}`
+
+**`/rest/app-chat/voice`**（2）
+
+- `POST` `/rest/app-chat/voice/post-recording` → 403 `{contentBytes,mimeType,conversationId,responseId,sessionMetadata,alignmentInfo}`
+- `POST` `/rest/app-chat/voice/share` → 403 `{videoBytes,text}`
+
+**`/rest/app-deployer/v1`**（5）
+
+- `GET` `/rest/app-deployer/v1/deployments:latest` → 404
+- `POST` `/rest/app-deployer/v1/moderation-reports` → 404
+- `GET` `/rest/app-deployer/v1/ping` → 404
+- `GET` `/rest/app-deployer/v1/projects` → 404
+- `POST` `/rest/app-deployer/v1/projects:init` → 404
+
+**`/rest/asset-shares`**（1）
+
+- `GET` `/rest/asset-shares` → 403
+
+**`/rest/assets`**（2）
+
+- `GET` `/rest/assets` → 403
+- `POST` `/rest/assets` → 403
+
+**`/rest/assets/clone-batch`**（1）
+
+- `POST` `/rest/assets/clone-batch` → 403
+
+**`/rest/assets/storage-usage`**（1）
+
+- `GET` `/rest/assets/storage-usage` → 403
+
+**`/rest/automations`**（2）
+
+- `GET` `/rest/automations` → 403
+- `POST` `/rest/automations` → 403
+
+**`/rest/automations/catalog`**（1）
+
+- `GET` `/rest/automations/catalog` → 403
+
+**`/rest/automations/trigger-resources`**（1）
+
+- `POST` `/rest/automations/trigger-resources` → 403
+
+**`/rest/automations/webhook`**（1）
+
+- `POST` `/rest/automations/webhook/rotate-secret` → ?
+
+**`/rest/conversations/files`**（4）
+
+- `GET` `/rest/conversations/files/content` → 401
+- `GET` `/rest/conversations/files/download-zip` → 401
+- `POST` `/rest/conversations/files/imagine-asset` → 403
+- `GET` `/rest/conversations/files/list` → 401
+
+**`/rest/grok-business/manageable-admin-teams`**（1）
+
+- `GET` `/rest/grok-business/manageable-admin-teams` → 403
+
+**`/rest/grok-for-teams/blocked-urls`**（4）
+
+- `DELETE` `/rest/grok-for-teams/blocked-urls` → 403
+- `GET` `/rest/grok-for-teams/blocked-urls` → 403
+- `POST` `/rest/grok-for-teams/blocked-urls/commit` → 403
+- `POST` `/rest/grok-for-teams/blocked-urls/upload-url` → 403
+
+**`/rest/grok-for-teams/collections`**（2）
+
+- `GET` `/rest/grok-for-teams/collections` → 403
+- `POST` `/rest/grok-for-teams/collections` → 403
+
+**`/rest/grok-for-teams/embedding-models`**（1）
+
+- `GET` `/rest/grok-for-teams/embedding-models` → 403
+
+**`/rest/grok-for-teams/migrate-personal`**（1）
+
+- `POST` `/rest/grok-for-teams/migrate-personal` → 403
+
+**`/rest/grok-for-teams/team-members`**（1）
+
+- `GET` `/rest/grok-for-teams/team-members` → 403
+
+**`/rest/grok-for-teams/team-public-settings`**（1）
+
+- `GET` `/rest/grok-for-teams/team-public-settings` → 403
+
+**`/rest/grok-for-teams/team-settings`**（2）
+
+- `GET` `/rest/grok-for-teams/team-settings` → 403
+- `PUT` `/rest/grok-for-teams/team-settings` → 403
+
+**`/rest/grok-for-teams/team-stats`**（1）
+
+- `GET` `/rest/grok-for-teams/team-stats` → 403
+
+**`/rest/issue-report`**（1）
+
+- `POST` `/rest/issue-report` → 403
+
+**`/rest/media/canvas`**（17）
+
+- `POST` `/rest/media/canvas/assets` → 403
+- `POST` `/rest/media/canvas/create` → 403
+- `POST` `/rest/media/canvas/delete` → ?
+- `POST` `/rest/media/canvas/ensure-conversation` → 403
+- `POST` `/rest/media/canvas/get` → 400
+- `POST` `/rest/media/canvas/list` → 403
+- `POST` `/rest/media/canvas/node/add-to-group` → 403
+- `POST` `/rest/media/canvas/node/bulk-get` → 403
+- `POST` `/rest/media/canvas/node/create` → 403
+- `POST` `/rest/media/canvas/node/delete` → ?
+- `POST` `/rest/media/canvas/node/list` → 400
+- `POST` `/rest/media/canvas/node/patch` → 403
+- `POST` `/rest/media/canvas/node/remove-from-group` → ?
+- `POST` `/rest/media/canvas/node/restore` → 403
+- `POST` `/rest/media/canvas/node/update` → 403
+- `POST` `/rest/media/canvas/set-thumbnail` → 403
+- `POST` `/rest/media/canvas/update` → 403
+
+**`/rest/media/collection`**（9）
+
+- `POST` `/rest/media/collection/assets/add` → 403
+- `POST` `/rest/media/collection/assets/list` → 403
+- `POST` `/rest/media/collection/assets/remove` → ?
+- `POST` `/rest/media/collection/create` → 403
+- `POST` `/rest/media/collection/delete` → ?
+- `POST` `/rest/media/collection/for-asset` → 403
+- `POST` `/rest/media/collection/get` → 403
+- `POST` `/rest/media/collection/list` → 403
+- `POST` `/rest/media/collection/update` → 403
+
+**`/rest/media/conversation`**（2）
+
+- `POST` `/rest/media/conversation/create` → 403
+- `POST` `/rest/media/conversation/get` → 403
+
+**`/rest/media/folder`**（6）
+
+- `POST` `/rest/media/folder/bulk-add` → 403
+- `POST` `/rest/media/folder/bulk-remove` → ?
+- `POST` `/rest/media/folder/create` → 403
+- `POST` `/rest/media/folder/delete` → ?
+- `POST` `/rest/media/folder/list` → 403
+- `POST` `/rest/media/folder/update` → 403
+
+**`/rest/media/generate-music`**（1）
+
+- `POST` `/rest/media/generate-music` → 403
+
+**`/rest/media/generate-voice`**（1）
+
+- `POST` `/rest/media/generate-voice` → 403
+
+**`/rest/media/gifs`**（2）
+
+- `GET` `/rest/media/gifs/search` → 403
+- `GET` `/rest/media/gifs/trending` → 403
+
+**`/rest/media/imagine`**（3）
+
+- `POST` `/rest/media/imagine/delete-all` → ?
+- `GET` `/rest/media/imagine/generation_estimate` → 403
+- `POST` `/rest/media/imagine/quota_info` → 403
+
+**`/rest/media/pipeline`**（17）
+
+- `POST` `/rest/media/pipeline/cancel` → ?
+- `POST` `/rest/media/pipeline/resume` → 403
+- `POST` `/rest/media/pipeline/run` → 403
+- `POST` `/rest/media/pipeline/template-folder/create` → 403
+- `POST` `/rest/media/pipeline/template-folder/delete` → ?
+- `POST` `/rest/media/pipeline/template-folder/list` → 200
+- `POST` `/rest/media/pipeline/template-folder/update` → 403
+- `POST` `/rest/media/pipeline/template/create` → 403
+- `POST` `/rest/media/pipeline/template/delete` → ?
+- `POST` `/rest/media/pipeline/template/fork` → 403
+- `POST` `/rest/media/pipeline/template/get` → 400
+- `POST` `/rest/media/pipeline/template/list` → 200
+- `POST` `/rest/media/pipeline/template/publish` → 403
+- `POST` `/rest/media/pipeline/template/rollback` → 403
+- `POST` `/rest/media/pipeline/template/save` → 403
+- `POST` `/rest/media/pipeline/template/unsave` → 403
+- `POST` `/rest/media/pipeline/template/update` → 403
+
+**`/rest/media/post`**（14）
+
+- `POST` `/rest/media/post/bulk-get` → 403
+- `POST` `/rest/media/post/bulk-unlike` → ?
+- `POST` `/rest/media/post/create` → 403
+- `POST` `/rest/media/post/create-link` → 403
+- `POST` `/rest/media/post/delete` → ?
+- `POST` `/rest/media/post/delete-all` → ?
+- `POST` `/rest/media/post/folders` → 403
+- `POST` `/rest/media/post/get` → 400
+- `POST` `/rest/media/post/imagine-feed` → 403
+- `POST` `/rest/media/post/like` → 403
+- `POST` `/rest/media/post/list` → 200
+- `POST` `/rest/media/post/list-shared-posts` → 403
+- `POST` `/rest/media/post/set-visibility` → 403
+- `POST` `/rest/media/post/unlike` → ?
+
+**`/rest/media/projects`**（1）
+
+- `POST` `/rest/media/projects/assets/add` → 403
+
+**`/rest/media/reference`**（7）
+
+- `POST` `/rest/media/reference/assets/add` → 403
+- `POST` `/rest/media/reference/assets/remove` → ?
+- `POST` `/rest/media/reference/create` → 403
+- `POST` `/rest/media/reference/delete` → ?
+- `POST` `/rest/media/reference/get` → 403
+- `POST` `/rest/media/reference/list` → 403
+- `POST` `/rest/media/reference/update` → 403
+
+**`/rest/media/search`**（4）
+
+- `POST` `/rest/media/search/debug` → 403
+- `POST` `/rest/media/search/query` → 403
+- `POST` `/rest/media/search/status` → 403
+- `POST` `/rest/media/search/trigger` → 403
+
+**`/rest/media/segment`**（1）
+
+- `POST` `/rest/media/segment` → 403
+
+**`/rest/media/video`**（3）
+
+- `POST` `/rest/media/video/caption` → 403
+- `POST` `/rest/media/video/music` → 403
+- `POST` `/rest/media/video/upscale` → 403
+
+**`/rest/media/video-sequence`**（1）
+
+- `POST` `/rest/media/video-sequence/create` → 403
+
+**`/rest/models`**（1）
+
+- `POST` `/rest/models` → 200
+
+**`/rest/models/imagine`**（1）
+
+- `POST` `/rest/models/imagine/overrides` → 401
+
+**`/rest/modes`**（1）
+
+- `POST` `/rest/modes` → 200
+
+**`/rest/notifications/list`**（1）
+
+- `GET` `/rest/notifications/list` → 403
+
+**`/rest/notifications/mark-read`**（1）
+
+- `POST` `/rest/notifications/mark-read` → 403
+
+**`/rest/notifications/update-access-request-status`**（1）
+
+- `POST` `/rest/notifications/update-access-request-status` → 403
+
+**`/rest/products`**（1）
+
+- `GET` `/rest/products` → 200
+
+**`/rest/rate-limits`**（1）
+
+- `POST` `/rest/rate-limits` → 403
+
+**`/rest/report-email-code`**（1）
+
+- `POST` `/rest/report-email-code` → 400
+
+**`/rest/sharing/my-org-teams`**（1）
+
+- `GET` `/rest/sharing/my-org-teams` → 403
+
+**`/rest/sharing/search`**（1）
+
+- `GET` `/rest/sharing/search` → 403
+
+**`/rest/skills`**（1）
+
+- `POST` `/rest/skills` → 200
+
+**`/rest/subscriptions`**（1）
+
+- `GET` `/rest/subscriptions` → 403
+
+**`/rest/subscriptions/apple`**（1）
+
+- `POST` `/rest/subscriptions/apple/report-purchase` → 403
+
+**`/rest/subscriptions/billing-portal`**（2）
+
+- `POST` `/rest/subscriptions/billing-portal` → 403
+- `POST` `/rest/subscriptions/billing-portal/update` → 403
+
+**`/rest/subscriptions/braintree-client-token`**（1）
+
+- `POST` `/rest/subscriptions/braintree-client-token/new` → 200
+
+**`/rest/subscriptions/customer`**（1）
+
+- `POST` `/rest/subscriptions/customer/new` → 403
+
+**`/rest/subscriptions/invoices`**（1）
+
+- `GET` `/rest/subscriptions/invoices` → 403
+
+**`/rest/subscriptions/payment-methods`**（1）
+
+- `GET` `/rest/subscriptions/payment-methods` → 403
+
+**`/rest/subscriptions/paypal-billing-agreement`**（1）
+
+- `POST` `/rest/subscriptions/paypal-billing-agreement/new` → 400
+
+**`/rest/subscriptions/subscribe`**（1）
+
+- `POST` `/rest/subscriptions/subscribe/new` → 403
+
+**`/rest/subscriptions/subscribe-via-braintree`**（1）
+
+- `POST` `/rest/subscriptions/subscribe-via-braintree/new` → 403
+
+**`/rest/subscriptions/subscribe-via-paypal`**（1）
+
+- `POST` `/rest/subscriptions/subscribe-via-paypal/new` → 403
+
+**`/rest/subscriptions/subscription`**（3）
+
+- `GET` `/rest/subscriptions/subscription/detail` → 403
+- `POST` `/rest/subscriptions/subscription/update` → 403
+- `POST` `/rest/subscriptions/subscription/update-preview` → 403
+
+**`/rest/subscriptions/sync`**（1）
+
+- `POST` `/rest/subscriptions/sync` → 403
+
+**`/rest/suggestions/profile`**（1）
+
+- `GET` `/rest/suggestions/profile` → 403
+
+**`/rest/suggestions/stream`**（1）
+
+- `POST` `/rest/suggestions/stream` → 400
+
+**`/rest/system-prompt/create`**（1）
+
+- `POST` `/rest/system-prompt/create` → 403
+
+**`/rest/system-prompt/list`**（1）
+
+- `POST` `/rest/system-prompt/list` → 403
+
+**`/rest/task-schedules`**（1）
+
+- `PATCH` `/rest/task-schedules` → ?
+
+**`/rest/task/task-schedules`**（1）
+
+- `PATCH` `/rest/task/task-schedules` → ?
+
+**`/rest/task/tools`**（1）
+
+- `GET` `/rest/task/tools` → 403
+
+**`/rest/tasks`**（3）
+
+- `GET` `/rest/tasks` → 403
+- `POST` `/rest/tasks` → 403
+- `PUT` `/rest/tasks` → 403
+
+**`/rest/tasks/archive`**（1）
+
+- `PUT` `/rest/tasks/archive` → ?
+
+**`/rest/tasks/inactive`**（1）
+
+- `GET` `/rest/tasks/inactive` → 403
+
+**`/rest/tasks/stat`**（1）
+
+- `GET` `/rest/tasks/stat` → 403
+
+**`/rest/tasks/usage`**（1）
+
+- `GET` `/rest/tasks/usage` → 403
+
+**`/rest/teams-where-user-has-active-sub`**（1）
+
+- `GET` `/rest/teams-where-user-has-active-sub` → 403
+
+**`/rest/tida-report`**（1）
+
+- `POST` `/rest/tida-report` → 400
+
+**`/rest/usage/free-usage-gates`**（1）
+
+- `GET` `/rest/usage/free-usage-gates` → 403
+
+**`/rest/user-settings`**（2）
+
+- `GET` `/rest/user-settings` → 403
+- `POST` `/rest/user-settings` → 403
+
+**`/rest/user-skills`**（2）
+
+- `GET` `/rest/user-skills` → 403
+- `POST` `/rest/user-skills` → 403
+
+**`/rest/user-skills/copy`**（1）
+
+- `POST` `/rest/user-skills/copy` → 403
+
+**`/rest/user-skills/hidden`**（1）
+
+- `GET` `/rest/user-skills/hidden` → 403
+
+**`/rest/user-skills/search`**（1）
+
+- `GET` `/rest/user-skills/search` → 403
+
+**`/rest/user-skills/shared`**（2）
+
+- `GET` `/rest/user-skills/shared` → 403
+- `GET` `/rest/user-skills/shared/search` → 403
+
+**`/rest/verified-age/persona`**（3）
+
+- `POST` `/rest/verified-age/persona/callback` → 403
+- `POST` `/rest/verified-age/persona/start` → 403
+- `GET` `/rest/verified-age/persona/status` → 403
+
+**`/rest/verified-age/selfie`**（1）
+
+- `POST` `/rest/verified-age/selfie` → 403
+
+**`/rest/verified-skills`**（2）
+
+- `GET` `/rest/verified-skills` → 403
+- `POST` `/rest/verified-skills` → 403
+
+**`/rest/verified-skills/promote`**（1）
+
+- `POST` `/rest/verified-skills/promote` → ?
+
+**`/rest/verified-skills/published`**（1）
+
+- `GET` `/rest/verified-skills/published` → 403
+
+**`/rest/verified-skills/search`**（1）
+
+- `GET` `/rest/verified-skills/search` → 403
+
+**`/rest/voice/admin`**（1）
+
+- `GET` `/rest/voice/admin/voices` → 403
+
+**`/rest/voice/align`**（1）
+
+- `POST` `/rest/voice/align` → 400
+
+**`/rest/voice/grokcasts`**（1）
+
+- `POST` `/rest/voice/grokcasts` → 403
+
+**`/rest/voice/passphrase`**（1）
+
+- `POST` `/rest/voice/passphrase` → 403
+
+**`/rest/voice/saved-voices`**（2）
+
+- `GET` `/rest/voice/saved-voices` → 403
+- `POST` `/rest/voice/saved-voices` → 403
+
+**`/rest/voice/search`**（1）
+
+- `GET` `/rest/voice/search` → 403
+
+**`/rest/voice/speech-to-text`**（1）
+
+- `POST` `/rest/voice/speech-to-text` → 403
+
+**`/rest/voice/top`**（1）
+
+- `GET` `/rest/voice/top` → 403
+
+**`/rest/voice/transcribe`**（1）
+
+- `POST` `/rest/voice/transcribe` → 400
+
+**`/rest/voice/voices`**（2）
+
+- `GET` `/rest/voice/voices` → 403
+- `POST` `/rest/voice/voices` → 403
+
+**`/rest/workspaces`**（2）
+
+- `GET` `/rest/workspaces` → 403
+- `POST` `/rest/workspaces` → 403
+
+**`/rest/workspaces/shared`**（1）
+
+- `GET` `/rest/workspaces/shared` → 403
 
 ## 2. 主对话端点
 

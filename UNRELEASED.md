@@ -88,8 +88,14 @@
 
 - **`silent_degrade` 有两个成因**：① **请求体不完整**（缺 `disableSearch` / `isReasoning` / `modelMode` 任一，或缺 `x-xai-request-id` 头）→ 200 + 无图 + 正文声称"已生成"；② **真配额耗尽**（完整 body 连发后）。**排查必须先确认走的是 `build_body`。**
 - **实测配额**（完整 body、`imagine-image-gen`）：`28hwsf4ag4`（干净、>3.5h 无活动）→ **8 次请求**（每次返 2 张，共 16 张）后 429；`2q7vuj955a`（紧接着）→ **仅 3 次**（6 张）后 429；`d781n9ynmc`（被密集重试过）→ 5 小时后仍 429。注意 **`numOfImages: 1` 时服务端仍返 2 张**。
-- **★★ 决定性实验：媒体配额按账号计量，与出口 IP 无关**（2026-10-21 晚）。用**轮换出口 IP 的住宅代理**做对照 —— 该代理实测每次请求换一个 IP（观察到 `107.173.10.110` / `193.176.84.35` / `198.2.214.3` / `64.118.136.68` / `23.95.84.106` / `62.210.124.132` / `67.159.48.146` 等），且**请求头无法固定**（`X-Proxy-Session` / `Proxy-Session` / `X-Sticky-Session` / `X-Session` / `X-Rotate` / `X-Exit-Country` / `X-Proxy-Url` / `Proxy-Url` / `X-Proxy` 共 9 种头全部被忽略）。让已 429 锁死 5h+ 的账号换该代理连发 10 次（**每次不同出口 IP**）→ **0 张图**（7×429、2×Cloudflare challenge、1×TLS 抖动）。**换 IP 不能绕过配额。**
-- 「`28hwsf4ag4` 拿 8 次 → `2q7vuj955a` 只拿 3 次」**不是** IP 共享，而是两账号**自身剩余额度不同**（后者此前已被部分消耗）。
+- **★★★ 找到真正的配额端点：`POST /rest/media/imagine/quota_info`**（2026-10-21）。**必须用 SSO cookie**（`Cookie: sso=<token>`），CLI 签发的 Bearer 一律 403 —— 这是之前一直读不到配额的原因。实测响应：`{"image":null,"imagePro":{"available":true,"remainingQueries":4,"windowSizeSeconds":86400},"imageEdit":null,"video":null,"video720p":{"available":true,"remainingQueries":1,"windowSizeSeconds":86400}}`。
+- **★ 窗口是 86400 秒 = 24 小时。** 这一条解释了此前所有矛盾：为什么 3.5 小时后仍未恢复；为什么 bundle 里 `formatAvailableAt` 的「+30 分钟」对不上（那是 **credit-quota** 的显示逻辑，不是 media quota）。实测消耗轨迹 `imagePro` 从 **4 → 1**（3 次生图请求）。
+- **桶的划分**：`image` / `imagePro` / `imageEdit` / `video` / `video720p`。实测 `image` / `imageEdit` / `video` 为 **null**，只有 `imagePro` 与 `video720p` 有数据 —— 当前账号走 Pro 桶。**`imageEdit` 为 null 说明图生图不单独计费，消耗 `imagePro`。**
+- **配额按账号计量，与出口 IP 无关**（决定性实验）：用每次换 IP 的轮换住宅代理，让已 429 的账号连发 10 次（每次不同出口 IP）→ **0 张图**（7×429、2×Cloudflare challenge、1×TLS 抖动）。代理的 9 种请求头（`X-Proxy-Session` / `Proxy-Session` / `X-Sticky-Session` / `X-Session` / `X-Rotate` / `X-Exit-Country` / `X-Proxy-Url` / `Proxy-Url` / `X-Proxy`）全部被忽略，无法固定 IP。
+- **已排除的旁路**：`template-chat` → 403；`pipeline/run` → 403；**`POST /rest/rate-limits` 不是配额端点**（GET 501 / POST 404 "Model not found."）；刷新 token 不重置；换生图模型无效（共享同一桶）；换 IP 无效；429 响应**无 `Retry-After`**。
+- **其它打通的用量端点（均需 SSO cookie）**：`GET /rest/media/imagine/generation_estimate`、`POST /rest/models/imagine/overrides`（→ `{"modelMapOverrides":[]}`）、`GET /rest/usage/free-usage-gates`（chat/imagine/voice/build 四组 allowance+remaining）、`GET /rest/tasks/usage`（frequent 0/2、occasional 0/10）、`GET /rest/assets/storage-usage`（**总配额 1 GiB**）、`POST /rest/media/reference/list`（→ `{"references":[]}`）。
+- **完整 API 表面**：从 1367 个 chunk（60 MB）静态提取 **250 个端点**，全量探测分布 **403×178 / 400×11 / 200×8 / 404×5 / 401×4**。**400 ≠ 403** —— 400 说明授权通过、只是参数不对，同样可用。清单见 `docs/grok-web-protocol.md` §1.20。
+- 新增 `quota_info()` / `remaining_media()` 与 `QUOTA_INFO_PATH` / `GENERATION_ESTIMATE_PATH` / `IMAGINE_OVERRIDES_PATH` / `MEDIA_QUOTA_BUCKETS` 常量；`download_image()` 新增 `cookies` 参数（SSO 也能下载）。
 - **账号级惩罚确实存在**：`d781n9ynmc` 被按 3 分钟间隔重试 8 次（第 5 次起转 429）后 **5 小时仍未恢复**，而同期从未被密集重试的 `28hwsf4ag4` 能拿满 8 次。**命中 429 后不要周期重试** —— 会触发更长的惩罚，应标为冷却并静默足够久。
 - **未验证**：正常配额的重置窗口时长。bundle 的 `formatAvailableAt` 是 `nextAvailableAt + 30 分钟`，但实测 3.5 小时未恢复（可能被惩罚期掩盖），且 30 分钟后三账号全部仍 429。
 - 备用出口实测可用：`socks5h://research:***@192.168.2.198:2260` 能到 `grok.com`（200 / 33 个模型）与 `auth.x.ai`（刷新 200），但**轮换 IP 会触发 Cloudflare challenge**，且对配额无帮助。
@@ -112,6 +118,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1202 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1210 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

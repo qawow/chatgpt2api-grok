@@ -2441,3 +2441,88 @@ class RefreshAccessTokenTest(unittest.TestCase):
         self.assertIn("offline_access", g.OAUTH_SCOPES)
         self.assertIn("grok-cli:access", g.OAUTH_SCOPES)
         self.assertIn("conversations:write", g.OAUTH_SCOPES)
+
+
+class MediaQuotaInfoTest(unittest.TestCase):
+    """`POST /rest/media/imagine/quota_info` —— **真正的配额端点**（2026-10-21 打通）。
+
+    **必须用 SSO cookie**；CLI 签发的 Bearer 一律 403。
+
+    实测响应::
+
+        {"image": null,
+         "imagePro": {"available": true, "remainingQueries": 4,
+                      "windowSizeSeconds": 86400},
+         "imageEdit": null, "video": null,
+         "video720p": {"available": true, "remainingQueries": 1,
+                       "windowSizeSeconds": 86400}}
+
+    **窗口是 86400 秒 = 24 小时。** 这解释了为什么 3.5 小时后仍未恢复 ——
+    bundle 里 `formatAvailableAt` 的「+30 分钟」是 credit-quota 的显示逻辑，
+    不是 media quota。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_it_sends_the_sso_cookie(self):
+        from unittest import mock
+
+        payload = {"imagePro": {"available": True, "remainingQueries": 4,
+                                "windowSizeSeconds": 86400}}
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(payload)) as sp:
+            g.quota_info(cookies={"sso": "abc"})
+        self.assertIn("/media/imagine/quota_info", sp.call_args[0][0])
+        self.assertEqual(sp.call_args.kwargs["cookies"], {"sso": "abc"})
+
+    def test_missing_auth_is_rejected_before_any_request(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            with self.assertRaises(g.GrokWebError):
+                g.quota_info()
+            sp.assert_not_called()
+
+    def test_the_window_is_twenty_four_hours(self):
+        quota = {"imagePro": {"available": True, "remainingQueries": 4,
+                              "windowSizeSeconds": 86400}}
+        out = g.remaining_media(quota)
+        self.assertEqual(out["imagePro"]["windowHours"], 24.0)
+        self.assertEqual(out["imagePro"]["remainingQueries"], 4)
+
+    def test_null_buckets_are_dropped(self):
+        quota = {"image": None, "imagePro": {"remainingQueries": 1,
+                                             "windowSizeSeconds": 86400},
+                 "imageEdit": None, "video": None, "video720p": None}
+        out = g.remaining_media(quota)
+        self.assertEqual(list(out), ["imagePro"])
+
+    def test_all_five_buckets_are_recognised(self):
+        self.assertEqual(g.MEDIA_QUOTA_BUCKETS,
+                         ("image", "imagePro", "imageEdit", "video", "video720p"))
+        quota = {b: {"remainingQueries": 1, "windowSizeSeconds": 3600}
+                 for b in g.MEDIA_QUOTA_BUCKETS}
+        self.assertEqual(len(g.remaining_media(quota)), 5)
+
+    def test_remaining_media_tolerates_garbage(self):
+        for value in ({}, None, [], "x"):
+            self.assertEqual(g.remaining_media(value), {})
+
+    def test_a_bad_window_value_does_not_raise(self):
+        out = g.remaining_media({"imagePro": {"windowSizeSeconds": "bad"}})
+        self.assertIsNone(out["imagePro"]["windowHours"])
+
+    def test_the_endpoint_paths_match_the_bundle(self):
+        self.assertEqual(g.QUOTA_INFO_PATH, "/rest/media/imagine/quota_info")
+        self.assertEqual(g.GENERATION_ESTIMATE_PATH,
+                         "/rest/media/imagine/generation_estimate")
+        self.assertEqual(g.IMAGINE_OVERRIDES_PATH, "/rest/models/imagine/overrides")

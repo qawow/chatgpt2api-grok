@@ -2617,33 +2617,152 @@ def refresh_access_token(
     return data
 
 
+# --------------------------------------------------------------------------
+# 媒体配额（真正的配额端点）
+# --------------------------------------------------------------------------
+#
+# **`POST /rest/media/imagine/quota_info`** —— 实测 2026-10-21 打通。
+#
+# **必须用 SSO cookie**（`Cookie: sso=<token>`）；CLI 签发的 Bearer 一律 403。
+#
+# 响应（实测）::
+#
+#   {"image": null,
+#    "imagePro": {"available": true, "remainingQueries": 4,
+#                 "windowSizeSeconds": 86400},
+#    "imageEdit": null,
+#    "video": null,
+#    "video720p": {"available": true, "remainingQueries": 1,
+#                  "windowSizeSeconds": 86400}}
+#
+# **窗口是 86400 秒 = 24 小时** —— 这解释了一切：
+# 为什么 3.5 小时后仍未恢复，为什么 bundle 里 `formatAvailableAt` 的
+# 「+30 分钟」对不上（那是 credit-quota 的显示逻辑，不是 media quota）。
+#
+# 桶的划分：`image` / `imagePro` / `imageEdit` / `video` / `video720p`。
+# 实测 `image` / `imageEdit` / `video` 为 null，只有 `imagePro` 与
+# `video720p` 有数据 —— 说明当前账号走的是 Pro 桶。
+#
+# 其它相关端点（实测）：
+#
+#   GET  /rest/media/imagine/generation_estimate
+#        → {"estimate": null, "shouldShow": false,
+#           "imagineFreeCreditActive": false,
+#           "imagineFreeCreditAllowance": "0",
+#           "imagineFreeCreditRemaining": "0"}
+#   POST /rest/models/imagine/overrides  → {"modelMapOverrides": []}
+#   GET  /rest/usage/free-usage-gates
+#        → {"chat":{"allowance":"0","remaining":"0"},
+#           "imagine":{...},"voice":{...},"build":{...}}
+#   GET  /rest/tasks/usage
+#        → {"frequentUsage":0,"frequentLimit":2,
+#           "occasionalUsage":0,"occasionalLimit":10}
+#   GET  /rest/assets/storage-usage
+#        → {"totalStorageBytes":"1073741824","usedStorageBytes":"0", ...}
+#   POST /rest/media/reference/list  → {"references": []}
+#
+# **`POST /rest/rate-limits` 不可用**：GET 返回 501 Method Not Allowed，
+# POST 返回 404 "Model not found." —— 它不是配额端点。
+QUOTA_INFO_PATH = "/rest/media/imagine/quota_info"
+GENERATION_ESTIMATE_PATH = "/rest/media/imagine/generation_estimate"
+IMAGINE_OVERRIDES_PATH = "/rest/models/imagine/overrides"
+MEDIA_QUOTA_BUCKETS = ("image", "imagePro", "imageEdit", "video", "video720p")
+
+
+def quota_info(
+    *,
+    cookies: Any = None,
+    bearer: str | None = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """读媒体配额（`POST /rest/media/imagine/quota_info`）。
+
+    **必须用 SSO cookie** —— CLI Bearer 一律 403。返回原始响应::
+
+        {"image": null,
+         "imagePro": {"available": true, "remainingQueries": 4,
+                      "windowSizeSeconds": 86400},
+         "imageEdit": null, "video": null,
+         "video720p": {"available": true, "remainingQueries": 1,
+                       "windowSizeSeconds": 86400}}
+
+    **窗口是 24 小时（86400 秒）。**
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 cookies（quota_info 只认 SSO cookie）")
+    resp = _stream_post(
+        f"{WEB_BASE}{QUOTA_INFO_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body={},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"配额查询 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def remaining_media(quota: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """把 :func:`quota_info` 的响应压成「有数据的桶」。
+
+    只保留值非 null 的桶，并补一个 `windowHours`：:
+
+        {"imagePro": {"available": true, "remainingQueries": 4,
+                      "windowSizeSeconds": 86400, "windowHours": 24.0},
+         "video720p": {...}}
+    """
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(quota, dict):
+        return out
+    for bucket in MEDIA_QUOTA_BUCKETS:
+        value = quota.get(bucket)
+        if not isinstance(value, dict):
+            continue
+        item = dict(value)
+        try:
+            item["windowHours"] = round(float(item.get("windowSizeSeconds") or 0) / 3600, 2)
+        except (TypeError, ValueError):
+            item["windowHours"] = None
+        out[bucket] = item
+    return out
+
+
 def download_image(
     key: str,
     *,
     bearer: str | None = None,
+    cookies: Any = None,
     proxy: str | None = None,
     timeout: float = 120.0,
 ) -> bytes:
     """下载 `assets.grok.com` 上的图片。
 
-    **必须带 Bearer** —— 实测无认证返回 403（0 字节），带 Bearer 返回
-    200 + `image/jpeg`（351,813 字节，784×1168）。
+    **必须带认证** —— 实测无认证返回 403（0 字节）；带 Bearer 或 SSO cookie
+    返回 200 + `image/jpeg`（351,813 字节，784×1168）。
 
     `key` 是 :func:`extract_images` 返回的 `image_url`（已是绝对地址）。
     """
     url = asset_url(key)
     if not url:
         raise GrokWebError("缺少图片 key")
-    token = str(bearer or "").strip()
-    if not token:
-        raise GrokWebError("下载图片需要 bearer")
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("下载图片需要 bearer 或 cookies")
+    headers: dict[str, str] = {"Accept": "image/*,*/*"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         resp = _stream_get(
             url,
-            headers={"Authorization": f"Bearer {token}",
-                     "User-Agent": "grok-cli/1.0.62",
-                     "Accept": "image/*,*/*"},
-            cookies=None,
+            headers=headers,
+            cookies=jar,
             proxy=proxy,
             timeout=timeout,
         )
