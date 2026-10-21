@@ -1893,41 +1893,42 @@ class UploadFileTest(unittest.TestCase):
 
 
 class MediaLimitDiagnosisTest(unittest.TestCase):
-    """媒体限流是 **IP 级**的（2026-10-21 决定性实验）。
+    """媒体预算诊断（结论已修正 2026-10-21 晚）。
 
-    四个账号的 `allow_access` / `subscriptionTier` / `creditUsagePercent` /
-    `productUsage` **完全相同**，其中三个从未生成过任何东西 —— 但三个全新账号
-    **首次调用就失败**，而曾成功的账号现在也失败。
+    曾一度认为「媒体配额按出口 IP 计量」，该结论**已推翻** —— 证据被请求体
+    缺陷污染：精简 body（缺 `disableSearch`/`isReasoning`/`modelMode` 与
+    `x-xai-request-id` 头）会得到 200 + 无图 + 正文声称已生成。
 
-    两种失败形态对应 IP 预算耗尽：
+    对照实验（同一账号同一 prompt）：
 
-        本窗口内已有用量 → 429 `Too many requests`
-        本窗口内尚无用量 → **静默降级**（200、无图、无 error）
+        build_body 完整 body   → 出图 ✅
+        精简 body              → 200 + 无图 ❌
 
-    **加账号不增加生图产能** —— 必须换出口 IP。
+    所以 `silent_degrade` 有两个成因：**请求体不完整**（调用方 bug）与
+    **真配额耗尽**（完整 body 连发约 4–8 次后）。
     """
 
-    def test_all_success_means_ip_has_budget(self):
+    def test_all_success_means_budget_remains(self):
         out = g.diagnose_media_limit([
             {"images": ["a"]}, {"images": ["b"]}])
         self.assertEqual(out["verdict"], "ok")
         self.assertEqual(out["ok_count"], 2)
         self.assertEqual(out["limited_count"], 0)
 
-    def test_all_failure_means_ip_exhausted(self):
-        """账号级限制不会让所有账号同时失败。"""
+    def test_all_failure_means_quota_exhausted(self):
+        """注意：若调用方用了精简 body，这里会误判 —— 见类文档。"""
         out = g.diagnose_media_limit([
             {"images": [], "rate_limited": ["hit limit"]},
             {"images": [], "silent_degrade": True},
             {"images": [], "failed": [{"system_err_code": 1006}]},
         ])
-        self.assertEqual(out["verdict"], "ip_exhausted")
+        self.assertEqual(out["verdict"], "quota_exhausted")
         self.assertEqual(out["ok_count"], 0)
         self.assertEqual(out["limited_count"], 3)
-        self.assertIn("IP", out["reason"])
+        self.assertIn("build_body", out["reason"])
 
     def test_mixed_means_account_level(self):
-        """成功的那批证明 IP 有预算。"""
+        """成功的那批证明预算存在，失败是账号差异。"""
         out = g.diagnose_media_limit([
             {"images": ["a"]},
             {"images": [], "silent_degrade": True},
@@ -1942,7 +1943,7 @@ class MediaLimitDiagnosisTest(unittest.TestCase):
 
     def test_the_verdict_table_is_complete(self):
         self.assertEqual(set(g.MEDIA_LIMIT_VERDICTS),
-                         {"ok", "ip_exhausted", "account_limited", "unknown"})
+                         {"ok", "quota_exhausted", "account_limited", "unknown"})
 
     def test_a_result_with_images_but_also_errors_counts_as_success(self):
         """只要出图就算成功 —— 部分失败帧不改变判定。"""
@@ -1952,3 +1953,66 @@ class MediaLimitDiagnosisTest(unittest.TestCase):
         ])
         self.assertEqual(out["ok_count"], 1)
         self.assertEqual(out["verdict"], "ok")
+
+
+class SilentDegradeCausesTest(unittest.TestCase):
+    """`silent_degrade` 有**两个完全不同**的成因（2026-10-21 对照实验）。
+
+    同一账号、同一 prompt，只改请求体：
+
+        build_body 完整 body                        → 出图 ✅
+        精简 body（缺 disableSearch / isReasoning /
+                   modelMode，缺 x-xai-request-id）  → 200 + 无图，
+                                                        正文却说
+                                                        "I generated an image ..."
+
+    所以「静默降级」不能直接当成配额耗尽 —— **先确认请求体是完整的**。
+    """
+
+    def test_the_full_body_contains_the_fields_the_probe_omitted(self):
+        body = g.build_body("x", image=True, model=g.IMAGE_GEN_MODEL)
+        for key in ("disableSearch", "isReasoning", "modelMode", "deviceEnvInfo"):
+            self.assertIn(key, body, f"完整 body 必须含 {key}")
+        self.assertIs(body["disableSearch"], False)
+        self.assertIs(body["isReasoning"], False)
+        self.assertEqual(body["modelMode"], "none")
+
+    def test_the_headers_carry_a_request_id(self):
+        """`x-xai-request-id` 是完整请求的一部分，精简探针漏了它。"""
+        headers = g.build_headers(bearer="tok")
+        self.assertIn("x-xai-request-id", headers)
+        self.assertTrue(headers["x-xai-request-id"])
+
+    def test_generate_image_passes_the_gen_config_through(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            resp = mock.MagicMock()
+            resp.status_code = 200
+            resp.text = ""
+            resp.iter_lines.return_value = []
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = lambda *a: None
+            sp.return_value = resp
+            g.generate_image("x", bearer="tok", model=g.IMAGE_GEN_MODEL,
+                             image_gen_config=g.build_image_gen_config(mode="fast"))
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(body["modelName"], g.IMAGE_GEN_MODEL)
+        self.assertEqual(body["imageGenModelConfig"]["mode"], "fast")
+
+    def test_generate_image_passes_the_edit_config_through(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            resp = mock.MagicMock()
+            resp.status_code = 200
+            resp.text = ""
+            resp.iter_lines.return_value = []
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = lambda *a: None
+            sp.return_value = resp
+            g.generate_image("x", bearer="tok", model=g.IMAGE_EDIT_MODEL,
+                             image_edit_config=g.build_image_edit_config(["a/1.jpg"]))
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(body["modelName"], g.IMAGE_EDIT_MODEL)
+        self.assertEqual(body["imageEditModelConfig"]["imageReferences"], ["a/1.jpg"])

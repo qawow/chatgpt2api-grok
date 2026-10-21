@@ -436,6 +436,8 @@ def build_body(
     video_resolution: str = "480p",
     video_skip_audio: bool = False,
     media_gen: dict[str, Any] | None = None,
+    image_gen_config: dict[str, Any] | None = None,
+    image_edit_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 `/rest/app-chat/conversations/new` 的请求体。
 
@@ -521,6 +523,12 @@ def build_body(
                 "modelConfigOverride": {"modelMap": {"imageEditModel": "imagine"}}
             },
         })
+        # 直连模型名（`imagine-image-gen` / `imagine-image-edit`）需要各自的
+        # 配置块 —— 见 :func:`build_image_gen_config` / :func:`build_image_edit_config`
+        if image_gen_config is not None:
+            body["imageGenModelConfig"] = dict(image_gen_config)
+        if image_edit_config is not None:
+            body["imageEditModelConfig"] = dict(image_edit_config)
     return body
 
 
@@ -2049,24 +2057,37 @@ def upload_file(
 # 媒体限流诊断
 # --------------------------------------------------------------------------
 #
-# **实测（2026-10-21）：媒体配额按出口 IP 计量，同一 IP 上所有账号共享预算。**
+# **修正（2026-10-21 晚）**：曾一度得出「媒体配额按出口 IP 计量」的结论，
+# 该结论**已被推翻** —— 证据被一个请求体缺陷污染了。
 #
-# 决定性证据：四个账号的 `allow_access` / `subscriptionTier` /
-# `creditUsagePercent` / `productUsage` **完全相同**，其中三个从未生成过任何
-# 东西 —— 但三个全新账号**首次调用就失败**，而曾成功的账号现在也失败。
+# 对照实验（同一账号、同一 prompt，只改请求体）：
 #
-# 两种失败形态对应 IP 预算耗尽的两种表现：
+#   A) `build_body` 的完整 body          → **出图** ✅
+#   B) 精简 body（缺 disableSearch / isReasoning / modelMode，
+#      且缺 `x-xai-request-id` 头）       → 200 + **无图**，正文却说
+#                                          "I generated an image with the prompt: ..."
 #
-#   本窗口内已有用量   → 429 `Too many requests`
-#   本窗口内尚无用量   → **静默降级**（200、无图、无 error）
+# 即 **`silent_degrade` 有两个完全不同的成因**：
 #
-# 对扩容的直接含义：**加账号不增加生图产能**，必须换出口 IP。
-# codex2api 的 `POST /proxies/auto-balance` 正是为此而存在，其 CHANGELOG 写明
-# "Too many Grok accounts egressing from one IP triggers upstream 402s"。
+#   1. **请求体不完整** —— 服务端照常回 200 并声称已生成，但不产出
+#      `cardAttachment`。缺 `disableSearch` / `isReasoning` / `modelMode`
+#      任一即可触发。**这是调用方的 bug，不是配额问题。**
+#   2. **真配额耗尽** —— 用完整 body 连发约 4–8 次后出现。
+#
+# 之前「三个全新账号首次调用即失败 → IP 级限流」的推断**不成立**：
+# 那三个账号当时用的正是精简 body。
+#
+# 正确的排查顺序：**先确认请求体走的是 `build_body`（完整字段 + request-id 头），
+# 再看是不是配额。** 用精简 body 探配额会得到假阳性。
+#
+# 关于 IP：codex2api 的 CHANGELOG 确实提到
+# "Too many Grok accounts egressing from one IP triggers upstream 402s"，
+# 且它有 `POST /proxies/auto-balance`。但**本仓库没有复现出 IP 级约束** ——
+# 同 IP 下新账号在完整 body 下可以正常出图。
 MEDIA_LIMIT_VERDICTS = {
-    "ok": "本 IP 仍有媒体预算",
-    "ip_exhausted": "IP 媒体预算耗尽（429 或静默降级）",
-    "account_limited": "疑似账号级限制（其它账号可用而此账号不可用）",
+    "ok": "仍有媒体预算",
+    "quota_exhausted": "配额耗尽（全部账号 429 / 静默降级）",
+    "account_limited": "账号级差异（部分账号可用）",
     "unknown": "无法判定",
 }
 
@@ -2083,9 +2104,13 @@ def diagnose_media_limit(
 
     判定逻辑：
 
-    * 有任一成功 → ``ok``（本 IP 有预算）
-    * **全部**失败 → ``ip_exhausted``（因为账号级限制不会让所有账号同时失败）
-    * 部分成功部分失败 → ``account_limited``（成功的那批证明 IP 有预算）
+    * 有任一成功 → ``ok``（还有预算）
+    * 全部失败 → ``quota_exhausted``
+    * 部分成功部分失败 → ``account_limited``（账号间存在差异）
+
+    **前提**：传入的结果必须来自 :func:`generate_image`（它走完整的
+    :func:`build_body`）。若调用方自己拼了精简 body，会得到假的
+    ``silent_degrade`` —— 那种情况下本函数会误判为 ``quota_exhausted``。
     """
     ok = 0
     limited = 0
@@ -2104,9 +2129,9 @@ def diagnose_media_limit(
         verdict, reason = ("account_limited",
                            "部分账号成功 —— IP 有预算，失败是账号级差异")
     elif limited and not ok:
-        verdict, reason = ("ip_exhausted",
-                           "全部账号失败 —— 账号级限制不会让所有账号同时失败，"
-                           "指向 IP 级预算耗尽")
+        verdict, reason = ("quota_exhausted",
+                           "全部账号失败 —— 先确认请求体走的是 build_body"
+                           "（完整字段 + request-id 头），再判断配额")
     else:
         verdict, reason = "unknown", "无有效结果"
     return {"verdict": verdict, "ok_count": ok, "limited_count": limited,
@@ -2161,6 +2186,8 @@ def generate_image(
     resolution: str | None = None,
     mode: str | None = None,
     model: str = IMAGE_MODEL,
+    image_gen_config: dict[str, Any] | None = None,
+    image_edit_config: dict[str, Any] | None = None,
     download: bool = False,
     timeout: float = 600.0,
 ) -> dict[str, Any]:
@@ -2184,6 +2211,8 @@ def generate_image(
         prompt, cookies=cookies, bearer=bearer, proxy=proxy, timeout=timeout,
         model=model, image=True, image_count=count, aspect_ratio=aspect_ratio,
         resolution=resolution, image_mode=mode,
+        image_gen_config=image_gen_config,
+        image_edit_config=image_edit_config,
     )
     # 失败帧（`systemErrCode` 且无 imageUrl）单独收集，不混进成功列表
     failed = [img for img in result["images"]

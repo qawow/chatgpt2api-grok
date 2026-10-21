@@ -1174,65 +1174,60 @@ imagine-video-gen          ✅ 26.6s
 静默降级后应**等待足够长的静默期**（实测 ≥15 分钟）再试，
 而不是周期性探测。
 
-### 1.16 ★★ 媒体限流是 **IP 级**的，不是账号级（2026-10-21 决定性实验）
+### 1.16 ★★ 撤回：「媒体限流是 IP 级」的结论不成立（2026-10-21 晚修正）
 
-这是本轮最重要的发现 —— 它决定性地影响**扩容策略**。
+> **本节是对 2026-10-21 早先结论的撤回。** 原结论（媒体配额按出口 IP 计量、
+> 加账号不增加产能）**证据不成立** —— 它被一个请求体缺陷污染了。
 
-#### 实验设计
+#### 原始（错误）推理
 
-四个账号，`allow_access` / `subscriptionTier` / `creditUsagePercent` /
-`productUsage` **完全相同**：
+四个账号的 `allow_access` / `subscriptionTier` / `creditUsagePercent` /
+`productUsage` 完全相同，其中三个从未生成过任何东西，却**首次调用即静默降级**；
+而曾成功过的账号也 429。于是推断「同一 IP 共享预算」。
 
-| 账号 | allow_access | tier | pct | productUsage | 历史 |
-|---|---|---|---|---|---|
-| `28hwsf4ag4` | True | None | 0 | `[]` | **从未用过** |
-| `2q7vuj955a` | True | None | 0 | `[]` | **从未用过** |
-| `cn9mka1e2q` | True | None | 0 | `[]` | **从未用过** |
-| `yqrpwedp6e` | True | None | 0 | `[]` | 曾成功 **3 图 + 1 视频** |
+#### 对照实验推翻了它
 
-#### 结果
+同一账号、同一 prompt，**只改请求体**：
 
-```
-三个全新账号（首次生图）  → HTTP 200 静默降级（无图、无 error）
-yqrpwedp6e（曾成功的）    → HTTP 429 Too many requests
-```
-
-**三个从未生成过任何东西的账号，第一次调用就失败。** 而曾经成功的账号
-现在也失败 —— 期间它的账号状态没有任何变化。
-
-#### 结论
-
-**媒体配额按出口 IP 计量，同一 IP 上的所有账号共享同一个预算。**
-
-两种失败形态对应 IP 预算耗尽的两种表现：
-
-| 账号状态 | 表现 |
+| 请求体 | 结果 |
 |---|---|
-| 本窗口内**已有**用量 | **429 `Too many requests`** |
-| 本窗口内**尚无**用量（全新账号） | **静默降级**（200、无图、无 error） |
+| `build_body` 的**完整** body | **出图** ✅ |
+| **精简** body（缺 `disableSearch` / `isReasoning` / `modelMode`，缺 `x-xai-request-id` 头） | 200 + **无图**，正文却说 `"I generated an image with the prompt: ..."` ❌ |
 
-**这解释了一个此前无法解释的现象**：为什么 `pd1jt9qjfa` 曾连出 8 张，
-后来同一账号静默降级；为什么新账号一上来就不能用。
+**服务端照常回 200 并声称已生成，但不产出 `cardAttachment`。**
 
-#### 对扩容的直接含义
+那三个「全新账号首次即失败」的探测，用的正是**精简 body** —— 所以它们的失败
+与 IP、与配额都无关，纯粹是**调用方漏了字段**。
 
-1. **加账号不增加生图产能** —— 它们共享同一 IP 预算。三个全新账号同时失败就是证据。
-2. 要扩容**必须换出口 IP**。codex2api 的 `POST /proxies/auto-balance`
-   （"spread accounts across enabled, reachable proxies least-bound-first"）
-   正是为此而存在，其 CHANGELOG 也写明
-   *"Too many Grok accounts egressing from one IP triggers upstream 402s"*。
-3. 本仓库的代理只接受固定用户名 `ob` —— 实测 `ob-session-<id>` / `ob-<id>` /
-   `ob_country_jp` 等 7 种变体**全部认证失败**（`curl: (97)`），
-   所以**当前无法在同一代理内换 IP**。
-4. 出口 IP 实测为 `45.192.199.151`（IPv4），另有 IPv6
-   `2a13:9500:15c:0:cafe::2a`。
+#### 正确的结论：`silent_degrade` 有两个成因
 
-#### 诊断脚本
+| 成因 | 触发条件 | 判别 |
+|---|---|---|
+| **① 请求体不完整** | 缺 `disableSearch` / `isReasoning` / `modelMode` 任一，或缺 `x-xai-request-id` | 正文声称"已生成"但无 `cardAttachment`；**换完整 body 立刻成功** |
+| **② 真配额耗尽** | 用完整 body 连发约 **4–8 次** | 429，或正文为空/拒绝 |
 
-判断当前 IP 是否还有媒体预算，最快的办法是看**两个不同账号**的表现：
+**排查顺序：先确认走的是 `build_body`（完整字段 + request-id 头），再看配额。**
+用精简 body 探配额会得到**假阳性**。
 
-* 若两个账号都静默降级/429 → IP 预算耗尽
-* 若一个成功一个失败 → 才可能是账号级差异
+#### 仍然成立的观察
+
+* 用完整 body 连发后确实会耗尽：`yqrpwedp6e` 出 3 图 + 1 视频后静默降级；
+  `d781n9ynmc` 出 4 图后 429。
+* 配额看起来是**按账号**的 —— 同 IP 下新账号在完整 body 下可以正常出图。
+* 图片与视频共享同一预算桶（一次视频成功后再发图片立刻 429）。
+* 密集重试会把自己锁死（每次重试都计入窗口）。
+
+#### 关于 IP 限流
+
+codex2api 的 CHANGELOG 确实提到
+*"Too many Grok accounts egressing from one IP triggers upstream 402s"*，
+它也有 `POST /proxies/auto-balance`。但**本仓库没有复现出 IP 级约束** ——
+同 IP 下新账号可以正常出图。可能只在更大量的账号/IP 压力下才出现，未验证。
+
+#### 教训
+
+**「模型说它生成了」不等于「真的生成了」。** 判定成功必须看
+`cardAttachment.image_chunk.imageUrl` 是否存在，不能看 HTTP 200，也不能看正文。
 
 ## 2. 主对话端点
 
