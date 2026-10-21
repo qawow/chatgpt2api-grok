@@ -2247,6 +2247,147 @@ def enhance_prompt(
     return result["text"].strip()
 
 
+# --------------------------------------------------------------------------
+# 语音合成（TTS）
+# --------------------------------------------------------------------------
+#
+# `POST /rest/app-chat/text-to-speech` —— 返回 **NDJSON**，每行
+# `{"result":{"data":"<base64 音频分块>"}}`，把所有 `data` 拼接后 base64 解码
+# 即为完整音频（实测 MP3，帧头 `0xFF 0xF3`）。
+#
+# 请求体（`chatTextToSpeechRaw`）：
+#   {text, voiceId, language, codec, sampleRate, bitRate,
+#    optimizeStreamingLatency, textNormalization, speed}
+#
+# `GET /rest/app-chat/tts-voices` 返回 `{voices:[{voiceId,name,language,gender}]}`；
+# 实测该端点用 **SSO cookie** 可读，用 CLI Bearer 可能 403。
+TTS_PATH = "/rest/app-chat/text-to-speech"
+TTS_VOICES_PATH = "/rest/app-chat/tts-voices"
+TTS_FIELDS = ("text", "voiceId", "language", "codec", "sampleRate", "bitRate",
+              "optimizeStreamingLatency", "textNormalization", "speed")
+
+
+def _audio_format(raw: bytes) -> str:
+    """按魔数判断音频容器。"""
+    if not raw:
+        return "empty"
+    if raw[:4] == b"RIFF":
+        return "wav"
+    if raw[:4] == b"OggS":
+        return "ogg"
+    if raw[:3] == b"ID3" or raw[:2] in (b"\xff\xf3", b"\xff\xfb", b"\xff\xf2"):
+        return "mp3"
+    if len(raw) >= 8 and raw[4:8] == b"ftyp":
+        return "m4a"
+    return "unknown"
+
+
+def text_to_speech(
+    text: str,
+    *,
+    voice_id: str = "altair",
+    language: str | None = None,
+    codec: str | None = None,
+    sample_rate: int | None = None,
+    bit_rate: int | None = None,
+    speed: float | None = None,
+    text_normalization: bool | None = None,
+    optimize_streaming_latency: bool | None = None,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 300.0,
+) -> dict[str, Any]:
+    """把文本合成为语音。
+
+    返回 `{"audio": bytes, "format": "mp3", "chunks": int, "bytes": int}`。
+
+    响应是 **NDJSON**：每行 `{"result":{"data":"<base64>"}}`，逐块拼接后
+    base64 解码得到完整音频（实测 MP3，`0xFF 0xF3` 帧头）。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    if not str(text or "").strip():
+        raise GrokWebError("文本为空")
+    body: dict[str, Any] = {"text": text, "voiceId": voice_id}
+    for key, value in (("language", language), ("codec", codec),
+                       ("sampleRate", sample_rate), ("bitRate", bit_rate),
+                       ("speed", speed),
+                       ("textNormalization", text_normalization),
+                       ("optimizeStreamingLatency", optimize_streaming_latency)):
+        if value is not None:
+            body[key] = value
+    resp = _stream_post(
+        f"{WEB_BASE}{TTS_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body=body,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"语音合成 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        raw = resp.text or ""
+    chunks: list[str] = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        result = item.get("result") if isinstance(item, dict) else None
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, str) and data:
+                chunks.append(data)
+    audio = b""
+    if chunks:
+        try:
+            audio = b"".join(base64.b64decode(c) for c in chunks)
+        except (ValueError, TypeError) as exc:
+            raise GrokWebError(f"音频分块解码失败：{exc}") from exc
+    return {"audio": audio, "format": _audio_format(audio),
+            "chunks": len(chunks), "bytes": len(audio)}
+
+
+def tts_voices(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> list[dict[str, Any]]:
+    """`GET /rest/app-chat/tts-voices` —— 可用音色列表。
+
+    返回 `[{voiceId, name, language, gender}, ...]`（实测含 `altair` / `ara` 等）。
+    该端点用 SSO cookie 可读；CLI Bearer 可能 403。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    resp = _stream_get(
+        f"{WEB_BASE}{TTS_VOICES_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"音色列表 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    voices = data.get("voices") if isinstance(data, dict) else None
+    return voices if isinstance(voices, list) else []
+
+
 def download_image(
     key: str,
     *,

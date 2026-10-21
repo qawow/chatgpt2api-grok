@@ -2134,3 +2134,135 @@ class EnhancePromptTest(unittest.TestCase):
 
     def test_the_model_name_is_the_probed_one(self):
         self.assertEqual(g.PROMPT_ENHANCE_MODEL, "imagine-video-prompt-enhance")
+
+
+class TextToSpeechTest(unittest.TestCase):
+    """`POST /rest/app-chat/text-to-speech` —— 语音合成（实测 2026-10-21）。
+
+    响应是 **NDJSON**：每行 `{"result":{"data":"<base64>"}}`，逐块拼接后
+    base64 解码得到完整音频。实测产物经 ffprobe 确认：
+
+        codec=mp3  sample_rate=24000  channels=1(mono)
+        bit_rate=128kbps  duration=2.616s  41856 字节  5 个分块
+
+    请求体（`chatTextToSpeechRaw`）：
+        {text, voiceId, language, codec, sampleRate, bitRate,
+         optimizeStreamingLatency, textNormalization, speed}
+    """
+
+    def _resp(self, lines, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = "\n".join(lines)
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_base64_chunks_are_concatenated_and_decoded(self):
+        import base64
+        from unittest import mock
+
+        part1 = base64.b64encode(b"\xff\xf3\xc4\xc4" + b"A" * 100).decode()
+        part2 = base64.b64encode(b"B" * 100).decode()
+        lines = [json.dumps({"result": {"data": part1}}),
+                 json.dumps({"result": {"data": part2}})]
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(lines)) as sp:
+            out = g.text_to_speech("hi", voice_id="altair", bearer="tok")
+        self.assertEqual(out["chunks"], 2)
+        self.assertEqual(out["bytes"], 204)
+        self.assertEqual(out["format"], "mp3")
+        self.assertTrue(out["audio"].startswith(b"\xff\xf3"))
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(body["text"], "hi")
+        self.assertEqual(body["voiceId"], "altair")
+
+    def test_optional_fields_are_only_sent_when_set(self):
+        from unittest import mock
+
+        lines = [json.dumps({"result": {"data": ""}})]
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(lines)) as sp:
+            g.text_to_speech("hi", bearer="tok")
+        body = sp.call_args.kwargs["body"]
+        self.assertNotIn("language", body)
+        self.assertNotIn("codec", body)
+
+    def test_optional_fields_are_passed_through(self):
+        from unittest import mock
+
+        lines = [json.dumps({"result": {"data": ""}})]
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(lines)) as sp:
+            g.text_to_speech("hi", language="en", codec="mp3", sample_rate=24000,
+                             speed=1.1, bearer="tok")
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(body["language"], "en")
+        self.assertEqual(body["codec"], "mp3")
+        self.assertEqual(body["sampleRate"], 24000)
+        self.assertEqual(body["speed"], 1.1)
+
+    def test_empty_text_is_rejected_before_any_request(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            for text in ("", "   ", None):
+                with self.assertRaises(g.GrokWebError):
+                    g.text_to_speech(text, bearer="tok")
+            sp.assert_not_called()
+
+    def test_a_non_ndjson_line_is_skipped(self):
+        import base64
+        from unittest import mock
+
+        good = base64.b64encode(b"\xff\xf3data").decode()
+        lines = ["not json", json.dumps({"result": {"data": good}}), ""]
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(lines)):
+            out = g.text_to_speech("hi", bearer="tok")
+        self.assertEqual(out["chunks"], 1)
+        self.assertEqual(out["bytes"], 6)
+
+    def test_audio_format_sniffing(self):
+        self.assertEqual(g._audio_format(b"RIFF...."), "wav")
+        self.assertEqual(g._audio_format(b"OggS...."), "ogg")
+        self.assertEqual(g._audio_format(b"ID3\x04"), "mp3")
+        self.assertEqual(g._audio_format(b"\xff\xf3\xc4\xc4"), "mp3")
+        self.assertEqual(g._audio_format(b"\x00\x00\x00\x20ftyp"), "m4a")
+        self.assertEqual(g._audio_format(b""), "empty")
+        self.assertEqual(g._audio_format(b"junk"), "unknown")
+
+    def test_the_field_list_matches_the_bundle(self):
+        self.assertEqual(g.TTS_FIELDS,
+                         ("text", "voiceId", "language", "codec", "sampleRate",
+                          "bitRate", "optimizeStreamingLatency",
+                          "textNormalization", "speed"))
+        self.assertEqual(g.TTS_PATH, "/rest/app-chat/text-to-speech")
+
+    def test_tts_voices_returns_the_list(self):
+        from unittest import mock
+
+        voices = [{"voiceId": "altair", "name": "Altair",
+                   "language": "multilingual", "gender": "male"}]
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"voices": voices}
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_get", return_value=resp) as sg:
+            out = g.tts_voices(cookies={"sso": "x"})
+        self.assertEqual(out, voices)
+        self.assertIn("/tts-voices", sg.call_args[0][0])
+
+    def test_tts_voices_tolerates_a_missing_field(self):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_get", return_value=resp):
+            self.assertEqual(g.tts_voices(cookies={"sso": "x"}), [])

@@ -69,6 +69,14 @@
 - **`imagine-video-prompt-enhance` 是纯文本模型，不消耗媒体配额**。实测所有生图模型都 429 时它仍返回 200，把 `"a cat walking in rain"` 扩写成一段详细的视频描述（`"A cat walks steadily through falling rain along a wet street or path. Raindrops glisten on its fur..."`）。新增 `enhance_prompt()`。
 - **所有生图模型共享同一个配额桶**：`imagine-image-gen` / `build` / `imagine-agent-mode` / `imagine-agent-mode-grok-4-5` 在配额耗尽后**全部** 429。此前观察到的「image-gen 成功、build 429、agent-mode 又成功」是**秒级请求限流**，不是独立配额桶。
 
+### 语音合成（TTS）
+
+- **`POST /rest/app-chat/text-to-speech` 可用**，产物是真实 MP3。响应是 **NDJSON**：每行 `{"result":{"data":"<base64>"}}`，全部拼接后 base64 解码才是完整音频（`//PExA` → `0xFF 0xF3` MPEG 帧同步字）。
+- 实测产物经 ffprobe 确认：**`codec=mp3 / sample_rate=24000 / channels=1(mono) / bit_rate=128kbps / duration=2.616s`**，5 个分块共 41,856 字节。
+- 请求字段全集：`{text, voiceId, language, codec, sampleRate, bitRate, optimizeStreamingLatency, textNormalization, speed}`。
+- `GET /rest/app-chat/tts-voices` → `{voices:[{voiceId,name,language,gender}]}`（含 `altair` / `ara` 等）。**该端点用 SSO cookie 可读，CLI Bearer 可能 403** —— 与其它 `/rest/app-chat/*` 端点相反。
+- 新增 `text_to_speech()` / `tts_voices()` / `_audio_format()` 与 `TTS_PATH` / `TTS_VOICES_PATH` / `TTS_FIELDS` 常量。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -85,6 +93,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1170 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1189 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

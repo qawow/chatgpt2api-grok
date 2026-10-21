@@ -1229,6 +1229,102 @@ codex2api 的 CHANGELOG 确实提到
 **「模型说它生成了」不等于「真的生成了」。** 判定成功必须看
 `cardAttachment.image_chunk.imageUrl` 是否存在，不能看 HTTP 200，也不能看正文。
 
+### 1.17 语音合成：`POST /rest/app-chat/text-to-speech`（2026-10-21 实测）
+
+**可用**，产物是真实 MP3。
+
+#### 请求
+
+```jsonc
+{"text": "Hello, this is a text to speech test.",
+ "voiceId": "altair",
+ // 以下均可选
+ "language": "en", "codec": "mp3", "sampleRate": 24000,
+ "bitRate": 128000, "speed": 1.0,
+ "textNormalization": true, "optimizeStreamingLatency": true}
+```
+
+字段全集（`chatTextToSpeechRaw`）：`{text, voiceId, language, codec,
+sampleRate, bitRate, optimizeStreamingLatency, textNormalization, speed}`。
+
+#### 响应是 **NDJSON**，不是原始音频
+
+```
+{"result":{"data":"//PExABDhCn0DtZY8RquQ..."}}
+{"result":{"data":"..."}}
+...
+```
+
+每行一个 base64 分块，**全部拼接后 base64 解码**才是完整音频。
+`//PExA` 解码后是 `0xFF 0xF3` —— MPEG 帧同步字。
+
+#### 实测产物
+
+```
+chunks=5   bytes=41856
+ffprobe:  codec=mp3  sample_rate=24000  channels=1(mono)
+          bit_rate=128kbps  duration=2.616s
+```
+
+即 **24 kHz 单声道 128 kbps MP3**。
+
+#### 音色列表
+
+`GET /rest/app-chat/tts-voices` → `{voices:[{voiceId,name,language,gender}]}`，
+实测含 `altair`（Altair / multilingual / male）、`ara` 等。
+
+**该端点用 SSO cookie 可读；CLI Bearer 可能 403** —— 与
+`/rest/app-chat/*` 的其它端点相反（那些更认 Bearer）。
+
+### 1.18 模型目录：`POST /rest/models`
+
+**必须用 POST**（GET 返回 501）。返回 33 个模型，单条 schema：
+
+```jsonc
+{"modelId": "build", "name": "", "description": "",
+ "modeDescription": "", "modeName": "", "badgeText": "Beta",
+ "tags": ["hide_tools_settings", "computer"],
+ "modelMode": "MODEL_MODE_BUILD", "promptingBackend": "CHAT"}
+```
+
+顶层另有：
+
+```jsonc
+{"defaultAnonMode": "MODEL_MODE_AUTO", "defaultAnonModel": "grok-3",
+ "defaultFreeMode": "MODEL_MODE_AUTO", "defaultFreeModel": "grok-3",
+ "defaultHeavyMode": "MODEL_MODE_AUTO", "defaultHeavyModel": "grok-4",
+ "defaultProMode": "MODEL_MODE_AUTO", "defaultProModel": "grok-4",
+ "unavailableModels": []}
+```
+
+目录里的媒体模型只有 5 个：`build`、`imagine-agent-mode`、
+`imagine-agent-mode-dev`、`imagine-agent-mode-grok-4-5`、
+`imagine-video-prompt-enhance`。
+
+**`imagine-image-gen` / `imagine-image-edit` / `imagine-video-gen` 不在目录里**
+—— 它们是前端 image studio 直连的隐藏模型名，只能从 bundle 解出（§1.15）。
+
+#### `imagine-video-prompt-enhance`：不消耗媒体配额的提示词增强
+
+实测所有生图模型都 429 时它仍返回 200。输入 `"a cat walking in rain"`：
+
+```
+A cat walks steadily through falling rain along a wet street or path.
+Raindrops glisten on its fur as it moves forward with a natural gait,
+paws carefully navigating puddles and reflective ground. ...
+```
+
+**这是纯文本任务**（不带 `mediaGenInput`、不走 `CONVERSATION_KIND_IMAGINE`），
+所以不吃媒体配额。
+
+#### 所有生图模型共享同一个配额桶
+
+配额耗尽后 `imagine-image-gen` / `build` / `imagine-agent-mode` /
+`imagine-agent-mode-grok-4-5` **全部** 429。
+
+此前观察到的「image-gen 成功 → build 429 → agent-mode 又成功」是
+**秒级请求限流**，不是独立配额桶。
+
 ## 2. 主对话端点
 
 ```
