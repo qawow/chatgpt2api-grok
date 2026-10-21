@@ -2016,3 +2016,121 @@ class SilentDegradeCausesTest(unittest.TestCase):
         body = sp.call_args.kwargs["body"]
         self.assertEqual(body["modelName"], g.IMAGE_EDIT_MODEL)
         self.assertEqual(body["imageEditModelConfig"]["imageReferences"], ["a/1.jpg"])
+
+
+class ModelCatalogTest(unittest.TestCase):
+    """`POST /rest/models` —— 模型目录（**必须 POST**，GET 返回 501）。
+
+    单条 schema：`{modelId, name, description, modeDescription, modeName,
+    badgeText, tags[], modelMode, promptingBackend}`。
+    顶层另有 `defaultAnonModel` / `defaultFreeModel`（`grok-3`）/
+    `defaultHeavyModel` / `defaultProModel`（`grok-4`）/ `unavailableModels`。
+
+    **`imagine-image-gen` / `imagine-image-edit` / `imagine-video-gen` 不在
+    目录里** —— 它们是前端 image studio 直连的隐藏模型名。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_it_posts_not_gets(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp({"models": []})) as sp:
+            g.list_models(bearer="tok")
+        self.assertIn("/rest/models", sp.call_args[0][0])
+        self.assertEqual(sp.call_args.kwargs["body"], {})
+
+    def test_model_ids_extracts_every_entry(self):
+        catalog = {"models": [
+            {"modelId": "build"}, {"modelId": "grok-3"}, {"modelId": "grok-4"},
+            {"name": "no-id"}, "garbage",
+        ]}
+        self.assertEqual(g.model_ids(catalog), ["build", "grok-3", "grok-4"])
+
+    def test_model_ids_tolerates_bad_shapes(self):
+        for value in ({}, {"models": None}, {"models": "x"}, None, []):
+            self.assertEqual(g.model_ids(value), [])
+
+    def test_the_catalog_media_models_match_the_probe(self):
+        self.assertEqual(g.CATALOG_MEDIA_MODELS,
+                         ("build", "imagine-agent-mode", "imagine-agent-mode-dev",
+                          "imagine-agent-mode-grok-4-5",
+                          "imagine-video-prompt-enhance"))
+
+    def test_the_hidden_models_are_not_in_the_catalog_list(self):
+        """目录里没有直连模型名 —— 它们是前端隐藏使用的。"""
+        for name in (g.IMAGE_GEN_MODEL, g.IMAGE_EDIT_MODEL, g.VIDEO_GEN_MODEL):
+            self.assertNotIn(name, g.CATALOG_MEDIA_MODELS)
+
+    def test_the_model_field_list_matches_the_schema(self):
+        self.assertEqual(g.MODEL_FIELDS,
+                         ("modelId", "name", "description", "modeDescription",
+                          "modeName", "badgeText", "tags", "modelMode",
+                          "promptingBackend"))
+        self.assertEqual(g.MODELS_PATH, "/rest/models")
+
+    def test_a_non_200_is_surfaced(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp({"code": 12}, 501)):
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.list_models(bearer="tok")
+        self.assertEqual(ctx.exception.status, 501)
+
+
+class EnhancePromptTest(unittest.TestCase):
+    """`imagine-video-prompt-enhance` —— **纯文本模型，不消耗媒体配额**。
+
+    实测：所有生图模型都 429 时它仍返回 200，把
+    `"a cat walking in rain"` 扩写成一段详细的视频描述。
+    """
+
+    def test_it_uses_the_enhancer_model(self):
+        from unittest import mock
+
+        frames = [{"result": {"response": {
+            "messageTag": "final", "token": "A cat walks steadily..."}}}]
+        lines = [json.dumps(f).encode() for f in frames]
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.text = "\n".join(json.dumps(f) for f in frames)
+        resp.iter_lines.return_value = lines
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_post", return_value=resp) as sp:
+            out = g.enhance_prompt("a cat walking in rain", bearer="tok")
+        body = sp.call_args.kwargs["body"]
+        self.assertEqual(body["modelName"], g.PROMPT_ENHANCE_MODEL)
+        self.assertIn("A cat walks", out)
+
+    def test_it_is_not_a_media_model(self):
+        """它不走 `kind: CONVERSATION_KIND_IMAGINE`。"""
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.text = ""
+        resp.iter_lines.return_value = []
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        with mock.patch.object(g, "_stream_post", return_value=resp) as sp:
+            g.enhance_prompt("x", bearer="tok")
+        body = sp.call_args.kwargs["body"]
+        self.assertNotIn("mediaGenInput", body)
+        self.assertNotEqual(body.get("kind"), g.KIND_IMAGINE)
+
+    def test_the_model_name_is_the_probed_one(self):
+        self.assertEqual(g.PROMPT_ENHANCE_MODEL, "imagine-video-prompt-enhance")

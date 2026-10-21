@@ -62,6 +62,13 @@
 - **`/rest/media/post/list` 不能用来数自己的生图** —— 返回公共 feed，穷举 18 种 `filter` 形态全部被服务端忽略。
 - 权限是**端点级**的：`oauth2-auth-forbidden`（已鉴权但策略拒绝）与 `bad-credentials`（token 校验失败）是两个不同错误，不可混为一谈。
 
+### 模型目录与提示词增强
+
+- **`POST /rest/models`**（GET 返回 501）返回 **33 个模型**。单条 schema：`{modelId, name, description, modeDescription, modeName, badgeText, tags[], modelMode, promptingBackend}`。例 `build`：`badgeText: "Beta"`、`tags: ["hide_tools_settings","computer"]`、`modelMode: "MODEL_MODE_BUILD"`、`promptingBackend: "CHAT"`。顶层另有 `defaultAnonModel`/`defaultFreeModel` = `grok-3`、`defaultHeavyModel`/`defaultProModel` = `grok-4`、`unavailableModels: []`。
+- **目录里的媒体模型只有 5 个**：`build`、`imagine-agent-mode`、`imagine-agent-mode-dev`、`imagine-agent-mode-grok-4-5`、`imagine-video-prompt-enhance`。**`imagine-image-gen` / `imagine-image-edit` / `imagine-video-gen` 不在目录里** —— 它们是前端 image studio 直连的隐藏模型名，只能从 bundle 解出。
+- **`imagine-video-prompt-enhance` 是纯文本模型，不消耗媒体配额**。实测所有生图模型都 429 时它仍返回 200，把 `"a cat walking in rain"` 扩写成一段详细的视频描述（`"A cat walks steadily through falling rain along a wet street or path. Raindrops glisten on its fur..."`）。新增 `enhance_prompt()`。
+- **所有生图模型共享同一个配额桶**：`imagine-image-gen` / `build` / `imagine-agent-mode` / `imagine-agent-mode-grok-4-5` 在配额耗尽后**全部** 429。此前观察到的「image-gen 成功、build 429、agent-mode 又成功」是**秒级请求限流**，不是独立配额桶。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。

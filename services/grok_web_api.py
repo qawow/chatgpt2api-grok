@@ -2138,6 +2138,115 @@ def diagnose_media_limit(
             "reason": reason}
 
 
+# --------------------------------------------------------------------------
+# 模型目录与提示词增强
+# --------------------------------------------------------------------------
+#
+# `POST /rest/models`（GET 返回 501）返回 33 个模型。单个条目 schema：
+#
+#   {modelId, name, description, modeDescription, modeName,
+#    badgeText, tags[], modelMode, promptingBackend}
+#
+# 例（`build`）：`badgeText: "Beta"`、`tags: ["hide_tools_settings", "computer"]`、
+# `modelMode: "MODEL_MODE_BUILD"`、`promptingBackend: "CHAT"`。
+#
+# 顶层另有默认值：
+#   defaultAnonModel/defaultFreeModel = "grok-3"
+#   defaultHeavyModel/defaultProModel = "grok-4"
+#   unavailableModels = []
+#
+# **注意：`imagine-image-gen` / `imagine-image-edit` / `imagine-video-gen`
+# 不在目录里** —— 它们是前端 image studio 直连的隐藏模型名。
+MODELS_PATH = "/rest/models"
+MODEL_FIELDS = ("modelId", "name", "description", "modeDescription",
+                "modeName", "badgeText", "tags", "modelMode", "promptingBackend")
+
+# 目录里的媒体相关模型（实测 2026-10-21）
+CATALOG_MEDIA_MODELS = (
+    "build", "imagine-agent-mode", "imagine-agent-mode-dev",
+    "imagine-agent-mode-grok-4-5", "imagine-video-prompt-enhance",
+)
+
+# 提示词增强 —— **纯文本模型，不消耗媒体配额**。
+# 实测：所有生图模型都 429 时它仍返回 200。
+# 输出形如："A cat walks steadily through falling rain along a wet street...
+#            Raindrops glisten on its fur as it moves forward with a natural
+#            gait, paws carefully navigating puddles and reflective ground."
+PROMPT_ENHANCE_MODEL = "imagine-video-prompt-enhance"
+
+
+def list_models(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """`POST /rest/models` —— 模型目录（**必须用 POST**，GET 返回 501）。
+
+    返回原始响应，含 `models[]` 与默认值字段（见 :data:`MODEL_FIELDS`）。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    resp = _stream_post(
+        f"{WEB_BASE}{MODELS_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body={},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"模型目录 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    return data if isinstance(data, dict) else {}
+
+
+def model_ids(catalog: dict[str, Any]) -> list[str]:
+    """从目录响应里取全部 `modelId`。"""
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return []
+    out: list[str] = []
+    for item in models:
+        if isinstance(item, dict):
+            value = item.get("modelId")
+            if isinstance(value, str) and value:
+                out.append(value)
+    return out
+
+
+def enhance_prompt(
+    prompt: str,
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 180.0,
+) -> str:
+    """用 `imagine-video-prompt-enhance` 把简短提示扩写成详细描述。
+
+    **这是纯文本模型，不消耗媒体配额** —— 实测所有生图模型都 429 时它仍返回 200。
+
+    实测输出（输入 `"a cat walking in rain"`）：
+
+        "A cat walks steadily through falling rain along a wet street or path.
+         Raindrops glisten on its fur as it moves forward with a natural gait,
+         paws carefully navigating puddles and reflective ground. ..."
+
+    返回扩写后的文本；无内容时返回空串。
+    """
+    result = ask(
+        prompt, cookies=cookies, bearer=bearer, proxy=proxy, timeout=timeout,
+        model=PROMPT_ENHANCE_MODEL, temporary=True,
+    )
+    return result["text"].strip()
+
+
 def download_image(
     key: str,
     *,
