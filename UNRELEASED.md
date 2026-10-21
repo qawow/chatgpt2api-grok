@@ -77,6 +77,13 @@
 - `GET /rest/app-chat/tts-voices` → `{voices:[{voiceId,name,language,gender}]}`（含 `altair` / `ara` 等）。**该端点用 SSO cookie 可读，CLI Bearer 可能 403** —— 与其它 `/rest/app-chat/*` 端点相反。
 - 新增 `text_to_speech()` / `tts_voices()` / `_audio_format()` 与 `TTS_PATH` / `TTS_VOICES_PATH` / `TTS_FIELDS` 常量。
 
+### Imagine 模板库
+
+- **20 个模板，全部 `creditCost: 0`（免费）**，16 个 image + 4 个 video。`POST /rest/media/pipeline/template/list` → `{templates[], summaries[]}`；`template-folder/list` → 4 个分类；`template/get` → `{summary, isSaved}`。
+- `summary` 含 `{id, name, description, thumbnailUrl, inputs[], publishedVersion, userId, runCount, creditCost, createdAt, primaryOutputMediaType, folders[]}`。**`inputs[]` 是 typed**：`inputType` 取 `image` / `text`，`required` 标明必填。最热门的是 **Quality Enhancer**（1,053,857 runs），其次 Chibi（951,339）、Professional Headshot（785,483）。
+- **两个限制**：① `template/get` **只返回 `summary`，不含实际提示词**（提示词与流水线定义在服务端）；② **`POST /rest/media/pipeline/run` 实测 403 `oauth2-auth-forbidden`** —— 模板能列能读，**不能用 API 跑**，只能从网页 UI 用。
+- 新增 `templates()` / `template_folders()` / `template_detail()` 与 `TEMPLATE_LIST_PATH` / `TEMPLATE_FOLDER_LIST_PATH` / `TEMPLATE_GET_PATH` / `PIPELINE_RUN_PATH` / `TEMPLATE_FIELDS` / `CATALOG_TEMPLATES` 常量。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -93,6 +100,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1189 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1197 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

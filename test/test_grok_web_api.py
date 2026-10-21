@@ -2266,3 +2266,105 @@ class TextToSpeechTest(unittest.TestCase):
         resp.__exit__ = lambda *a: None
         with mock.patch.object(g, "_stream_get", return_value=resp):
             self.assertEqual(g.tts_voices(cookies={"sso": "x"}), [])
+
+
+class TemplateLibraryTest(unittest.TestCase):
+    """Imagine 模板库（实测 2026-10-21）。
+
+        POST /rest/media/pipeline/template/list         → {templates[], summaries[]}
+        POST /rest/media/pipeline/template-folder/list  → {folders[]}
+        POST /rest/media/pipeline/template/get          → {summary, isSaved}
+
+    **20 个模板全部 `creditCost: 0`（免费）**，16 个 image + 4 个 video。
+
+    `summary` 字段：`{id, name, description, thumbnailUrl, inputs[],
+    publishedVersion, userId, runCount, creditCost, createdAt,
+    primaryOutputMediaType, folders[]}`；`inputs[]` 是 typed：
+    `{name, inputType: "image"|"text", label, required}`。
+
+    **`template/get` 只返回 `summary`，不含提示词**（服务端持有）；
+    **`POST /rest/media/pipeline/run` 实测 403** —— 能列能读，不能用 API 跑。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_templates_returns_the_summaries(self):
+        from unittest import mock
+
+        payload = {"templates": [], "summaries": [
+            {"id": "t1", "name": "Chibi", "creditCost": 0,
+             "primaryOutputMediaType": "image"},
+            {"id": "t2", "name": "Funky Dance", "creditCost": 0,
+             "primaryOutputMediaType": "video"},
+        ]}
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(payload)) as sp:
+            out = g.templates(bearer="tok")
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["name"], "Chibi")
+        self.assertIn("/template/list", sp.call_args[0][0])
+
+    def test_templates_tolerates_a_missing_field(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp({})):
+            self.assertEqual(g.templates(bearer="tok"), [])
+
+    def test_folders_are_returned(self):
+        from unittest import mock
+
+        payload = {"folders": [{"slug": "functional", "name": "Image Editing",
+                                "sortOrder": 0}]}
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(payload)) as sp:
+            out = g.template_folders(bearer="tok")
+        self.assertEqual(out[0]["slug"], "functional")
+        self.assertIn("/template-folder/list", sp.call_args[0][0])
+
+    def test_detail_sends_template_id_camel_case(self):
+        from unittest import mock
+
+        payload = {"summary": {"id": "t1", "name": "Chibi"}, "isSaved": False}
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(payload)) as sp:
+            out = g.template_detail("t1", bearer="tok")
+        self.assertEqual(out["name"], "Chibi")
+        self.assertEqual(sp.call_args.kwargs["body"], {"templateId": "t1"})
+
+    def test_detail_rejects_an_empty_id_before_any_request(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            for tid in ("", "   ", None):
+                with self.assertRaises(g.GrokWebError):
+                    g.template_detail(tid, bearer="tok")
+            sp.assert_not_called()
+
+    def test_the_catalog_has_twenty_templates_all_free(self):
+        self.assertEqual(len(g.CATALOG_TEMPLATES), 20)
+        names = [n for n, _ in g.CATALOG_TEMPLATES]
+        self.assertIn("Quality Enhancer", names)
+        self.assertIn("Chibi", names)
+        videos = [n for n, k in g.CATALOG_TEMPLATES if k == "video"]
+        self.assertEqual(len(videos), 4)
+        self.assertIn("Funky Dance", videos)
+
+    def test_the_field_list_matches_the_summary_schema(self):
+        self.assertEqual(g.TEMPLATE_FIELDS,
+                         ("id", "name", "description", "thumbnailUrl", "inputs",
+                          "publishedVersion", "userId", "runCount", "creditCost",
+                          "createdAt", "primaryOutputMediaType", "folders"))
+
+    def test_pipeline_run_is_documented_as_forbidden(self):
+        """`pipeline/run` 实测 403 —— 常量存在但只作记录。"""
+        self.assertEqual(g.PIPELINE_RUN_PATH, "/rest/media/pipeline/run")

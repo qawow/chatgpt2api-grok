@@ -2388,6 +2388,155 @@ def tts_voices(
     return voices if isinstance(voices, list) else []
 
 
+# --------------------------------------------------------------------------
+# 模板库（Imagine pipeline templates）
+# --------------------------------------------------------------------------
+#
+# 实测（2026-10-21）：**20 个模板，全部 `creditCost: 0`（免费）**。
+#
+#   POST /rest/media/pipeline/template/list           → {templates[], summaries[]}
+#   POST /rest/media/pipeline/template-folder/list    → {folders[]}
+#   POST /rest/media/pipeline/template/get            → {summary, isSaved}
+#
+# `summary` 字段：
+#   {id, name, description, thumbnailUrl, inputs[], publishedVersion, userId,
+#    runCount, creditCost, createdAt, primaryOutputMediaType, folders[]}
+#
+#   `inputs[]` 是 **typed**：`{name, inputType: "image"|"text", label, required}`
+#   `primaryOutputMediaType` 实测为 `image` 或 `video`
+#
+# **`template/get` 只返回 `summary`，不含实际提示词/流水线定义** —— 提示词在服务端。
+# **`POST /rest/media/pipeline/run` 实测 403 `oauth2-auth-forbidden`** ——
+# 模板可以列、可以读，但**不能用 API 跑**（只能从网页 UI 用）。
+TEMPLATE_LIST_PATH = "/rest/media/pipeline/template/list"
+TEMPLATE_FOLDER_LIST_PATH = "/rest/media/pipeline/template-folder/list"
+TEMPLATE_GET_PATH = "/rest/media/pipeline/template/get"
+PIPELINE_RUN_PATH = "/rest/media/pipeline/run"
+
+# 模板 summary 的字段集
+TEMPLATE_FIELDS = ("id", "name", "description", "thumbnailUrl", "inputs",
+                   "publishedVersion", "userId", "runCount", "creditCost",
+                   "createdAt", "primaryOutputMediaType", "folders")
+
+# 实测 20 个模板的名称 → 输出类型（2026-10-21）
+CATALOG_TEMPLATES = (
+    ("Glossy Product Shot", "image"), ("Chibi", "image"),
+    ("Object Remover", "image"), ("Professional Headshot", "image"),
+    ("Haze Portrait", "image"), ("Product Showcase", "video"),
+    ("Logo Editor", "image"), ("70s Street Style", "image"),
+    ("Quality Enhancer", "image"), ("Comic Book", "image"),
+    ("80s Anime", "image"), ("Watercolor Portrait", "image"),
+    ("Video Game", "image"), ("3D Animation", "image"),
+    ("Spaghetti Western", "image"), ("Funky Dance", "video"),
+    ("Future Past", "image"), ("Roman Empire", "image"),
+    ("Ad Astra", "video"), ("Add Girlfriend", "video"),
+)
+
+
+def templates(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> list[dict[str, Any]]:
+    """列出 Imagine 模板库（实测 20 个，全部 `creditCost: 0`）。
+
+    返回 `summaries[]`，每项含 `id` / `name` / `description` / `inputs[]` /
+    `primaryOutputMediaType` / `runCount` / `folders[]` 等。
+
+    **注意**：模板可以列、可以读，但 `POST /rest/media/pipeline/run` 实测
+    **403** —— 不能用 API 执行，只能从网页 UI 用。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    resp = _stream_post(
+        f"{WEB_BASE}{TEMPLATE_LIST_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body={},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"模板列表 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    if not isinstance(data, dict):
+        return []
+    summaries = data.get("summaries")
+    return summaries if isinstance(summaries, list) else []
+
+
+def template_folders(
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> list[dict[str, Any]]:
+    """模板分类（`{slug, name, sortOrder}`）。"""
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    resp = _stream_post(
+        f"{WEB_BASE}{TEMPLATE_FOLDER_LIST_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body={},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"模板分类 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    if not isinstance(data, dict):
+        return []
+    folders = data.get("folders")
+    return folders if isinstance(folders, list) else []
+
+
+def template_detail(
+    template_id: str,
+    *,
+    bearer: str | None = None,
+    cookies: Any = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """取单个模板的 `summary`（**不含提示词** —— 提示词在服务端）。"""
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    tid = str(template_id or "").strip()
+    if not tid:
+        raise GrokWebError("template_id 为空")
+    resp = _stream_post(
+        f"{WEB_BASE}{TEMPLATE_GET_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body={"templateId": tid},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"模板详情 HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        data = resp.json()
+    if not isinstance(data, dict):
+        return {}
+    summary = data.get("summary")
+    return summary if isinstance(summary, dict) else data
+
+
 def download_image(
     key: str,
     *,

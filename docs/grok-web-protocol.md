@@ -1325,6 +1325,69 @@ paws carefully navigating puddles and reflective ground. ...
 此前观察到的「image-gen 成功 → build 429 → agent-mode 又成功」是
 **秒级请求限流**，不是独立配额桶。
 
+### 1.19 Imagine 模板库（2026-10-21 实测）
+
+**20 个模板，全部 `creditCost: 0`（免费）**，16 个 image + 4 个 video。
+
+```
+POST /rest/media/pipeline/template/list          → {templates[], summaries[]}
+POST /rest/media/pipeline/template-folder/list   → {folders[]}   （实测 4 个分类）
+POST /rest/media/pipeline/template/get           → {summary, isSaved}
+```
+
+#### `summary` 结构
+
+```jsonc
+{"id": "6eb19374-c248-44be-a2ca-43f6d027e149",
+ "name": "Glossy Product Shot",
+ "description": "Create a glossy product shot with a background in your color of choice.",
+ "thumbnailUrl": "https://imagine-public.x.ai/imagine-public/share-images/....jpg",
+ "inputs": [
+   {"name": "your_product",     "inputType": "image", "label": "Your product",                "required": true},
+   {"name": "background_color", "inputType": "text",  "label": "Describe your background color", "required": true}
+ ],
+ "publishedVersion": 1,
+ "userId": "aaac4fc7-...",
+ "runCount": "57819",
+ "creditCost": 0,
+ "createdAt": "2026-04-24T15:59:37.847Z",
+ "primaryOutputMediaType": "image",
+ "folders": ["product-visualization"]}
+```
+
+`inputs[]` 是 **typed**：`inputType` 取 `image` / `text`，`required` 标明必填。
+`primaryOutputMediaType` 取 `image` / `video`。
+
+#### 20 个模板
+
+| # | 名称 | 输出 | runs |
+|---|---|---|---|
+| 1 | Glossy Product Shot | image | 57,819 |
+| 2 | Chibi | image | 951,339 |
+| 3 | Object Remover | image | 146,236 |
+| 4 | Professional Headshot | image | 785,483 |
+| 5 | Haze Portrait | image | 168,488 |
+| 6 | Product Showcase | **video** | 146,588 |
+| 7 | Logo Editor | image | 196,352 |
+| 8 | 70s Street Style | image | 339,525 |
+| 9 | **Quality Enhancer** | image | **1,053,857** |
+| 10 | Comic Book | image | 386,959 |
+| 11 | 80s Anime | image | 279,080 |
+| 12 | Watercolor Portrait | image | 336,867 |
+| 13 | Video Game | image | 132,091 |
+| 14 | 3D Animation | image | 519,009 |
+| 15 | Spaghetti Western | image | 190,868 |
+| 16 | Funky Dance | **video** | 467,271 |
+| 17 | Future Past | image | 62,615 |
+| 18 | Roman Empire | image | 135,492 |
+| 19 | Ad Astra | **video** | 51,927 |
+| 20 | Add Girlfriend | **video** | 377,686 |
+
+#### 两个限制
+
+1. **`template/get` 只返回 `summary`，不含实际提示词** —— 提示词与流水线定义在服务端，客户端拿不到。
+2. **`POST /rest/media/pipeline/run` 实测 403 `oauth2-auth-forbidden`** —— 模板**能列、能读，但不能用 API 跑**，只能从网页 UI 用。
+
 ## 2. 主对话端点
 
 ```
