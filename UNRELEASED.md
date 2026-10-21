@@ -88,8 +88,11 @@
 
 - **`silent_degrade` 有两个成因**：① **请求体不完整**（缺 `disableSearch` / `isReasoning` / `modelMode` 任一，或缺 `x-xai-request-id` 头）→ 200 + 无图 + 正文声称"已生成"；② **真配额耗尽**（完整 body 连发后）。**排查必须先确认走的是 `build_body`。**
 - **实测配额**（完整 body、`imagine-image-gen`）：`28hwsf4ag4`（干净、>3.5h 无活动）→ **8 次请求**（每次返 2 张，共 16 张）后 429；`2q7vuj955a`（紧接着）→ **仅 3 次**（6 张）后 429；`d781n9ynmc`（被密集重试过）→ 5 小时后仍 429。注意 **`numOfImages: 1` 时服务端仍返 2 张**。
-- **推断（有证据但未定论）**：「8 次 → 3 次」的序列支持**预算按出口 IP 共享**；但 `d781n9ynmc` 静默 3.5h 后仍 429 而同期 `28hwsf4ag4` 能拿满 8 次，反证纯 IP 说。最可能的模型是 **IP 级预算 + 账号级惩罚**（被密集重试过的账号进入更长惩罚期）。**窗口时长未验证** —— bundle 的 `formatAvailableAt` 是 `nextAvailableAt + 30 分钟`，但实测 3.5h 未恢复，不能确认是 30 分钟。
-- **已排除的旁路**：`template-chat` → **403**；`pipeline/run` → **403**；`template/get` 只返回 summary 不含提示词；**刷新 access token 不重置配额**；换生图模型无效（共享同一桶）；429 响应**无 `Retry-After` 或任何限流头**。
+- **★★ 决定性实验：媒体配额按账号计量，与出口 IP 无关**（2026-10-21 晚）。用**轮换出口 IP 的住宅代理**做对照 —— 该代理实测每次请求换一个 IP（观察到 `107.173.10.110` / `193.176.84.35` / `198.2.214.3` / `64.118.136.68` / `23.95.84.106` / `62.210.124.132` / `67.159.48.146` 等），且**请求头无法固定**（`X-Proxy-Session` / `Proxy-Session` / `X-Sticky-Session` / `X-Session` / `X-Rotate` / `X-Exit-Country` / `X-Proxy-Url` / `Proxy-Url` / `X-Proxy` 共 9 种头全部被忽略）。让已 429 锁死 5h+ 的账号换该代理连发 10 次（**每次不同出口 IP**）→ **0 张图**（7×429、2×Cloudflare challenge、1×TLS 抖动）。**换 IP 不能绕过配额。**
+- 「`28hwsf4ag4` 拿 8 次 → `2q7vuj955a` 只拿 3 次」**不是** IP 共享，而是两账号**自身剩余额度不同**（后者此前已被部分消耗）。
+- **账号级惩罚确实存在**：`d781n9ynmc` 被按 3 分钟间隔重试 8 次（第 5 次起转 429）后 **5 小时仍未恢复**，而同期从未被密集重试的 `28hwsf4ag4` 能拿满 8 次。**命中 429 后不要周期重试** —— 会触发更长的惩罚，应标为冷却并静默足够久。
+- **未验证**：正常配额的重置窗口时长。bundle 的 `formatAvailableAt` 是 `nextAvailableAt + 30 分钟`，但实测 3.5 小时未恢复（可能被惩罚期掩盖），且 30 分钟后三账号全部仍 429。
+- 备用出口实测可用：`socks5h://research:***@192.168.2.198:2260` 能到 `grok.com`（200 / 33 个模型）与 `auth.x.ai`（刷新 200），但**轮换 IP 会触发 Cloudflare challenge**，且对配额无帮助。
 - **不消耗媒体配额**：`imagine-video-prompt-enhance`、`run-code`、`text-to-speech`、模板只读接口。
 - 新增 `refresh_access_token()`（含 `OAUTH_TOKEN_URL` / `OAUTH_CLIENT_ID` / `OAUTH_SCOPES` 常量）：实测 `grant_type=refresh_token` 可用，返回新 token（`expires_in=21600` = 6h）；**失效 refresh token 返回 HTTP 400 + `invalid_grant`**（永久性错误，重试无用）。刷新**不重置**媒体配额。
 
