@@ -2368,3 +2368,76 @@ class TemplateLibraryTest(unittest.TestCase):
     def test_pipeline_run_is_documented_as_forbidden(self):
         """`pipeline/run` 实测 403 —— 常量存在但只作记录。"""
         self.assertEqual(g.PIPELINE_RUN_PATH, "/rest/media/pipeline/run")
+
+
+class RefreshAccessTokenTest(unittest.TestCase):
+    """`POST https://auth.x.ai/oauth2/token` + `grant_type=refresh_token`。
+
+    实测（2026-10-21）：可用，返回新 `access_token`（`expires_in=21600` = 6h）。
+
+    **失效的 refresh token 返回 HTTP 400 + `invalid_grant`**
+    （`Invalid or unknown refresh token`）—— 永久性错误，重试无用。
+
+    **刷新不重置媒体配额** —— 实测刷新后仍受同一预算约束。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        return resp
+
+    def _session_mock(self, resp):
+        from unittest import mock
+
+        session = mock.MagicMock()
+        session.post.return_value = resp
+        return mock.patch.object(g, "_session", return_value=session), session
+
+    def test_a_successful_refresh_returns_the_token(self):
+        payload = {"access_token": "new-at", "refresh_token": "new-rt",
+                   "expires_in": 21600, "token_type": "Bearer"}
+        patcher, session = self._session_mock(self._resp(payload))
+        with patcher:
+            out = g.refresh_access_token("old-rt")
+        self.assertEqual(out["access_token"], "new-at")
+        self.assertEqual(out["expires_in"], 21600)
+        form = session.post.call_args.kwargs["data"]
+        self.assertEqual(form["grant_type"], "refresh_token")
+        self.assertEqual(form["refresh_token"], "old-rt")
+        self.assertEqual(form["client_id"], g.OAUTH_CLIENT_ID)
+
+    def test_invalid_grant_is_reported_as_permanent(self):
+        payload = {"error": "invalid_grant",
+                   "error_description": "Invalid or unknown refresh token"}
+        patcher, _ = self._session_mock(self._resp(payload, 400))
+        with patcher:
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.refresh_access_token("dead-rt")
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("invalid_grant", str(ctx.exception))
+
+    def test_an_empty_refresh_token_is_rejected_before_any_request(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_session") as sess:
+            for rt in ("", "   ", None):
+                with self.assertRaises(g.GrokWebError):
+                    g.refresh_access_token(rt)
+            sess.assert_not_called()
+
+    def test_a_response_without_access_token_raises(self):
+        patcher, _ = self._session_mock(self._resp({"expires_in": 21600}))
+        with patcher:
+            with self.assertRaises(g.GrokWebError):
+                g.refresh_access_token("rt")
+
+    def test_the_oauth_constants_match_the_jwt(self):
+        self.assertEqual(g.OAUTH_CLIENT_ID, "b1a00492-073a-47ea-816f-4c329264a828")
+        self.assertEqual(g.OAUTH_TOKEN_URL, "https://auth.x.ai/oauth2/token")
+        self.assertIn("offline_access", g.OAUTH_SCOPES)
+        self.assertIn("grok-cli:access", g.OAUTH_SCOPES)
+        self.assertIn("conversations:write", g.OAUTH_SCOPES)

@@ -2537,6 +2537,86 @@ def template_detail(
     return summary if isinstance(summary, dict) else data
 
 
+# --------------------------------------------------------------------------
+# OAuth 刷新
+# --------------------------------------------------------------------------
+#
+# 实测（2026-10-21）：`POST https://auth.x.ai/oauth2/token` +
+# `grant_type=refresh_token` 可用，返回新的 `access_token`（有效期 21600s = 6h）。
+#
+#   data: grant_type=refresh_token&refresh_token=<rt>&client_id=<cid>
+#   → {access_token, refresh_token?, expires_in, token_type, id_token?}
+#
+# **失效的 refresh token 返回 HTTP 400 + `invalid_grant`**
+# （`Invalid or unknown refresh token`）—— 这是永久性错误，重试无用。
+#
+# **刷新不重置媒体配额** —— 实测刷新后仍受同一预算约束。
+OAUTH_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+OAUTH_SCOPES = ("openid", "profile", "email", "offline_access",
+                "grok-cli:access", "api:access",
+                "conversations:read", "conversations:write")
+
+
+def refresh_access_token(
+    refresh_token: str,
+    *,
+    client_id: str = OAUTH_CLIENT_ID,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """用 refresh_token 换新的 access_token。
+
+    返回 `{"access_token", "refresh_token"?, "expires_in", "token_type",
+    "id_token"?}`。
+
+    **`invalid_grant` 是永久性错误**（HTTP 400，`Invalid or unknown refresh
+    token`）—— refresh token 已死，重试无用，应把账号标为需重新授权。
+
+    **刷新不重置媒体配额** —— 实测刷新后仍受同一预算约束。
+    """
+    rt = str(refresh_token or "").strip()
+    if not rt:
+        raise GrokWebError("缺少 refresh_token")
+    from urllib.parse import urlparse
+
+    from services.proxy_service import is_transient_tls_error
+
+    form = {"grant_type": "refresh_token", "refresh_token": rt,
+            "client_id": client_id}
+    headers = {"Content-Type": "application/x-www-form-urlencoded",
+               "Accept": "application/json"}
+    host = urlparse(OAUTH_TOKEN_URL).netloc
+    resp = None
+    last: Exception | None = None
+    for attempt in range(1, 9):
+        try:
+            resp = _session(host, proxy).post(
+                OAUTH_TOKEN_URL, data=form, headers=headers, timeout=timeout)
+            break
+        except requests.RequestException as exc:
+            last = exc
+            if attempt < 8 and is_transient_tls_error(str(exc), method="post"):
+                _SESSIONS.pop(f"{host}|{proxy or ''}", None)
+                time.sleep(0.4 * attempt)
+                continue
+            raise GrokWebError(f"刷新请求失败: {exc}") from exc
+    if resp is None:
+        raise GrokWebError(f"刷新请求失败: {last}")
+    text = resp.text or ""
+    if resp.status_code != 200:
+        kind = "invalid_grant" if "invalid_grant" in text else "error"
+        raise GrokWebError(f"刷新失败（{resp.status_code}/{kind}）：{text[:200]}",
+                           status=resp.status_code, body=text[:300])
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise GrokWebError(f"刷新响应不是 JSON：{text[:200]}") from exc
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise GrokWebError(f"刷新响应缺少 access_token：{text[:200]}")
+    return data
+
+
 def download_image(
     key: str,
     *,

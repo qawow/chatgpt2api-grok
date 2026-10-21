@@ -84,6 +84,15 @@
 - **两个限制**：① `template/get` **只返回 `summary`，不含实际提示词**（提示词与流水线定义在服务端）；② **`POST /rest/media/pipeline/run` 实测 403 `oauth2-auth-forbidden`** —— 模板能列能读，**不能用 API 跑**，只能从网页 UI 用。
 - 新增 `templates()` / `template_folders()` / `template_detail()` 与 `TEMPLATE_LIST_PATH` / `TEMPLATE_FOLDER_LIST_PATH` / `TEMPLATE_GET_PATH` / `PIPELINE_RUN_PATH` / `TEMPLATE_FIELDS` / `CATALOG_TEMPLATES` 常量。
 
+### 媒体配额：实测数字（第三版修订）
+
+- **`silent_degrade` 有两个成因**：① **请求体不完整**（缺 `disableSearch` / `isReasoning` / `modelMode` 任一，或缺 `x-xai-request-id` 头）→ 200 + 无图 + 正文声称"已生成"；② **真配额耗尽**（完整 body 连发后）。**排查必须先确认走的是 `build_body`。**
+- **实测配额**（完整 body、`imagine-image-gen`）：`28hwsf4ag4`（干净、>3.5h 无活动）→ **8 次请求**（每次返 2 张，共 16 张）后 429；`2q7vuj955a`（紧接着）→ **仅 3 次**（6 张）后 429；`d781n9ynmc`（被密集重试过）→ 5 小时后仍 429。注意 **`numOfImages: 1` 时服务端仍返 2 张**。
+- **推断（有证据但未定论）**：「8 次 → 3 次」的序列支持**预算按出口 IP 共享**；但 `d781n9ynmc` 静默 3.5h 后仍 429 而同期 `28hwsf4ag4` 能拿满 8 次，反证纯 IP 说。最可能的模型是 **IP 级预算 + 账号级惩罚**（被密集重试过的账号进入更长惩罚期）。**窗口时长未验证** —— bundle 的 `formatAvailableAt` 是 `nextAvailableAt + 30 分钟`，但实测 3.5h 未恢复，不能确认是 30 分钟。
+- **已排除的旁路**：`template-chat` → **403**；`pipeline/run` → **403**；`template/get` 只返回 summary 不含提示词；**刷新 access token 不重置配额**；换生图模型无效（共享同一桶）；429 响应**无 `Retry-After` 或任何限流头**。
+- **不消耗媒体配额**：`imagine-video-prompt-enhance`、`run-code`、`text-to-speech`、模板只读接口。
+- 新增 `refresh_access_token()`（含 `OAUTH_TOKEN_URL` / `OAUTH_CLIENT_ID` / `OAUTH_SCOPES` 常量）：实测 `grant_type=refresh_token` 可用，返回新 token（`expires_in=21600` = 6h）；**失效 refresh token 返回 HTTP 400 + `invalid_grant`**（永久性错误，重试无用）。刷新**不重置**媒体配额。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -100,6 +109,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1197 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1202 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

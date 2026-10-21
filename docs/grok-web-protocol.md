@@ -1174,60 +1174,72 @@ imagine-video-gen          ✅ 26.6s
 静默降级后应**等待足够长的静默期**（实测 ≥15 分钟）再试，
 而不是周期性探测。
 
-### 1.16 ★★ 撤回：「媒体限流是 IP 级」的结论不成立（2026-10-21 晚修正）
+### 1.16 媒体配额：实测数字与仍未确定的边界（2026-10-21 修订三版）
 
-> **本节是对 2026-10-21 早先结论的撤回。** 原结论（媒体配额按出口 IP 计量、
-> 加账号不增加产能）**证据不成立** —— 它被一个请求体缺陷污染了。
+> 本节经历了三次修订，每次都被新证据推翻一半。这里只写**实测数字**和
+> **明确标注的推断**，不再给单一结论。
 
-#### 原始（错误）推理
+#### 已确证：`silent_degrade` 有两个成因
 
-四个账号的 `allow_access` / `subscriptionTier` / `creditUsagePercent` /
-`productUsage` 完全相同，其中三个从未生成过任何东西，却**首次调用即静默降级**；
-而曾成功过的账号也 429。于是推断「同一 IP 共享预算」。
-
-#### 对照实验推翻了它
-
-同一账号、同一 prompt，**只改请求体**：
+同一账号、同一 prompt，只改请求体：
 
 | 请求体 | 结果 |
 |---|---|
 | `build_body` 的**完整** body | **出图** ✅ |
 | **精简** body（缺 `disableSearch` / `isReasoning` / `modelMode`，缺 `x-xai-request-id` 头） | 200 + **无图**，正文却说 `"I generated an image with the prompt: ..."` ❌ |
 
-**服务端照常回 200 并声称已生成，但不产出 `cardAttachment`。**
+**① 请求体不完整** = 调用方 bug；**② 真配额耗尽** = 完整 body 连发后出现。
+排查必须先确认走的是 `build_body`。
 
-那三个「全新账号首次即失败」的探测，用的正是**精简 body** —— 所以它们的失败
-与 IP、与配额都无关，纯粹是**调用方漏了字段**。
+#### 实测配额数字（完整 body，`imagine-image-gen`）
 
-#### 正确的结论：`silent_degrade` 有两个成因
+| 账号 | 起始状态 | 成功请求数 | 产出图片 | 之后 |
+|---|---|---|---|---|
+| `28hwsf4ag4` | 干净（>3.5h 无活动） | **8 次** | 16 张（每次返 2 张） | 429 |
+| `2q7vuj955a` | 紧接着上一行 | **3 次** | 6 张 | 429 |
+| `d781n9ynmc` | 被密集重试过 | ~4 次 | — | 5 小时后仍 429 |
 
-| 成因 | 触发条件 | 判别 |
-|---|---|---|
-| **① 请求体不完整** | 缺 `disableSearch` / `isReasoning` / `modelMode` 任一，或缺 `x-xai-request-id` | 正文声称"已生成"但无 `cardAttachment`；**换完整 body 立刻成功** |
-| **② 真配额耗尽** | 用完整 body 连发约 **4–8 次** | 429，或正文为空/拒绝 |
+**注意 `numOfImages: 1` 时服务端仍返回 2 张** —— 两次请求共 16 张。
 
-**排查顺序：先确认走的是 `build_body`（完整字段 + request-id 头），再看配额。**
-用精简 body 探配额会得到**假阳性**。
+#### 推断（有证据但未定论）：预算疑似按出口 IP 共享
 
-#### 仍然成立的观察
+「`28hwsf4ag4` 拿到 8 次 → `2q7vuj955a` 紧接着只拿到 3 次」这个序列
+**支持 IP 共享预算**：若纯按账号，第二个干净账号应同样拿到 8 次。
 
-* 用完整 body 连发后确实会耗尽：`yqrpwedp6e` 出 3 图 + 1 视频后静默降级；
-  `d781n9ynmc` 出 4 图后 429。
-* 配额看起来是**按账号**的 —— 同 IP 下新账号在完整 body 下可以正常出图。
-* 图片与视频共享同一预算桶（一次视频成功后再发图片立刻 429）。
-* 密集重试会把自己锁死（每次重试都计入窗口）。
+但**反证也存在**：`d781n9ynmc` 在 3.5 小时静默后仍 429，而同期
+`28hwsf4ag4` 能拿到完整 8 次 —— 若纯按 IP，两者不该有差异。
 
-#### 关于 IP 限流
+最可能的模型：**IP 级预算 + 账号级惩罚**。被密集重试过的账号进入更长的
+惩罚期（`d781n9ynmc` 我按 3 分钟间隔重试了 8 次，第 5 次起转 429）。
 
-codex2api 的 CHANGELOG 确实提到
-*"Too many Grok accounts egressing from one IP triggers upstream 402s"*，
-它也有 `POST /proxies/auto-balance`。但**本仓库没有复现出 IP 级约束** ——
-同 IP 下新账号可以正常出图。可能只在更大量的账号/IP 压力下才出现，未验证。
+**未验证**：窗口时长。bundle 里 `formatAvailableAt` 是
+`nextAvailableAt + 30 分钟`（`18e5` ms），暗示 30 分钟量级；但实测 3.5 小时
+后 `d781n9ynmc` 仍未恢复，所以**不能确认是 30 分钟**。
+
+#### 已排除的旁路
+
+| 路径 | 结果 |
+|---|---|
+| `POST /rest/app-chat/template-chat`（`{template, requested(bool), locale}`） | **403 `oauth2-auth-forbidden`** |
+| `POST /rest/media/pipeline/run` | **403 `oauth2-auth-forbidden`** |
+| `POST /rest/media/pipeline/template/get` | 200，但**只返回 summary，不含提示词** |
+| 刷新 access token | 不重置配额（刷新后仍受同一预算约束） |
+| 换生图模型 | 无效 —— 所有生图模型共享同一桶 |
+| 429 响应头 | **无 `Retry-After` / 无任何限流头** |
+
+#### 不消耗媒体配额的路径（已确认）
+
+| 路径 | 说明 |
+|---|---|
+| `imagine-video-prompt-enhance` | 纯文本，所有生图模型 429 时仍可用 |
+| `POST /rest/app-chat/run-code` | 代码执行，走独立预算 |
+| `POST /rest/app-chat/text-to-speech` | 语音合成，走独立预算 |
+| 模板列表 / 分类 / 详情 | 只读，免费 |
 
 #### 教训
 
-**「模型说它生成了」不等于「真的生成了」。** 判定成功必须看
-`cardAttachment.image_chunk.imageUrl` 是否存在，不能看 HTTP 200，也不能看正文。
+**「模型说它生成了」不等于「真的生成了」** —— 判定必须看
+`cardAttachment.image_chunk.imageUrl`，不能看 HTTP 200 或正文。
 
 ### 1.17 语音合成：`POST /rest/app-chat/text-to-speech`（2026-10-21 实测）
 
