@@ -102,6 +102,22 @@
 - **不消耗媒体配额**：`imagine-video-prompt-enhance`、`run-code`、`text-to-speech`、模板只读接口。
 - 新增 `refresh_access_token()`（含 `OAUTH_TOKEN_URL` / `OAUTH_CLIENT_ID` / `OAUTH_SCOPES` 常量）：实测 `grant_type=refresh_token` 可用，返回新 token（`expires_in=21600` = 6h）；**失效 refresh token 返回 HTTP 400 + `invalid_grant`**（永久性错误，重试无用）。刷新**不重置**媒体配额。
 
+### 生图失败的五种形态（2026-10-22 补全）
+
+- 判定生图成功**只能看** `cardAttachment.image_chunk.imageUrl`。HTTP 200、正文声称"已生成"、agent 说"这是结果" —— **全都不可信**。五种形态：① 请求层 429；② 流内 `renderToolRateLimited` + `systemErrCode 1006`；③ **请求体不完整**（正文 `"I generated an image with the prompt: ..."`）；④ **agent 幻觉**（正文 `"Here's the apple recolored to bright green, ... preserved:"`，冒号后什么都没有）；⑤ **模型报错**（`"Oops, something broke. Talk to me later?"`）。
+- **形态 ④ 最危险**：`imagine-agent-mode` 在配额耗尽时用自然语言描述一张**并不存在的图**。抓完整 170 帧确认：`assets.grok.com` 出现 **0 次**、`cardAttachment` **0 次**，只有 `modelResponse`。新增 `claims_success_without_image()` / `model_broken()` / `quota_exhausted_hint()` 用于自动识别。
+- 配额耗尽时 agent 追问后才明说：`"It looks like you've hit the image generation limit for this session, so I can't create or edit images right now."` —— 注意 "for this session" 的措辞，但换新会话（`temporary: true`）无效，仍是账号级配额。
+- **`imagine-image-edit` 疑似不可用**：无论 body 形状一律返回 `"Oops, something broke. Talk to me later?"`，而同一时刻 `imagine-image-gen` / `imagine-agent-mode` 都能出图 —— **不是配额，是该模型自身报错**。图生图应改用 `mediaGenInput.imageToImage`。
+- **`build` 有独立且更紧的限流**：`build` 429 时 `imagine-image-gen` 仍能出图 —— 与「所有生图模型共享同一桶」的旧结论**部分冲突**，已在文档标注。
+
+### 图生图：`mediaGenInput.imageToImage`
+
+- 正确形状：`modelName`（`build` / `imagine-image-gen` / `imagine-agent-mode`）+ `kind: CONVERSATION_KIND_IMAGINE` + `mediaGenInput.imageToImage{prompt, inputAssets[], numOfImages, aspectRatio}`。字段全集含 `resolutionName` / `modelName` / `selectionRegions` / `mediaReferences`。**`inputAssets` 与 `mediaReferences` 是两个独立字段**。
+- **★ 不需要 `upload-file`**：生成的图本身就是服务端资产，URL 结构 `https://assets.grok.com/users/<uid>/generated/<imageId>/image.jpg`，把 `assets.grok.com/` 之后的部分直接作 `inputAssets` 即可。这绕开了 `upload-file` 的权限限制。
+- **`upload-file` 只认 SSO cookie**：Bearer → 403 `oauth2-auth-forbidden`。带 SSO 时 body 必须 **raw base64**（data URL 会 400），返回 `fileUri: users/<uid>/<fileMetadataId>/content`（**不是文件路径**）。`fileSource` 枚举 `SELF_UPLOAD_FILE_SOURCE` / `IMAGINE_SELF_UPLOAD_FILE_SOURCE`。
+- 图片资产完整字段：`{kind: "stream", image_url, asset_id, image_id, progress}`，`asset_id` 与 `image_id` 相同。
+- **验证进度**：`build` + `imageToImage` + 资产 key → 模型**确实读到了图**（为 "make it green" 的歧义要求澄清）。换明确 prompt 后撞配额耗尽，**最终产物尚未取得**。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -118,6 +134,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1210 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1216 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

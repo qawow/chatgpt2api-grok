@@ -1303,6 +1303,149 @@ Content-Type: application/json
 `imagine-video-prompt-enhance`（提示词增强）、`run-code`、`text-to-speech`、
 模板只读接口、`/rest/models`、`/rest/modes`、`/rest/products`。
 
+### 1.16b 生图失败的**五种**形态（2026-10-22 实测补全）
+
+判定生图是否成功**只能看** `cardAttachment.image_chunk.imageUrl` 是否存在。
+HTTP 200、正文声称"已生成"、agent 说"这是结果" —— **全都不可信**。
+
+| # | 形态 | 特征 | 判别 |
+|---|---|---|---|
+| ① | 请求层 429 | `{"error":{"code":8,"message":"Too many requests"}}`，流开始前 | 状态码 429 |
+| ② | 流内限流 | `renderToolRateLimited` + `image_chunk.systemErrCode: 1006`，`progress` 仍是 100 但无 `imageUrl` | `systemErrCode` 非空 |
+| ③ | **请求体不完整** | 200、无图、正文 `"I generated an image with the prompt: ..."` | 换完整 body 立刻成功 |
+| ④ | **agent 幻觉** | 200、无图、正文 `"Here's the apple recolored to bright green, with the original shape... preserved:"` | **正文像成功但无 `cardAttachment`** |
+| ⑤ | 模型报错 | 200、无图、正文 `"Oops, something broke. Talk to me later?"` | 固定文案 |
+
+#### 形态 ④ 最危险
+
+`imagine-agent-mode` 在配额耗尽时会**用自然语言描述一张并不存在的图**：
+
+```
+"Here's the apple recolored to bright green, with the original shape, size,
+ lighting, texture, and white background preserved:"
+```
+
+冒号后面什么都没有。**只解析正文的客户端会误判成功。**
+
+抓完整 170 帧后确认：整个流里 `assets.grok.com` 出现 **0 次**，
+`cardAttachment` 出现 **0 次**，只有 `modelResponse`。
+
+#### 配额耗尽时的显式提示
+
+继续追问后 agent 才说实话：
+
+```
+"It looks like you've hit the image generation limit for this session,
+ so I can't create or edit images right now.
+ ...
+ If you upload the photo now, I'll be ready to apply the edit as soon as
+ the quota allows."
+```
+
+注意 **"for this session"** 的措辞 —— 但实测换新会话（`temporary: true`）无效，
+仍是账号级配额（见 §1.16）。
+
+#### `imagine-image-edit` 疑似不可用
+
+单独测该模型（无论 body 形状）：
+
+```
+imagine-image-edit  →  200  images=0  text="Oops, something broke. Talk to me later?"
+```
+
+同一时刻 `imagine-image-gen` 与 `imagine-agent-mode` 都能出图 ——
+所以**不是配额问题，是该模型自身报错**。图生图应改用
+`mediaGenInput.imageToImage`（见 §1.16c）。
+
+### 1.16c 图生图：`mediaGenInput.imageToImage`
+
+#### 正确形状
+
+```jsonc
+{"message": "<prompt>",
+ "modelName": "build",              // 或 imagine-image-gen / imagine-agent-mode
+ "kind": "CONVERSATION_KIND_IMAGINE",
+ "enableImageGeneration": true,
+ "enableImageStreaming": true,
+ "disableSearch": false, "isReasoning": false, "modelMode": "none",
+ "mediaGenInput": {
+   "imageToImage": {
+     "prompt": "<prompt>",
+     "inputAssets": ["users/<uid>/generated/<imageId>/image.jpg"],
+     "numOfImages": 1,
+     "aspectRatio": "1:1"
+   }}}
+```
+
+`imageToImage` 的字段全集：`{prompt, inputAssets, numOfImages, aspectRatio,
+resolutionName, modelName, selectionRegions, mediaReferences}`。
+
+**`inputAssets` 与 `mediaReferences` 是两个独立字段**（bundle
+`1nina2n46pgtw.js` 里 `[...e.value.inputAssets, ...e.value.mediaReferences]`）。
+
+#### ★ 不需要 upload-file —— 直接用已生成资产的 key
+
+生成的图片本身就是服务端资产，其 URL 结构是：
+
+```
+https://assets.grok.com/users/<uid>/generated/<imageId>/image.jpg
+```
+
+把 `assets.grok.com/` 之后的部分直接作为 `inputAssets` 即可：
+
+```
+users/<uid>/generated/<imageId>/image.jpg
+```
+
+**这条路绕开了 `upload-file` 的权限限制**（见下）。
+
+#### `upload-file` 只认 SSO cookie
+
+```
+POST /rest/app-chat/upload-file  + Bearer
+→ 403 {"code":7,"message":"Action cannot be performed by OAuth2 token users.
+        [WKE=unauthorized:oauth2-auth-forbidden]"}
+```
+
+带 **SSO cookie** 时可用，body 必须是 **raw base64**（data URL 会 400）：
+
+```jsonc
+{"fileName": "t.png", "fileMimeType": "image/png",
+ "content": "<raw base64>", "makePublic": false}
+→ {"fileMetadataId": "...", "fileMimeType": "image/png", "fileName": "t.png",
+   "fileUri": "users/<uid>/<fileMetadataId>/content",
+   "parsedFileUri": "", "createTime": "...", "fileSource": "SELF_UPLOAD_FILE_SOURCE"}
+```
+
+**`fileUri` 形如 `users/<uid>/<id>/content`，不是文件路径。**
+
+`fileSource` 枚举：`SELF_UPLOAD_FILE_SOURCE` / `IMAGINE_SELF_UPLOAD_FILE_SOURCE`
+（Imagine 用后者）。
+
+#### 图片资产的完整字段
+
+`extract_images` 返回的每项：
+
+```jsonc
+{"kind": "stream",
+ "image_url": "https://assets.grok.com/users/<uid>/generated/<id>/image.jpg",
+ "asset_id": "<id>", "image_id": "<id>", "progress": 100}
+```
+
+`asset_id` 与 `image_id` 相同，都是 `<id>`。
+
+#### 已验证到哪一步
+
+`build` + `imageToImage` + 资产 key → 模型**确实读到了图**：
+
+```
+text: "Thinking about your request / Interpreting the ambiguous request /
+       What would you like me to make green?"
+```
+
+它在为 "make it green" 的歧义**要求澄清** —— 证明图片引用生效。
+换明确 prompt 后撞上配额耗尽，**最终产物尚未取得**。
+
 ### 1.17 语音合成：`POST /rest/app-chat/text-to-speech`（2026-10-21 实测）
 
 **可用**，产物是真实 MP3。

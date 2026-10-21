@@ -2734,6 +2734,71 @@ def remaining_media(quota: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+# --------------------------------------------------------------------------
+# 生图失败的五种形态
+# --------------------------------------------------------------------------
+#
+# 判定生图成功**只能看** `cardAttachment.image_chunk.imageUrl` 是否存在。
+# HTTP 200、正文声称"已生成"、agent 说"这是结果" —— **全都不可信**。
+#
+#   ① 请求层 429        {"error":{"code":8,"message":"Too many requests"}}
+#   ② 流内限流          renderToolRateLimited + systemErrCode 1006
+#   ③ 请求体不完整      200、无图、正文 "I generated an image with the prompt: ..."
+#   ④ **agent 幻觉**    200、无图、正文 "Here's the apple recolored to ..."
+#   ⑤ 模型报错          200、无图、正文 "Oops, something broke. Talk to me later?"
+#
+# **形态 ④ 最危险**：`imagine-agent-mode` 在配额耗尽时会用自然语言描述一张
+# 并不存在的图，冒号后面什么都没有。只解析正文的客户端会误判成功。
+#
+# 实测（170 帧完整流）：`assets.grok.com` 出现 0 次、`cardAttachment` 0 次，
+# 只有 `modelResponse`。
+AGENT_HALLUCINATION_MARKERS = (
+    "here's the", "here is the", "here you go", "i've recolored",
+    "i've changed", "i've edited", "preserved:",
+)
+MODEL_BROKEN_MARKER = "Oops, something broke"
+QUOTA_EXHAUSTED_MARKER = "image generation limit"
+
+
+def claims_success_without_image(
+    text: str,
+    images: Sequence[Any] | None = None,
+) -> bool:
+    """检测**形态 ④：agent 幻觉** —— 正文声称给了图，但没有图。
+
+    实测反例（`imagine-agent-mode` 配额耗尽时）::
+
+        "Here's the apple recolored to bright green, with the original shape,
+         size, lighting, texture, and white background preserved:"
+
+    冒号后面什么都没有，整个 170 帧流里 `cardAttachment` 出现 0 次。
+
+    返回 True 表示**看起来成功但其实没有图** —— 调用方应视为失败。
+    """
+    if images:
+        return False
+    body = str(text or "").strip().lower()
+    if not body:
+        return False
+    return any(marker in body for marker in AGENT_HALLUCINATION_MARKERS)
+
+
+def model_broken(text: str) -> bool:
+    """**形态 ⑤**：模型自身报错（实测 `imagine-image-edit` 稳定复现）。"""
+    return MODEL_BROKEN_MARKER.lower() in str(text or "").lower()
+
+
+def quota_exhausted_hint(text: str) -> bool:
+    """正文里是否出现配额耗尽的显式提示。
+
+    实测 agent 在追问后会明说::
+
+        "It looks like you've hit the image generation limit for this session,
+         so I can't create or edit images right now."
+    """
+    return QUOTA_EXHAUSTED_MARKER.lower() in str(text or "").lower()
+
+
 def download_image(
     key: str,
     *,

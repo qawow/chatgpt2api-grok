@@ -2526,3 +2526,51 @@ class MediaQuotaInfoTest(unittest.TestCase):
         self.assertEqual(g.GENERATION_ESTIMATE_PATH,
                          "/rest/media/imagine/generation_estimate")
         self.assertEqual(g.IMAGINE_OVERRIDES_PATH, "/rest/models/imagine/overrides")
+
+
+class GenerationFailureModesTest(unittest.TestCase):
+    """生图失败的**五种**形态（2026-10-22 实测）。
+
+    判定成功**只能看** `cardAttachment.image_chunk.imageUrl`。
+    HTTP 200、正文声称"已生成"、agent 说"这是结果" —— 全都不可信。
+
+        ① 请求层 429        {"error":{"code":8,"message":"Too many requests"}}
+        ② 流内限流          renderToolRateLimited + systemErrCode 1006
+        ③ 请求体不完整      "I generated an image with the prompt: ..."
+        ④ **agent 幻觉**    "Here's the apple recolored to ..."
+        ⑤ 模型报错          "Oops, something broke. Talk to me later?"
+    """
+
+    HALLUCINATION = ("Here's the apple recolored to bright green, with the "
+                     "original shape, size, lighting, texture, and white "
+                     "background preserved:")
+
+    def test_the_agent_hallucination_is_caught(self):
+        """实测：170 帧流里 cardAttachment 出现 0 次，只有 modelResponse。"""
+        self.assertTrue(g.claims_success_without_image(self.HALLUCINATION, []))
+        self.assertTrue(g.claims_success_without_image(self.HALLUCINATION, None))
+
+    def test_real_images_are_never_flagged(self):
+        self.assertFalse(g.claims_success_without_image(
+            self.HALLUCINATION, [{"image_url": "x"}]))
+
+    def test_ordinary_text_is_not_flagged(self):
+        for text in ("", "   ", "What would you like me to make green?",
+                     "I cannot help with that.", None):
+            self.assertFalse(g.claims_success_without_image(text, []))
+
+    def test_the_broken_model_marker(self):
+        self.assertTrue(g.model_broken("Oops, something broke. Talk to me later?"))
+        self.assertFalse(g.model_broken("Here's the image"))
+
+    def test_the_quota_exhausted_hint(self):
+        self.assertTrue(g.quota_exhausted_hint(
+            "It looks like you've hit the image generation limit for this session, "
+            "so I can't create or edit images right now."))
+        self.assertFalse(g.quota_exhausted_hint("a blue circle"))
+
+    def test_the_marker_tables_are_populated(self):
+        self.assertIn("here's the", g.AGENT_HALLUCINATION_MARKERS)
+        self.assertIn("preserved:", g.AGENT_HALLUCINATION_MARKERS)
+        self.assertEqual(g.MODEL_BROKEN_MARKER, "Oops, something broke")
+        self.assertEqual(g.QUOTA_EXHAUSTED_MARKER, "image generation limit")
