@@ -17,7 +17,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from services.config import DATA_DIR, config
 from utils.log_safety import redact_text, sanitize_log_value
@@ -251,6 +251,161 @@ def parse_domain_pool(text: object) -> list[str]:
             seen.add(domain)
             out.append(domain)
     return out
+
+
+# --------------------------------------------------------------------------
+# 根域名感知的域名轮换（2026-10-22）
+# --------------------------------------------------------------------------
+#
+# 远端实测：所有注册账号都落在**一个根域名**下 ——
+# `5122331.xyz` 出现 511 次、含 **391 个不同子域**。
+# 而选域名的代码是 `random.choice(domain_pool)`：扁平随机，没有根域名
+# 计数、没有冷却、没有拒绝记忆。
+#
+# **封禁发生在根域名层面**（`account:email-domain-rejected` /
+# `form-invalid:disposable-email`），所以轮换子域完全无效 —— 必须按
+# eTLD+1 计数并轮换。
+#
+# 常见两段式公共后缀，避免把 `a.co.uk` 误判成 `co.uk`。
+_MULTI_PART_SUFFIXES = frozenset({
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "com.br", "com.tw", "com.hk", "com.sg", "com.my", "com.mx", "com.ar",
+    "co.jp", "or.jp", "ne.jp", "co.kr", "or.kr",
+    "com.ru", "com.ua", "com.tr", "co.in", "co.za", "co.nz", "co.il",
+})
+
+# 域名被服务端拒绝的特征（大小写无关）
+DOMAIN_REJECT_MARKERS = (
+    "email-domain-rejected",
+    "email_domain_rejected",
+    "email-domain-not-allowed",
+    "disposable-email",
+    "disposable_email",
+    "email-domain-pending",
+    "email_domain_pending",
+    "email_domain_rejected",
+    "email_domain_not_allowed",
+    "domain is not allowed",
+    "domain not allowed",
+)
+
+
+def root_domain(host: object) -> str:
+    """取 eTLD+1。
+
+    `a.b.example.com` → `example.com`；`x.dpdns.org` → `dpdns.org`；
+    `a.b.co.uk` → `b.co.uk`。已是根域名时原样返回。
+    """
+    parts = [p for p in str(host or "").strip().lower().lstrip("@").split(".") if p]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    tail2 = ".".join(parts[-2:])
+    if tail2 in _MULTI_PART_SUFFIXES and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return tail2
+
+
+def looks_like_domain_rejection(text: object) -> bool:
+    """注册失败信息里是否含「域名被拒」特征。"""
+    low = str(text or "").lower()
+    return any(marker in low for marker in DOMAIN_REJECT_MARKERS)
+
+
+class DomainRotator:
+    """按**根域名**计数的域名选择器。
+
+    解决的问题：`random.choice(domain_pool)` 会在同一个根域名下无限注册，
+    直到该根域名被服务端封禁（实测 391 个子域全在 `5122331.xyz` 下）。
+
+    策略：
+      * 每个根域名最多用 ``max_per_root`` 次，之后整根冷却
+      * 被服务端拒绝过的域名（及**其整个根域名**）立刻冷却
+      * 优先选「同根已用次数最少」的域名，同分随机
+
+    用法::
+
+        rotator = DomainRotator(max_per_root=20, cooldown_secs=6 * 3600)
+        domain = rotator.pick(domain_pool)          # 取代 random.choice
+        ...
+        rotator.mark_rejected(domain, reason=err)   # 注册失败时回调
+        rotator.mark_used(domain)                   # 注册成功时回调
+    """
+
+    def __init__(self, *, max_per_root: int = 20,
+                 cooldown_secs: float = 6 * 3600.0,
+                 clock: "Callable[[], float] | None" = None) -> None:
+        self.max_per_root = max(1, int(max_per_root))
+        self.cooldown_secs = max(0.0, float(cooldown_secs))
+        self._clock = clock or time.time
+        self._used: dict[str, int] = {}          # root -> 已用次数
+        self._cooling: dict[str, float] = {}     # root -> 冷却到什么时候
+        self._rejected: dict[str, str] = {}      # domain -> 拒绝原因
+
+    # -- 内部 ---------------------------------------------------------
+    def _cooling_until(self, root: str) -> float:
+        return self._cooling.get(root, 0.0)
+
+    def _is_cooling(self, root: str) -> bool:
+        return self._clock() < self._cooling_until(root)
+
+    def _is_saturated(self, root: str) -> bool:
+        return self._used.get(root, 0) >= self.max_per_root
+
+    def _available(self, root: str) -> bool:
+        return not self._is_cooling(root) and not self._is_saturated(root)
+
+    # -- 对外 ---------------------------------------------------------
+    def pick(self, pool: "list[str]", *, rng: "random.Random | None" = None) -> str:
+        """从池里挑一个域名。全不可用时**退化为随机**（不阻断注册）。"""
+        domains = [d for d in (pool or []) if d]
+        if not domains:
+            raise ValueError("domain pool is empty")
+        chooser = rng or random
+        # 优先：可用的根域名里，同根已用次数最少
+        usable = [d for d in domains if self._available(root_domain(d))]
+        if usable:
+            least = min(self._used.get(root_domain(d), 0) for d in usable)
+            candidates = [d for d in usable
+                          if self._used.get(root_domain(d), 0) == least]
+            return chooser.choice(candidates)
+        # 全饱和/全冷却：退化为「冷却最早结束」的那个，避免注册直接失败
+        domains.sort(key=lambda d: self._cooling_until(root_domain(d)))
+        return domains[0]
+
+    def mark_used(self, domain: object) -> None:
+        root = root_domain(domain)
+        if root:
+            self._used[root] = self._used.get(root, 0) + 1
+
+    def mark_rejected(self, domain: object, *, reason: object = "") -> None:
+        """域名被服务端拒绝 → 冷却**整个根域名**（不只是这个子域）。"""
+        host = str(domain or "").strip().lower().lstrip("@")
+        root = root_domain(host)
+        if not root:
+            return
+        self._rejected[host] = str(reason or "")[:200]
+        until = self._clock() + self.cooldown_secs
+        if until > self._cooling_until(root):
+            self._cooling[root] = until
+
+    def snapshot(self) -> dict[str, Any]:
+        """可序列化状态，便于落盘跨进程复用。"""
+        return {"used": dict(self._used), "cooling": dict(self._cooling),
+                "rejected": dict(self._rejected),
+                "max_per_root": self.max_per_root,
+                "cooldown_secs": self.cooldown_secs}
+
+    def load(self, data: object) -> None:
+        if not isinstance(data, dict):
+            return
+        for key, target in (("used", self._used), ("cooling", self._cooling),
+                            ("rejected", self._rejected)):
+            value = data.get(key)
+            if isinstance(value, dict):
+                target.clear()
+                target.update(value)
 
 
 MAIL_PROVIDER_CFD1 = "cloudflare_d1_api"
@@ -1109,8 +1264,32 @@ class GptRegisterService:
         proxy_pool = parse_proxy_pool(settings.get("proxy"))
         pool_key, domain_key = mail_domain_setting_keys(settings)
         domain_pool = parse_domain_pool(settings.get(pool_key))
+        rotator: DomainRotator | None = None
         if domain_pool:
-            self._append_log(job_id, f"邮箱域名池启用：{len(domain_pool)} 个域名随机轮换")
+            # 按**根域名**计数轮换：轮换子域无效，封禁在 eTLD+1 层面生效。
+            # 实测远端 391 个子域全在 5122331.xyz 下，导致根域名被封。
+            rotator = DomainRotator(
+                max_per_root=_clamp_int(
+                    settings.get("mail_max_per_root_domain"), 20, 1, 100000),
+                cooldown_secs=float(
+                    _clamp_int(settings.get("mail_domain_cooldown_minutes"),
+                               360, 0, 43200) * 60),
+            )
+            roots = sorted({root_domain(d) for d in domain_pool})
+            self._append_log(
+                job_id,
+                f"邮箱域名池启用：{len(domain_pool)} 个域名 / "
+                f"{len(roots)} 个根域名，按根域名计数轮换"
+                f"（每根上限 {rotator.max_per_root}，"
+                f"冷却 {int(rotator.cooldown_secs // 60)} 分钟）",
+            )
+            if len(roots) == 1:
+                self._append_log(
+                    job_id,
+                    f"⚠ 域名池只有一个根域名 {roots[0]} —— "
+                    "子域轮换不能规避根域名封禁，建议补充独立根域名",
+                    level="warn",
+                )
         # ``max_per_proxy`` is the explicit "how many concurrent registrations may
         # share one exit" knob; 0 means unlimited. The old code ignored it and
         # clamped concurrency to the *pool size* instead, so a single proxy
@@ -1194,15 +1373,36 @@ class GptRegisterService:
                     random.choice(proxy_pool) if total == 1 else pick_proxy(proxy_pool, index + pool_offset)
                 )
             if domain_pool:
-                # random, not index round-robin: auto-replenish jobs are count=1
-                # (always index 1), which would pin every registration to pool[0].
-                per_settings[domain_key] = random.choice(domain_pool)
+                # 按根域名计数挑选（取代原先的 random.choice）：
+                # auto-replenish 是 count=1，纯随机会在同一根域名下无限注册。
+                per_settings[domain_key] = (
+                    rotator.pick(domain_pool) if rotator
+                    else random.choice(domain_pool)
+                )
             if concurrency > 1:
                 # gpt-auto-register: stagger workers so N accounts don't hit
                 # the same egress in the same second.
                 time.sleep(0.8 * ((max(index, 1) - 1) % concurrency))
             try:
                 result = self._register_once(per_settings)
+                if rotator is not None:
+                    used_domain = str(per_settings.get(domain_key) or "")
+                    if result.get("ok"):
+                        rotator.mark_used(used_domain)
+                    else:
+                        blob = " ".join(str(x) for x in (
+                            result.get("error"),
+                            *(result.get("logs") or []),
+                        ) if x)
+                        if looks_like_domain_rejection(blob):
+                            rotator.mark_rejected(used_domain, reason=blob[:200])
+                            self._append_log(
+                                job_id,
+                                f"域名 {used_domain} 被服务端拒绝 → "
+                                f"整根 {root_domain(used_domain)} 冷却 "
+                                f"{int(rotator.cooldown_secs // 60)} 分钟",
+                                level="warn",
+                            )
                 prefix_logs: list[str] = []
                 if proxy_pool:
                     prefix_logs.append(

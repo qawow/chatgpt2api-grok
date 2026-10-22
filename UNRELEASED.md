@@ -4,6 +4,13 @@
 
 ## 修复与优化
 
+- **★ 域名轮换改为按根域名计数（修「注册太多封根域名」）**。远端实测：所有注册账号都落在**一个根域名**下 —— `5122331.xyz` 出现 **511 次、含 391 个不同子域**。而选域名的代码只有一行 `per_settings[domain_key] = random.choice(domain_pool)`：**扁平随机，没有根域名计数、没有冷却、没有拒绝记忆**。封禁发生在 eTLD+1 层面（`account:email-domain-rejected` / `form-invalid:disposable-email`），所以**轮换子域完全无效**。
+- 新增 `root_domain()`（eTLD+1，含 `co.uk` / `com.cn` / `com.au` 等两段式公共后缀）、`looks_like_domain_rejection()`、`DomainRotator`（每根域名上限 + 整根冷却 + 拒绝记忆 + `snapshot`/`load` 可落盘）。`pick()` 优先选「同根已用次数最少」，全饱和时退化为「冷却最早结束」以避免阻断注册。
+- 接线：域名池初始化时构造 rotator 并打印根域名数量；**只有一个根域名时打 warn**（「子域轮换不能规避根域名封禁，建议补充独立根域名」）；注册成功回调 `mark_used()`，失败且命中域名拒绝特征时 `mark_rejected()` —— **冷却整个根域名**并记 warn 日志。
+- 新增两个可调项（走 `_clamp_int` 校验）：`mail_max_per_root_domain`（默认 20，范围 1–100000）、`mail_domain_cooldown_minutes`（默认 360，范围 0–43200）。
+- 新增 `test/test_gpt_register_domains.py`（12 项）：根域名折叠、两段式后缀、拒绝特征识别、跨根分散、整根冷却、饱和退化、空池报错、快照往返、冷却过期。
+
+
 - Grok 刷新网络错误：远端 `refresh network error: HTTPSConnectionPool(host='auth.x.ai', port=443): Read timed out.` 的根因**不是代理不通**（同一代理打该端点 0.4 秒返回）。真实链路是：该 SOCKS 池对**新建** TLS 握手有 25-50% 的 `SSLEOFError: UNEXPECTED_EOF_WHILE_READING` 抖动（复用 keep-alive 连接实测 8/8 成功）；urllib3 把这个抖动包装成 `Max retries exceeded`，正好命中 `_is_egress_connect_error`，于是**一次丢包被当成「出口已死」** —— 拉黑健康出口并回退 `direct`，而直连无路由，挂满整个 30 秒预算，最终抛出的直连超时掩盖了真实原因。修复：新增 `is_transient_tls_error()` 两级分类（握手 EOF 可重试任意方法；连接重置等**阶段不明**的失败仅对幂等方法重试，避免重放一个可能已轮换一次性凭证的 POST），`grok_backend_api._request` 对**同一出口**重试 3 次后才降级，并优先抛出主出口的错误而非回退路径的超时。实测真实代理 12/12 = 100%。
 - Grok 死 refresh_token 不再被当成健康号：`_classify_failure` 只认 401/403，而 xAI 的 token 端点对失效 refresh_token 返回 **HTTP 400 + `invalid_grant`**（RFC 6749 §5.2，永久性错误，重试无用），且 `status is not None` 分支在检查文本前就把它判成 `other`；`ensure_fresh_account` 又硬编码 `{401, 403}`，`refresh_accounts` 更是**只写 `last_error`、从不改 `status`**。三处叠加的结果是：一个 `access_token` 已过期 85 天、每次刷新都被拒的账号，在号池里始终显示「正常」并被反复选中。修复：`invalid_grant` 在状态回退分支**之前**判定为 `auth`（仅此一个 OAuth 协议错误码穿透，`_classify_failure(502, "HTTP 403 somewhere in attempts")` 仍为 `other`，既有裸数字防护不变），`ensure_fresh_account` 改走 `_classify_failure`，`refresh_accounts` 按判定结果落 `异常`/`限流`（网络抖动仍保持「正常」）。
 - 测试隔离：新增用例曾用 `mock.patch.stopall` 清理，它会连带停掉**其他测试模块**正在生效的 patch，导致 `test_image_recovery_regressions` 随机失败。改为显式 `addCleanup(patcher.stop)`。
@@ -203,6 +210,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1261 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1273 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。
