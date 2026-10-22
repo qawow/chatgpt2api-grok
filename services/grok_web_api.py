@@ -2943,6 +2943,156 @@ def is_empty_response(
     )
 
 
+# --------------------------------------------------------------------------
+# 文件上传 v2（三段式，2026-10-22 实测打通）
+# --------------------------------------------------------------------------
+#
+# **v1 `POST /rest/app-chat/upload-file` 已不可靠** —— 同一张图、同一账号，
+# 2026-10-22 00:11 返回 200，05:20 起稳定返回
+# `400 {"code":3,"message":"Cannot open given image [WKE=file:parse-failed]"}`，
+# 与图片格式、尺寸、大小都无关（8×8 / 259 字节的干净 PNG 也失败）。
+#
+# **v2 是网页 UI 实际使用的路径**，三段式：
+#
+#   1. POST /rest/app-chat/upload-file-v2/init
+#      body {fileName, fileMimeType, fileSource, sizeBytes,
+#            resumableSupported, multipartSupported}
+#      → {uploadId, assetId, expiresAt,
+#         uploadMethod: "UPLOAD_METHOD_SINGLE_PUT",
+#         singlePut: {url: <预签名 GCS URL>, requiredHeaders: {...}}}
+#
+#   2. PUT <singlePut.url>  —— **必须原样带上 requiredHeaders**
+#      （缺任何一个都会得到 GCS 的 `MalformedSecurityHeader`）
+#
+#   3. POST /rest/app-chat/upload-file-v2/complete
+#      body {presigned: <整个 init 响应>, completedParts: [],
+#            mode: "UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT"}
+#      → {uploadId, fileMetadata: {fileMetadataId, fileUri, ...}}
+#
+# **预签名 URL 的签名头**（实测）：`content-type;host;x-amz-meta-upload-id`
+# 其中 `x-amz-meta-upload-id` 就是 init 返回的 `uploadId`。
+#
+# `requiredHeaders` 实测内容::
+#
+#   {"Content-Length": "<sizeBytes>", "Content-Type": "<fileMimeType>",
+#    "x-amz-meta-upload-id": "<uploadId>"}
+#
+# 存储桶：`storage.googleapis.com/xai-enterprise-api-mc-assets-prod/`
+# 签名服务账号：`grok-backend-production@enterprise-api-425510.iam.gserviceaccount.com`
+# 预签名有效期：`X-Goog-Expires: 3600`（1 小时）
+#
+# 最终 `fileUri` 形如 `users/<uid>/<assetId>/content`，可直接用作
+# `mediaGenInput.imageToImage.inputAssets`。
+UPLOAD_V2_INIT_PATH = "/rest/app-chat/upload-file-v2/init"
+UPLOAD_V2_COMPLETE_PATH = "/rest/app-chat/upload-file-v2/complete"
+UPLOAD_V2_PATCH_PATH = "/rest/app-chat/upload-file-v2/patch"
+UPLOAD_V2_ABORT_PATH = "/rest/app-chat/upload-file-v2/abort"
+UPLOAD_V2_STATUS_PATH = "/rest/app-chat/upload-file-v2/status"
+UPLOAD_V2_MODES = ("UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT",)
+UPLOAD_V2_SOURCE_IMAGINE = "IMAGINE_SELF_UPLOAD_FILE_SOURCE"
+UPLOAD_V2_SOURCE_SELF = "SELF_UPLOAD_FILE_SOURCE"
+
+
+def upload_file_v2(
+    content: bytes,
+    *,
+    file_name: str,
+    mime_type: str,
+    file_source: str = UPLOAD_V2_SOURCE_IMAGINE,
+    cookies: Any = None,
+    bearer: str | None = None,
+    proxy: str | None = None,
+    timeout: float = 300.0,
+) -> dict[str, Any]:
+    """三段式上传（`init` → `PUT` → `complete`），返回 `fileMetadata`。
+
+    实测可用（2026-10-22）。**v1 `upload-file` 已不可靠**，应改用本函数。
+
+    返回::
+
+        {"uploadId": "...", "assetId": "...",
+         "fileMetadataId": "...", "fileUri": "users/<uid>/<id>/content",
+         "fileName": "...", "fileMimeType": "..."}
+
+    `fileUri` 可直接用作 `mediaGenInput.imageToImage.inputAssets`。
+
+    **PUT 必须原样带上 `singlePut.requiredHeaders`** —— 预签名 URL 签了
+    `content-type;host;x-amz-meta-upload-id`，缺任何一个都会被 GCS 拒绝
+    （`MalformedSecurityHeader`）。
+    """
+    jar, token = _auth(cookies, bearer)
+    if not jar and not token:
+        raise GrokWebError("缺少认证：需要 bearer 或 cookies")
+    payload = bytes(content or b"")
+    if not payload:
+        raise GrokWebError("上传内容为空")
+    init_body = {
+        "fileName": str(file_name or "file"),
+        "fileMimeType": str(mime_type or "application/octet-stream"),
+        "fileSource": file_source,
+        "sizeBytes": len(payload),
+        "resumableSupported": False,
+        "multipartSupported": False,
+    }
+    resp = _stream_post(
+        f"{WEB_BASE}{UPLOAD_V2_INIT_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body=init_body,
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:300]
+            raise GrokWebError(f"上传 init HTTP {resp.status_code}：{detail}",
+                               status=resp.status_code, body=detail)
+        init = resp.json()
+    if not isinstance(init, dict):
+        raise GrokWebError("上传 init 响应不是对象")
+    single = init.get("singlePut")
+    if not isinstance(single, dict) or not single.get("url"):
+        raise GrokWebError("上传 init 未返回 singlePut.url")
+    upload_url = str(single["url"])
+    required = single.get("requiredHeaders")
+    headers = dict(required) if isinstance(required, dict) else {}
+    headers.setdefault("Content-Type", init_body["fileMimeType"])
+    headers.setdefault("Content-Length", str(len(payload)))
+    from urllib.parse import urlparse as _urlparse
+
+    host = _urlparse(upload_url).netloc
+    put = _session(host, proxy).put(
+        upload_url, data=payload, headers=headers, timeout=timeout)
+    if put.status_code not in (200, 201, 204):
+        raise GrokWebError(
+            f"上传 PUT HTTP {put.status_code}：{(put.text or '')[:300]}",
+            status=put.status_code, body=(put.text or "")[:300])
+    mode = UPLOAD_V2_MODES[0]
+    done = _stream_post(
+        f"{WEB_BASE}{UPLOAD_V2_COMPLETE_PATH}",
+        headers=build_headers(bearer=token),
+        cookies=jar,
+        body={"presigned": init, "completedParts": [], "mode": mode},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with done:
+        if done.status_code != 200:
+            detail = (done.text or "")[:300]
+            raise GrokWebError(f"上传 complete HTTP {done.status_code}：{detail}",
+                               status=done.status_code, body=detail)
+        finished = done.json()
+    if not isinstance(finished, dict):
+        raise GrokWebError("上传 complete 响应不是对象")
+    meta = finished.get("fileMetadata")
+    if not isinstance(meta, dict):
+        raise GrokWebError("上传 complete 未返回 fileMetadata")
+    out = dict(meta)
+    out.setdefault("uploadId", init.get("uploadId"))
+    out.setdefault("assetId", init.get("assetId"))
+    return out
+
+
 def download_image(
     key: str,
     *,

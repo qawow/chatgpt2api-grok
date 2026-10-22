@@ -2675,3 +2675,134 @@ class EmptyResponseTest(unittest.TestCase):
         self.assertEqual(g.NEW_CONVERSATION_TITLE, "New conversation")
         self.assertEqual(g.IMAGINE_AGENT_MODEL_ID, "imagine_agent_model")
         self.assertEqual(g.STREAM_ERROR_SEVERITY_FATAL, "STREAM_ERROR_SEVERITY_FATAL")
+
+
+class UploadFileV2Test(unittest.TestCase):
+    """三段式上传（2026-10-22 实测打通）。
+
+    **v1 `POST /rest/app-chat/upload-file` 已不可靠** —— 同一张图、同一账号，
+    00:11 返回 200，05:20 起稳定 400 `Cannot open given image
+    [WKE=file:parse-failed]`，与格式/尺寸/大小无关（8×8、259 字节的干净 PNG
+    也失败）。
+
+    v2 流程：
+
+        POST /upload-file-v2/init  → {uploadId, assetId, singlePut:{url,
+                                      requiredHeaders}}
+        PUT  <singlePut.url>       ← **必须原样带上 requiredHeaders**
+        POST /upload-file-v2/complete  {presigned, completedParts:[],
+                                        mode:"UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT"}
+
+    预签名 URL 的签名头实测为 `content-type;host;x-amz-meta-upload-id`，
+    其中 `x-amz-meta-upload-id` 就是 init 返回的 `uploadId`。
+    """
+
+    INIT = {
+        "uploadId": "u-1", "assetId": "a-1",
+        "expiresAt": "2026-10-22T06:30:18Z",
+        "uploadMethod": "UPLOAD_METHOD_SINGLE_PUT",
+        "singlePut": {
+            "url": "https://storage.googleapis.com/bucket/users/u/a/content?sig=x",
+            "requiredHeaders": {"Content-Length": "3",
+                                "Content-Type": "image/png",
+                                "x-amz-meta-upload-id": "u-1"},
+        },
+    }
+    DONE = {"uploadId": "u-1",
+            "fileMetadata": {"fileMetadataId": "a-1", "fileMimeType": "image/png",
+                             "fileName": "t.png",
+                             "fileUri": "users/u/a-1/content"}}
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def _run(self, init=None, done=None, put_status=200):
+        from unittest import mock
+
+        init = init or self.INIT
+        done = done or self.DONE
+        put = mock.MagicMock()
+        put.status_code = put_status
+        put.text = ""
+        session = mock.MagicMock()
+        session.put.return_value = put
+        posts = [self._resp(init), self._resp(done)]
+        with mock.patch.object(g, "_session", return_value=session), \
+             mock.patch.object(g, "_stream_post", side_effect=posts) as sp:
+            out = g.upload_file_v2(b"abc", file_name="t.png",
+                                   mime_type="image/png", cookies={"sso": "x"})
+        return out, session, sp
+
+    def test_the_three_steps_run_in_order(self):
+        out, session, sp = self._run()
+        self.assertEqual(out["fileUri"], "users/u/a-1/content")
+        init_body = sp.call_args_list[0].kwargs["body"]
+        self.assertEqual(init_body["sizeBytes"], 3)
+        self.assertEqual(init_body["fileSource"], g.UPLOAD_V2_SOURCE_IMAGINE)
+        self.assertFalse(init_body["multipartSupported"])
+        self.assertTrue(session.put.called)
+        complete_body = sp.call_args_list[1].kwargs["body"]
+        self.assertEqual(complete_body["mode"],
+                         "UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT")
+        self.assertEqual(complete_body["completedParts"], [])
+        self.assertEqual(complete_body["presigned"], self.INIT)
+
+    def test_the_put_carries_the_required_headers_verbatim(self):
+        """缺 `x-amz-meta-upload-id` 会被 GCS 拒为 MalformedSecurityHeader。"""
+        _, session, _ = self._run()
+        headers = session.put.call_args.kwargs["headers"]
+        self.assertEqual(headers["x-amz-meta-upload-id"], "u-1")
+        self.assertEqual(headers["Content-Length"], "3")
+        self.assertEqual(headers["Content-Type"], "image/png")
+
+    def test_a_failed_put_is_surfaced(self):
+        from unittest import mock
+
+        put = mock.MagicMock()
+        put.status_code = 400
+        put.text = "<Error><Code>MalformedSecurityHeader</Code></Error>"
+        session = mock.MagicMock()
+        session.put.return_value = put
+        with mock.patch.object(g, "_session", return_value=session), \
+             mock.patch.object(g, "_stream_post",
+                               side_effect=[self._resp(self.INIT)]):
+            with self.assertRaises(g.GrokWebError) as ctx:
+                g.upload_file_v2(b"abc", file_name="t.png",
+                                 mime_type="image/png", cookies={"sso": "x"})
+        self.assertIn("MalformedSecurityHeader", str(ctx.exception))
+
+    def test_an_empty_payload_is_rejected_before_any_request(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            with self.assertRaises(g.GrokWebError):
+                g.upload_file_v2(b"", file_name="t.png",
+                                 mime_type="image/png", cookies={"sso": "x"})
+            sp.assert_not_called()
+
+    def test_a_missing_single_put_is_surfaced(self):
+        bad = {"uploadId": "u-1", "assetId": "a-1"}
+        with self.assertRaises(g.GrokWebError):
+            self._run(init=bad)
+
+    def test_a_missing_file_metadata_is_surfaced(self):
+        with self.assertRaises(g.GrokWebError):
+            self._run(done={"uploadId": "u-1"})
+
+    def test_the_paths_match_the_bundle(self):
+        self.assertEqual(g.UPLOAD_V2_INIT_PATH,
+                         "/rest/app-chat/upload-file-v2/init")
+        self.assertEqual(g.UPLOAD_V2_COMPLETE_PATH,
+                         "/rest/app-chat/upload-file-v2/complete")
+        self.assertEqual(g.UPLOAD_V2_MODES,
+                         ("UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT",))
+        self.assertEqual(g.UPLOAD_V2_SOURCE_IMAGINE,
+                         "IMAGINE_SELF_UPLOAD_FILE_SOURCE")

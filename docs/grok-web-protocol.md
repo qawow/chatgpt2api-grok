@@ -1399,28 +1399,99 @@ users/<uid>/generated/<imageId>/image.jpg
 
 **这条路绕开了 `upload-file` 的权限限制**（见下）。
 
-#### `upload-file` 只认 SSO cookie
+#### ★ 上传用 v2，不要用 v1
+
+**v1 `POST /rest/app-chat/upload-file` 已不可靠。** 同一张图、同一账号：
+
+| 时间 | 结果 |
+|---|---|
+| 2026-10-22 00:11 | 200，返回 `fileUri` |
+| 2026-10-22 05:20 起 | 稳定 `400 {"code":3,"message":"Cannot open given image [WKE=file:parse-failed]"}` |
+
+**与格式、尺寸、大小都无关** —— 8×8、259 字节的干净 PNG 同样失败。
+另外 v1 对 **Bearer 一律 403**（`oauth2-auth-forbidden`），只认 SSO cookie。
+
+**v2 是网页 UI 实际使用的路径，三段式，已实测打通：**
 
 ```
-POST /rest/app-chat/upload-file  + Bearer
-→ 403 {"code":7,"message":"Action cannot be performed by OAuth2 token users.
-        [WKE=unauthorized:oauth2-auth-forbidden]"}
+1) POST /rest/app-chat/upload-file-v2/init
+   {"fileName":"src.jpg", "fileMimeType":"image/jpeg",
+    "fileSource":"IMAGINE_SELF_UPLOAD_FILE_SOURCE",
+    "sizeBytes":269995, "resumableSupported":false, "multipartSupported":false}
+
+   → {"uploadId":"ba145ad9-...", "assetId":"ef1f10b2-...",
+      "expiresAt":"2026-10-22T06:27:06Z",
+      "uploadMethod":"UPLOAD_METHOD_SINGLE_PUT",
+      "singlePut":{
+        "url":"https://storage.googleapis.com/xai-enterprise-api-mc-assets-prod/
+               users/<uid>/<assetId>/content?X-Goog-Algorithm=GOOG4-RSA-SHA256&...",
+        "requiredHeaders":{"Content-Length":"269995",
+                           "Content-Type":"image/jpeg",
+                           "x-amz-meta-upload-id":"ba145ad9-..."}}}
+
+2) PUT <singlePut.url>    ← **必须原样带上 requiredHeaders**
+
+3) POST /rest/app-chat/upload-file-v2/complete
+   {"presigned": <整个 init 响应>, "completedParts": [],
+    "mode": "UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT"}
+
+   → {"uploadId":"ba145ad9-...",
+      "fileMetadata":{"fileMetadataId":"ef1f10b2-...",
+                      "fileMimeType":"image/jpeg", "fileName":"src.jpg",
+                      "fileUri":"users/<uid>/ef1f10b2-.../content", ...}}
 ```
 
-带 **SSO cookie** 时可用，body 必须是 **raw base64**（data URL 会 400）：
+#### PUT 的坑：`MalformedSecurityHeader`
 
-```jsonc
-{"fileName": "t.png", "fileMimeType": "image/png",
- "content": "<raw base64>", "makePublic": false}
-→ {"fileMetadataId": "...", "fileMimeType": "image/png", "fileName": "t.png",
-   "fileUri": "users/<uid>/<fileMetadataId>/content",
-   "parsedFileUri": "", "createTime": "...", "fileSource": "SELF_UPLOAD_FILE_SOURCE"}
+预签名 URL 的签名头实测为：
+
+```
+X-Goog-SignedHeaders = content-type;host;x-amz-meta-upload-id
 ```
 
-**`fileUri` 形如 `users/<uid>/<id>/content`，不是文件路径。**
+**`x-amz-meta-upload-id` 就是 init 返回的 `uploadId`。** 漏掉它（或漏
+`Content-Length`）会被 GCS 拒为：
 
+```xml
+<Error><Code>MalformedSecurityHeader</Code>
+<Message>Invalid argument.</Message>
+<Details>Your request has a malformed header.</Details></Error>
+```
+
+其它实测细节：
+
+| 项 | 值 |
+|---|---|
+| 存储桶 | `storage.googleapis.com/xai-enterprise-api-mc-assets-prod/` |
+| 签名服务账号 | `grok-backend-production@enterprise-api-425510.iam.gserviceaccount.com` |
+| 预签名有效期 | `X-Goog-Expires: 3600`（1 小时） |
+| 上传方式 | `UPLOAD_METHOD_SINGLE_PUT` |
+
+**`fileUri` 形如 `users/<uid>/<assetId>/content`，不是文件路径。**
 `fileSource` 枚举：`SELF_UPLOAD_FILE_SOURCE` / `IMAGINE_SELF_UPLOAD_FILE_SOURCE`
 （Imagine 用后者）。
+
+#### ★★ 图生图已完整验证（2026-10-22）
+
+用 SSO 凭证走完整链路，**成功产出编辑后的图**：
+
+```
+1) v2 上传源图 (832×1248 JPEG, 269,995 B)  → fileUri
+2) modelName: "imagine-image-gen"
+   mediaGenInput.imageToImage{prompt, inputAssets:[fileUri],
+                              numOfImages:1, aspectRatio:"1:1"}
+   imageGenModelConfig{aspectRatio:"1:1", mode:"fast"}
+3) → 200, images=2, 无幻觉
+4) 下载 → 768×1152 JPEG, 21,631 B
+```
+
+**消耗 `imagePro` 1 次**（实测 `remainingQueries` 从 1 → 0）。
+
+产物对比：源图中心像素 `(219,180,149)` → 输出 `(129,131,82)`（偏绿），
+尺寸 832×1248 → 768×1152。模型确实读了输入并执行了指令。
+
+**注意**：`modelName` 用 `imagine-image-gen`（不是 `imagine-image-edit`，
+后者稳定报 `"Oops, something broke"`）；`build` 在该账号上有更紧的独立限流。
 
 #### 图片资产的完整字段
 
@@ -1434,17 +1505,13 @@ POST /rest/app-chat/upload-file  + Bearer
 
 `asset_id` 与 `image_id` 相同，都是 `<id>`。
 
-#### 已验证到哪一步
+#### 已验证：完整链路跑通
 
-`build` + `imageToImage` + 资产 key → 模型**确实读到了图**：
+见上文「图生图已完整验证」。用 `imagine-image-gen` + v2 上传，
+**成功产出编辑后的图片**（768×1152 JPEG）。
 
-```
-text: "Thinking about your request / Interpreting the ambiguous request /
-       What would you like me to make green?"
-```
-
-它在为 "make it green" 的歧义**要求澄清** —— 证明图片引用生效。
-换明确 prompt 后撞上配额耗尽，**最终产物尚未取得**。
+`build` + `imageToImage` 也能工作（模型会为歧义 prompt 要求澄清），
+但 `build` 在部分账号上有更紧的独立限流，容易 429。
 
 ### 1.17 语音合成：`POST /rest/app-chat/text-to-speech`（2026-10-21 实测）
 

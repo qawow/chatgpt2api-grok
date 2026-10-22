@@ -137,6 +137,15 @@
 - **`/rest/*` 实际必需头**只有 6 个：`Content-Type` / `x-xai-request-id`（uuid4，前端唯一显式设置的自定义头）/ `Accept` / `Origin` / `Referer` / `Authorization`（或 `Cookie: sso=`）。另有 `x-acting-organization-id` 仅在**有活跃组织时**注入（个人账号不带）。
 - 遥测端点（`/v1/app_config`）的 15 个 `x-device-*` / `x-user-*` / `x-forwarded-*` 头**不用于 `/rest/*`**。常见误判：`x-statsig-id` 在 1367 个 chunk 里**无此字符串**；`x-app-language` / `x-app-timezone` 是 WebSocket query 参数不是 HTTP 头。
 
+### ★★ 图生图完整打通 + 上传改走 v2（2026-10-22）
+
+- **图生图已完整验证并产出图片**：v2 上传源图（832×1248 JPEG, 269,995 B）→ `modelName: "imagine-image-gen"` + `mediaGenInput.imageToImage{prompt, inputAssets:[fileUri], numOfImages:1, aspectRatio:"1:1"}` → 200、images=2、无幻觉 → 下载得 768×1152 JPEG（21,631 B）。源图中心像素 `(219,180,149)` → 输出 `(129,131,82)`（偏绿），模型确实读了输入并执行指令。**消耗 `imagePro` 1 次**（`remainingQueries` 1 → 0）。
+- **`imagine-image-edit` 不要用** —— 稳定返回 `"Oops, something broke. Talk to me later?"`。`build` 可用但在部分账号上有更紧的独立限流。
+- **★ v1 `upload-file` 已不可靠，改用 v2 三段式**：同一张图同一账号，00:11 返回 200，05:20 起稳定 `400 Cannot open given image [WKE=file:parse-failed]` —— **与格式/尺寸/大小无关**（8×8、259 字节的干净 PNG 也失败），且 v1 对 Bearer 一律 403。
+- **v2 流程**：`POST /rest/app-chat/upload-file-v2/init` → `{uploadId, assetId, singlePut:{url, requiredHeaders}}` → `PUT <url>` **必须原样带 `requiredHeaders`** → `POST .../complete` `{presigned, completedParts:[], mode:"UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT"}` → `fileMetadata.fileUri = users/<uid>/<assetId>/content`。
+- **PUT 的坑**：预签名 URL 的签名头实测为 `content-type;host;x-amz-meta-upload-id`，其中 `x-amz-meta-upload-id` 就是 init 返回的 `uploadId`。漏掉会被 GCS 拒为 `MalformedSecurityHeader`。存储桶 `storage.googleapis.com/xai-enterprise-api-mc-assets-prod/`，签名服务账号 `grok-backend-production@enterprise-api-425510.iam.gserviceaccount.com`，预签名有效期 `X-Goog-Expires: 3600`。
+- 新增 `upload_file_v2()` 与 `UPLOAD_V2_INIT_PATH` / `UPLOAD_V2_COMPLETE_PATH` / `UPLOAD_V2_PATCH_PATH` / `UPLOAD_V2_ABORT_PATH` / `UPLOAD_V2_STATUS_PATH` / `UPLOAD_V2_MODES` / `UPLOAD_V2_SOURCE_IMAGINE` / `UPLOAD_V2_SOURCE_SELF` 常量。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -153,6 +162,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1232 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1239 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。
