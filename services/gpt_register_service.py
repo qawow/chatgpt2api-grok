@@ -307,10 +307,33 @@ def root_domain(host: object) -> str:
     return tail2
 
 
+# 「信发了但收不到」的特征 —— 与「域名被拒」不同：
+# 服务端返回 200（接受发送），但邮件被接收方 MTA **静默丢弃**，
+# 无退信、无报错。根域名信誉崩掉时的典型表现。
+SILENT_DROP_MARKERS = (
+    "获取验证码失败",
+    "等待验证码超时",
+    "login_challenge 静默不投递",
+    "静默不投递",
+    "无 otp 投递",
+    "no otp delivered",
+)
+
+
 def looks_like_domain_rejection(text: object) -> bool:
-    """注册失败信息里是否含「域名被拒」特征。"""
+    """注册失败信息里是否含「域名被拒」特征（服务端明确拒绝）。"""
     low = str(text or "").lower()
     return any(marker in low for marker in DOMAIN_REJECT_MARKERS)
+
+
+def looks_like_silent_drop(text: object) -> bool:
+    """注册失败信息里是否含「发了但收不到」特征（邮件被静默丢弃）。
+
+    与 :func:`looks_like_domain_rejection` 的区别：这里服务端**接受**了发送
+    （HTTP 200），邮件在投递链路上被丢弃。根域名信誉崩掉时最常见。
+    """
+    low = str(text or "").lower()
+    return any(marker in low for marker in SILENT_DROP_MARKERS)
 
 
 class DomainRotator:
@@ -335,13 +358,18 @@ class DomainRotator:
 
     def __init__(self, *, max_per_root: int = 20,
                  cooldown_secs: float = 6 * 3600.0,
+                 max_silent_drops: int = 2,
                  clock: "Callable[[], float] | None" = None) -> None:
         self.max_per_root = max(1, int(max_per_root))
         self.cooldown_secs = max(0.0, float(cooldown_secs))
+        # 同一根域名连续多少次「信发了但收不到」就整根冷却。
+        # 0 表示不启用该判据。
+        self.max_silent_drops = max(0, int(max_silent_drops))
         self._clock = clock or time.time
         self._used: dict[str, int] = {}          # root -> 已用次数
         self._cooling: dict[str, float] = {}     # root -> 冷却到什么时候
         self._rejected: dict[str, str] = {}      # domain -> 拒绝原因
+        self._silent: dict[str, int] = {}        # root -> 连续静默丢弃次数
 
     # -- 内部 ---------------------------------------------------------
     def _cooling_until(self, root: str) -> float:
@@ -378,6 +406,26 @@ class DomainRotator:
         root = root_domain(domain)
         if root:
             self._used[root] = self._used.get(root, 0) + 1
+            self._silent.pop(root, None)   # 收到信 = 该根域名投递正常
+
+    def mark_undelivered(self, domain: object, *, reason: object = "") -> bool:
+        """「信发了但收不到」→ 累计连续次数，达阈值则冷却整根。
+
+        返回 True 表示本次触发了冷却。
+        """
+        host = str(domain or "").strip().lower().lstrip("@")
+        root = root_domain(host)
+        if not root:
+            return False
+        self._silent[root] = self._silent.get(root, 0) + 1
+        if self.max_silent_drops and self._silent[root] >= self.max_silent_drops:
+            self._rejected[host] = f"silent_drop x{self._silent[root]}: {str(reason or '')[:160]}"
+            until = self._clock() + self.cooldown_secs
+            if until > self._cooling_until(root):
+                self._cooling[root] = until
+            self._silent[root] = 0
+            return True
+        return False
 
     def mark_rejected(self, domain: object, *, reason: object = "") -> None:
         """域名被服务端拒绝 → 冷却**整个根域名**（不只是这个子域）。"""
@@ -393,7 +441,7 @@ class DomainRotator:
     def snapshot(self) -> dict[str, Any]:
         """可序列化状态，便于落盘跨进程复用。"""
         return {"used": dict(self._used), "cooling": dict(self._cooling),
-                "rejected": dict(self._rejected),
+                "rejected": dict(self._rejected), "silent": dict(self._silent),
                 "max_per_root": self.max_per_root,
                 "cooldown_secs": self.cooldown_secs}
 
@@ -401,7 +449,7 @@ class DomainRotator:
         if not isinstance(data, dict):
             return
         for key, target in (("used", self._used), ("cooling", self._cooling),
-                            ("rejected", self._rejected)):
+                            ("rejected", self._rejected), ("silent", self._silent)):
             value = data.get(key)
             if isinstance(value, dict):
                 target.clear()
@@ -1274,6 +1322,8 @@ class GptRegisterService:
                 cooldown_secs=float(
                     _clamp_int(settings.get("mail_domain_cooldown_minutes"),
                                360, 0, 43200) * 60),
+                max_silent_drops=_clamp_int(
+                    settings.get("mail_silent_drop_limit"), 2, 0, 100),
             )
             roots = sorted({root_domain(d) for d in domain_pool})
             self._append_log(
@@ -1403,6 +1453,20 @@ class GptRegisterService:
                                 f"{int(rotator.cooldown_secs // 60)} 分钟",
                                 level="warn",
                             )
+                        elif looks_like_silent_drop(blob):
+                            # 信发了但收不到：服务端 200，邮件被接收方静默丢弃。
+                            # 单次不足以判定，累计到阈值才冷却整根。
+                            cooled = rotator.mark_undelivered(
+                                used_domain, reason=blob[:200])
+                            if cooled:
+                                self._append_log(
+                                    job_id,
+                                    f"根域名 {root_domain(used_domain)} 连续 "
+                                    f"{rotator.max_silent_drops} 次收不到验证码 "
+                                    f"→ 冷却 {int(rotator.cooldown_secs // 60)} 分钟"
+                                    "（邮件信誉可能已崩）",
+                                    level="warn",
+                                )
                 prefix_logs: list[str] = []
                 if proxy_pool:
                     prefix_logs.append(

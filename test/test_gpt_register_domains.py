@@ -13,6 +13,7 @@ import unittest
 from services.gpt_register_service import (
     DomainRotator,
     looks_like_domain_rejection,
+    looks_like_silent_drop,
     root_domain,
 )
 
@@ -49,6 +50,47 @@ class DomainRejectionTest(unittest.TestCase):
     def test_non_rejection(self):
         for text in ("", "TLS connect error", "upstream connection timed out"):
             self.assertFalse(looks_like_domain_rejection(text), text)
+
+
+class SilentDropTest(unittest.TestCase):
+    """「信发了但收不到」——服务端 200，邮件被接收方 MTA 静默丢弃。
+
+    远端实测：69 条注册任务报 `获取验证码失败`、`email: null`、
+    `failure_kind: unknown`，耗时 209 秒。根域名 `5122331.xyz` 下 391 个
+    子域，邮件信誉已崩，接收方直接丢弃、不发退信。
+
+    与 `looks_like_domain_rejection` 的区别：这里服务端**接受**了发送。
+    """
+
+    def test_markers(self):
+        for text in ("获取验证码失败",
+                     "获取验证码失败: login_challenge 静默不投递（建议换邮箱域/住宅出口后重试）",
+                     "等待验证码超时",
+                     "无 OTP 投递"):
+            self.assertTrue(looks_like_silent_drop(text), text)
+
+    def test_non_silent(self):
+        for text in ("", "TLS connect error", "account:email-domain-rejected",
+                     "upstream connection timed out"):
+            self.assertFalse(looks_like_silent_drop(text), text)
+
+    def test_it_cools_only_after_the_threshold(self):
+        r = DomainRotator(max_per_root=99, cooldown_secs=3600, max_silent_drops=2)
+        self.assertFalse(r.mark_undelivered("a.5122331.xyz"))
+        self.assertTrue(r.mark_undelivered("b.5122331.xyz"))
+        # 冷却的是整根
+        self.assertEqual(r.pick(["a.5122331.xyz", "c.other.com"]), "c.other.com")
+
+    def test_a_delivered_mail_resets_the_counter(self):
+        r = DomainRotator(max_per_root=99, cooldown_secs=3600, max_silent_drops=2)
+        r.mark_undelivered("a.5122331.xyz")
+        r.mark_used("a.5122331.xyz")          # 收到信 = 投递正常，清零
+        self.assertFalse(r.mark_undelivered("a.5122331.xyz"))
+
+    def test_threshold_zero_disables_the_rule(self):
+        r = DomainRotator(max_per_root=99, cooldown_secs=3600, max_silent_drops=0)
+        for _ in range(10):
+            self.assertFalse(r.mark_undelivered("a.5122331.xyz"))
 
 
 class DomainRotatorTest(unittest.TestCase):

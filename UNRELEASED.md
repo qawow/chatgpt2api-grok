@@ -8,7 +8,9 @@
 - 新增 `root_domain()`（eTLD+1，含 `co.uk` / `com.cn` / `com.au` 等两段式公共后缀）、`looks_like_domain_rejection()`、`DomainRotator`（每根域名上限 + 整根冷却 + 拒绝记忆 + `snapshot`/`load` 可落盘）。`pick()` 优先选「同根已用次数最少」，全饱和时退化为「冷却最早结束」以避免阻断注册。
 - 接线：域名池初始化时构造 rotator 并打印根域名数量；**只有一个根域名时打 warn**（「子域轮换不能规避根域名封禁，建议补充独立根域名」）；注册成功回调 `mark_used()`，失败且命中域名拒绝特征时 `mark_rejected()` —— **冷却整个根域名**并记 warn 日志。
 - 新增两个可调项（走 `_clamp_int` 校验）：`mail_max_per_root_domain`（默认 20，范围 1–100000）、`mail_domain_cooldown_minutes`（默认 360，范围 0–43200）。
-- 新增 `test/test_gpt_register_domains.py`（12 项）：根域名折叠、两段式后缀、拒绝特征识别、跨根分散、整根冷却、饱和退化、空池报错、快照往返、冷却过期。
+- **★ 新增「信发了但收不到」的域名级判据**。远端实测 69 条注册任务报 `获取验证码失败`、`email: null`、`failure_kind: unknown`，耗时 209 秒 —— **服务端 `send_otp` 返回 200（接受发送），但邮件被接收方 MTA 静默丢弃**，无退信无报错。根域名 `5122331.xyz` 下 391 个子域，邮件信誉已崩。代码里原本只有 `login_challenge` 会快速失败，**「200 但静默不投递」没有反馈到域名轮换**。
+- 新增 `looks_like_silent_drop()`（识别 `获取验证码失败` / `等待验证码超时` / `login_challenge 静默不投递` / `无 OTP 投递`）与 `DomainRotator.mark_undelivered()`：累计同一根域名的**连续**收不到信次数，达阈值则冷却整根；`mark_used()` 收到信时清零计数。新增可调项 `mail_silent_drop_limit`（默认 2，0 表示不启用）。
+- 新增 `test/test_gpt_register_domains.py`（17 项）：根域名折叠、两段式后缀、拒绝特征识别、跨根分散、整根冷却、饱和退化、空池报错、快照往返、冷却过期。
 
 
 - Grok 刷新网络错误：远端 `refresh network error: HTTPSConnectionPool(host='auth.x.ai', port=443): Read timed out.` 的根因**不是代理不通**（同一代理打该端点 0.4 秒返回）。真实链路是：该 SOCKS 池对**新建** TLS 握手有 25-50% 的 `SSLEOFError: UNEXPECTED_EOF_WHILE_READING` 抖动（复用 keep-alive 连接实测 8/8 成功）；urllib3 把这个抖动包装成 `Max retries exceeded`，正好命中 `_is_egress_connect_error`，于是**一次丢包被当成「出口已死」** —— 拉黑健康出口并回退 `direct`，而直连无路由，挂满整个 30 秒预算，最终抛出的直连超时掩盖了真实原因。修复：新增 `is_transient_tls_error()` 两级分类（握手 EOF 可重试任意方法；连接重置等**阶段不明**的失败仅对幂等方法重试，避免重放一个可能已轮换一次性凭证的 POST），`grok_backend_api._request` 对**同一出口**重试 3 次后才降级，并优先抛出主出口的错误而非回退路径的超时。实测真实代理 12/12 = 100%。
@@ -210,6 +212,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1273 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1278 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。
