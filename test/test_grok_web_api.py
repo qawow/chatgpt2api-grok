@@ -2806,3 +2806,59 @@ class UploadFileV2Test(unittest.TestCase):
                          ("UPLOAD_FILE_COMPLETE_MODE_SINGLE_PUT",))
         self.assertEqual(g.UPLOAD_V2_SOURCE_IMAGINE,
                          "IMAGINE_SELF_UPLOAD_FILE_SOURCE")
+
+
+class AccountRevocationTest(unittest.TestCase):
+    """账号吊销与风控（远端 8000 条日志实证，2026-10-13 → 10-22）。
+
+    三层递进吊销：
+
+        ① session_refresh_stale_token_revoked   989 次
+        ② token invalidated (/backend-api/me)   867 次
+        ③ password_verify_failed_401             23 次
+           └─ code: "password_reset_required"    ← 真正的"拉黑"
+
+    **触发链**：refresh token 失效 → fallback 到密码登录 → 从非注册环境发起
+    → 判定可疑 → 要求改密码。反复 fallback 会加重（一个账号被探测 112 次，
+    状态反复横跳近 6 小时）。
+    """
+
+    LOCK_BODY = ('{"error": {"message": "For improved security please change '
+                 'your password and then log in again.", '
+                 '"type": "invalid_request_error", '
+                 '"code": "password_reset_required"}}')
+
+    def test_the_lock_code_is_detected(self):
+        self.assertTrue(g.password_reset_required(self.LOCK_BODY))
+
+    def test_ordinary_errors_are_not_the_lock(self):
+        for text in ("", "rate limited", "invalid_request_error", None):
+            self.assertFalse(g.password_reset_required(text), text)
+
+    def test_revocation_markers(self):
+        for text in ("session_refresh_stale_token_revoked",
+                     "token invalidated (/backend-api/me)",
+                     "Encountered invalidated oauth token",
+                     '{"error":"invalid_grant"}',
+                     self.LOCK_BODY):
+            self.assertTrue(g.account_revoked(text), text)
+        self.assertFalse(g.account_revoked("a blue circle"))
+
+    def test_auth_errors_never_fall_back_to_password(self):
+        """密码登录是 `password_reset_required` 的唯一入口。"""
+        for text in ("session_refresh_stale_token_revoked",
+                     "token invalidated (/backend-api/me)",
+                     self.LOCK_BODY):
+            self.assertFalse(g.should_fallback_to_password(text), text)
+
+    def test_transport_errors_may_retry(self):
+        for text in ("Failed to perform, curl: (35) TLS connect error",
+                     "curl: (97) cannot complete SOCKS5 connection",
+                     "curl: (28) Connection timed out",
+                     "SSL: UNEXPECTED_EOF_WHILE_READING"):
+            self.assertTrue(g.should_fallback_to_password(text), text)
+
+    def test_the_marker_tables_are_wired(self):
+        self.assertEqual(g.PASSWORD_RESET_REQUIRED, "password_reset_required")
+        self.assertIn("password_reset_required", g.ACCOUNT_REVOKED_MARKERS)
+        self.assertEqual(g.NO_PASSWORD_FALLBACK_MARKERS, g.ACCOUNT_REVOKED_MARKERS)

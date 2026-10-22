@@ -146,6 +146,18 @@
 - **PUT 的坑**：预签名 URL 的签名头实测为 `content-type;host;x-amz-meta-upload-id`，其中 `x-amz-meta-upload-id` 就是 init 返回的 `uploadId`。漏掉会被 GCS 拒为 `MalformedSecurityHeader`。存储桶 `storage.googleapis.com/xai-enterprise-api-mc-assets-prod/`，签名服务账号 `grok-backend-production@enterprise-api-425510.iam.gserviceaccount.com`，预签名有效期 `X-Goog-Expires: 3600`。
 - 新增 `upload_file_v2()` 与 `UPLOAD_V2_INIT_PATH` / `UPLOAD_V2_COMPLETE_PATH` / `UPLOAD_V2_PATCH_PATH` / `UPLOAD_V2_ABORT_PATH` / `UPLOAD_V2_STATUS_PATH` / `UPLOAD_V2_MODES` / `UPLOAD_V2_SOURCE_IMAGINE` / `UPLOAD_V2_SOURCE_SELF` 常量。
 
+### ★★★ 风控拆解：账号是怎么被"拉黑"的（远端 8000 条日志实证）
+
+- 数据源：远端 `http://192.168.2.198:3000/api/logs`，拉取 **8000 条**（2026-10-13 19:11 → 10-22 17:34；`account` 7472 / `call` 528）。
+- **不是"拉黑"，是三层递进吊销**：① `session_refresh_stale_token_revoked` **989 次**；② `token invalidated (/backend-api/me)` **867 次**；③ `password_verify_failed_401` **23 次** → `code: "password_reset_required"` —— **这才是真正的锁定码**，响应体 `"For improved security please change your password and then log in again."`。
+- **触发链**：refresh token 失效 → 系统 fallback 到**密码登录** → 密码登录从与注册时不同的环境（不同 IP / TLS 指纹 / 无原始 cookie）发起 → 服务端判定可疑 → 要求改密码。**反复 fallback 会加重**：一个账号被 `remote_probe` 探测 **112 次**，状态在 `session_refresh_token_still_invalid` ↔ `password_verify_failed_401` 之间反复横跳近 6 小时。
+- **`failure_kind` 分布**：`token_revoked` 989 / `http_auth` 869 / `unknown` 330 / `tls` 106 / `proxy_connect` 76 / `timeout` 17。
+- **`source` 分布**：**`remote_probe` 1147 次是第一大 refresh 触发源**（超过正常调用），覆盖 **928 个不同账号**；其后 `backend_session_refresh` 1013、`refresh_accounts` 722、`image_stream:auth_failed` 232。
+- **网络失败会放大吊销**：451 条网络失败（`curl(35)` TLS 246 / `curl(97)` SOCKS 161 / `curl(28)` 超时 37），**25% 的 `token_revoked` 在发生前 5 分钟内有网络失败**。
+- **吊销的小时分布是平的**（每小时稳定 10–16 次，无突发尖峰）—— 说明这是**结构性损耗**，不是某次操作触发封禁。
+- **内容政策拦截与吊销是两件事**：34 次裸露/色情拦截、24 次提示词拦截、23 次内容政策、6 次欺诈拦截，都只是**单次请求被拒**，账号仍健康，不消耗寿命。
+- 新增 `password_reset_required()` / `account_revoked()` / `should_fallback_to_password()` 与 `PASSWORD_RESET_REQUIRED` / `ACCOUNT_REVOKED_MARKERS` / `NO_PASSWORD_FALLBACK_MARKERS` 常量。**`should_fallback_to_password()` 的核心结论：鉴权类错误永远不该 fallback 到密码登录**，只有传输层错误（TLS/SOCKS/超时）才值得重试。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -162,6 +174,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1239 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1245 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

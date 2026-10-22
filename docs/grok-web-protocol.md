@@ -2543,6 +2543,126 @@ a && e("x-acting-organization-id", a)
 | `x-app-language` / `x-app-timezone` | 是 WebSocket **query 参数**，不是 HTTP 头 |
 | `x-grok-client-version` | 只有 **CLI** 路径需要（实测 1.0.13，低于则 426） |
 
+### 1.24 ★★★ 风控拆解：账号是怎么被"拉黑"的（远端日志实证）
+
+数据来源：远端 `http://192.168.2.198:3000/api/logs`，拉取 **8000 条**
+（2026-10-13 19:11 → 10-22 17:34），`account` 类 7472 条 / `call` 类 528 条。
+
+#### 结论先行：不是"拉黑"，是**三层递进的吊销**
+
+```
+① session_refresh_stale_token_revoked     989 次   refresh token 已死
+② token invalidated (/backend-api/me)     867 次   access token 被判无效
+③ password_verify_failed_401              23 次   密码登录被拒
+   └─ code: "password_reset_required"              ← 这才是真正的"拉黑"
+```
+
+**`password_reset_required` 是官方的锁定码** —— 完整响应体：
+
+```json
+{"error": {"message": "For improved security please change your password
+                      and then log in again.",
+           "type": "invalid_request_error",
+           "code": "password_reset_required"}}
+```
+
+#### 触发链（从日志还原的精确顺序）
+
+以 `7fu6en2oj8ex@lg.zc.233159.xyz` 为例（2026-10-13 20:00:18 → 20:00:21）：
+
+```
+20:00:18  refresh_accounts:preflight:session
+          → error=session_refresh_token_still_invalid   failure_kind=unknown
+20:00:18  access_token 刷新失败(无可用续期手段)
+          → 系统认为「无可用续期手段」
+20:00:21  refresh_accounts:preflight
+          → error=password_verify_failed_401
+          → code=password_reset_required                ← 锁定
+```
+
+**关键：refresh token 失效后，系统会 fallback 到「密码登录」重试。**
+而密码登录是从一个**与注册时不同的环境**（不同 IP、不同 TLS 指纹、
+无原始 cookie）发起的，服务端判定为可疑 → 要求改密码。
+
+**反复 fallback 会加重它。** 以 `token:a46954b1b9` 为例，同一账号被
+`remote_probe` 探测 **112 次**，状态在
+`session_refresh_token_still_invalid` ↔ `password_verify_failed_401` 之间
+反复横跳，从 12:44 一直持续到 18:28（近 6 小时）。
+
+#### 各类失败的完整分布
+
+`failure_kind`：
+
+| kind | 次数 |
+|---|---|
+| `token_revoked` | **989** |
+| `http_auth` | **869** |
+| `unknown` | 330 |
+| `tls` | 106 |
+| `proxy_connect` | 76 |
+| `timeout` | 17 |
+| `transport` | 6 |
+| `upstream` | 1 |
+
+触发 refresh 的 `source`（谁在打）：
+
+| source | 次数 | 说明 |
+|---|---|---|
+| **`remote_probe`** | **1147** | 健康探测 —— **最大的触发源** |
+| `backend_session_refresh` | 1013 | 会话续期 |
+| `refresh_accounts` | 722 | 批量刷新 |
+| `image_stream:auth_failed` | 232 | 生图鉴权失败 |
+| `image_stream` | 210 | 生图流程 |
+| `refresh_accounts:preflight` | 55 | 预检（会 fallback 密码） |
+
+**`remote_probe` 是 refresh 的第一大来源，超过正常调用。** 它覆盖
+**928 个不同账号**，单账号最多 112 次。
+
+#### 网络失败会放大吊销
+
+451 条网络类失败：`curl(35)` TLS 握手 246 次、`curl(97)` SOCKS 失败 161 次、
+`curl(28)` 超时 37 次。
+
+**25% 的 `token_revoked` 在发生前 5 分钟内有过网络失败。**
+即：连接抖动 → 请求失败 → 重试 → 触发吊销判定的概率上升。
+
+#### 吊销的小时分布是**平的**
+
+```
+10-21 12时 10 次 → 13时 16 → 14时 12 → 15时 14 → 16时 10 → 17时 10
+18时 14 → 19时 14 → 20时 6 → 21时 15 → 22时 12 → 23时 12
+10-22 00时 10 → 01时 10 → 02时 16
+```
+
+**每小时稳定 10–16 次，没有突发尖峰。** 说明这不是"某次操作触发了封禁"，
+而是**持续的、结构性的损耗** —— 账号在自然寿命内被逐步吊销。
+
+#### 对策略的直接含义
+
+1. **不要 fallback 到密码登录。** refresh token 失效即视为账号死亡，
+   直接标异常。密码登录是**主动往枪口上撞** —— 它是 `password_reset_required`
+   的唯一入口。
+2. **`remote_probe` 的频率要降。** 1147 次探测 / 8000 条日志 ≈ 14%，
+   且覆盖 928 个账号。对一个已死的账号探测 112 次毫无收益，只会加重锁定。
+3. **网络失败要退避，不要立刻重试。** 25% 的吊销前有网络失败；
+   TLS/SOCKS 抖动本身不该被当成"token 有问题"。
+4. **`password_reset_required` 是不可恢复的终态** —— 该账号只能改密码
+   重新登录，自动流程里应直接丢弃。
+
+#### 一个反直觉的观察
+
+**内容政策拦截与账号吊销是两件事**，不要混为一谈：
+
+```
+34 次  "生成的图片可能违反了关于裸露、色情或情色内容的防护限制"
+24 次  "该提示可能违反了关于裸露、色情或情色内容的防护限制"
+23 次  "该提示可能违反了我们的内容政策"
+ 6 次  "生成的图片可能违反了关于潜在欺诈或诈骗活动的防护限制"
+```
+
+这些是**单次请求被拒**，账号本身仍然健康（`remote_probe` 仍报"正常"）。
+它们不消耗账号寿命，只是返回一句中文拒绝文案。
+
 ## 2. 主对话端点
 
 ```

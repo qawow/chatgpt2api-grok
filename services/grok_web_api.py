@@ -3093,6 +3093,73 @@ def upload_file_v2(
     return out
 
 
+# --------------------------------------------------------------------------
+# 账号吊销与风控（远端日志实证，2026-10-22）
+# --------------------------------------------------------------------------
+#
+# 远端 8000 条日志（10-13 → 10-22）还原出的三层递进吊销：
+#
+#   ① session_refresh_stale_token_revoked   989 次  refresh token 已死
+#   ② token invalidated (/backend-api/me)   867 次  access token 被判无效
+#   ③ password_verify_failed_401             23 次  密码登录被拒
+#      └─ code: "password_reset_required"            ← 真正的"拉黑"
+#
+# **触发链**：refresh token 失效 → 系统 fallback 到密码登录 → 密码登录从
+# 与注册时不同的环境（不同 IP / TLS 指纹 / 无原始 cookie）发起 → 服务端
+# 判定可疑 → 要求改密码。
+#
+# **反复 fallback 会加重它**：一个账号被 remote_probe 探测 112 次，
+# 状态在 session_refresh_token_still_invalid ↔ password_verify_failed_401
+# 之间反复横跳近 6 小时。
+#
+# 结论：
+#   * **不要 fallback 到密码登录** —— refresh 失效即视为账号死亡
+#   * `remote_probe` 是 refresh 的第一大来源（1147/8000，覆盖 928 账号）
+#   * 网络失败要退避（25% 的吊销前 5 分钟内有 TLS/SOCKS 失败）
+#   * `password_reset_required` 是**不可恢复终态**，自动流程应直接丢弃
+PASSWORD_RESET_REQUIRED = "password_reset_required"
+ACCOUNT_REVOKED_MARKERS = (
+    "password_reset_required",
+    "change your password",
+    "session_refresh_stale_token_revoked",
+    "token invalidated",
+    "invalidated oauth token",
+    "invalid_grant",
+)
+# 这些错误**不该**触发密码登录 fallback
+NO_PASSWORD_FALLBACK_MARKERS = ACCOUNT_REVOKED_MARKERS
+
+
+def password_reset_required(text: str) -> bool:
+    """服务端要求改密码 —— **不可恢复终态**，账号只能人工重置。"""
+    return PASSWORD_RESET_REQUIRED in str(text or "")
+
+
+def account_revoked(text: str) -> bool:
+    """账号是否已被吊销（refresh token 失效 / token 被判无效 / 要求改密码）。"""
+    low = str(text or "").lower()
+    return any(m.lower() in low for m in ACCOUNT_REVOKED_MARKERS)
+
+
+def should_fallback_to_password(error_text: str) -> bool:
+    """refresh 失败后**是否应该** fallback 到密码登录。
+
+    **实测答案是几乎永远不该。** 密码登录是 `password_reset_required` 的
+    唯一入口，且从非注册环境发起会被判可疑。
+
+    仅当错误明显是**传输层**问题（TLS / SOCKS / 超时）时才值得重试；
+    任何鉴权类错误都应直接判定账号死亡。
+    """
+    low = str(error_text or "").lower()
+    if any(m.lower() in low for m in NO_PASSWORD_FALLBACK_MARKERS):
+        return False
+    transport = ("tls", "socks", "timeout", "timed out", "connection reset",
+                 "eof occurred", "unexpected_eof", "while_reading",
+                 "curl: (35)", "curl: (97)", "curl: (28)",
+                 "curl: (52)", "curl: (56)")
+    return any(t in low for t in transport)
+
+
 def download_image(
     key: str,
     *,
