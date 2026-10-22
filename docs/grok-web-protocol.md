@@ -2266,6 +2266,216 @@ POST /rest/media/pipeline/template/get           → {summary, isSaved}
 
 - `GET` `/rest/workspaces/shared` → 403
 
+### 1.21 ★★★ 完整错误分类法（从 bundle 提取，权威）
+
+前端模块 `962117` / `4150825`（`0lm06h5jbq2j6.js`）里有一套**固定优先级**的
+错误判定函数 `F(e)`。这是服务端错误语义的唯一权威来源 —— **比按状态码猜准确
+得多**，因为配额耗尽时 HTTP 仍是 200。
+
+#### 判定辅助函数
+
+```js
+isRateLimitedStatus(e)            → e === 429
+isRateLimitedTransportError(e)    → e.status === 429 或 e.response.status === 429
+isRenderRateLimitedStreamError(e) → "renderToolRateLimited" in e && e != null
+isFatal(e)                        → severity === "STREAM_ERROR_SEVERITY_FATAL"
+                                    或 kind ∈ {beyondContextLength}
+```
+
+#### 20 种 error kind（按优先级顺序，命中即返回）
+
+| 顺序 | 流内字段 | kind |
+|---|---|---|
+| 1 | `beyondContextLength` | `beyondContextLength` |
+| 2 | `userPromptTooLong` | `userPromptTooLong` |
+| 3 | `modelNotAvailable` | `modelNotAvailable` |
+| 4 | `globalRateLimit` | `globalRateLimit` |
+| 5 | `concurrencyLimit` | `concurrencyLimit` |
+| 6 | `systemKillSwitch` | `systemKillSwitch` |
+| 7 | `global_rate_limit`（snake） | `globalRateLimit` |
+| 8 | `concurrency_limit`（snake） | `concurrencyLimit` |
+| 9 | `usagePoolExhausted` / `usage_pool_exhausted` | `usagePoolExhausted` |
+| 10 | `usageLimitReached` / `usage_limit_reached` | `usageLimitReached` |
+| 11 | `toolCallFailed` + message 含 auth 特征 | `connectorAuthFailed` |
+| 12 | `attachmentModerated` | `attachmentModerated` |
+| 13 | `attachmentImageTooLarge` | `attachmentImageTooLarge` |
+| 14 | `attachmentFileTooLarge` | `attachmentFileTooLarge` |
+| 15 | `attachmentTooManyPages` | `attachmentTooManyPages` |
+| 16 | `attachmentLoadFailed` | `attachmentLoadFailed` |
+| 17 | `renderToolFailed` | `renderToolFailed` |
+| 18 | `renderToolRateLimited` | `renderToolRateLimited` |
+| 19 | `renderPerMessageLimitExceeded` | `renderPerMessageLimitExceeded` |
+| 20 | message 正则兜底 | `beyondContextLength` |
+
+兜底正则（原文）：
+
+```js
+/conversation is too long|hit (?:its|the) context limit|context (?:length|window) (?:exceeded|limit)/i
+```
+
+#### 只有一种 fatal
+
+```js
+D = new Set(["beyondContextLength"])
+```
+
+外加 `severity === "STREAM_ERROR_SEVERITY_FATAL"`。
+
+#### ★ 空响应的官方判据（= silent_degrade）
+
+前端函数 `B(e)`，**四个都空才算空响应**：
+
+```js
+!text.trim()
+  && cardAttachments.length === 0
+  && cardAttachmentsJson.length === 0
+  && !error
+  && usageLimitKind == null
+  && !concurrencyLimited
+  && !rateLimited
+```
+
+即：**没正文、没卡片、没错误、没限流标记**。
+
+这解释了为什么「请求体不完整」会表现为静默降级 —— 服务端回了正文
+（`"I generated an image with the prompt: ..."`），所以 `text.trim()` 非空，
+前端**不会**判为空响应；但如果客户端只看卡片，就会以为失败了。
+
+#### 配额耗尽的三种表达（同一语义，三个字段）
+
+```js
+errCode: "usage_pool_exhausted"        → pool_exhausted
+errCode: "usage_limit_reached"         → limit_reached
+failureReason: "PIPELINE_FAILURE_REASON_USAGE_POOL_EXHAUSTED" → pool_exhausted
+failureReason: "PIPELINE_FAILURE_REASON_USAGE_LIMIT_REACHED"  → limit_reached
+typedError.usagePoolExhausted / .usage_pool_exhausted         → pool_exhausted
+typedError.usageLimitReached  / .usage_limit_reached          → limit_reached
+message.startsWith("usage_pool_exhausted")  → pool_exhausted
+message.startsWith("usage_limit_reached")   → limit_reached
+```
+
+**两种语义不同**：`pool_exhausted` 是**共享池**耗尽（团队/组织级），
+`limit_reached` 是**个人上限**。二者冷却策略应不同。
+
+### 1.22 凭据体系：JWT 全量实测
+
+#### Header
+
+```json
+{"typ": "at+jwt", "alg": "ES256", "kid": "oauth2-production-2026-02-19"}
+```
+
+`access_token` 是 `at+jwt`；`id_token` 是 `JWT`。**同一个 kid**，ES256。
+
+#### access_token claims（10 个账号逐一解码，完全一致）
+
+```jsonc
+{"aud": "b1a00492-073a-47ea-816f-4c329264a828",
+ "client_id": "b1a00492-073a-47ea-816f-4c329264a828",   // 与 aud 相同
+ "exp": 1792597311,          // iat + 21600（6 小时）
+ "grant_time": 1792575711,   // 部分 token 有
+ "iat": 1792575711,
+ "iss": "https://auth.x.ai",
+ "jti": "<uuid>",
+ "principal_id": "<user-uuid>",
+ "principal_type": "User",
+ "scope": "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write",
+ "sub": "<user-uuid>",       // == principal_id
+ "team_id": "<team-uuid>"}
+```
+
+**只有 `team_id` / `principal_id` / `jti` / 时间戳不同。**
+
+**Grok 只有 1 个 client_id**（`b1a00492-073a-47ea-816f-4c329264a828`），
+与 GPT 的 3 个 client_id 不同。bundle 里**搜不到任何 client_id**
+—— 网页前端走 SSO cookie，不走 OAuth。
+
+#### id_token claims
+
+```jsonc
+{"aud": "b1a00492-...", "email": "...", "email_verified": true,
+ "exp": ..., "family_name": "Smith", "given_name": "Karen",
+ "iat": ..., "iss": "https://auth.x.ai", "sub": "<user-uuid>"}
+```
+
+**注意 `family_name` / `given_name` 是注册时生成的假名**（Smith / Martinez /
+Lee / Wilson / Perez / Rodriguez / Garcia / Davis / Thompson）。
+
+#### scope 的 8 个条目
+
+```
+openid profile email offline_access grok-cli:access api:access
+conversations:read conversations:write
+```
+
+`grok-cli:access` 是 CLI 路径的关键；没有它就拿不到 CLI 端点。
+
+#### 两种凭证的能力边界（实测汇总）
+
+| 能力 | Bearer（OAuth） | SSO cookie |
+|---|---|---|
+| `/rest/app-chat/conversations/new`（生图/对话） | ✅ | ✅ |
+| `assets.grok.com` 下载 | ✅ | ✅ |
+| `/rest/models` | ✅ | ✅ |
+| `/rest/media/imagine/quota_info` | ❌ 403 | ✅ |
+| `/rest/app-chat/upload-file` | ❌ 403 `oauth2-auth-forbidden` | ✅ |
+| `/rest/app-chat/template-chat` | ❌ 403 | ✅ |
+| `/rest/media/pipeline/run` | ❌ 403 | ✅ |
+| `/rest/app-chat/tts-voices` | ❌ 403 | ✅ |
+| `/rest/grok/credits` | ⚠️ 看 team | ✅ |
+
+**规律：只读 + 生成认 Bearer；文件写入、模板执行、配额、音色列表认 SSO。**
+
+### 1.23 请求头全集
+
+#### `/rest/*` 实际必需（实测）
+
+```http
+Content-Type: application/json
+x-xai-request-id: <uuid4>          ← 前端唯一显式设置的自定义头
+Accept: */*
+Origin: https://grok.com
+Referer: https://grok.com/
+Authorization: Bearer <access_token>   ← 或 Cookie: sso=<token>
+```
+
+前端中间件 `tG` 只做两件事：注入 `x-xai-request-id`（`crypto.randomUUID()`）
+和调用 `applyActingOrgHeader`。
+
+#### `x-acting-organization-id`
+
+前端函数 `applyActingOrgHeader` 在**有活跃组织时**注入：
+
+```js
+a && e("x-acting-organization-id", a)
+```
+
+`a` 由 cookie 里的 org id、team 的 `organizationId`、`mappedOrganizationId`
+三者推导。个人账号不带此头。
+
+#### 遥测端点头（`/v1/app_config` 等，非 `/rest/*`）
+
+```jsonc
+{"x-device-os": "...", "x-device-model": "...",
+ "x-user-language": "...", "x-user-locale": "...", "x-api-key": "...",
+ "x-user-country": "...", "x-forwarded-region": "...",
+ "x-forwarded-region-code": "...", "x-forwarded-ip-country": "...",
+ "x-user-type": "...", "x-team-id": "...", "x-organization-id": "...",
+ "x-user-segment": "...", "x-growthbook-environment": "...",
+ "x-growthbook-attributes": "<JSON 字符串>"}
+```
+
+这些**不用于 `/rest/*`**，只用于遥测与 feature flag。
+
+#### 常见误判（已验证不存在）
+
+| 头 | 实际情况 |
+|---|---|
+| `x-statsig-id` | 1367 个 chunk 里**无此字符串** |
+| `x-app-version` / `x-device-model` / `x-device-vendor` | 只存在于一个**无调用点**的遥测方法 |
+| `x-app-language` / `x-app-timezone` | 是 WebSocket **query 参数**，不是 HTTP 头 |
+| `x-grok-client-version` | 只有 **CLI** 路径需要（实测 1.0.13，低于则 426） |
+
 ## 2. 主对话端点
 
 ```

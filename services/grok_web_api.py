@@ -2799,6 +2799,150 @@ def quota_exhausted_hint(text: str) -> bool:
     return QUOTA_EXHAUSTED_MARKER.lower() in str(text or "").lower()
 
 
+# --------------------------------------------------------------------------
+# 完整错误分类法（从 bundle `0lm06h5jbq2j6.js` 模块 962117 / 4150825 提取）
+# --------------------------------------------------------------------------
+#
+# 前端 `F(e)` 按**固定优先级**遍历流内错误对象，命中即返回。这是服务端错误
+# 语义的唯一权威来源 —— 比按状态码猜准确得多。
+#
+# 判定辅助（同模块）：
+#
+#   isRateLimitedStatus(e)            → e === 429
+#   isRateLimitedTransportError(e)    → e.status === 429 或 e.response.status === 429
+#   isRenderRateLimitedStreamError(e) → "renderToolRateLimited" in e && != null
+#   isFatal(e)                        → severity === "STREAM_ERROR_SEVERITY_FATAL"
+#                                       或 kind ∈ {beyondContextLength}
+#
+# **空响应检测**（前端自己的 silent_degrade 判据）::
+#
+#   !text.trim() && cardAttachments.length === 0
+#     && cardAttachmentsJson.length === 0
+#     && !error && usageLimitKind == null
+#     && !concurrencyLimited && !rateLimited
+#
+# 即：没正文、没卡片、没错误、没限流标记 —— 四个都空，前端判定为「空响应」。
+STREAM_ERROR_KINDS = (
+    # (字段名, kind) —— 按前端 F() 的优先级顺序
+    ("beyondContextLength", "beyondContextLength"),
+    ("userPromptTooLong", "userPromptTooLong"),
+    ("modelNotAvailable", "modelNotAvailable"),
+    ("globalRateLimit", "globalRateLimit"),
+    ("concurrencyLimit", "concurrencyLimit"),
+    ("systemKillSwitch", "systemKillSwitch"),
+    ("global_rate_limit", "globalRateLimit"),
+    ("concurrency_limit", "concurrencyLimit"),
+    ("usagePoolExhausted", "usagePoolExhausted"),
+    ("usage_pool_exhausted", "usagePoolExhausted"),
+    ("usageLimitReached", "usageLimitReached"),
+    ("usage_limit_reached", "usageLimitReached"),
+    ("attachmentModerated", "attachmentModerated"),
+    ("attachmentImageTooLarge", "attachmentImageTooLarge"),
+    ("attachmentFileTooLarge", "attachmentFileTooLarge"),
+    ("attachmentTooManyPages", "attachmentTooManyPages"),
+    ("attachmentLoadFailed", "attachmentLoadFailed"),
+    ("renderToolFailed", "renderToolFailed"),
+    ("renderToolRateLimited", "renderToolRateLimited"),
+    ("renderPerMessageLimitExceeded", "renderPerMessageLimitExceeded"),
+)
+
+# 前端 D = new Set(["beyondContextLength"]) —— 只有它是 fatal
+FATAL_STREAM_KINDS = frozenset({"beyondContextLength"})
+STREAM_ERROR_SEVERITY_FATAL = "STREAM_ERROR_SEVERITY_FATAL"
+
+# 配额耗尽的两种 kind（对应 errCode `usage_pool_exhausted` /
+# `usage_limit_reached`，以及 failureReason
+# `PIPELINE_FAILURE_REASON_USAGE_POOL_EXHAUSTED` /
+# `PIPELINE_FAILURE_REASON_USAGE_LIMIT_REACHED`）
+USAGE_EXHAUSTED_KINDS = frozenset({"usagePoolExhausted", "usageLimitReached"})
+
+# 前端 $ 正则 —— 正文兜底判 context 超限
+CONTEXT_LIMIT_RE = re.compile(
+    r"conversation is too long|hit (?:its|the) context limit|"
+    r"context (?:length|window) (?:exceeded|limit)",
+    re.IGNORECASE,
+)
+
+# 前端常量：默认新会话标题 / agent 模型 id
+NEW_CONVERSATION_TITLE = "New conversation"
+IMAGINE_AGENT_MODEL_ID = "imagine_agent_model"
+
+
+def stream_error_kind(frames: Sequence[Any]) -> str | None:
+    """按前端 `F()` 的优先级顺序判定流内错误种类。
+
+    `frames` 是流里的 `response` 对象序列（或含 `error` 的 dict）。
+    返回 kind 字符串，或 None。
+
+    这比按 HTTP 状态码猜准确 —— 例如配额耗尽在流里表现为
+    `usagePoolExhausted` / `usageLimitReached`，而 HTTP 仍是 200。
+    """
+    objects: list[dict[str, Any]] = []
+    for frame in frames or []:
+        if not isinstance(frame, dict):
+            continue
+        objects.append(frame)
+        inner = frame.get("error")
+        if isinstance(inner, dict):
+            objects.append(inner)
+    for field, kind in STREAM_ERROR_KINDS:
+        for obj in objects:
+            if obj.get(field) is not None:
+                return kind
+    # connector 认证失败：toolCallFailed + message 命中 auth 特征
+    for obj in objects:
+        message = obj.get("message")
+        if not isinstance(message, str):
+            continue
+        low = message.lower()
+        if any(marker in low for marker in (
+                "invalid_grant", "invalid_token", "authrequired",
+                "auth required", "token expired", "token revoked",
+                "authentication_error", "not authenticated")):
+            return "connectorAuthFailed"
+        if CONTEXT_LIMIT_RE.search(message):
+            return "beyondContextLength"
+    return None
+
+
+def is_fatal_stream_error(frames: Sequence[Any]) -> bool:
+    """前端 `P()`：severity 为 FATAL，或 kind 属于 fatal 集合。"""
+    for frame in frames or []:
+        if isinstance(frame, dict) and frame.get("severity") == STREAM_ERROR_SEVERITY_FATAL:
+            return True
+    return stream_error_kind(frames) in FATAL_STREAM_KINDS
+
+
+def is_empty_response(
+    *,
+    text: str,
+    card_attachments: Sequence[Any] | None = None,
+    card_attachments_json: Sequence[Any] | None = None,
+    error: Any = None,
+    usage_limit_kind: str | None = None,
+    concurrency_limited: bool = False,
+    rate_limited: bool = False,
+) -> bool:
+    """前端 `B(e)` —— **silent_degrade 的官方判据**。
+
+    四个都空才算空响应：没正文、没卡片、没错误、没限流标记。
+
+        !text.trim() && cardAttachments.length === 0
+          && cardAttachmentsJson.length === 0
+          && !error && usageLimitKind == null
+          && !concurrencyLimited && !rateLimited
+    """
+    return (
+        not str(text or "").strip()
+        and not (card_attachments or [])
+        and not (card_attachments_json or [])
+        and error is None
+        and usage_limit_kind is None
+        and not concurrency_limited
+        and not rate_limited
+    )
+
+
 def download_image(
     key: str,
     *,

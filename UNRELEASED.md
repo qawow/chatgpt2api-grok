@@ -118,6 +118,25 @@
 - 图片资产完整字段：`{kind: "stream", image_url, asset_id, image_id, progress}`，`asset_id` 与 `image_id` 相同。
 - **验证进度**：`build` + `imageToImage` + 资产 key → 模型**确实读到了图**（为 "make it green" 的歧义要求澄清）。换明确 prompt 后撞配额耗尽，**最终产物尚未取得**。
 
+### 完整错误分类法（从 bundle 提取，权威）
+
+- 前端模块 `962117` / `4150825` 里有一套**固定优先级**的错误判定 `F(e)`，是服务端错误语义的唯一权威来源 —— **比按状态码猜准确**，因为配额耗尽时 HTTP 仍是 200。
+- **20 种 error kind**（按优先级）：`beyondContextLength` / `userPromptTooLong` / `modelNotAvailable` / `globalRateLimit` / `concurrencyLimit` / `systemKillSwitch` / 三个 snake_case 变体 / `usagePoolExhausted` / `usageLimitReached` / `connectorAuthFailed` / `attachmentModerated` / `attachmentImageTooLarge` / `attachmentFileTooLarge` / `attachmentTooManyPages` / `attachmentLoadFailed` / `renderToolFailed` / `renderToolRateLimited` / `renderPerMessageLimitExceeded` / 正则兜底。
+- **只有 `beyondContextLength` 是 fatal**（`D = new Set(["beyondContextLength"])`），外加 `severity === "STREAM_ERROR_SEVERITY_FATAL"`。
+- **★ 空响应的官方判据**（前端 `B(e)`，即 silent_degrade）：`!text.trim() && cardAttachments.length===0 && cardAttachmentsJson.length===0 && !error && usageLimitKind==null && !concurrencyLimited && !rateLimited`。**四个都空才算空响应。** 这解释了为什么「请求体不完整」会表现为静默降级 —— 服务端回了正文，`text.trim()` 非空，前端不会判空。
+- **配额耗尽有两种语义**：`usage_pool_exhausted`（**共享池**，团队级）与 `usage_limit_reached`（**个人上限**），冷却策略应不同。各可由 `errCode` / `failureReason`（`PIPELINE_FAILURE_REASON_*`）/ `typedError` / `message.startsWith` 四种字段表达。
+- 新增 `stream_error_kind()` / `is_fatal_stream_error()` / `is_empty_response()` 与 `STREAM_ERROR_KINDS` / `FATAL_STREAM_KINDS` / `USAGE_EXHAUSTED_KINDS` / `CONTEXT_LIMIT_RE` / `NEW_CONVERSATION_TITLE` / `IMAGINE_AGENT_MODEL_ID` 常量。
+
+### 凭据体系与请求头（JWT 全量实测）
+
+- **Header**：`{"typ":"at+jwt","alg":"ES256","kid":"oauth2-production-2026-02-19"}`。`access_token` 是 `at+jwt`，`id_token` 是 `JWT`。
+- **10 个账号逐一解码，claims 完全一致**：`aud == client_id == b1a00492-073a-47ea-816f-4c329264a828`，`exp = iat + 21600`（6h），`iss=https://auth.x.ai`，`sub == principal_id`，scope 恒为 8 项（含 `grok-cli:access`）。**只有 `team_id` / `principal_id` / `jti` / 时间戳不同。**
+- **Grok 只有 1 个 client_id**（与 GPT 的 3 个不同）；bundle 里**搜不到任何 client_id** —— 网页走 SSO cookie，不走 OAuth。
+- `id_token` 的 `family_name` / `given_name` 是注册时生成的假名（Smith / Martinez / Lee / Wilson / Perez / Rodriguez / Garcia / Davis / Thompson）。
+- **凭证能力边界**：只读 + 生成认 **Bearer**；文件写入（`upload-file`）、模板执行（`template-chat` / `pipeline/run`）、配额（`quota_info`）、音色列表（`tts-voices`）认 **SSO cookie**。
+- **`/rest/*` 实际必需头**只有 6 个：`Content-Type` / `x-xai-request-id`（uuid4，前端唯一显式设置的自定义头）/ `Accept` / `Origin` / `Referer` / `Authorization`（或 `Cookie: sso=`）。另有 `x-acting-organization-id` 仅在**有活跃组织时**注入（个人账号不带）。
+- 遥测端点（`/v1/app_config`）的 15 个 `x-device-*` / `x-user-*` / `x-forwarded-*` 头**不用于 `/rest/*`**。常见误判：`x-statsig-id` 在 1367 个 chunk 里**无此字符串**；`x-app-language` / `x-app-timezone` 是 WebSocket query 参数不是 HTTP 头。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -134,6 +153,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1216 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1232 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

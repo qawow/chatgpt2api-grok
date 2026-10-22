@@ -2574,3 +2574,104 @@ class GenerationFailureModesTest(unittest.TestCase):
         self.assertIn("preserved:", g.AGENT_HALLUCINATION_MARKERS)
         self.assertEqual(g.MODEL_BROKEN_MARKER, "Oops, something broke")
         self.assertEqual(g.QUOTA_EXHAUSTED_MARKER, "image generation limit")
+
+
+class StreamErrorTaxonomyTest(unittest.TestCase):
+    """完整错误分类法（从 bundle 模块 962117 / 4150825 提取）。
+
+    前端 `F(e)` 按**固定优先级**遍历流内错误对象，命中即返回。
+    这是服务端错误语义的唯一权威来源 —— 比按状态码猜准确，因为配额耗尽时
+    HTTP 仍是 200。
+    """
+
+    def test_the_priority_order_matches_the_bundle(self):
+        names = [f for f, _ in g.STREAM_ERROR_KINDS]
+        self.assertEqual(names[:6], ["beyondContextLength", "userPromptTooLong",
+                                     "modelNotAvailable", "globalRateLimit",
+                                     "concurrencyLimit", "systemKillSwitch"])
+        self.assertEqual(len(g.STREAM_ERROR_KINDS), 20)
+
+    def test_higher_priority_wins(self):
+        """beyondContextLength 排在 usageLimitReached 前面。"""
+        kind = g.stream_error_kind([
+            {"usageLimitReached": {}}, {"beyondContextLength": {}}])
+        self.assertEqual(kind, "beyondContextLength")
+
+    def test_snake_case_variants_are_recognised(self):
+        self.assertEqual(g.stream_error_kind([{"global_rate_limit": {}}]),
+                         "globalRateLimit")
+        self.assertEqual(g.stream_error_kind([{"usage_pool_exhausted": {}}]),
+                         "usagePoolExhausted")
+        self.assertEqual(g.stream_error_kind([{"usage_limit_reached": {}}]),
+                         "usageLimitReached")
+
+    def test_nested_error_objects_are_searched(self):
+        self.assertEqual(
+            g.stream_error_kind([{"error": {"renderToolRateLimited": {}}}]),
+            "renderToolRateLimited")
+
+    def test_the_context_limit_regex_fallback(self):
+        for msg in ("conversation is too long",
+                    "You have hit the context limit",
+                    "context window exceeded"):
+            self.assertEqual(g.stream_error_kind([{"message": msg}]),
+                             "beyondContextLength", msg)
+
+    def test_connector_auth_failure(self):
+        self.assertEqual(g.stream_error_kind([{"message": "invalid_grant"}]),
+                         "connectorAuthFailed")
+
+    def test_clean_stream_returns_none(self):
+        for frames in ([], [{"token": "hi"}], [{"message": "hello"}]):
+            self.assertIsNone(g.stream_error_kind(frames))
+
+    def test_only_beyond_context_length_is_fatal(self):
+        self.assertEqual(g.FATAL_STREAM_KINDS, frozenset({"beyondContextLength"}))
+        self.assertTrue(g.is_fatal_stream_error([{"beyondContextLength": {}}]))
+        self.assertFalse(g.is_fatal_stream_error([{"usageLimitReached": {}}]))
+
+    def test_the_fatal_severity_marker(self):
+        self.assertTrue(g.is_fatal_stream_error(
+            [{"severity": "STREAM_ERROR_SEVERITY_FATAL"}]))
+
+    def test_the_two_quota_kinds_are_distinct(self):
+        """pool_exhausted 是共享池耗尽，limit_reached 是个人上限。"""
+        self.assertEqual(g.USAGE_EXHAUSTED_KINDS,
+                         frozenset({"usagePoolExhausted", "usageLimitReached"}))
+        self.assertNotEqual(g.stream_error_kind([{"usagePoolExhausted": {}}]),
+                            g.stream_error_kind([{"usageLimitReached": {}}]))
+
+
+class EmptyResponseTest(unittest.TestCase):
+    """前端 `B(e)` —— **silent_degrade 的官方判据**。
+
+        !text.trim() && cardAttachments.length === 0
+          && cardAttachmentsJson.length === 0
+          && !error && usageLimitKind == null
+          && !concurrencyLimited && !rateLimited
+
+    四个都空才算空响应。
+    """
+
+    def test_all_empty_is_an_empty_response(self):
+        self.assertTrue(g.is_empty_response(text=""))
+        self.assertTrue(g.is_empty_response(text="   "))
+
+    def test_text_makes_it_non_empty(self):
+        self.assertFalse(g.is_empty_response(text="I generated an image"))
+
+    def test_cards_make_it_non_empty(self):
+        self.assertFalse(g.is_empty_response(text="", card_attachments=[{}]))
+
+    def test_an_error_makes_it_non_empty(self):
+        self.assertFalse(g.is_empty_response(text="", error={"code": 8}))
+
+    def test_a_rate_limit_marker_makes_it_non_empty(self):
+        self.assertFalse(g.is_empty_response(text="", rate_limited=True))
+        self.assertFalse(g.is_empty_response(text="", concurrency_limited=True))
+        self.assertFalse(g.is_empty_response(text="", usage_limit_kind="pool_exhausted"))
+
+    def test_the_bundle_constants(self):
+        self.assertEqual(g.NEW_CONVERSATION_TITLE, "New conversation")
+        self.assertEqual(g.IMAGINE_AGENT_MODEL_ID, "imagine_agent_model")
+        self.assertEqual(g.STREAM_ERROR_SEVERITY_FATAL, "STREAM_ERROR_SEVERITY_FATAL")
