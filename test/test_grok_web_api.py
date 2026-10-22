@@ -2862,3 +2862,87 @@ class AccountRevocationTest(unittest.TestCase):
         self.assertEqual(g.PASSWORD_RESET_REQUIRED, "password_reset_required")
         self.assertIn("password_reset_required", g.ACCOUNT_REVOKED_MARKERS)
         self.assertEqual(g.NO_PASSWORD_FALLBACK_MARKERS, g.ACCOUNT_REVOKED_MARKERS)
+
+
+class AuthErrorCodeTest(unittest.TestCase):
+    """认证错误码全表 + 风控引擎（bundle `1p85i_ke_7ewx.js` 实证）。
+
+    服务端返回 `WKE=<code>` 形式的错误标识，9 个命名空间共 66 个码。
+
+    **真正的"拉黑"是 `unauthorized:blocked-user`**，官方文案
+    `"Your account has been blocked."`。
+
+    风控两层：
+      1. **Castle** 第三方反欺诈引擎 —— `castle:token-failed`；
+         令牌 TTL 60 秒，method ∈ {auth, chat, commerce}
+      2. **Cloudflare Turnstile** —— sitekey `0x4AAAAAABSXp6OOe7EVGPnR`；
+         缺令牌时登录返回 `403 anti-abuse:token-missing`
+
+    另有 **一次性邮箱封禁**：`form-invalid:disposable-email`。
+    """
+
+    def test_the_wke_marker_is_extracted(self):
+        self.assertEqual(
+            g.auth_error_code('{"code":7,"message":"Anti-abuse token is missing. '
+                              '[WKE=anti-abuse:token-missing]","details":[]}'),
+            "anti-abuse:token-missing")
+
+    def test_a_bare_code_is_also_found(self):
+        self.assertEqual(g.auth_error_code("unauthorized:blocked-user"),
+                         "unauthorized:blocked-user")
+
+    def test_no_code_returns_none(self):
+        for text in ("", "a blue circle", "rate limited", None):
+            self.assertIsNone(g.auth_error_code(text))
+
+    def test_the_blocked_user_is_terminal(self):
+        """官方文案："Your account has been blocked." """
+        self.assertTrue(g.is_terminal_auth_error("[WKE=unauthorized:blocked-user]"))
+        self.assertEqual(g.AUTH_ERROR_MESSAGES["unauthorized:blocked-user"],
+                         "Your account has been blocked.")
+
+    def test_the_password_lock_is_terminal(self):
+        self.assertTrue(g.is_terminal_auth_error(
+            "[WKE=account:password-reset-login-required]"))
+
+    def test_the_disposable_email_block_is_terminal(self):
+        self.assertTrue(g.is_terminal_auth_error(
+            "[WKE=form-invalid:disposable-email]"))
+
+    def test_transient_errors_are_not_terminal(self):
+        for code in ("rate-limit:too-many-requests",
+                     "anti-abuse:token-missing",
+                     "castle:token-failed",
+                     "unauthenticated:session-expired"):
+            self.assertFalse(g.is_terminal_auth_error(f"[WKE={code}]"), code)
+
+    def test_the_code_table_covers_nine_namespaces(self):
+        spaces = {c.split(":")[0] for c in g.AUTH_ERROR_CODES}
+        self.assertEqual(spaces, {"account", "anti-abuse", "castle", "email",
+                                  "form-invalid", "mfa", "oauth", "rate-limit",
+                                  "sso", "unauthenticated", "unauthorized"}
+                         - {"sso"} | {"sso"})
+
+    def test_the_castle_parameters(self):
+        self.assertEqual(g.CASTLE_TOKEN_TTL_MS, 60_000)
+        self.assertEqual(g.CASTLE_METHODS, ("auth", "chat", "commerce"))
+        self.assertEqual(g.CASTLE_TIMEOUTS["open"],
+                         {"initMs": 5000, "mintMs": 4000})
+        self.assertEqual(g.CASTLE_TIMEOUTS["closed"],
+                         {"initMs": 10000, "mintMs": 10000})
+        self.assertIn("castle-token-timeout", g.CASTLE_FAILURE_CAUSES)
+
+    def test_the_turnstile_constants(self):
+        self.assertEqual(g.TURNSTILE_SITEKEY, "0x4AAAAAABSXp6OOe7EVGPnR")
+        self.assertEqual(g.TURNSTILE_VERIFY_PATH, "/api/verify-turnstile")
+
+    def test_the_auth_method_enum(self):
+        self.assertEqual(g.AUTH_METHODS[1], "EMAIL_PASSWORD")
+        self.assertEqual(g.AUTH_METHODS[5], "SSO")
+        self.assertEqual(g.AUTH_METHODS[9], "EMAIL_CODE")
+        self.assertEqual(len(g.AUTH_METHODS), 13)
+
+    def test_the_login_endpoints(self):
+        self.assertEqual(g.AUTH_CREATE_SESSION_V2_PATH,
+                         "/rest/auth/create-session-v2")
+        self.assertEqual(g.AUTH_GET_USER_PATH, "/rest/auth/get-user")

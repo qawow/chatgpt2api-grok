@@ -158,6 +158,18 @@
 - **内容政策拦截与吊销是两件事**：34 次裸露/色情拦截、24 次提示词拦截、23 次内容政策、6 次欺诈拦截，都只是**单次请求被拒**，账号仍健康，不消耗寿命。
 - 新增 `password_reset_required()` / `account_revoked()` / `should_fallback_to_password()` 与 `PASSWORD_RESET_REQUIRED` / `ACCOUNT_REVOKED_MARKERS` / `NO_PASSWORD_FALLBACK_MARKERS` 常量。**`should_fallback_to_password()` 的核心结论：鉴权类错误永远不该 fallback 到密码登录**，只有传输层错误（TLS/SOCKS/超时）才值得重试。
 
+### ★★★ 认证协议逆向：风控的两层结构（2026-10-22）
+
+- **登录 body 的确切形状（40+ 次爆破得出）**：`{"credentials":{"emailAndPassword":{"email":"...","password":"..."}}}`。命中后错误从 `"Credentials must be provided."` 变成 `403 {"code":7,"message":"Anti-abuse token is missing. [WKE=anti-abuse:token-missing]"}`。关键观察：**未知字段被静默忽略**（顶层 `{"bogusFieldXyz":1}` 也回基线错误），只能靠「错误是否变化」定位；`credentials` 传非对象会得到 `proto: syntax error (line 1:17)`，确认它是 message 字段。
+- **风控第一层：Cloudflare Turnstile** —— sitekey `0x4AAAAAABSXp6OOe7EVGPnR`，`POST /api/verify-turnstile {token}` → `{success}`。密码登录缺令牌即 403。
+- **风控第二层：Castle（第三方反欺诈引擎）** —— `castle-provider` 通过 `createRequestToken({method})` 铸造，`method ∈ {auth, chat, commerce}`。**令牌 TTL 60 秒**（`Date.now()+6e4`）；超时预算前台 `init 5s / mint 4s`、后台 `init 10s / mint 10s`；失败原因 `mint_error` / `castle-token-timeout` / `unmatched-castle-token-result`；错误类 `CastleTokenError`；遥测 `castle_mint` / `castle_mint_failed`。**Chat 请求也铸 Castle 令牌** —— 发消息同样在被打分。
+- **完整错误码表 66 个 / 9 个命名空间**。真正的"拉黑"是 **`unauthorized:blocked-user`**，官方文案 **`"Your account has been blocked."`**。`unauthorized:*` 占 29 个（含 `banned-organization` / `x-user-suspended` / `deleted-user` / `oauth2-auth-forbidden`）。
+- **★ 一次性邮箱被封**：`form-invalid:disposable-email` —— 这是号池大规模死亡的直接原因之一，号池全是临时邮箱域名（`awa91.cyou` / `5122331.xyz` / `cyt233.dpdns.org` 等）。
+- **登录方式枚举 13 种**：`EMAIL_PASSWORD=1` / `GOOGLE_OAUTH2=2` / `X_OAUTH2=3` / `APPLE_OAUTH2=4` / `SSO=5` / `KEYCLOAK_OIDC=6` / `SPACEX_OIDC=7` / `GITHUB_OAUTH2=8` / `EMAIL_CODE=9` / `CURSOR_PARTNER=10` / `CURSOR_SIGN_IN_LINK=11` / `ANDROID_RESTORE_KEY=12`。
+- **8 个终态错误**（命中即丢弃账号）：`account:password-reset-login-required` / `unauthorized:blocked-user` / `blocked-user-cursor-enterprise` / `blocked-user-underage` / `banned-organization` / `deleted-user` / `x-user-suspended` / `form-invalid:disposable-email`。
+- 实测可达的认证端点：`POST /rest/auth/create-session-v2` / `create-session`，`GET /rest/auth/get-user` / `list-teams` / `get-user-feature-controls`（→ `{"allowNsfwContent":true}`）/ `list-mfa-devices` / `get-auth-status`。
+- 新增 `auth_error_code()` / `is_terminal_auth_error()` 与 `AUTH_ERROR_CODES`（66 条）/ `AUTH_ERROR_MESSAGES` / `TERMINAL_AUTH_CODES` / `CASTLE_*` / `TURNSTILE_*` / `AUTH_METHODS` / `AUTH_*_PATH` 常量。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -174,6 +186,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1245 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1257 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

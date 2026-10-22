@@ -3160,6 +3160,188 @@ def should_fallback_to_password(error_text: str) -> bool:
     return any(t in low for t in transport)
 
 
+# --------------------------------------------------------------------------
+# 认证错误码全表 + 风控引擎（bundle 1p85i_ke_7ewx.js 实证）
+# --------------------------------------------------------------------------
+#
+# 服务端返回 `WKE=<code>` 形式的错误标识。完整 51 个错误码，9 个命名空间。
+#
+# **真正的"拉黑"是 `unauthorized:blocked-user`** —— 官方文案
+# `"Your account has been blocked."`。
+#
+# 风控由**两层**构成：
+#
+#   1. **Castle**（第三方反欺诈引擎）—— `castle:token-failed`
+#      前端 `castle-provider` 通过 `createRequestToken({method})` 铸造令牌，
+#      method ∈ {"auth", "chat", "commerce"}。令牌 **60 秒**过期
+#      （`Date.now() + 6e4`）。超时预算：前台 `init 5s / mint 4s`，
+#      后台标签页 `init 10s / mint 10s`。失败原因：`mint_error` /
+#      `castle-token-timeout` / `unmatched-castle-token-result`。
+#      受 feature flag `ENABLE_CASTLE_CHAT_MINTING` / `enableAuthMinting` /
+#      `enableCommerceMinting` 控制。
+#
+#   2. **Cloudflare Turnstile** —— sitekey `0x4AAAAAABSXp6OOe7EVGPnR`
+#      `POST /api/verify-turnstile {token}` → `{success: bool}`。
+#      缺令牌时登录接口返回 `403 anti-abuse:token-missing`。
+#
+# **一次性邮箱被封**：`form-invalid:disposable-email`。
+AUTH_ERROR_CODES = {
+    # account:*
+    "account:invalid-credentials": "账号或密码错误",
+    "account:email-in-use": "邮箱已被占用",
+    "account:email-malformed": "邮箱格式错误",
+    "account:email-domain-rejected": "邮箱域名被拒",
+    "account:email-domain-pending": "邮箱域名待审核",
+    "account:email-signup-unavailable": "该邮箱不可注册",
+    "account:cannot-unlink-last-sign-in-method": "不能解绑最后一个登录方式",
+    "account:cannot-unlink-sso-managed-account": "SSO 托管账号不能解绑",
+    "account:oauth-data-token-not-found": "OAuth 数据令牌不存在",
+    "account:user-underage": "用户未成年",
+    "account:password-reset-login-required": "★ 必须改密码后才能登录（锁定）",
+    "account:select-account": "需要选择账号",
+    "account:creation-skipped": "账号创建被跳过",
+    "account:existing-email": "邮箱已存在",
+    # anti-abuse / castle
+    "anti-abuse:token-missing": "★ 缺反滥用令牌（Turnstile）",
+    "castle:token-failed": "★ Castle 反欺诈令牌失败",
+    # form-invalid:*
+    "form-invalid:password": "密码不符合要求",
+    "form-invalid:disposable-email": "★ 一次性邮箱被封",
+    # rate-limit / email / mfa
+    "rate-limit:too-many-requests": "请求过多",
+    "email:invalid-validation-code": "验证码错误",
+    "email:send-validation-code-rate-limited": "验证码发送过频",
+    "email:validation-code-expired": "验证码过期",
+    "mfa:invalid-otp": "OTP 错误",
+    "mfa:session-verify": "需要 MFA 会话验证",
+    "mfa:use-mfa-recovery-code-rate-limited": "恢复码使用过频",
+    # oauth:*
+    "oauth:exchange-failed": "OAuth 交换失败",
+    "oauth:id-token-exchange-not-configured": "未配置 id_token 交换",
+    "oauth:missing-code": "缺 code",
+    "oauth:missing-id-token": "缺 id_token",
+    "oauth:missing-nonce": "缺 nonce",
+    "oauth:missing-state": "缺 state",
+    "oauth:provider-unavailable": "OAuth 提供方不可用",
+    "sso:exchange-failed": "SSO 交换失败",
+    # unauthenticated:*
+    "unauthenticated:bad-credentials": "凭证无效",
+    "unauthenticated:invalid-credentials": "凭证不正确",
+    "unauthenticated:no-credentials": "未提供凭证",
+    "unauthenticated:session-expired": "会话过期",
+    # unauthorized:*
+    "unauthorized:auth-method-not-allowed": "该登录方式不允许",
+    "unauthorized:banned-organization": "组织被封禁",
+    "unauthorized:blocked-user": "★★ 账号已被封禁（真正的拉黑）",
+    "unauthorized:blocked-user-cursor-enterprise": "Cursor 企业账号被封",
+    "unauthorized:blocked-user-underage": "账号因未成年被封",
+    "unauthorized:deleted-user": "账号已删除",
+    "unauthorized:email-domain-not-allowed": "邮箱域名不允许",
+    "unauthorized:google-oauth-only-domain": "该域名只能用 Google 登录",
+    "unauthorized:grok-cli-token-auth-forbidden": "CLI 令牌被拒",
+    "unauthorized:grok-cli-token-auth-required": "需要 CLI 令牌",
+    "unauthorized:impersonation-forbidden": "禁止模拟",
+    "unauthorized:integration-forbidden": "集成被拒",
+    "unauthorized:missing-acl": "缺 ACL",
+    "unauthorized:missing-email": "缺邮箱",
+    "unauthorized:oauth2-auth-forbidden": "★ OAuth2 令牌被策略拒绝",
+    "unauthorized:oauth2-auth-required": "需要 OAuth2 令牌",
+    "unauthorized:rw-required": "需要读写权限",
+    "unauthorized:second-factor-needed": "需要二次验证",
+    "unauthorized:session-expired": "会话过期",
+    "unauthorized:sso-action-not-allowed": "SSO 动作不允许",
+    "unauthorized:sso-only-domain": "该域名只能用 SSO 登录",
+    "unauthorized:tos-accepted-version-required": "需要接受新版 TOS",
+    "unauthorized:unconfirmed-email": "邮箱未确认",
+    "unauthorized:x-chat-auth-forbidden": "X 聊天鉴权被拒",
+    "unauthorized:x-chat-auth-required": "需要 X 聊天鉴权",
+    "unauthorized:x-developer-auth-forbidden": "X 开发者鉴权被拒",
+    "unauthorized:x-developer-auth-required": "需要 X 开发者鉴权",
+    "unauthorized:x-user-auth-required": "需要 X 用户鉴权",
+    "unauthorized:x-user-suspended": "X 账号被停用",
+}
+
+# 官方英文文案（bundle 里的映射原文）
+AUTH_ERROR_MESSAGES = {
+    "unauthorized:blocked-user": "Your account has been blocked.",
+    "unauthorized:deleted-user": "This account has been deleted.",
+    "unauthorized:x-user-suspended": "This X account has been suspended.",
+    "unauthorized:sso-only-domain": "This email domain requires SSO sign-in.",
+    "unauthorized:missing-email": ("We couldn’t get an email address from that "
+                                   "account. Try another sign-in method."),
+    "castle:token-failed": "Something went wrong. Please try again.",
+}
+
+# 终态：命中即应丢弃账号，不再重试
+TERMINAL_AUTH_CODES = frozenset({
+    "account:password-reset-login-required",
+    "unauthorized:blocked-user",
+    "unauthorized:blocked-user-cursor-enterprise",
+    "unauthorized:blocked-user-underage",
+    "unauthorized:banned-organization",
+    "unauthorized:deleted-user",
+    "unauthorized:x-user-suspended",
+    "form-invalid:disposable-email",
+})
+
+# Castle 反欺诈引擎参数（bundle 实证）
+CASTLE_TOKEN_TTL_MS = 60_000          # Date.now() + 6e4
+CASTLE_METHODS = ("auth", "chat", "commerce")
+CASTLE_TIMEOUTS = {"open": {"initMs": 5000, "mintMs": 4000},
+                   "closed": {"initMs": 10000, "mintMs": 10000}}
+CASTLE_FAILURE_CAUSES = ("mint_error", "castle-token-timeout",
+                         "unmatched-castle-token-result")
+
+# Turnstile
+TURNSTILE_SITEKEY = "0x4AAAAAABSXp6OOe7EVGPnR"
+TURNSTILE_VERIFY_PATH = "/api/verify-turnstile"
+
+# 登录接口（实测可达）
+AUTH_CREATE_SESSION_PATH = "/rest/auth/create-session"
+AUTH_CREATE_SESSION_V2_PATH = "/rest/auth/create-session-v2"
+AUTH_GET_USER_PATH = "/rest/auth/get-user"
+AUTH_LIST_TEAMS_PATH = "/rest/auth/list-teams"
+AUTH_GET_USER_FEATURE_CONTROLS_PATH = "/rest/auth/get-user-feature-controls"
+AUTH_LIST_MFA_DEVICES_PATH = "/rest/auth/list-mfa-devices"
+AUTH_GET_AUTH_STATUS_PATH = "/rest/auth/get-auth-status"
+
+# 登录方式枚举（bundle 实证）
+AUTH_METHODS = {
+    0: "UNSPECIFIED", 1: "EMAIL_PASSWORD", 2: "GOOGLE_OAUTH2",
+    3: "X_OAUTH2", 4: "APPLE_OAUTH2", 5: "SSO", 6: "KEYCLOAK_OIDC",
+    7: "SPACEX_OIDC", 8: "GITHUB_OAUTH2", 9: "EMAIL_CODE",
+    10: "CURSOR_PARTNER", 11: "CURSOR_SIGN_IN_LINK", 12: "ANDROID_RESTORE_KEY",
+}
+
+
+def auth_error_code(text: str) -> str | None:
+    """从响应里抽出 `WKE=<code>` 形式的认证错误码。"""
+    raw = str(text or "")
+    marker = "WKE="
+    idx = raw.find(marker)
+    if idx >= 0:
+        rest = raw[idx + len(marker):]
+        for stop in ('"', "]", "}", " ", chr(92)):
+            cut = rest.find(stop)
+            if cut > 0:
+                rest = rest[:cut]
+        return rest.strip() or None
+    for code in AUTH_ERROR_CODES:
+        if code in raw:
+            return code
+    return None
+
+
+def is_terminal_auth_error(text: str) -> bool:
+    """命中终态认证错误 —— 应丢弃账号，不再重试。
+
+    含 `unauthorized:blocked-user`（"Your account has been blocked."）、
+    `account:password-reset-login-required`、`form-invalid:disposable-email` 等。
+    """
+    code = auth_error_code(text)
+    return bool(code) and code in TERMINAL_AUTH_CODES
+
+
 def download_image(
     key: str,
     *,

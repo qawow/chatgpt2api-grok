@@ -2663,6 +2663,151 @@ a && e("x-acting-organization-id", a)
 这些是**单次请求被拒**，账号本身仍然健康（`remote_probe` 仍报"正常"）。
 它们不消耗账号寿命，只是返回一句中文拒绝文案。
 
+### 1.25 ★★★ 认证协议逆向：风控的两层结构
+
+从 bundle `1p85i_ke_7ewx.js` / `0x345nc95_lqy.js` / `0__nwepjsaz6y.js`
+提取，并用真实凭证实测。
+
+#### 登录接口（实测可达）
+
+```
+POST /rest/auth/create-session-v2     ← 主登录入口
+POST /rest/auth/create-session        ← v1，同一套 body
+GET  /rest/auth/get-user              ← 200，返回完整用户记录
+GET  /rest/auth/list-teams            ← 200
+GET  /rest/auth/get-user-feature-controls  ← {"allowNsfwContent":true,...}
+GET  /rest/auth/list-mfa-devices      ← {"devices":[]}
+GET  /rest/auth/get-auth-status       ← {} （已登录时为空）
+```
+
+#### ★ 登录 body 的确切形状（爆破得出）
+
+**经过 40+ 次字段名探测才确定** —— 服务端只回一句
+`"Credentials must be provided."`，且**未知字段被静默忽略**，
+所以只能靠「错误是否变化」来定位：
+
+```jsonc
+{"credentials": {"emailAndPassword": {"email": "...", "password": "..."}}}
+```
+
+命中后错误立刻变成：
+
+```json
+{"code":7,"message":"Anti-abuse token is missing. [WKE=anti-abuse:token-missing]"}
+```
+
+**这就是风控的第一道闸：密码登录强制要求反滥用令牌。**
+
+探测过程中的关键观察：
+
+| 输入 | 结果 |
+|---|---|
+| `{"credentials": {}}` | `Credentials must be provided.` |
+| `{"credentials": 1}` / `[]` / `true` / `""` | `proto: syntax error (line 1:17): unexpected token …` |
+| `{"credentials": {"email": "...", "password": "..."}}` | 仍是 `Credentials must be provided.`（字段名不对，被忽略） |
+| `{"bogusFieldXyz": 1}` | 仍是基线错误（**顶层未知字段被静默忽略**） |
+| **`{"credentials":{"emailAndPassword":{...}}}`** | **`403 anti-abuse:token-missing`** ★ |
+
+`line 1:17` 这个位置也确认了 `credentials` 在 JSON 里的偏移。
+
+#### 风控第一层：Cloudflare Turnstile
+
+```
+sitekey:  0x4AAAAAABSXp6OOe7EVGPnR
+endpoint: POST /api/verify-turnstile  {"token": "<turnstile-token>"}
+        → {"success": true|false}
+```
+
+回调链：`callback`（成功）/ `error-callback`（`Turnstile challenge failed`）/
+`expired-callback`（`Turnstile token expired`）/ `timeout-callback`。
+
+#### 风控第二层：Castle（第三方反欺诈引擎）
+
+```
+castle-provider  →  createRequestToken({method})
+                     method ∈ {"auth", "chat", "commerce"}
+```
+
+| 参数 | 实测值 |
+|---|---|
+| 令牌 TTL | **60 秒**（`Date.now() + 6e4`） |
+| 前台标签页超时 | `init 5s` / `mint 4s` |
+| 后台标签页超时 | `init 10s` / `mint 10s` |
+| 失败原因 | `mint_error` / `castle-token-timeout` / `unmatched-castle-token-result` |
+| 错误类 | `CastleTokenError` |
+| 遥测事件 | `castle_mint` / `castle_mint_failed` |
+| Feature flag | `ENABLE_CASTLE_CHAT_MINTING` / `enableAuthMinting` / `enableCommerceMinting` |
+
+**Chat 请求也铸 Castle 令牌**（`registerCastleChatMinter`，
+在用户输入时 `refreshCastleChatToken()`）—— 所以不只是登录，
+**发消息也在被风控打分**。
+
+#### 完整错误码表（66 个，9 个命名空间）
+
+服务端用 `WKE=<code>` 标识错误。**真正的"拉黑"是**：
+
+```
+unauthorized:blocked-user   →   "Your account has been blocked."
+```
+
+按命名空间统计：
+
+| 命名空间 | 数量 | 代表 |
+|---|---|---|
+| `unauthorized:*` | **29** | `blocked-user` / `banned-organization` / `x-user-suspended` / `deleted-user` / `oauth2-auth-forbidden` |
+| `account:*` | 14 | `password-reset-login-required` / `invalid-credentials` / `email-domain-rejected` |
+| `oauth:*` | 7 | `exchange-failed` / `missing-nonce` |
+| `unauthenticated:*` | 4 | `bad-credentials` / `session-expired` |
+| `mfa:*` | 3 | `invalid-otp` |
+| `email:*` | 3 | `invalid-validation-code` / `send-validation-code-rate-limited` |
+| `form-invalid:*` | 2 | **`disposable-email`** / `password` |
+| `anti-abuse:*` | 1 | `token-missing` |
+| `castle:*` | 1 | `token-failed` |
+| `rate-limit:*` | 1 | `too-many-requests` |
+| `sso:*` | 1 | `exchange-failed` |
+
+#### ★ 一次性邮箱被封
+
+```
+form-invalid:disposable-email
+```
+
+**这是本项目账号池大规模死亡的一个直接原因** —— 号池用的全是临时邮箱域名
+（`awa91.cyou` / `5122331.xyz` / `cyt233.dpdns.org` / `rtz47.vm59hcmj...`）。
+
+#### 其它封禁态
+
+```
+unauthorized:banned-organization           组织被封禁
+unauthorized:blocked-user-cursor-enterprise Cursor 企业账号被封
+unauthorized:blocked-user-underage         未成年
+unauthorized:x-user-suspended              X 账号被停用
+unauthorized:deleted-user                  账号已删除
+```
+
+#### 登录方式枚举（13 种）
+
+```
+0  UNSPECIFIED        1  EMAIL_PASSWORD     2  GOOGLE_OAUTH2
+3  X_OAUTH2           4  APPLE_OAUTH2       5  SSO
+6  KEYCLOAK_OIDC      7  SPACEX_OIDC        8  GITHUB_OAUTH2
+9  EMAIL_CODE         10 CURSOR_PARTNER     11 CURSOR_SIGN_IN_LINK
+12 ANDROID_RESTORE_KEY
+```
+
+#### 8 个终态（命中即应丢弃账号）
+
+```
+account:password-reset-login-required
+unauthorized:blocked-user
+unauthorized:blocked-user-cursor-enterprise
+unauthorized:blocked-user-underage
+unauthorized:banned-organization
+unauthorized:deleted-user
+unauthorized:x-user-suspended
+form-invalid:disposable-email
+```
+
 ## 2. 主对话端点
 
 ```
