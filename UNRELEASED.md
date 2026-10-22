@@ -170,6 +170,14 @@
 - 实测可达的认证端点：`POST /rest/auth/create-session-v2` / `create-session`，`GET /rest/auth/get-user` / `list-teams` / `get-user-feature-controls`（→ `{"allowNsfwContent":true}`）/ `list-mfa-devices` / `get-auth-status`。
 - 新增 `auth_error_code()` / `is_terminal_auth_error()` 与 `AUTH_ERROR_CODES`（66 条）/ `AUTH_ERROR_MESSAGES` / `TERMINAL_AUTH_CODES` / `CASTLE_*` / `TURNSTILE_*` / `AUTH_METHODS` / `AUTH_*_PATH` 常量。
 
+### `/api/verify-turnstile` 完整行为 + 两个未解项（2026-10-22）
+
+- **`POST /api/verify-turnstile`** 是 grok.com 自己的 Next.js API 路由，把 token 转给 Cloudflare `siteverify`。字段名就是 **`token`**。响应矩阵：`{}` → 400 `Missing or invalid Turnstile token`；`{"token":""}` → 400；`{"turnstileToken":"x"}` → 400（字段名不对）；`{"token":"x"}` → **403 `Invalid Turnstile token`**；`GET` → 405。**400 vs 403 是关键**：400 是「没给或给错字段」，403 说明服务端真的去 Cloudflare 校验了并失败。
+- **★★ 未解：`create-session-v2` 的反滥用令牌字段名。** 已穷举约 **300 个候选**：260 个 body 字段名（20 前缀 × 13 后缀，分别在顶层与 `credentials` 内层）、14 个请求头、12 种嵌套 message 形状，全部返回同一个 `403 anti-abuse:token-missing`。**结论：无法靠盲猜得出**，只能抓真实浏览器的登录请求；Castle 令牌由浏览器端 JS 铸造，静态 bundle 里没有明文。
+- **一个差点误判的陷阱**（已记录）：爆破中 `turnstileResponse` 内层连续 3 次返回 Cloudflare 质询页 `"Just a moment..."`，看起来像「字段对了、触发了更深层检查」。冷却后做对照 —— 基线正常、内层仍 CF、顶层正常 —— 证明那是**时间相关的边缘限流，与字段无关**。
+- **★ 反向发现：密集 auth 请求会触发 Cloudflare WAF。** 260 候选 × 2 形状、间隔 0.15s 的爆破连续收到 `<title>Just a moment...</title>` 挑战页。认证端点前面还有一层 Cloudflare WAF，对短时间内的重复 POST **独立于应用层限流**生效 —— 与 §1.24 的「密集重试 → 更长惩罚」是同一类机制的两层。
+- 新增 `verify_turnstile()` 与 `TURNSTILE_VERIFY_URL` 常量。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。
@@ -186,6 +194,6 @@
 unshare --net bash -c 'ip link set lo up && exec .venv/bin/python -m pytest -q --tb=short'
 ```
 
-全套结果：1257 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
+全套结果：1261 passed、17 skipped；另有 101 项 subtests 通过。跳过项依赖真实服务。两项已有警告涉及 SQLAlchemy 弃用接口及安全 Cookie 属性。前端类型检查 `web/node_modules/.bin/tsc --noEmit --incremental false -p web/tsconfig.json` 通过。
 
 验证前后，现有 `config.json`、`VERSION` 和 `data/` 内 JSON/版本文件的内容哈希应保持不变。发布前请确认没有未提交的密钥、没有更新发布标签。

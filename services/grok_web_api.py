@@ -3342,6 +3342,74 @@ def is_terminal_auth_error(text: str) -> bool:
     return bool(code) and code in TERMINAL_AUTH_CODES
 
 
+# --------------------------------------------------------------------------
+# Turnstile 校验端点（实测 2026-10-22）
+# --------------------------------------------------------------------------
+#
+# `POST /api/verify-turnstile` —— grok.com 自己的 API 路由，把 token 转给
+# Cloudflare `siteverify` 校验。
+#
+#   {"token": "<turnstile-token>"}       ← 字段名就是 token
+#
+# 实测响应矩阵：
+#
+#   {}                     → 400 {"error":"Missing or invalid Turnstile token"}
+#   {"token": ""}          → 400 同上
+#   {"turnstileToken":"x"} → 400 同上（字段名不对）
+#   {"response":"x"}       → 400 同上（字段名不对）
+#   {"token": "x"}         → 403 {"error":"Invalid Turnstile token"}
+#   GET                    → 405
+#
+# **400 vs 403 是关键**：400 是「没给或给错字段」；403 说明服务端真的去
+# Cloudflare 校验了并失败。所以只要能产出 token，这个端点会诚实回答真伪。
+TURNSTILE_VERIFY_URL = f"{WEB_BASE}/api/verify-turnstile"
+
+
+def verify_turnstile(
+    token: str,
+    *,
+    cookies: Any = None,
+    bearer: str | None = None,
+    proxy: str | None = None,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """把 Turnstile token 交给 grok.com 校验。
+
+    返回 `{"ok": bool, "status": int, "error": str | None}`。
+
+    实测：有效 token → 200 `{"success": true}`；无效 → 403
+    `{"error":"Invalid Turnstile token"}`；空/缺失 → 400。
+    """
+    value = str(token or "").strip()
+    if not value:
+        raise GrokWebError("Turnstile token 为空")
+    jar, bearer_token = _auth(cookies, bearer)
+    resp = _stream_post(
+        TURNSTILE_VERIFY_URL,
+        headers=build_headers(bearer=bearer_token),
+        cookies=jar,
+        body={"token": value},
+        proxy=proxy,
+        timeout=timeout,
+    )
+    with resp:
+        text = (resp.text or "").strip()
+        status = resp.status_code
+        data: Any = None
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+    ok = status == 200 and isinstance(data, dict) and bool(data.get("success"))
+    error = None
+    if not ok:
+        if isinstance(data, dict) and data.get("error"):
+            error = str(data["error"])
+        else:
+            error = text[:200] or f"HTTP {status}"
+    return {"ok": ok, "status": status, "error": error, "data": data}
+
+
 def download_image(
     key: str,
     *,

@@ -2946,3 +2946,64 @@ class AuthErrorCodeTest(unittest.TestCase):
         self.assertEqual(g.AUTH_CREATE_SESSION_V2_PATH,
                          "/rest/auth/create-session-v2")
         self.assertEqual(g.AUTH_GET_USER_PATH, "/rest/auth/get-user")
+
+
+class VerifyTurnstileTest(unittest.TestCase):
+    """`POST /api/verify-turnstile`（实测 2026-10-22）。
+
+    字段名就是 `token`。响应矩阵：
+
+        {}                     → 400 Missing or invalid Turnstile token
+        {"token": ""}          → 400 同上
+        {"turnstileToken":"x"} → 400 同上（字段名不对）
+        {"token": "x"}         → 403 Invalid Turnstile token
+        GET                    → 405
+
+    **400 vs 403 是关键**：400 是「没给或给错字段」；403 说明服务端真的去
+    Cloudflare 校验了并失败。
+    """
+
+    def _resp(self, payload, status=200):
+        from unittest import mock
+
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.text = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+        resp.json.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_a_valid_token_reports_ok(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp({"success": True})) as sp:
+            out = g.verify_turnstile("good-token")
+        self.assertTrue(out["ok"])
+        self.assertEqual(sp.call_args.kwargs["body"], {"token": "good-token"})
+
+    def test_an_invalid_token_reports_the_error(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post",
+                               return_value=self._resp(
+                                   {"error": "Invalid Turnstile token"}, 403)):
+            out = g.verify_turnstile("bad")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["status"], 403)
+        self.assertIn("Invalid Turnstile", out["error"])
+
+    def test_an_empty_token_is_rejected_locally(self):
+        from unittest import mock
+
+        with mock.patch.object(g, "_stream_post") as sp:
+            for token in ("", "   ", None):
+                with self.assertRaises(g.GrokWebError):
+                    g.verify_turnstile(token)
+            sp.assert_not_called()
+
+    def test_the_url_is_the_grok_route(self):
+        self.assertEqual(g.TURNSTILE_VERIFY_URL,
+                         f"{g.WEB_BASE}/api/verify-turnstile")
+        self.assertEqual(g.TURNSTILE_SITEKEY, "0x4AAAAAABSXp6OOe7EVGPnR")

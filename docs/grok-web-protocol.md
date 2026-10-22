@@ -2680,6 +2680,59 @@ GET  /rest/auth/list-mfa-devices      ← {"devices":[]}
 GET  /rest/auth/get-auth-status       ← {} （已登录时为空）
 ```
 
+#### `/api/verify-turnstile` 的完整行为（实测）
+
+这是 grok.com 自己的 API 路由（Next.js），把 Turnstile token 转给 Cloudflare
+`siteverify` 校验。
+
+```jsonc
+POST /api/verify-turnstile
+{"token": "<turnstile-token>"}          // 字段名就是 token
+```
+
+| 输入 | 响应 |
+|---|---|
+| `{}` | `400 {"error":"Missing or invalid Turnstile token"}` |
+| `{"token": ""}` | `400` 同上 |
+| `{"turnstileToken": "x"}` | `400` 同上（**字段名不对**） |
+| `{"response": "x"}` | `400` 同上（**字段名不对**） |
+| `{"token": "x"}` | **`403 {"error":"Invalid Turnstile token"}`** |
+| `GET` | `405` |
+
+**400 vs 403 的区别是关键**：400 是「没给或给错字段」；**403 说明服务端真的
+去 Cloudflare 校验了并失败**。所以只要有办法产出 token，这个端点会诚实回答
+真伪。
+
+#### ★★ 未解：`create-session-v2` 的反滥用令牌字段名
+
+**这是本次逆向唯一没攻下的点。** 已穷举约 **300 个候选**：
+
+- 260 个 body 字段名（`{antiAbuse,anti_abuse,turnstile,captcha,cf,castle,abuse,risk,fraud,bot,human,verification,challenge,proof,attestation,security,antiBot,anti_bot,device,session} × {Token,token,"",Response,response,String,Jwt,JWT,Payload,TokenString,VerificationToken,Challenge,Code}`），分别在**顶层**与 **`credentials` 内层**尝试
+- 14 个请求头（`x-castle-request-token` / `castle-request-token` / `x-turnstile-token` / `x-anti-abuse-token` / `cf-turnstile-response` 等）
+- 12 种嵌套 message 形状（`antiAbuse.token` / `antiAbuseToken.token` / `castle.token` 等）
+
+全部返回同一个 `403 anti-abuse:token-missing`。
+
+**一个差点误判的陷阱**：爆破过程中 `turnstileResponse` 内层连续 3 次返回
+Cloudflare 质询页（`"Just a moment..."`），看起来像「字段对了、触发了更深层
+检查」。但冷却后做对照——基线正常返回、内层仍 CF、顶层正常返回——证明
+**那是时间相关的边缘限流，与字段无关**。
+
+**结论：该字段名无法靠盲猜得出**，只能抓一次真实浏览器的登录请求。
+Castle 令牌由浏览器端 JS 铸造，静态 bundle 里没有明文。
+
+#### ★ 反向发现：密集 auth 请求会触发 Cloudflare WAF
+
+爆破过程中（260 候选 × 2 形状，间隔 0.15s）连续收到：
+
+```html
+<title>Just a moment...</title>   <!-- Cloudflare 挑战页 -->
+```
+
+**这本身是一个风控信号** —— 认证端点前面还有一层 Cloudflare WAF，
+对短时间内的重复 POST 独立于应用层限流生效。与 §1.24 的
+「密集重试 → 更长惩罚」是同一类机制的两层。
+
 #### ★ 登录 body 的确切形状（爆破得出）
 
 **经过 40+ 次字段名探测才确定** —— 服务端只回一句
