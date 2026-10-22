@@ -178,6 +178,15 @@
 - **★ 反向发现：密集 auth 请求会触发 Cloudflare WAF。** 260 候选 × 2 形状、间隔 0.15s 的爆破连续收到 `<title>Just a moment...</title>` 挑战页。认证端点前面还有一层 Cloudflare WAF，对短时间内的重复 POST **独立于应用层限流**生效 —— 与 §1.24 的「密集重试 → 更长惩罚」是同一类机制的两层。
 - 新增 `verify_turnstile()` 与 `TURNSTILE_VERIFY_URL` 常量。
 
+### 浏览器抓包尝试（未走通，工具留在 `.verify/`）
+
+- **CDP 直连可行**：`--remote-debugging-port` + 系统 `python3` 的 `websockets` 能完整驱动浏览器（`Page.navigate` / `Runtime.evaluate` / `Page.captureScreenshot` 全部工作）。环境里 `xvfb-run`、`chromium-1234`、`google-chrome 150.0.7871.128` 都在。
+- **直连 grok.com 卡在 Cloudflare 全站 Turnstile 挑战**（标题 `请稍候…`，正文「正在进行安全验证」，隐藏字段 `cf-turnstile-response`）—— 数据中心 IP 过不去。
+- **自写 HTTP→SOCKS5 桥部分可用**：`curl` 单发正常（`icanhazip.com` 200、`grok.com/rest/models` 200），但 **chromium 并发连接时 SOCKS5 握手层超时**。关键诊断：原始 TCP 连 `192.168.2.198:19053` **10/10 瞬间成功（0.00s）** —— 不是 TCP 层限流，是 SOCKS5 握手层对并发会话有限制。
+- **已知缺陷**：桥的 `pipe()` 在连接不关闭时会挂住，导致信号量槽位泄漏；继续的话应给 `pipe` 加空闲超时并强制关闭两端。
+- **建议**：不用自建桥，直接用 Playwright 的 `proxy: {server, username, password}`（原生支持 SOCKS5 认证），比自建桥可靠得多。
+- 工具（`.verify/`，未入库）：`cdp_capture_login.py` / `cdp_diag_page.py` / `http_to_socks_bridge.py`。
+
 ### 新增 API
 
 `services/grok_web_api.py` 新增：`download_image` / `free_usage_gates` / `imagine_quota` / `cli_rate_limits` / `billing` / `subscription` / `client_settings` / `auto_topup_rule` / `classify_upstream_error` / `clamp_rate_limit_cooldown` / `version_outdated` / `required_client_version` / `web_credits` / `product_name` / `usage_poll_interval_ms` / `crossed_usage_threshold` / `run_code` / `image_generations` / `generate_video` / `upload_file` / `diagnose_media_limit` / `media_gen_kind` / `build_text_to_video` / `build_image_gen_config` / `build_image_edit_config`，以及 `image_rate_limited` / `silent_degrade` 判定。

@@ -2721,6 +2721,29 @@ Cloudflare 质询页（`"Just a moment..."`），看起来像「字段对了、�
 **结论：该字段名无法靠盲猜得出**，只能抓一次真实浏览器的登录请求。
 Castle 令牌由浏览器端 JS 铸造，静态 bundle 里没有明文。
 
+#### 尝试过的浏览器路径（未走通，工具已留在 `.verify/`）
+
+| 步骤 | 结果 |
+|---|---|
+| 环境探测 | `xvfb-run` + `Xvfb` 可用；`chromium-1234/chrome-linux64/chrome`（Playwright 版）与 `/usr/bin/google-chrome`（150.0.7871.128）都在；系统 `python3` 有 `websockets` |
+| **CDP 直连** | ✅ **可用** —— `--remote-debugging-port` + `websockets` 能完整驱动浏览器，`Page.navigate` / `Runtime.evaluate` / `Page.captureScreenshot` 全部工作 |
+| **直连 grok.com** | ❌ 卡在 **Cloudflare 全站 Turnstile 挑战**（标题 `请稍候…`，页面正文「正在进行安全验证」，隐藏字段 `cf-turnstile-response`）。数据中心 IP 过不去 |
+| **HTTP→SOCKS5 桥** | ⚠️ 部分可用 —— 自己写了 `http_to_socks_bridge.py`（本地免认证 HTTP CONNECT 代理 → 带认证 SOCKS5）。**curl 单发正常**（`icanhazip.com` 200、`grok.com/rest/models` 200），但 **chromium 并发连接时 SOCKS5 握手层超时** |
+| 关键诊断 | 原始 TCP 连 `192.168.2.198:19053` **10/10 瞬间成功**（0.00s）—— 所以不是 TCP 层限流，是 **SOCKS5 握手层**对并发会话有限制 |
+
+**留作后续的工具**（都在 `.verify/`，未纳入版本控制）：
+`cdp_capture_login.py`（CDP 抓包 + 表单自动填写）、`cdp_diag_page.py`
+（页面状态分阶段诊断 + 截图）、`http_to_socks_bridge.py`（HTTP→SOCKS5 桥）。
+
+**已知缺陷**：桥的 `pipe()` 在连接不关闭时会挂住，导致信号量槽位泄漏；
+若要继续，应给 `pipe` 加空闲超时并在隧道结束时强制关闭两端。
+
+#### 若要继续，最省事的路径
+
+不用自己写桥：**让浏览器直接走宿主机上已有的可认证代理**，或给 chromium
+装一个支持 SOCKS5 用户名密码的扩展。Playwright 的 `proxy` 选项原生支持
+`{server, username, password}`，装一个 `playwright` 包比自建桥可靠得多。
+
 #### ★ 反向发现：密集 auth 请求会触发 Cloudflare WAF
 
 爆破过程中（260 候选 × 2 形状，间隔 0.15s）连续收到：
