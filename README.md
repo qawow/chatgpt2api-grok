@@ -273,11 +273,11 @@ environment:
 - 搜索：**没有独立端点**，内嵌在对话流里；来源在
   `outputChunks[].toolResult.webSearch.webpages[]`（20 字段富版本）
 - 画图：`kind: "CONVERSATION_KIND_IMAGINE"` + `mediaGenInput.textToImage`
-- 客户端：`services/grok_web_api.py`（`search()` / `generate_image()`）
-- 文档：[docs/grok-web-protocol.md](./docs/grok-web-protocol.md)
+- 客户端：`services/grok_web_api.py`（`search()` / `generate_image()` / `generate_video()` / `text_to_speech()` / `upload_file_v2()` / `quota_info()` / `run_code()` / `enhance_prompt()` 等）
+- 文档：[docs/grok-web-protocol.md](./docs/grok-web-protocol.md)（3600+ 行，§1.0–1.25）
 
-> **未实况验证**：本环境没有可用的 grok.com 会话 cookie，全部结论来自 bundle 静态逆向。
-> 解析层有 62 项单测覆盖，网络与认证需真实 cookie 才能确认。
+> **实测状态**：文生图、图生图（`mediaGenInput.imageToImage`，产出 768×1152 JPEG）、语音合成（TTS，24kHz 单声道 MP3）、代码执行（gVisor 沙箱）、模板库（20 个全免费）、提示词增强、文件上传 v2（三段式预签名 GCS）均已用真实凭证验证。媒体配额端点 `quota_info`（SSO cookie、24h 窗口）实测可用，配额按账号计量、与出口 IP 无关。
+> 风控为两层：Cloudflare Turnstile（sitekey `0x4AAAAAABSXp6OOe7EVGPnR`）+ Castle 反欺诈引擎（令牌 60s TTL，发消息也在打分）。生图失败有**五种形态**（含 agent 幻觉 —— 正文声称成功但 `cardAttachment` 为空），客户端提供自动识别。
 
 ### GPT Free 批量注册
 
@@ -291,6 +291,7 @@ environment:
 - 设置页 **GPT注册**：数量 / 并发 / 间隔 / 邮箱 / 代理 / CFD1 域名等可填；默认自动补号，保持号池至少 1 个可生图账号
 - **并发**：`concurrency` 不再被代理池大小钳制（1.8.13 起）。单代理部署下 3 并发实测 132.8 秒完成 3 号（44.3 秒/号），串行需 250.9 秒。要限制每个出口的并发数用 `max_per_proxy`（0=不限）
 - **收信域名**：`tempmail_domains` 是逐号轮换的域名池（1.8.13 起真正生效）。投递能力是**域名级**的 —— 实测 `5122331.xyz` 在 depth 1/10/12/17 全部可投递，而 `233159.xyz`、`awa91.cyou` 建号 API 返回 200 但邮件永远不到，`cyt233.dpdns.org` 命中 DBL 黑名单。`tempmail_subdomain_depth` 默认 10（单域名可用地址约 10^63，地址空间不是瓶颈）
+- **根域名轮换（1.8.14）**：封禁发生在 **eTLD+1 层面**，轮换子域无效。域名选择按根域名计数（`DomainRotator`）—— 每根域名上限 `mail_max_per_root_domain`（默认 20）、整根冷却 `mail_domain_cooldown_minutes`（默认 360）、被拒整根冷却、**「信发了但收不到」连续 `mail_silent_drop_limit`（默认 2）次整根冷却**。域名池只有一个根域名时打 warn。
 - 管理 API：`/api/gpt-register/settings`、`/start`、`/jobs*`、`/cancel`
 - 成功账号进入 **ChatGPT 号池**（不进 Grok）；默认 `push_mode=local` 进程内入库
 - 密钥放 `data/gpt_register.env` 或环境变量；SOCKS 需 `PySocks`

@@ -39,6 +39,16 @@
 | PPT / PSD 可编辑文件 | ❌  | 已移除。 |
 | 图片尺寸参数 | ⚠️ | 网页会把 `WxH` 写入提示词；Codex 工具会带 `size`。不是严格按像素出图。 |
 | 服务端图片 URL 缓存 | ✅  | 已实现。 |
+| Grok 网页协议逆向 | ✅  | `docs/grok-web-protocol.md`（3600+ 行）记录全部结论：250 个 `/rest/` 端点、媒体配额端点 `quota_info`（SSO cookie、24h 窗口）、生图失败五种形态（含 agent 幻觉）、20 种流内错误 kind、66 个认证错误码、Turnstile+Castle 两层风控、JWT 全量实测、请求头全集。 |
+| Grok 网页生图（`build` 模型） | ✅  | `POST /rest/app-chat/conversations/new` + `kind: CONVERSATION_KIND_IMAGINE` + `mediaGenInput.textToImage`，图片在 `cardAttachment.image_chunk.imageUrl`。直连模型 `imagine-image-gen` 比 `build` 快一倍。 |
+| Grok 图生图 | ✅  | `mediaGenInput.imageToImage` + 资产 key（或 v2 上传 fileUri），实测产出 768×1152 JPEG；消耗 `imagePro` 配额。 |
+| Grok 文件上传 v2 | ✅  | 三段式：`upload-file-v2/init` → `PUT 预签名 GCS URL`（须带 `requiredHeaders`）→ `complete`；v1 `upload-file` 已不可靠。 |
+| Grok 语音合成（TTS） | ✅  | `POST /rest/app-chat/text-to-speech`，NDJSON 流，产物 24kHz 单声道 128kbps MP3。 |
+| Grok 代码执行 | ✅  | `POST /rest/app-chat/run-code`，CPython 3.12.3 / Node 24 / bash，gVisor 沙箱（DNS 通、TCP 拒）。 |
+| Grok 模板库 | ✅  | `POST /rest/media/pipeline/template/list`，20 个模板全部 `creditCost: 0`（免费），16 图 + 4 视频。 |
+| Grok 提示词增强 | ✅  | `imagine-video-prompt-enhance` 纯文本模型，**不消耗媒体配额**。 |
+| 域名轮换按根域名计数 | ✅  | 修「注册太多封根域名」：`DomainRotator` 每根上限 + 整根冷却 + 拒绝记忆 + 静默丢弃判据（`mail_max_per_root_domain` / `mail_domain_cooldown_minutes` / `mail_silent_drop_limit`）。 |
+| 媒体配额按账号计量 | ✅  | 轮换住宅代理对照实验证明：配额与出口 IP 无关，24 小时窗口。 |
 | `rt_token` 刷新 | ❌  | 待实现。 |
 | 代理配置功能 | ✅  | 网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H；账号绑定 `proxy` 后不再回落 runtime / 全局 / 直连。 |
 | session_only 免费号生图 | ✅  | 无 `refresh_token` 也可生图；复用 `oai-device-id` / session cookie；`chat_requirements_prepare` 401 不 hard revoke，同请求换号，对外 `upstream session expired`。 |
