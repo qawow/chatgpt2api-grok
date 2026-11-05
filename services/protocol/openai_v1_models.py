@@ -15,6 +15,7 @@ from utils.image_models import (
     PROVIDER_GROK,
     PROVIDER_ZHITU360,
     WEB_IMAGE_MODEL,
+    WEB_IMAGE_MODEL_26,
     ZHITU360_IMAGE_MODELS,
 )
 
@@ -42,7 +43,7 @@ def chatgpt_image_models() -> list[str]:
     accounts = [account for account in account_service.list_accounts() if isinstance(account, dict)]
     if not accounts:
         return []
-    models = [WEB_IMAGE_MODEL]
+    models = [WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26]
     codex_types = {
         normalized
         for account in accounts

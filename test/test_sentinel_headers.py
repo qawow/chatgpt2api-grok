@@ -136,6 +136,37 @@ class SentinelHeaderEmissionTests(unittest.TestCase):
         self.assertEqual(headers[SENTINEL_HEADER_PROOF], "proof-token")
         self.assertEqual(headers["X-Conduit-Token"], "conduit")
 
+    def test_image_headers_emit_existing_challenge_tokens(self):
+        for path, accept in (
+            ("/backend-api/f/conversation/prepare", "*/*"),
+            ("/backend-api/f/conversation", "text/event-stream"),
+            ("/backend-api/f/conversation/resume", "text/event-stream"),
+        ):
+            with self.subTest(path=path):
+                headers = self.api._image_headers(path, self._requirements(), "conduit", accept)
+                self.assertEqual(headers[SENTINEL_HEADER_TURNSTILE], "turnstile-token")
+                self.assertEqual(headers[SENTINEL_HEADER_SESSION_OBSERVER], "so-token")
+
+    def test_image_headers_do_not_fabricate_challenge_tokens(self):
+        from services.openai_backend_api import ChatRequirements
+
+        headers = self.api._image_headers("/backend-api/f/conversation", ChatRequirements(token="requirements"))
+        for name in (SENTINEL_HEADER_PROOF, SENTINEL_HEADER_TURNSTILE, SENTINEL_HEADER_SESSION_OBSERVER):
+            self.assertNotIn(name, headers)
+
+    def test_mcp_form_version_is_limited_to_prepare_and_start(self):
+        for path in ("/backend-api/f/conversation/prepare", "/backend-api/f/conversation"):
+            self.assertEqual(self.api._image_headers(path, self._requirements())["x-oai-mcp-form-version"], "2")
+        for path in ("/backend-api/f/conversation/resume", "/backend-api/files/file-unit/content"):
+            self.assertNotIn("x-oai-mcp-form-version", self.api._image_headers(path, self._requirements()))
+
+    def test_explicit_turn_trace_survives_resume(self):
+        for path in ("/backend-api/f/conversation", "/backend-api/f/conversation/resume"):
+            headers = self.api._image_headers(
+                path, self._requirements(), "conduit", "text/event-stream", turn_trace_id="unit-turn-trace",
+            )
+            self.assertEqual(headers["X-Oai-Turn-Trace-Id"], "unit-turn-trace")
+
     def test_telemetry_is_omitted_when_absent(self):
         """没有 proof/turnstile 时不应凭空造出这两个头。"""
         from services.openai_backend_api import ChatRequirements

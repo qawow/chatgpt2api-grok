@@ -15,10 +15,11 @@ from fastapi import HTTPException
 from PIL import Image
 
 from services.config import DATA_DIR, config
+from utils.image_media import sniff_image_media
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 class ImageStorageError(RuntimeError):
@@ -222,7 +223,8 @@ class ImageStorageService:
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
-        filename = f"{int(time.time())}_{file_hash}.png"
+        _, extension = sniff_image_media(image_data)
+        filename = f"{int(time.time())}_{file_hash}{extension}"
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
@@ -245,7 +247,7 @@ class ImageStorageService:
         if mode in {"webdav", "both"}:
             client = WebDAVClient(self.settings())
             try:
-                remote_url = client.put(rel, image_data)
+                remote_url = client.put(rel, image_data, content_type=sniff_image_media(image_data)[0])
             finally:
                 _close_webdav_client(client)
             stored_webdav = True
@@ -439,7 +441,7 @@ class ImageStorageService:
                         continue
                     try:
                         payload = path.read_bytes()
-                        remote_url = client.put(rel, payload)
+                        remote_url = client.put(rel, payload, content_type=sniff_image_media(payload)[0])
                         dimensions = _image_dimensions(payload)
                         items[rel] = {
                             **item,

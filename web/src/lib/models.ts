@@ -4,6 +4,7 @@
 // documentation examples and capability checks.
 
 export const WEB_IMAGE_MODEL = "gpt-image-2.5";
+export const WEB_IMAGE_MODEL_26 = "gpt-image-2.6";
 export const CODEX_IMAGE_MODEL = "codex-gpt-image-2";
 export const GROK_IMAGINE_IMAGE_MODEL = "grok-imagine-image";
 export const GROK_2_IMAGE_MODEL = "grok-2-image";
@@ -15,6 +16,7 @@ export const DEFAULT_IMAGE_MODEL = WEB_IMAGE_MODEL;
 /** Canonical ids shown in docs / the API card. */
 export const DOCUMENTED_IMAGE_MODELS: readonly string[] = [
   WEB_IMAGE_MODEL,
+  WEB_IMAGE_MODEL_26,
   CODEX_IMAGE_MODEL,
   GROK_IMAGINE_IMAGE_MODEL,
   GROK_2_IMAGE_MODEL,

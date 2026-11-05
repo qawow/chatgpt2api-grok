@@ -1,23 +1,54 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
+from fastapi.responses import FileResponse
 from PIL import Image
 
+from services import image_service
 from services.image_storage_service import ImageStorageError, ImageStorageService, WebDAVClient
+from utils.image_media import sniff_image_media
+
+
+def image_bytes(image_format: str) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(buffer, format=image_format)
+    return buffer.getvalue()
 
 
 def png_bytes() -> bytes:
-    path = Path(tempfile.gettempdir()) / "chatgpt2api-test-image.png"
-    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(path, format="PNG")
-    return path.read_bytes()
+    return image_bytes("PNG")
+
+
+def animated_gif_bytes() -> bytes:
+    buffer = io.BytesIO()
+    first = Image.new("RGB", (2, 2), color=(255, 0, 0))
+    second = Image.new("RGB", (2, 2), color=(0, 0, 255))
+    first.save(
+        buffer, format="GIF", save_all=True, append_images=[second],
+        duration=[100, 200], loop=2, disposal=2,
+    )
+    return buffer.getvalue()
+
+
+def image_fixtures() -> list[tuple[bytes, str, str]]:
+    return [
+        (png_bytes(), "image/png", ".png"),
+        (image_bytes("JPEG"), "image/jpeg", ".jpg"),
+        (image_bytes("WEBP"), "image/webp", ".webp"),
+        (animated_gif_bytes(), "image/gif", ".gif"),
+    ]
 
 
 class FakeWebDAVClient:
     uploaded: dict[str, bytes] = {}
+    content_types: dict[str, str] = {}
     deleted: list[str] = []
     instances: list["FakeWebDAVClient"] = []
 
@@ -28,8 +59,9 @@ class FakeWebDAVClient:
     def close(self):
         self.closed = True
 
-    def put(self, rel: str, payload: bytes) -> str:
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
         self.uploaded[rel] = payload
+        self.content_types[rel] = content_type
         return f"https://dav.example.test/{rel}"
 
     def get(self, rel: str) -> bytes:
@@ -38,12 +70,30 @@ class FakeWebDAVClient:
     def delete(self, rel: str) -> bool:
         self.deleted.append(rel)
         self.uploaded.pop(rel, None)
+        self.content_types.pop(rel, None)
         return True
 
     def test(self) -> dict[str, object]:
         self.put(".chatgpt2api_webdav_test.txt", b"chatgpt2api webdav test\n")
         self.delete(".chatgpt2api_webdav_test.txt")
         return {"ok": True, "status": 200, "error": None}
+
+
+class ImageMediaTests(unittest.TestCase):
+    def test_supported_media_signatures(self):
+        for payload, mime_type, extension in image_fixtures():
+            with self.subTest(mime_type=mime_type):
+                self.assertEqual(sniff_image_media(payload), (mime_type, extension))
+
+    def test_both_gif_signature_versions(self):
+        for signature in (b"GIF87a", b"GIF89a"):
+            with self.subTest(signature=signature):
+                self.assertEqual(sniff_image_media(signature), ("image/gif", ".gif"))
+
+    def test_unknown_and_short_payloads_keep_png_fallback(self):
+        for payload in (b"", b"opaque", b"GIF", b"GIF90a", b"RIFF", b"RIFF\x00\x00\x00\x00WAVE"):
+            with self.subTest(payload=payload):
+                self.assertEqual(sniff_image_media(payload), ("image/png", ".png"))
 
 
 class ImageStorageServiceTests(unittest.TestCase):
@@ -69,6 +119,7 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.mock_config.cleanup_old_images.return_value = 0
         self.mock_config.get_image_storage_settings.side_effect = lambda: dict(self.settings)
         FakeWebDAVClient.uploaded = {}
+        FakeWebDAVClient.content_types = {}
         FakeWebDAVClient.deleted = []
         FakeWebDAVClient.instances = []
 
@@ -205,6 +256,224 @@ class ImageStorageServiceTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 service.sync_all()
         client.close.assert_called_once_with()
+
+    def _assert_gif_animation(self, payload: bytes):
+        with Image.open(io.BytesIO(payload)) as image:
+            self.assertEqual(image.format, "GIF")
+            self.assertEqual(image.n_frames, 2)
+            self.assertEqual(image.info.get("loop"), 2)
+            durations = []
+            for index in range(image.n_frames):
+                image.seek(index)
+                durations.append(image.info.get("duration"))
+            self.assertEqual(durations, [100, 200])
+
+    def test_png_relative_path_rule_is_unchanged(self):
+        payload = png_bytes()
+        date_parts = {"%Y": "2026", "%m": "11", "%d": "05"}
+        with (
+            mock.patch("services.image_storage_service.time.time", return_value=1234567890),
+            mock.patch("services.image_storage_service.time.strftime", side_effect=date_parts.__getitem__),
+        ):
+            rel = self.service().make_relative_path(payload)
+        self.assertEqual(rel, f"2026/11/05/1234567890_{hashlib.md5(payload).hexdigest()}.png")
+
+    def test_unknown_payload_keeps_png_suffix_and_original_bytes(self):
+        payload = b"opaque legacy payload"
+        service = self.service()
+        stored = service.save(payload)
+        self.assertEqual(Path(stored.rel).suffix, ".png")
+        self.assertEqual(service.get_bytes(stored.rel), payload)
+
+    def test_local_saves_preserve_each_media_format(self):
+        service = self.service()
+        for payload, mime_type, extension in image_fixtures():
+            with self.subTest(mime_type=mime_type):
+                stored = service.save(payload, "http://app.test")
+                self.assertEqual(Path(stored.rel).suffix, extension)
+                self.assertEqual((self.images_dir / stored.rel).read_bytes(), payload)
+                self.assertEqual(service.get_bytes(stored.rel), payload)
+                self.assertTrue(service.exists(stored.rel))
+                self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+                item = service._load_index()[stored.rel]
+                self.assertNotIn("mime_type", item)
+                self.assertNotIn("content_type", item)
+
+    def test_webdav_saves_preserve_each_media_format_and_content_type(self):
+        self.settings.update({"enabled": True, "mode": "webdav", "webdav_url": "https://dav.example.test"})
+        service = self.service()
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            for payload, mime_type, extension in image_fixtures():
+                with self.subTest(mime_type=mime_type):
+                    stored = service.save(payload)
+                    self.assertEqual(Path(stored.rel).suffix, extension)
+                    self.assertEqual(FakeWebDAVClient.uploaded[stored.rel], payload)
+                    self.assertEqual(FakeWebDAVClient.content_types[stored.rel], mime_type)
+                    self.assertEqual(service.get_bytes(stored.rel), payload)
+                    self.assertFalse((self.images_dir / stored.rel).exists())
+                    self.assertTrue(service.exists(stored.rel))
+        self.assertTrue(all(client.closed for client in FakeWebDAVClient.instances))
+
+    def test_sync_uses_payload_mime_without_renaming_legacy_paths(self):
+        self.settings.update({"enabled": True, "mode": "both", "webdav_url": "https://dav.example.test"})
+        self.images_dir.mkdir(parents=True)
+        fixtures = {f"sync{extension}": (payload, mime_type)
+                    for payload, mime_type, extension in image_fixtures()}
+        fixtures["legacy.png"] = (animated_gif_bytes(), "image/gif")
+        for rel, (payload, _mime_type) in fixtures.items():
+            (self.images_dir / rel).write_bytes(payload)
+        service = self.service()
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            result = service.sync_all()
+        self.assertEqual(result, {"uploaded": len(fixtures), "skipped": 0, "failed": 0})
+        self.assertEqual(set(service._load_index()), set(fixtures))
+        for rel, (payload, mime_type) in fixtures.items():
+            with self.subTest(rel=rel):
+                self.assertEqual(FakeWebDAVClient.uploaded[rel], payload)
+                self.assertEqual(FakeWebDAVClient.content_types[rel], mime_type)
+                self.assertEqual((self.images_dir / rel).read_bytes(), payload)
+        self.assertTrue((self.images_dir / "legacy.png").is_file())
+        self.assertTrue(all(client.closed for client in FakeWebDAVClient.instances))
+
+    def test_both_mode_preserves_gif_frames_durations_and_loop(self):
+        self.settings.update({"enabled": True, "mode": "both", "webdav_url": "https://dav.example.test"})
+        payload = animated_gif_bytes()
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            stored = self.service().save(payload)
+        self.assertEqual(Path(stored.rel).suffix, ".gif")
+        self.assertEqual(FakeWebDAVClient.content_types[stored.rel], "image/gif")
+        for saved_payload in ((self.images_dir / stored.rel).read_bytes(), FakeWebDAVClient.uploaded[stored.rel]):
+            self.assertEqual(saved_payload, payload)
+            self.assertEqual(hashlib.sha256(saved_payload).digest(), hashlib.sha256(payload).digest())
+            self._assert_gif_animation(saved_payload)
+
+    def test_local_http_headers_use_payload_mime(self):
+        service = self.service()
+        with (
+            mock.patch("services.image_service.config", self.mock_config),
+            mock.patch("services.image_service.image_storage_service", service),
+        ):
+            for payload, mime_type, _extension in image_fixtures():
+                stored = service.save(payload)
+                for handler in (image_service.get_image_response, image_service.get_image_download_response):
+                    with self.subTest(mime_type=mime_type, handler=handler.__name__):
+                        with mock.patch.object(service, "get_bytes", side_effect=AssertionError("local must stream")) as get_bytes:
+                            response = handler(stored.rel)
+                        get_bytes.assert_not_called()
+                        self.assertIsInstance(response, FileResponse)
+                        self.assertEqual(response.headers["content-type"], mime_type)
+                        self.assertEqual(response.headers["access-control-allow-origin"], "*")
+                        self.assertEqual(Path(response.path), (self.images_dir / stored.rel).resolve())
+                        self.assertEqual((self.images_dir / stored.rel).read_bytes(), payload)
+
+    def test_local_header_sniff_reads_only_twelve_bytes(self):
+        path = mock.MagicMock(spec=Path)
+        handle = path.open.return_value.__enter__.return_value
+        handle.read.return_value = animated_gif_bytes()[:12]
+        self.assertEqual(image_service._local_image_media_type(path), "image/gif")
+        path.open.assert_called_once_with("rb")
+        handle.read.assert_called_once_with(12)
+
+    def test_remote_http_headers_use_payload_mime_and_fetch_once(self):
+        self.settings.update({"enabled": True, "mode": "webdav", "webdav_url": "https://dav.example.test"})
+        service = self.service()
+        with (
+            mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient),
+            mock.patch("services.image_service.config", self.mock_config),
+            mock.patch("services.image_service.image_storage_service", service),
+        ):
+            for payload, mime_type, _extension in image_fixtures():
+                stored = service.save(payload)
+                for handler in (image_service.get_image_response, image_service.get_image_download_response):
+                    with self.subTest(mime_type=mime_type, handler=handler.__name__):
+                        with mock.patch.object(service, "get_bytes", wraps=service.get_bytes) as get_bytes:
+                            response = handler(stored.rel)
+                        get_bytes.assert_called_once_with(stored.rel)
+                        self.assertEqual(response.headers["content-type"], mime_type)
+                        self.assertEqual(response.headers["access-control-allow-origin"], "*")
+                        self.assertEqual(response.body, payload)
+                        if mime_type == "image/gif":
+                            self._assert_gif_animation(response.body)
+        self.assertTrue(all(client.closed for client in FakeWebDAVClient.instances))
+
+    def test_local_legacy_png_url_serves_original_gif(self):
+        rel = "2026/11/05/legacy.png"
+        payload = animated_gif_bytes()
+        path = self.images_dir / rel
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        service = self.service()
+        with (
+            mock.patch("services.image_service.config", self.mock_config),
+            mock.patch("services.image_service.image_storage_service", service),
+        ):
+            response = image_service.get_image_response(rel)
+            download = image_service.get_image_download_response(rel)
+        self.assertEqual(response.headers["content-type"], "image/gif")
+        self.assertEqual(download.headers["content-type"], "image/gif")
+        self.assertEqual(download.headers["content-disposition"], 'attachment; filename="legacy.png"')
+        self.assertEqual(Path(response.path), path.resolve())
+        self.assertEqual(Path(download.path), path.resolve())
+        self.assertEqual(path.read_bytes(), payload)
+        self._assert_gif_animation(path.read_bytes())
+        self.assertEqual(service.list_items("http://app.test")[0]["url"], f"http://app.test/images/{rel}")
+
+    def test_remote_legacy_png_url_serves_original_gif_without_index_changes(self):
+        self.settings.update({"enabled": True, "mode": "webdav", "webdav_url": "https://dav.example.test"})
+        rel = "2026/11/05/legacy.png"
+        payload = animated_gif_bytes()
+        item = {"rel": rel, "path": rel, "name": "legacy.png", "size": len(payload),
+                "storage": "webdav", "local": False, "webdav": True,
+                "remote_url": f"https://dav.example.test/{rel}"}
+        service = self.service()
+        service._save_index({rel: item})
+        FakeWebDAVClient.uploaded[rel] = payload
+        with (
+            mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient),
+            mock.patch("services.image_service.config", self.mock_config),
+            mock.patch("services.image_service.image_storage_service", service),
+        ):
+            for handler in (image_service.get_image_response, image_service.get_image_download_response):
+                with self.subTest(handler=handler.__name__):
+                    with mock.patch.object(service, "get_bytes", wraps=service.get_bytes) as get_bytes:
+                        response = handler(rel)
+                    get_bytes.assert_called_once_with(rel)
+                    self.assertEqual(response.headers["content-type"], "image/gif")
+                    self.assertEqual(response.body, payload)
+                    self._assert_gif_animation(response.body)
+                    if handler is image_service.get_image_download_response:
+                        self.assertEqual(response.headers["content-disposition"], 'attachment; filename="legacy.png"')
+        self.assertEqual(service._load_index()[rel], item)
+        self.assertFalse((self.images_dir / rel).exists())
+        self.assertTrue(all(client.closed for client in FakeWebDAVClient.instances))
+
+    def test_gif_listing_and_zip_download_preserve_original_bytes(self):
+        service = self.service()
+        payload = animated_gif_bytes()
+        stored = service.save(payload, "http://app.test")
+        self.assertEqual([item["rel"] for item in service.list_items("http://app.test")], [stored.rel])
+        self.assertTrue(service.has_local(stored.rel))
+        with (
+            mock.patch("services.image_service.config", self.mock_config),
+            mock.patch("services.image_service.image_storage_service", service),
+        ):
+            archive_bytes = image_service.download_images_zip([stored.rel])
+        with zipfile.ZipFile(archive_bytes) as archive:
+            self.assertEqual(archive.namelist(), [Path(stored.rel).name])
+            saved_payload = archive.read(Path(stored.rel).name)
+        self.assertEqual(saved_payload, payload)
+        self._assert_gif_animation(saved_payload)
+
+    def test_capacity_cleanup_dry_run_includes_gif(self):
+        service = self.service()
+        stored = service.save(animated_gif_bytes())
+        with (
+            mock.patch("services.image_service.config", self.mock_config),
+            mock.patch("services.image_service.shutil.disk_usage", return_value=mock.Mock(free=0)),
+        ):
+            result = image_service.delete_to_target(1, dry_run=True)
+        self.assertEqual(result["removed"], 1)
+        self.assertTrue((self.images_dir / stored.rel).is_file())
 
 
 if __name__ == "__main__":

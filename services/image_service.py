@@ -14,6 +14,7 @@ from PIL import Image, ImageOps
 from services.config import config
 from services.image_storage_service import IMAGE_EXTENSIONS, image_storage_service
 from services.image_tags_service import load_tags, remove_tags, remove_tags_batch
+from utils.image_media import sniff_image_media
 from utils.log import logger
 
 THUMBNAIL_SIZE = (320, 320)
@@ -50,6 +51,11 @@ def _safe_image_path(relative_path: str) -> Path:
     return path
 
 
+def _local_image_media_type(path: Path) -> str:
+    with path.open("rb") as image_file:
+        return sniff_image_media(image_file.read(12))[0]
+
+
 def get_image_response(relative_path: str) -> FileResponse | Response:
     headers = {
         "Access-Control-Allow-Origin": "*",
@@ -57,8 +63,10 @@ def get_image_response(relative_path: str) -> FileResponse | Response:
         "Access-Control-Allow-Headers": "*",
     }
     if image_storage_service.has_local(relative_path):
-        return FileResponse(_safe_image_path(relative_path), headers=headers)
-    return Response(content=image_storage_service.get_bytes(relative_path), media_type="image/png", headers=headers)
+        path = _safe_image_path(relative_path)
+        return FileResponse(path, media_type=_local_image_media_type(path), headers=headers)
+    payload = image_storage_service.get_bytes(relative_path)
+    return Response(content=payload, media_type=sniff_image_media(payload)[0], headers=headers)
 
 
 def _thumbnail_path(relative_path: str) -> Path:
@@ -125,7 +133,7 @@ def get_thumbnail_response(relative_path: str) -> FileResponse:
     return FileResponse(ensure_thumbnail(relative_path), headers=headers)
 
 
-def get_image_download_response(relative_path: str) -> FileResponse:
+def get_image_download_response(relative_path: str) -> FileResponse | Response:
     cors_headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -134,15 +142,16 @@ def get_image_download_response(relative_path: str) -> FileResponse:
     if image_storage_service.has_local(relative_path):
         path = _safe_image_path(relative_path)
         headers = {**cors_headers, "Content-Disposition": f'attachment; filename="{path.name}"'}
-        return FileResponse(path, filename=path.name, headers=headers)
+        return FileResponse(path, filename=path.name, media_type=_local_image_media_type(path), headers=headers)
     rel = _safe_relative_path(relative_path)
     headers = {
         **cors_headers,
         "Content-Disposition": f'attachment; filename="{Path(rel).name}"',
     }
+    payload = image_storage_service.get_bytes(rel)
     return Response(
-        content=image_storage_service.get_bytes(rel),
-        media_type="image/png",
+        content=payload,
+        media_type=sniff_image_media(payload)[0],
         headers=headers,
     )
 

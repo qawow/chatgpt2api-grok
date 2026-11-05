@@ -36,6 +36,8 @@ test_batch_output/
 utils/output/
 # Local backups (may contain secrets)
 backups/
+# 安全工作流备份目录（可能含旧凭据）
+.bak/
 
 # Local audit / issue notes
 issues/

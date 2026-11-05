@@ -282,14 +282,14 @@ class ImageModelSlugTests(unittest.TestCase):
         return OpenAIBackendAPI._image_model_slug(MagicMock(), model)
 
     def test_web_image_models_resolve_to_a_catalog_slug(self) -> None:
-        for model in ("gpt-image-2.5", "gpt-image-2"):
+        for model in ("gpt-image-2.5", "gpt-image-2.6", "gpt-image-2"):
             slug = self._slug(model)
             self.assertIn(slug, self.LIVE_CATALOG, msg=model)
 
     def test_web_image_models_no_longer_target_the_retired_slug(self) -> None:
         """``gpt-5-3`` 已从目录下架，不能再作为映射目标。"""
         self.assertNotIn("gpt-5-3", self.LIVE_CATALOG)
-        for model in ("gpt-image-2.5", "gpt-image-2"):
+        for model in ("gpt-image-2.5", "gpt-image-2.6", "gpt-image-2"):
             self.assertNotEqual(self._slug(model), "gpt-5-3")
 
     def test_codex_model_passes_through(self) -> None:

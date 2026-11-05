@@ -29,7 +29,9 @@ class EgressLocaleTests(unittest.TestCase):
         self.assertEqual(tokyo.offset_min, -540)
         self.assertEqual(tokyo.gmt_offset, "+0900")
         la = egress_locale._build("America/Los_Angeles", "US", "test")
-        self.assertEqual(la.gmt_offset[:3], "-07")  # 9 月是 PDT -0700
+        # 洛杉矶有夏令时：PDT -0700 / PST -0800，取决于运行日期。断言结构而不是
+        # 某个季节的固定值，否则 CI 在切换夏令时后会稳定失败。
+        self.assertIn(la.gmt_offset, {"-0700", "-0800"})
         self.assertGreater(la.offset_min, 0)
 
     def test_language_follows_country(self) -> None:

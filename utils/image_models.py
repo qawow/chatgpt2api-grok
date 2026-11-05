@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # ── ChatGPT web (chatgpt.com, picture_v2) ────────────────────────────────────
 WEB_IMAGE_MODEL = "gpt-image-2.5"
+WEB_IMAGE_MODEL_26 = "gpt-image-2.6"
 # Pre-1.8.3 name. Still accepted so existing clients keep working; not listed.
 LEGACY_WEB_IMAGE_MODELS = frozenset({"gpt-image-2"})
 
@@ -119,6 +120,7 @@ def image_model_provider(model: object) -> str | None:
     name = _norm(model)
     if (
         name == WEB_IMAGE_MODEL
+        or name == WEB_IMAGE_MODEL_26
         or name in LEGACY_WEB_IMAGE_MODELS
         or name == CODEX_IMAGE_MODEL
         or name in PREFIXED_CODEX_IMAGE_MODELS
@@ -130,7 +132,7 @@ def image_model_provider(model: object) -> str | None:
 # Shown when a client asks for a text model. Built from the constants so it can
 # never drift again (it still said "gpt-image-2" two releases after the rename).
 IMAGE_MODELS_HINT = " / ".join(
-    (WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL, GROK_IMAGINE_IMAGE_MODEL, GROK_2_IMAGE_MODEL, DOUBAO_IMAGE_MODEL,
+    (WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26, CODEX_IMAGE_MODEL, GROK_IMAGINE_IMAGE_MODEL, GROK_2_IMAGE_MODEL, DOUBAO_IMAGE_MODEL,
      DEFAULT_ZHITU360_MODEL)
 )
 TEXT_MODELS_DISABLED = f"this backend only serves image models ({IMAGE_MODELS_HINT}); text models are disabled"

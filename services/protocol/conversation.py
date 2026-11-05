@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, NamedTuple
 
+from curl_cffi import requests
+
 from services.account_service import AccountService, account_service
 from services.image_task_control import ImageTaskControl
 from services.config import config
@@ -20,12 +22,16 @@ from services.openai_backend_api import (
     ImageContentPolicyError,
     ImagePollTimeoutError,
     OpenAIBackendAPI,
+    is_resumable_image_stream_error,
     ToolCooldownError,
     ToolQuotaError,
 )
 from services.proxy_service import proxy_settings
 from utils.helper import (
     IMAGE_MODELS,
+    SseStreamTimeoutError,
+    SseProtocolError,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -69,6 +75,15 @@ class ImageGenerationError(Exception):
         if self.account_email:
             error_dict["error"]["account_email"] = self.account_email
         return error_dict
+
+
+def _accepted_image_conversation_id(error: object, backend: OpenAIBackendAPI | None) -> str:
+    for candidate in (
+        getattr(error, "conversation_id", None), getattr(backend, "_image_conversation_id", None),
+    ):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return ""
 
 
 def public_image_error_message(message: str) -> str:
@@ -285,6 +300,33 @@ def is_upstream_connection_error(message: str) -> bool:
         or "max retries exceeded" in text
         or "upstream image connection failed" in text
     )
+
+
+def _call_image_callback(callback: Any, payload: Any) -> Any:
+    try:
+        return callback(payload)
+    except Exception as exc:
+        try:
+            exc._image_callback_error = True
+        except Exception:
+            pass
+        raise
+
+
+def _is_retryable_image_read_error(error: object) -> bool:
+    if getattr(error, "_image_callback_error", False):
+        return False
+    if isinstance(error, (SseProtocolError, ImageContentPolicyError, ArkoseRequiredError, ToolCooldownError, ToolQuotaError)):
+        return False
+    if isinstance(error, TimeoutError) and not isinstance(error, SseStreamTimeoutError):
+        return False
+    if isinstance(error, UpstreamHTTPError):
+        return error.status_code >= 500 or error.status_code in {408, 409, 425}
+    if isinstance(error, ImagePollTimeoutError):
+        return True
+    if isinstance(error, (SseStreamTimeoutError, requests.exceptions.RequestException)):
+        return is_resumable_image_stream_error(error)
+    return isinstance(error, RuntimeError) and is_upstream_connection_error(str(error))
 
 
 def image_stream_error_message(message: str) -> str:
@@ -754,9 +796,15 @@ def is_image_tool_event(event: dict[str, Any]) -> bool:
 
 
 def _is_user_message_event(event: dict[str, Any]) -> bool:
-    """检查事件是否来自 user 角色消息。"""
+    """输入消息及 user 角色携带的是参考图，不能成为生成输出。"""
+    if event.get("type") == "input_message":
+        return True
     value = event.get("v")
-    message = event.get("message") or (value.get("message") if isinstance(value, dict) else None)
+    if isinstance(value, dict) and value.get("type") == "input_message":
+        return True
+    message = event.get("input_message") or event.get("message") or (
+        value.get("message") if isinstance(value, dict) else None
+    )
     if isinstance(message, dict):
         author = message.get("author") or {}
         if str(author.get("role") or "").strip().lower() == "user":
@@ -1068,41 +1116,109 @@ def stream_image_outputs(
     last: dict[str, Any] = {}
     checkpoint_conversation_id = ""
     started_at = time.time()
-    for event in conversation_events(
-            backend,
-            prompt=request.prompt,
-            model=request.model,
-            images=request.images or [],
-            size=request.size,
-            quality=request.quality,
-    ):
-        last = event
-        event_conversation_id = str(event.get("conversation_id") or "")
-        if event_conversation_id and event_conversation_id != checkpoint_conversation_id:
-            checkpoint_conversation_id = event_conversation_id
-            claim_conversation(event_conversation_id)
-            if request.checkpoint_callback:
-                request.checkpoint_callback({"conversation_id": event_conversation_id})
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
+    stream_error: Exception | None = None
+    backend._image_has_output = False
+
+    def wait_for_recovery(seconds: float) -> None:
+        control = request.task_control or getattr(backend, "task_control", None)
+        if control is not None:
+            control.wait(seconds)
+        else:
+            time.sleep(seconds)
+
+    def recover_conversation_id() -> str:
+        nonlocal checkpoint_conversation_id
+        control = request.task_control or getattr(backend, "task_control", None)
+        timeout = control.remaining(5.0) if control is not None else 5.0
+        try:
+            recovered_id = backend.find_conversation_by_prompt(
+                request.prompt, started_at, timeout_secs=timeout,
+                exclude_ids=claimed_conversation_ids(),
             )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-            )
+        except (SseStreamTimeoutError, requests.exceptions.RequestException) as exc:
+            if not is_resumable_image_stream_error(exc):
+                raise
+            if control is not None:
+                control.remaining()
+            logger.warning({"event": "image_conversation_recovery_transport_error", "error_type": type(exc).__name__})
+            return ""
+        if control is not None:
+            control.remaining()
+        if not recovered_id or not claim_conversation(recovered_id):
+            return ""
+        checkpoint_conversation_id = recovered_id
+        backend._image_conversation_id = recovered_id
+        if request.checkpoint_callback:
+            _call_image_callback(request.checkpoint_callback, {"conversation_id": recovered_id})
+        return recovered_id
+
+    events = iter(conversation_events(
+        backend,
+        prompt=request.prompt,
+        model=request.model,
+        images=request.images or [],
+        size=request.size,
+        quality=request.quality,
+    ))
+    try:
+        while True:
+            try:
+                event = next(events)
+            except StopIteration:
+                break
+            except (SseStreamTimeoutError, requests.exceptions.RequestException) as exc:
+                if not is_resumable_image_stream_error(exc):
+                    raise
+                control = request.task_control or getattr(backend, "task_control", None)
+                if control is not None:
+                    control.remaining()
+                if last.get("blocked"):
+                    raise ImageContentPolicyError("Image generation was rejected by upstream policy.") from exc
+                if not (last.get("conversation_id") or last.get("file_ids") or last.get("sediment_ids")):
+                    raise
+                stream_error = exc
+                logger.info({
+                    "event": "image_stream_recovering_existing_result",
+                    "conversation_id": last.get("conversation_id", ""),
+                    "error_type": type(exc).__name__,
+                })
+                break
+            # Keep callbacks outside the transport try: an application error
+            # must not be interpreted as a socket reset and silently recovered.
+            last = event
+            if any(item and item != "file_upload" for item in (event.get("file_ids") or [])) or event.get("sediment_ids"):
+                backend._image_has_output = True
+            event_conversation_id = str(event.get("conversation_id") or "")
+            if event_conversation_id and event_conversation_id != checkpoint_conversation_id:
+                checkpoint_conversation_id = event_conversation_id
+                backend._image_conversation_id = event_conversation_id
+                claim_conversation(event_conversation_id)
+                if request.checkpoint_callback:
+                    _call_image_callback(request.checkpoint_callback, {"conversation_id": event_conversation_id})
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                )
+    finally:
+        close = getattr(events, "close", None)
+        if callable(close):
+            close()
 
     conversation_id = str(last.get("conversation_id") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
@@ -1117,7 +1233,7 @@ def stream_image_outputs(
         "turn_use_case": last.get("turn_use_case"),
     })
     if request.progress_callback:
-        request.progress_callback("image_stream_resolve_start")
+        _call_image_callback(request.progress_callback, "image_stream_resolve_start")
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
@@ -1133,7 +1249,8 @@ def stream_image_outputs(
     # plus the "model is still generating" heuristic instead.
     turn_use_case = str(last.get("turn_use_case") or "").replace(" ", "_").lower()
     should_poll_for_image = (
-        bool(request.images)
+        stream_error is not None
+        or bool(request.images)
         or "image" in turn_use_case
         or (is_supported_image_model(request.model) and is_model_text_reply_instead_of_image(message))
     )
@@ -1156,28 +1273,13 @@ def stream_image_outputs(
     # SSE 流太短时（模型返回文本而非触发图片工具），conversation_id 可能未被捕获，
     # 但图片已在上游异步生成。通过列出最近对话来恢复 conversation_id。
     if is_text_reply and not conversation_id:
-        try:
-            # started_at used to be time.time() at *recovery* time, which widened
-            # the window to conversations that began before this request.
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, started_at, timeout_secs=5.0,
-                exclude_ids=claimed_conversation_ids(),
-            )
-            if recovered_id and not claim_conversation(recovered_id):
-                # Lost the race to another generation between list and claim.
-                logger.info({"event": "image_conversation_recovery_claimed_elsewhere", "conversation_id": recovered_id})
-                recovered_id = ""
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                    "message_preview": message[:200],
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
+        recovered_id = recover_conversation_id()
+        if recovered_id:
+            conversation_id = recovered_id
+            logger.info({
+                "event": "image_conversation_id_recovered",
+                "conversation_id": conversation_id,
+                "message_preview": message[:200],
             })
 
     # 在轮询图片之前，先检查 /backend-api/tasks/ 是否有 moderation 拦截
@@ -1238,8 +1340,9 @@ def stream_image_outputs(
         else:
             raise
     except Exception as exc:
-        # 当检测到文本回复时，首次轮询的临时网络错误不应直接中断，
-        # 因为图片可能仍在后台异步生成中，后续 retry poll 会继续尝试。
+        # Only transient reads can be retried for the same accepted turn.
+        if not _is_retryable_image_read_error(exc):
+            raise
         if is_text_reply and conversation_id:
             logger.warning({
                 "event": "image_text_reply_first_poll_error_ignored",
@@ -1264,7 +1367,7 @@ def stream_image_outputs(
 
     if image_urls:
         if request.progress_callback:
-            request.progress_callback("receiving_image")
+            _call_image_callback(request.progress_callback, "receiving_image")
         image_items = [
             {"b64_json": base64.b64encode(image_data).decode("ascii")}
             for image_data in backend.download_image_bytes(image_urls)
@@ -1292,22 +1395,13 @@ def stream_image_outputs(
         # 此时应再尝试轮询图片结果，而不是直接把文本当作最终输出。
         # 当 is_text_reply 但 conversation_id 丢失时，尝试从最近对话列表恢复
         if is_text_reply and not conversation_id:
-            try:
-                import time as _time
-                recovered_id = backend.find_conversation_by_prompt(
-                    request.prompt, _time.time(), timeout_secs=5.0,
-                )
-                if recovered_id:
-                    conversation_id = recovered_id
-                    logger.info({
-                        "event": "image_text_reply_conversation_id_recovered",
-                        "conversation_id": conversation_id,
-                        "message_preview": message[:200],
-                    })
-            except Exception as exc:
-                logger.warning({
-                    "event": "image_text_reply_conversation_id_recovery_failed",
-                    "error": repr(exc)[:300],
+            recovered_id = recover_conversation_id()
+            if recovered_id:
+                conversation_id = recovered_id
+                logger.info({
+                    "event": "image_text_reply_conversation_id_recovered",
+                    "conversation_id": conversation_id,
+                    "message_preview": message[:200],
                 })
         if is_text_reply and conversation_id:
             logger.info({
@@ -1331,14 +1425,7 @@ def stream_image_outputs(
                     sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                     break  # 轮询成功，退出重试循环
                 except Exception as exc:
-                    error_str = str(exc)
-                    is_transient = (
-                        isinstance(exc, ImagePollTimeoutError)
-                        or is_tls_connection_error(error_str)
-                        or "upstream" in error_str.lower()
-                        or "connection" in error_str.lower()
-                        or "timeout" in error_str.lower()
-                    )
+                    is_transient = _is_retryable_image_read_error(exc)
                     logger.warning({
                         "event": "image_model_text_reply_poll_failed",
                         "conversation_id": conversation_id,
@@ -1346,20 +1433,14 @@ def stream_image_outputs(
                         "error": repr(exc)[:300],
                         "is_transient": is_transient,
                     })
-                    # 如果还有重试次数且不是超时/内容违规错误，继续重试
-                    if poll_attempt < MAX_POLL_RETRIES and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
-                        # 递增退避：30s, 60s, 90s
+                    if not is_transient:
+                        raise
+                    if poll_attempt < MAX_POLL_RETRIES and not isinstance(exc, ImagePollTimeoutError):
                         backoff = 30.0 * poll_attempt
-                        logger.info({
-                            "event": "image_model_text_reply_poll_retry",
-                            "conversation_id": conversation_id,
-                            "poll_attempt": poll_attempt,
-                            "backoff_secs": backoff,
-                        })
-                        time.sleep(backoff)
+                        wait_for_recovery(backoff)
                         continue
-                    # 超时错误或重试次数用尽，停止重试
-                    break
+                    exc.conversation_id = conversation_id
+                    raise
 
             if file_ids or sediment_ids:
                 image_urls = backend.resolve_conversation_image_urls(
@@ -1367,7 +1448,7 @@ def stream_image_outputs(
                 )
                 if image_urls:
                     if request.progress_callback:
-                        request.progress_callback("receiving_image")
+                        _call_image_callback(request.progress_callback, "receiving_image")
                     image_items = [
                         {"b64_json": base64.b64encode(image_data).decode("ascii")}
                         for image_data in backend.download_image_bytes(image_urls)
@@ -1403,21 +1484,12 @@ def stream_image_outputs(
     })
     # 当 should_poll_for_image 为 True 但 conversation_id 丢失时，尝试恢复
     if should_poll_for_image and not conversation_id:
-        try:
-            import time as _time
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
-            )
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_fallback_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_fallback_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
+        recovered_id = recover_conversation_id()
+        if recovered_id:
+            conversation_id = recovered_id
+            logger.info({
+                "event": "image_fallback_conversation_id_recovered",
+                "conversation_id": conversation_id,
             })
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
@@ -1432,7 +1504,7 @@ def stream_image_outputs(
                 "retry_wait_secs": retry_wait_secs,
                 "poll_attempt": poll_attempt,
             })
-            time.sleep(retry_wait_secs)
+            wait_for_recovery(retry_wait_secs)
             try:
                 polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                     conversation_id,
@@ -1444,14 +1516,7 @@ def stream_image_outputs(
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                 break  # 轮询成功，退出重试循环
             except Exception as exc:
-                error_str = str(exc)
-                is_transient = (
-                    isinstance(exc, ImagePollTimeoutError)
-                    or is_tls_connection_error(error_str)
-                    or "upstream" in error_str.lower()
-                    or "connection" in error_str.lower()
-                    or "timeout" in error_str.lower()
-                )
+                is_transient = _is_retryable_image_read_error(exc)
                 logger.warning({
                     "event": "image_stream_retry_poll_failed",
                     "conversation_id": conversation_id,
@@ -1459,20 +1524,14 @@ def stream_image_outputs(
                     "error": repr(exc)[:300],
                     "is_transient": is_transient,
                 })
-                # 如果还有重试次数且不是超时/内容违规错误，继续重试
-                if poll_attempt < MAX_FALLBACK_POLL_RETRIES and not isinstance(exc, (ImagePollTimeoutError, ImageContentPolicyError)):
-                    # 递增退避：30s, 60s
+                if not is_transient:
+                    raise
+                if poll_attempt < MAX_FALLBACK_POLL_RETRIES and not isinstance(exc, ImagePollTimeoutError):
                     backoff = 30.0 * poll_attempt
-                    logger.info({
-                        "event": "image_stream_retry_poll_retry",
-                        "conversation_id": conversation_id,
-                        "poll_attempt": poll_attempt,
-                        "backoff_secs": backoff,
-                    })
-                    time.sleep(backoff)
+                    wait_for_recovery(backoff)
                     continue
-                # 超时错误或重试次数用尽，停止重试
-                break
+                exc.conversation_id = conversation_id
+                raise
         
         if file_ids or sediment_ids:
             image_urls = backend.resolve_conversation_image_urls(
@@ -1480,7 +1539,7 @@ def stream_image_outputs(
             )
             if image_urls:
                 if request.progress_callback:
-                    request.progress_callback("receiving_image")
+                    _call_image_callback(request.progress_callback, "receiving_image")
                 image_items = [
                     {"b64_json": base64.b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
@@ -1664,9 +1723,9 @@ def _generate_single_image_impl(
             # picker hand the same exhausted account straight back out.
             if retry_after_secs > 0:
                 checkpoint["retry_after_secs"] = float(retry_after_secs)
-            request.checkpoint_callback(checkpoint)
+            _call_image_callback(request.checkpoint_callback, checkpoint)
         if request.progress_callback:
-            request.progress_callback("switching_account")
+            _call_image_callback(request.progress_callback, "switching_account")
 
     def recover_auth(active_token: str, error: str) -> None:
         # Keep the reserved slot while refreshing: token rotation migrates it.
@@ -1783,7 +1842,7 @@ def _generate_single_image_impl(
             raise ImageGenerationError("image task attempt cancelled", code="task_cancelled")
         try:
             if request.progress_callback:
-                request.progress_callback("getting_account")
+                _call_image_callback(request.progress_callback, "getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
             if state["sticky_token"]:
@@ -1836,7 +1895,7 @@ def _generate_single_image_impl(
         account_email = str(account.get("email") or "").strip()
         lease.result_id = uuid.uuid4().hex
         if request.checkpoint_callback:
-            request.checkpoint_callback({
+            _call_image_callback(request.checkpoint_callback, {
                 "account_email": account_email, "conversation_id": "",
                 "account_token_hash": hashlib.sha256(token.encode()).hexdigest(),
                 "generation_id": lease.result_id,
@@ -1869,7 +1928,7 @@ def _generate_single_image_impl(
         outputs: list[ImageOutput] = []
         try:
             if request.progress_callback:
-                request.progress_callback("preparing_conversation")
+                _call_image_callback(request.progress_callback, "preparing_conversation")
             backend = OpenAIBackendAPI(access_token=token, force_proxy=proxy_url)
             backend.task_control = request.task_control
             if request.progress_callback:
@@ -1879,7 +1938,7 @@ def _generate_single_image_impl(
                 if request.is_cancelled and request.is_cancelled():
                     raise ImageGenerationError("image task attempt cancelled", code="task_cancelled")
                 if output.conversation_id and request.checkpoint_callback:
-                    request.checkpoint_callback({"conversation_id": output.conversation_id})
+                    _call_image_callback(request.checkpoint_callback, {"conversation_id": output.conversation_id})
                 if account_email and not output.account_email:
                     output.account_email = account_email
                 if output.kind == "progress":
@@ -1952,7 +2011,10 @@ def _generate_single_image_impl(
                 account_email=account_email,
             ) from exc
         except (ToolCooldownError, ToolQuotaError) as exc:
-            # The image tool refused this turn without consuming any quota.
+            if getattr(backend, "_image_has_output", False) is True and not returned_result:
+                lease.finish(False)
+                raise
+            # A refusal before any output is observed may fail over.
             # Both kinds are per-credential pacing verdicts, so they must not
             # fail the request while other accounts still have budget: park the
             # credential for the window upstream stated and move on.
@@ -2009,11 +2071,19 @@ def _generate_single_image_impl(
                 lease.finish(True)
                 return outputs
             lease.finish(False)
-            # 轮询超时：把超时号排除出候选，下一次选号必然换号续传，
-            # 而不是反复扎进同一个可能已挂死的账号。
+            accepted_id = _accepted_image_conversation_id(exc, backend)
+            if accepted_id or getattr(backend, "_image_has_output", False) is True:
+                exc.conversation_id = accepted_id
+                if accepted_id and request.checkpoint_callback:
+                    _call_image_callback(request.checkpoint_callback, {"conversation_id": accepted_id})
+                # No other account may regenerate a turn with an accepted
+                # conversation or a generated output already observed.
+                raise
+            # Only a failure without a trustworthy checkpoint may use the
+            # existing bounded account-failover path.
             exclude_account(token, str(exc))
             if request.checkpoint_callback and getattr(exc, "conversation_id", ""):
-                request.checkpoint_callback({"conversation_id": exc.conversation_id})
+                _call_image_callback(request.checkpoint_callback, {"conversation_id": exc.conversation_id})
             poll_timeout_retry_count += 1
             if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                 logger.warning({
@@ -2061,6 +2131,11 @@ def _generate_single_image_impl(
             if returned_result and outputs:
                 lease.finish(True)
                 return outputs
+            accepted_id = _accepted_image_conversation_id(exc, backend)
+            if accepted_id or getattr(backend, "_image_has_output", False) is True:
+                lease.finish(False)
+                exc.conversation_id = accepted_id
+                raise
             if not emitted_for_token and is_token_invalid_error(error_text):
                 recover_auth(token, error_text)
                 continue
@@ -2103,6 +2178,10 @@ def _generate_single_image_impl(
                     conversation_id=getattr(exc, "conversation_id", ""),
                 ) from exc
             if not emitted_for_token and is_upstream_connection_error(error_text):
+                if _accepted_image_conversation_id(exc, backend):
+                    lease.finish(False)
+                    exc.conversation_id = _accepted_image_conversation_id(exc, backend)
+                    raise
                 logger.warning({
                     "event": "image_stream_fail",
                     "request_token": token,
@@ -2138,6 +2217,20 @@ def _generate_single_image_impl(
             if returned_result and outputs:
                 lease.finish(True)
                 return outputs
+            accepted_id = _accepted_image_conversation_id(exc, backend)
+            if accepted_id or getattr(backend, "_image_has_output", False) is True:
+                lease.finish(False)
+                if not _is_retryable_image_read_error(exc):
+                    raise
+                pending_message = (
+                    "Image generation started upstream but its result is incomplete. Resume polling the existing conversation."
+                    if accepted_id else
+                    "Generated output exists upstream but could not be downloaded. Retrieve the existing output instead of generating again."
+                )
+                raise ImageGenerationError(
+                    pending_message,
+                    code="upstream_result_pending", account_email=account_email, conversation_id=accepted_id,
+                ) from exc
             if not emitted_for_token and is_model_not_found_error(exc):
                 # 不能像瞬态错误那样把账号放回池子——那只会让下一次请求再挑中它，
                 # 白等一轮 3.6~4.9 秒的上游往返。

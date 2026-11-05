@@ -1,10 +1,13 @@
 import base64
 import hashlib
 import json
+import math
 import mimetypes
 import re
 import time
 import uuid
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
@@ -16,20 +19,21 @@ from utils.log import logger
 from utils.ssrf import UnsafeUrlError, assert_safe_url
 
 # 模型 id 统一定义在 utils/image_models.py；这里仅为兼容旧 import 而再导出。
-# 官网生图链路自 2026-09-08 起出的就是 ChatGPT Images 2.5，故对外正名为
-# gpt-image-2.5。画图档位由服务端决定，改名不改上游请求（仍发 gpt-5-3 +
-# picture_v2）。老 id 继续接受，避免打挂在用的客户端，但不再对外列出。
+# 网页图片链路的对外模型名与上游聊天模型解耦：仍发 auto + picture_v2，
+# 实际图像版本和档位由服务端选择，不凭请求参数或 UI 文案判定 2.6 已启用。
+# 老 id 继续接受，避免打挂在用的客户端，但不再对外列出。
 from utils.image_models import (  # noqa: E402
     CODEX_IMAGE_MODEL,
     CODEX_PLAN_PREFIXES as IMAGE_MODEL_PLAN_TYPES,
     LEGACY_WEB_IMAGE_MODELS,
     PREFIXED_CODEX_IMAGE_MODELS,
     WEB_IMAGE_MODEL,
+    WEB_IMAGE_MODEL_26,
 )
 
-BASE_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL} | LEGACY_WEB_IMAGE_MODELS
+BASE_IMAGE_MODELS = {WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26, CODEX_IMAGE_MODEL} | LEGACY_WEB_IMAGE_MODELS
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
-PUBLIC_IMAGE_MODELS = {WEB_IMAGE_MODEL, CODEX_IMAGE_MODEL} | PREFIXED_CODEX_IMAGE_MODELS
+PUBLIC_IMAGE_MODELS = {WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26, CODEX_IMAGE_MODEL} | PREFIXED_CODEX_IMAGE_MODELS
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
@@ -202,7 +206,7 @@ def sse_json_stream(items) -> Iterator[str]:
     yield ": stream-open\n\n"
     try:
         for item in items:
-            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps(item, ensure_ascii=True)}\n\n"
     except Exception as exc:
         logger.warning({
             "event": "sse_stream_error",
@@ -212,7 +216,7 @@ def sse_json_stream(items) -> Iterator[str]:
         error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
             "error": {"message": str(exc), "type": exc.__class__.__name__}
         }
-        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps(error, ensure_ascii=True)}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -221,7 +225,7 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         for item in items:
             event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
             yield f"event: {event}\n"
-            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps(item, ensure_ascii=True)}\n\n"
     except Exception as exc:
         logger.warning({
             "event": "anthropic_sse_stream_error",
@@ -230,11 +234,432 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         })
         error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
         yield "event: error\n"
-        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps(error, ensure_ascii=True)}\n\n"
 
 
 class SseStreamTimeoutError(TimeoutError):
     """Raised when an SSE stream stalls longer than the idle/wall budget."""
+
+
+@dataclass(frozen=True)
+class SseFrame:
+    event: str = "message"
+    data: str = ""
+    id: str = ""
+
+
+class SseProtocolError(ValueError):
+    """An upstream SSE/delta payload cannot be decoded safely."""
+
+
+class _DeltaUndefined:
+    __slots__ = ()
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+_V1_UNDEFINED = _DeltaUndefined()
+
+
+class V1DeltaDecoder:
+    """Decode the web client's v1 deltas into independent JSON channel states.
+
+    Matches Ydv6's short-field expansion and *global* previous-delta defaults.
+    Missing values are JS undefined, not an inherited value or JSON null. The
+    returned JSON projection omits undefined object members and maps undefined
+    array entries / roots to None. A failed delta commits neither state nor
+    defaults, including when a later operation in a nested patch fails.
+    """
+
+    _FIELDS = (("channel", "c"), ("path", "p"), ("op", "o"), ("value", "v"))
+    _INDEX = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+    _UNSAFE_KEYS = frozenset(("__proto__", "constructor", "prototype"))
+    # Limit allocations caused by sparse indices / growth, not existing input
+    # arrays: 100k slots is ample for conversation frames, but not billions.
+    _MAX_ARRAY_LENGTH = 100_000
+
+    def __init__(self) -> None:
+        self._states: dict[int, Any] = {}
+        self._previous_delta = {
+            "channel": 0,
+            "path": "",
+            "op": "add",
+            "value": _V1_UNDEFINED,
+        }
+
+    def apply_delta(self, value: Any) -> Any:
+        if not isinstance(value, dict):
+            raise SseProtocolError("v1 delta must be an object")
+        raw = deepcopy(value)
+        # The actual decoder fills missing SHORT keys before expanding aliases.
+        # Therefore an inherited short field also overrides an explicit long one.
+        for long_name, short_name in self._FIELDS:
+            if long_name != "value" and short_name not in raw:
+                raw[short_name] = self._previous_delta[long_name]
+        delta = self._expand_fields(raw)
+        channel = delta.get("channel")
+        if isinstance(channel, bool) or not isinstance(channel, (int, float)):
+            raise SseProtocolError("v1 channel must be a non-negative safe integer")
+        if isinstance(channel, float) and (not math.isfinite(channel) or not channel.is_integer()):
+            raise SseProtocolError("v1 channel must be a non-negative safe integer")
+        if channel < 0 or channel > 2**53 - 1:
+            raise SseProtocolError("v1 channel must be a non-negative safe integer")
+        channel = int(channel)
+        delta["channel"] = channel
+        root = {"__root": deepcopy(self._states.get(channel, _V1_UNDEFINED))}
+        self._apply(root, delta)
+        state = root.get("__root", _V1_UNDEFINED)
+        result = self._project_json(state)
+        self._states[channel] = state
+        self._previous_delta = delta
+        return result
+
+    @classmethod
+    def _expand_fields(cls, raw: dict[str, Any]) -> dict[str, Any]:
+        result = dict(raw)
+        for long_name, short_name in cls._FIELDS:
+            if short_name in raw:
+                result[long_name] = raw[short_name]
+                result.pop(short_name, None)
+        return result
+
+    @classmethod
+    def _safe_key(cls, key: Any) -> None:
+        if isinstance(key, str) and key in cls._UNSAFE_KEYS:
+            raise SseProtocolError("unsafe v1 path or append key")
+
+    @classmethod
+    def _path(cls, path: Any) -> list[str | int]:
+        if path is None:
+            path = ""
+        if not isinstance(path, str):
+            raise SseProtocolError("v1 path must be a string")
+        if path == "":
+            return ["__root"]
+        if path.startswith("/"):
+            path = path[1:]
+        parts: list[str | int] = ["__root"]
+        for part in path.split("/"):
+            decoded = part.replace("~1", "/").replace("~0", "~")
+            cls._safe_key(decoded)
+            numeric = cls._INDEX.fullmatch(part) is not None
+            if numeric and len(part) > 16:
+                raise SseProtocolError("v1 numeric path exceeds the safe index range")
+            index = int(part) if numeric else None
+            if index is not None and index > 2**53 - 1:
+                raise SseProtocolError("v1 numeric path exceeds the safe index range")
+            parts.append(index if index is not None else decoded)
+        return parts
+
+    @staticmethod
+    def _array_index(key: str | int) -> int:
+        if not isinstance(key, int) or isinstance(key, bool) or key < 0:
+            raise SseProtocolError("v1 array path requires a non-negative index")
+        return key
+
+    @classmethod
+    def _check_growth(cls, array: list[Any], length: int) -> None:
+        if length > len(array) and length > cls._MAX_ARRAY_LENGTH:
+            raise SseProtocolError("v1 array expansion exceeds the 100000-slot safety limit")
+
+    @classmethod
+    def _get(cls, parent: Any, key: str | int) -> Any:
+        if isinstance(parent, dict):
+            return parent.get(str(key), _V1_UNDEFINED)
+        if isinstance(parent, list):
+            index = cls._array_index(key)
+            return parent[index] if index < len(parent) else _V1_UNDEFINED
+        raise SseProtocolError("v1 path traverses a non-container")
+
+    @classmethod
+    def _set(cls, parent: Any, key: str | int, value: Any) -> None:
+        if isinstance(parent, dict):
+            parent[str(key)] = value
+        elif isinstance(parent, list):
+            index = cls._array_index(key)
+            cls._check_growth(parent, index + 1)
+            if index >= len(parent):
+                parent.extend([_V1_UNDEFINED] * (index + 1 - len(parent)))
+            parent[index] = value
+        else:
+            raise SseProtocolError("v1 path targets a non-container")
+
+    @classmethod
+    def _js_string(cls, value: Any) -> str:
+        if value is _V1_UNDEFINED:
+            return "undefined"
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return ",".join("" if item is None or item is _V1_UNDEFINED else cls._js_string(item) for item in value)
+        if isinstance(value, dict):
+            return "[object Object]"
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    @classmethod
+    def _js_number(cls, value: Any) -> float:
+        if value is _V1_UNDEFINED:
+            return math.nan
+        if value is None:
+            return 0.0
+        if isinstance(value, (bool, int, float)):
+            try:
+                return float(value)
+            except OverflowError:
+                return math.inf if value > 0 else -math.inf
+        if isinstance(value, list):
+            return cls._js_number(cls._js_string(value))
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return 0.0
+            try:
+                if text.lower().startswith(("0x", "0o", "0b")):
+                    return float(int(text, 0))
+                return float(text)
+            except (ValueError, OverflowError):
+                return math.nan
+        return math.nan
+
+    @classmethod
+    def _substring(cls, text: str, value: Any) -> str:
+        length = cls._js_number(value)
+        if math.isnan(length) or length <= 0:
+            return ""
+        if math.isinf(length):
+            return text
+        # JS substring counts UTF-16 code units, not Python Unicode code points.
+        encoded = text.encode("utf-16-le", errors="surrogatepass")
+        units = int(length)
+        if units >= len(encoded) // 2:
+            return text
+        return encoded[: units * 2].decode("utf-16-le", errors="surrogatepass")
+
+    @classmethod
+    def _apply(cls, root: dict[str, Any], delta: dict[str, Any]) -> None:
+        parts = cls._path(delta.get("path", ""))
+        parent: Any = root
+        for position, key in enumerate(parts[:-1]):
+            child = cls._get(parent, key)
+            if child is _V1_UNDEFINED:
+                child = [] if isinstance(parts[position + 1], int) else {}
+                cls._set(parent, key, child)
+            if not isinstance(child, (dict, list)):
+                raise SseProtocolError("v1 path traverses a non-container")
+            parent = child
+        key = parts[-1]
+        current = cls._get(parent, key)
+        op = delta.get("op")
+        value = delta.get("value", _V1_UNDEFINED)
+        if op == "patch":
+            if not isinstance(value, list):
+                raise SseProtocolError("v1 patch value must be an array of operations")
+            patched = {"__root": current}
+            for nested in value:
+                if not isinstance(nested, dict):
+                    raise SseProtocolError("v1 patch operation must be an object")
+                # Nested patch operations expand aliases, but do NOT inherit.
+                cls._apply(patched, cls._expand_fields(nested))
+            cls._set(parent, key, patched.get("__root", _V1_UNDEFINED))
+        elif op == "add":
+            if isinstance(parent, list):
+                index = cls._array_index(key)
+                cls._check_growth(parent, len(parent) + 1)
+                parent.insert(min(index, len(parent)), value)
+            else:
+                cls._set(parent, key, value)
+        elif op == "remove":
+            if isinstance(parent, list):
+                index = cls._array_index(key)
+                del parent[index : index + 1]
+            else:
+                parent.pop(str(key), None)
+        elif op == "replace":
+            cls._set(parent, key, value)
+        elif op == "append":
+            if isinstance(current, str):
+                cls._set(parent, key, current + cls._js_string(value))
+            elif isinstance(current, list):
+                items = value if isinstance(value, list) else [value]
+                cls._check_growth(current, len(current) + len(items))
+                current.extend(items)
+            elif isinstance(current, dict) and isinstance(value, dict):
+                for name in value:
+                    cls._safe_key(name)
+                current.update(value)
+            else:
+                cls._set(parent, key, value)
+        elif op == "truncate":
+            if isinstance(current, str):
+                cls._set(parent, key, cls._substring(current, value))
+            elif isinstance(current, list):
+                length = cls._js_number(value)
+                if not math.isfinite(length) or not length.is_integer() or not 0 <= length <= 2**32 - 1:
+                    raise SseProtocolError("v1 array length must be a valid unsigned integer")
+                size = int(length)
+                cls._check_growth(current, size)
+                if size < len(current):
+                    del current[size:]
+                elif size > len(current):
+                    current.extend([_V1_UNDEFINED] * (size - len(current)))
+        else:
+            raise SseProtocolError("unknown v1 delta operation")
+
+    @classmethod
+    def _project_json(cls, value: Any) -> Any:
+        if value is _V1_UNDEFINED:
+            return None
+        if isinstance(value, dict):
+            return {key: cls._project_json(item) for key, item in value.items() if item is not _V1_UNDEFINED}
+        if isinstance(value, list):
+            return [cls._project_json(item) for item in value]
+        return deepcopy(value)
+
+
+def iter_sse_frames(
+    response: requests.Response,
+    *,
+    idle_timeout_secs: float | None = None,
+    total_timeout_secs: float | None = None,
+) -> Iterator[SseFrame]:
+    """Yield complete SSE events while bounding reader memory and wait time.
+
+    HTTP response objects, comments and data-less events are not emitted. The
+    reader treats every incoming line (including heartbeats) as activity. It
+    uses a bounded queue for backpressure and is stopped/closed on exhaustion,
+    errors, timeout or generator.close(); join is bounded for broken transports.
+    """
+    import queue
+    import threading
+
+    stop_event = threading.Event()
+    reader: threading.Thread | None = None
+    try:
+        if idle_timeout_secs is None or total_timeout_secs is None:
+            try:
+                from services.config import config as _cfg  # lazy: avoid import cycles
+
+                if idle_timeout_secs is None:
+                    idle_timeout_secs = float(_cfg.image_sse_idle_timeout_secs)
+                if total_timeout_secs is None:
+                    total_timeout_secs = float(_cfg.image_sse_total_timeout_secs)
+            except Exception:
+                if idle_timeout_secs is None:
+                    idle_timeout_secs = 90.0
+                if total_timeout_secs is None:
+                    total_timeout_secs = 420.0
+        idle_budget = float(idle_timeout_secs)
+        total_budget = float(total_timeout_secs)
+        if not math.isfinite(idle_budget) or idle_budget <= 0:
+            raise ValueError("idle_timeout_secs must be positive and finite")
+        if not math.isfinite(total_budget) or total_budget <= 0:
+            raise ValueError("total_timeout_secs must be positive and finite")
+
+        line_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=64)
+        started = time.monotonic()
+        last_activity = started
+
+        def _put(kind: str, payload: object) -> bool:
+            while not stop_event.is_set():
+                try:
+                    line_queue.put((kind, payload), timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _reader() -> None:
+            nonlocal last_activity
+            try:
+                for raw_line in response.iter_lines():
+                    if stop_event.is_set():
+                        return
+                    last_activity = time.monotonic()
+                    if not _put("line", raw_line):
+                        return
+                _put("done", None)
+            except Exception as exc:
+                _put("error", exc)
+
+        reader = threading.Thread(target=_reader, name="sse-reader", daemon=True)
+        reader.start()
+        data_lines: list[str] = []
+        event_name = ""
+        event_id = ""
+        first_line = True
+        while True:
+            now = time.monotonic()
+            remaining_total = total_budget - (now - started)
+            if remaining_total <= 0:
+                raise SseStreamTimeoutError(f"SSE stream exceeded total timeout ({total_budget:g}s)")
+            try:
+                kind, payload = line_queue.get_nowait()
+            except queue.Empty:
+                remaining_idle = idle_budget - (now - last_activity)
+                if remaining_idle <= 0:
+                    raise SseStreamTimeoutError(f"SSE stream idle timeout ({idle_budget:g}s) with no data")
+                try:
+                    kind, payload = line_queue.get(timeout=min(remaining_total, remaining_idle))
+                except queue.Empty:
+                    continue  # Recheck monotonic deadlines; prefer total if both elapsed.
+
+            if kind == "done":
+                return  # An unterminated final event is not a complete SSE frame.
+            if kind == "error":
+                raise payload  # type: ignore[misc]
+            if payload is None:
+                continue
+            if isinstance(payload, bytes):
+                line = payload.decode("utf-8")  # Reject corruption, never silently drop bytes.
+            elif isinstance(payload, str):
+                line = payload
+            else:
+                raise SseProtocolError("SSE iter_lines must yield bytes or text")
+            if line.endswith("\n"):
+                line = line[:-1]
+            if line.endswith("\r"):
+                line = line[:-1]
+            if first_line:
+                first_line = False
+                if line.startswith("\ufeff"):
+                    line = line[1:]
+            if line == "":
+                if data_lines:
+                    frame = SseFrame(event=event_name or "message", data="\n".join(data_lines), id=event_id)
+                    data_lines = []
+                    event_name = ""
+                    yield frame
+                else:
+                    event_name = ""
+                continue
+            if line.startswith(":"):
+                continue
+            field, separator, value = line.partition(":")
+            if separator and value.startswith(" "):
+                value = value[1:]
+            if field == "data":
+                data_lines.append(value)
+            elif field == "event":
+                event_name = value
+            elif field == "id" and "\0" not in value:
+                event_id = value
+    finally:
+        stop_event.set()
+        try:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass  # Cleanup must not hide the original transport/protocol error.
+        if reader is not None and reader.ident is not None:
+            reader.join(timeout=0.1)
 
 
 def iter_sse_payloads(
@@ -243,96 +668,17 @@ def iter_sse_payloads(
     idle_timeout_secs: float | None = None,
     total_timeout_secs: float | None = None,
 ) -> Iterator[str]:
-    """Yield SSE ``data:`` payloads with optional idle/wall timeouts.
-
-    curl_cffi's ``timeout=`` on the POST mainly covers connect/headers; once the
-    response body is open, ``iter_lines()`` can block indefinitely on a half-open
-    proxy socket (observed: stuck at progress=generating with CLOSE-WAIT SOCKS).
-
-    Implementation: background reader thread + queue so idle/wall budgets can
-    fire even when the underlying socket never returns another byte.
-    """
-    import queue
-    import threading
-
-    if idle_timeout_secs is None or total_timeout_secs is None:
-        try:
-            from services.config import config as _cfg  # lazy: avoid import cycles
-
-            if idle_timeout_secs is None:
-                idle_timeout_secs = float(_cfg.image_sse_idle_timeout_secs)
-            if total_timeout_secs is None:
-                total_timeout_secs = float(_cfg.image_sse_total_timeout_secs)
-        except Exception:
-            if idle_timeout_secs is None:
-                idle_timeout_secs = 90.0
-            if total_timeout_secs is None:
-                total_timeout_secs = 420.0
-    idle_timeout_secs = max(1.0, float(idle_timeout_secs or 90.0))
-    # Keep wall and idle independent so a short wall budget can still fire first.
-    total_timeout_secs = max(1.0, float(total_timeout_secs or 420.0))
-
-    line_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-
-    def _reader() -> None:
-        try:
-            for raw_line in response.iter_lines():
-                line_queue.put(("line", raw_line))
-            line_queue.put(("done", None))
-        except Exception as exc:  # pragma: no cover - network errors
-            line_queue.put(("error", exc))
-
-    reader = threading.Thread(target=_reader, name="sse-reader", daemon=True)
-    reader.start()
-
-    started = time.time()
-    last_activity = started
-    while True:
-        now = time.time()
-        remaining_total = total_timeout_secs - (now - started)
-        if remaining_total <= 0:
-            raise SseStreamTimeoutError(
-                f"SSE stream exceeded total timeout ({int(total_timeout_secs)}s)"
-            )
-        remaining_idle = idle_timeout_secs - (now - last_activity)
-        if remaining_idle <= 0:
-            # If wall budget is also exhausted, prefer the total-timeout message.
-            if now - started >= total_timeout_secs:
-                raise SseStreamTimeoutError(
-                    f"SSE stream exceeded total timeout ({int(total_timeout_secs)}s)"
-                )
-            raise SseStreamTimeoutError(
-                f"SSE stream idle timeout ({int(idle_timeout_secs)}s) with no data"
-            )
-        wait = max(0.05, min(remaining_total, remaining_idle))
-        try:
-            kind, payload = line_queue.get(timeout=wait)
-        except queue.Empty:
-            now = time.time()
-            # Prefer wall-clock message when the total budget is exhausted
-            # (use >= so exact equality still counts as total timeout).
-            if now - started >= total_timeout_secs:
-                raise SseStreamTimeoutError(
-                    f"SSE stream exceeded total timeout ({int(total_timeout_secs)}s)"
-                )
-            raise SseStreamTimeoutError(
-                f"SSE stream idle timeout ({int(idle_timeout_secs)}s) with no data"
-            )
-
-        if kind == "done":
-            return
-        if kind == "error":
-            raise payload  # type: ignore[misc]
-        last_activity = time.time()
-        raw_line = payload
-        if not raw_line:
-            continue
-        line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
-        if not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data:
-            yield data
+    """Compatibility adapter: yield each complete frame's data as a string."""
+    frames = iter_sse_frames(
+        response,
+        idle_timeout_secs=idle_timeout_secs,
+        total_timeout_secs=total_timeout_secs,
+    )
+    try:
+        for frame in frames:
+            yield frame.data
+    finally:
+        frames.close()
 
 
 def save_images_from_text(text: str, prefix: str) -> list[Path]:
@@ -617,5 +963,14 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
             continue
         b64_json = str(item.get("b64_json") or "").strip()
         if b64_json:
-            markdown_images.append(f"![image_{index}](data:image/png;base64,{b64_json})")
+            mime_type = "image/png"
+            try:
+                from utils.image_media import sniff_image_media
+
+                detected_mime, _ = sniff_image_media(base64.b64decode(b64_json, validate=True))
+                if detected_mime.startswith("image/"):
+                    mime_type = detected_mime
+            except (ValueError, TypeError):
+                pass  # Unknown media / bad base64 keeps the legacy PNG declaration.
+            markdown_images.append(f"![image_{index}](data:{mime_type};base64,{b64_json})")
     return "\n\n".join(markdown_images) if markdown_images else "Image generation completed."

@@ -27,8 +27,13 @@ from utils.egress_locale import resolve_egress_locale
 from utils.helper import (
     LEGACY_WEB_IMAGE_MODELS,
     WEB_IMAGE_MODEL,
+    WEB_IMAGE_MODEL_26,
+    SseProtocolError,
+    SseStreamTimeoutError,
+    V1DeltaDecoder,
     UpstreamHTTPError,
     ensure_ok,
+    iter_sse_frames,
     iter_sse_payloads,
     new_uuid,
     split_image_model,
@@ -234,6 +239,29 @@ class ChatRequirements:
     turnstile_token: str = ""
     so_token: str = ""
     raw_finalize: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class _ImageStreamState:
+    """Per-turn state: resume offset counts complete events, never bytes/lines."""
+    conversation_id: str = ""
+    resume_token: str = ""
+    offset: int = 0
+    decoder: Optional[V1DeltaDecoder] = None
+    completed: bool = False
+
+
+def is_resumable_image_stream_error(error: object) -> bool:
+    """Only body transport failures are recoverable, not HTTP/SDK/task errors."""
+    if isinstance(error, SseStreamTimeoutError):
+        return True
+    if not isinstance(error, requests.exceptions.RequestException):
+        return False
+    response = getattr(error, "response", None)
+    for status in (getattr(error, "status_code", None), getattr(response, "status_code", None)):
+        if isinstance(status, int) and status >= 400:
+            return False
+    return True
 
 
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
@@ -1355,15 +1383,17 @@ class OpenAIBackendAPI:
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto"
-        if base_model == WEB_IMAGE_MODEL or base_model in LEGACY_WEB_IMAGE_MODELS:
+        if base_model == WEB_IMAGE_MODEL or base_model == WEB_IMAGE_MODEL_26 or base_model in LEGACY_WEB_IMAGE_MODELS:
             return "auto"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"
 
-    def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
-            Dict[str, str]:
-        """构造图片链路请求头。"""
+    def _image_headers(
+            self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*",
+            *, turn_trace_id: str = "",
+    ) -> Dict[str, str]:
+        """构造图片链路请求头；不要把挑战 token 发给资源下载域名。"""
         headers = {
             "Content-Type": "application/json",
             "Accept": accept,
@@ -1371,10 +1401,16 @@ class OpenAIBackendAPI:
         }
         if requirements.proof_token:
             headers[SENTINEL_HEADER_PROOF] = requirements.proof_token
+        if requirements.turnstile_token:
+            headers[SENTINEL_HEADER_TURNSTILE] = requirements.turnstile_token
+        if requirements.so_token:
+            headers[SENTINEL_HEADER_SESSION_OBSERVER] = requirements.so_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
+        if path in {"/backend-api/f/conversation/prepare", "/backend-api/f/conversation"}:
+            headers["x-oai-mcp-form-version"] = "2"
         if accept == "text/event-stream":
-            headers["X-Oai-Turn-Trace-Id"] = new_uuid()
+            headers["X-Oai-Turn-Trace-Id"] = turn_trace_id or new_uuid()
         headers[SENTINEL_HEADER_TELEMETRY] = sentinel_echo_logs()
         headers[SENTINEL_HEADER_TIMING] = SENTINEL_TIMING_FALLBACK
         return self._headers(path, headers)
@@ -1779,7 +1815,8 @@ class OpenAIBackendAPI:
         }
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+                                references: Optional[list[Dict[str, Any]]] = None,
+                                *, turn_trace_id: str = "") -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -1834,12 +1871,40 @@ class OpenAIBackendAPI:
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+            headers=self._image_headers(
+                path, requirements, conduit_token, "text/event-stream", turn_trace_id=turn_trace_id,
+            ),
             json=payload,
             timeout=self._request_timeout(300),
             stream=True,
         )
-        ensure_ok(response, path)
+        try:
+            ensure_ok(response, path)
+        except BaseException:
+            response.close()
+            raise
+        return response
+
+    def _resume_image_conversation(
+            self, requirements: ChatRequirements, state: _ImageStreamState, turn_trace_id: str,
+            timeout_secs: float,
+    ) -> requests.Response:
+        """Resume the accepted turn; never resubmit its prompt or prepare token."""
+        path = "/backend-api/f/conversation/resume"
+        response = self.session.post(
+            self.base_url + path,
+            headers=self._image_headers(
+                path, requirements, state.resume_token, "text/event-stream", turn_trace_id=turn_trace_id,
+            ),
+            json={"conversation_id": state.conversation_id, "offset": state.offset},
+            timeout=self._request_timeout(min(300.0, timeout_secs)),
+            stream=True,
+        )
+        try:
+            ensure_ok(response, path)
+        except BaseException:
+            response.close()
+            raise
         return response
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
@@ -1916,7 +1981,10 @@ class OpenAIBackendAPI:
         prompt_lower = str(prompt or "").lower().strip()
         best_match = ""
         best_score = 0.0
+        ambiguous = False
         for item in items:
+            if not isinstance(item, dict):
+                continue
             # item 可能是完整的 conversation 对象或摘要
             conv_id = str(item.get("id") or item.get("conversation_id") or "")
             if not conv_id:
@@ -1928,8 +1996,11 @@ class OpenAIBackendAPI:
             if exclude_ids and conv_id in exclude_ids:
                 continue
             # 检查时间范围：对话的 updated_at 应该在请求开始时间之后（或附近）
-            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
-            if updated_at and started_at and (updated_at < started_at - 30 or updated_at > started_at + 600):
+            try:
+                updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not started_at or not updated_at or not started_at - 30 <= updated_at <= started_at + 600:
                 continue
             # 匹配 prompt 关键词
             title = str(item.get("title") or "").lower()
@@ -1942,30 +2013,24 @@ class OpenAIBackendAPI:
                 common = prompt_words & title_words
                 if common:
                     score = len(common) / max(len(prompt_words), 1)
-            # 图生图通常标题为 "Image" 开头
-            if title.startswith("image"):
+            # Generic "Image" titles alone do not establish request ownership.
+            if score > 0 and title.startswith("image"):
                 score += 0.3
             if score > best_score:
                 best_score = score
                 best_match = conv_id
-        if best_match and best_score > 0.1:
+                ambiguous = False
+            elif score > 0 and score == best_score and conv_id != best_match:
+                ambiguous = True
+        if best_match and best_score > 0.1 and not ambiguous:
             logger.info({
                 "event": "conversation_prompt_match_found",
                 "conversation_id": best_match,
                 "match_score": round(best_score, 2),
             })
             return best_match
-        # 如果没有标题匹配，返回最新的对话（时间最近的）
-        for item in items:
-            conv_id = str(item.get("id") or item.get("conversation_id") or "")
-            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
-            if conv_id and updated_at and started_at and updated_at >= started_at - 30:
-                logger.info({
-                    "event": "conversation_latest_match",
-                    "conversation_id": conv_id,
-                    "updated_at": updated_at,
-                })
-                return conv_id
+        # Do not guess the latest conversation when titles provide no unique
+        # match. It may belong to another request, even inside the time window.
         return ""
 
     @staticmethod
@@ -2700,10 +2765,78 @@ class OpenAIBackendAPI:
             )
         raise ToolCooldownError(retry_after_secs=retry_after_secs)
 
-    def _iter_image_sse_payloads(self, response: requests.Response) -> Iterator[str]:
-        for payload in iter_sse_payloads(response):
-            self._raise_if_tool_refusal(payload)
-            yield payload
+    def _iter_image_sse_payloads(
+            self, response: requests.Response, *, state: Optional[_ImageStreamState] = None,
+            total_timeout_secs: Optional[float] = None,
+    ) -> Iterator[str]:
+        state = state if state is not None else _ImageStreamState()
+        frames = iter_sse_frames(response, total_timeout_secs=total_timeout_secs)
+        try:
+            for frame in frames:
+                control = getattr(self, "task_control", None)
+                if control is not None:
+                    control.remaining()
+                payload = frame.data
+                if payload == "[DONE]":
+                    state.offset += 1
+                    state.completed = True
+                    yield payload
+                    return
+                if frame.event == "delta_encoding":
+                    try:
+                        encoding = json.loads(payload)
+                    except json.JSONDecodeError:
+                        encoding = payload
+                    if encoding != "v1":
+                        raise SseProtocolError("Unknown SSE delta encoding")
+                    # A declaration starts a new encoding baseline, matching
+                    # the web decoder. Without it a resumed stream keeps state.
+                    state.decoder = V1DeltaDecoder()
+                    state.offset += 1
+                    continue
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError as exc:
+                    if frame.event == "delta":
+                        raise SseProtocolError("Malformed SSE delta JSON") from exc
+                    event = None  # Preserve the legacy non-JSON payload surface.
+                if frame.event == "delta":
+                    if state.decoder is None:
+                        raise SseProtocolError("SSE delta event before delta_encoding")
+                    event = state.decoder.apply_delta(event)
+                    payload = json.dumps(event, ensure_ascii=True)
+                if isinstance(event, dict):
+                    value = event.get("v")
+                    conversation_id = event.get("conversation_id") or (
+                        value.get("conversation_id") if isinstance(value, dict) else None
+                    )
+                    if isinstance(conversation_id, str) and conversation_id:
+                        if state.conversation_id and conversation_id != state.conversation_id:
+                            raise SseProtocolError("SSE conversation changed during the same turn")
+                        state.conversation_id = conversation_id
+                        self._image_conversation_id = conversation_id
+                    if event.get("type") == "resume_conversation_token" and {
+                        "token", "conversation_id",
+                    }.issubset(event):
+                        token = event["token"]
+                        control_id = event["conversation_id"]
+                        if not isinstance(control_id, str) or not control_id or not isinstance(token, str) or not token:
+                            raise SseProtocolError("Invalid SSE resume control frame")
+                        state.resume_token = token
+                        # The control frame itself is acknowledged, but credentials
+                        # must not enter progress events or persisted checkpoints.
+                        state.offset += 1
+                        yield json.dumps({
+                            "type": "conversation_checkpoint", "conversation_id": state.conversation_id,
+                        })
+                        continue
+                self._raise_if_tool_refusal(payload)
+                state.offset += 1
+                yield payload
+        finally:
+            close = getattr(frames, "close", None)
+            if callable(close):
+                close()
 
     def _stream_picture_conversation(
             self,
@@ -2713,9 +2846,12 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        self._image_conversation_id = ""
+        self._image_has_output = False
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         response: Optional[requests.Response] = None
+        turn_trace_id = new_uuid()
         for attempt in range(2):
             self._report_progress("bootstrapping")
             self._bootstrap()
@@ -2725,7 +2861,9 @@ class OpenAIBackendAPI:
             conduit_token = self._prepare_image_conversation(prompt, requirements, model)
             self._report_progress("starting_generation")
             try:
-                response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+                response = self._start_image_generation(
+                    prompt, requirements, conduit_token, model, references, turn_trace_id=turn_trace_id,
+                )
                 break
             except UpstreamHTTPError as exc:
                 if attempt == 0 and is_sentinel_proof_rejected(exc):
@@ -2741,10 +2879,53 @@ class OpenAIBackendAPI:
         if response is None:
             raise RuntimeError("image generation did not start")
         self._report_progress("generating")
+        state = _ImageStreamState()
         try:
-            yield from self._iter_image_sse_payloads(response)
-        finally:
+            stream_budget = self._request_timeout(max(0.001, float(config.image_sse_total_timeout_secs or 420.0)))
+        except BaseException:
             response.close()
+            raise
+        stream_deadline = time.monotonic() + stream_budget
+        for stream_attempt in range(2):
+            active_response = response
+            try:
+                remaining = stream_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SseStreamTimeoutError("SSE stream exceeded its shared total timeout")
+                yield from self._iter_image_sse_payloads(active_response, state=state, total_timeout_secs=remaining)
+                return  # Normal EOF is resolved by the existing result poller.
+            except (SseStreamTimeoutError, requests.exceptions.RequestException) as exc:
+                if state.conversation_id:
+                    exc.conversation_id = state.conversation_id
+                if not is_resumable_image_stream_error(exc):
+                    raise
+                control = getattr(self, "task_control", None)
+                if control is not None:
+                    control.remaining()  # Cancellation/deadline is not resumable.
+                remaining = stream_deadline - time.monotonic()
+                if stream_attempt or not state.resume_token or not state.conversation_id or remaining <= 0:
+                    raise
+                response.close()
+                logger.info({
+                    "event": "image_stream_resuming", "conversation_id": state.conversation_id,
+                    "offset": state.offset, "attempt": 1,
+                })
+                try:
+                    response = self._resume_image_conversation(requirements, state, turn_trace_id, remaining)
+                except UpstreamHTTPError as resume_error:
+                    resume_error.conversation_id = state.conversation_id
+                    if 400 <= resume_error.status_code < 500 and resume_error.status_code not in {408, 409, 425}:
+                        raise  # Never hide terminal HTTP/auth/validation/quota errors.
+                    # Transient resume/backend failures let the caller poll the
+                    # *same* accepted conversation, without another prompt POST.
+                    raise exc from resume_error
+                except requests.exceptions.RequestException as resume_error:
+                    if not is_resumable_image_stream_error(resume_error):
+                        resume_error.conversation_id = state.conversation_id
+                        raise
+                    raise exc from resume_error
+            finally:
+                active_response.close()
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。

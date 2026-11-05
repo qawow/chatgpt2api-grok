@@ -7,7 +7,7 @@ from services.openai_backend_api import (
     OpenAIBackendAPI,
     is_sentinel_proof_rejected,
 )
-from utils.helper import UpstreamHTTPError
+from utils.helper import SseFrame, UpstreamHTTPError
 from utils.pow import _fnv1a32, _pow_generate, build_pow_config
 
 
@@ -87,7 +87,7 @@ class PictureConversationPowRetryTests(unittest.TestCase):
             patch.object(api, "_get_chat_requirements", lambda **kw: object()),
             patch.object(api, "_prepare_image_conversation", lambda *a, **k: "conduit"),
             patch.object(api, "_start_image_generation", start_mock),
-            patch("services.openai_backend_api.iter_sse_payloads", lambda resp: iter(["chunk"])),
+            patch("services.openai_backend_api.iter_sse_frames", lambda resp, **kw: iter([SseFrame(data="chunk")])),
         ]
         return api, patches, start_mock
 

@@ -75,7 +75,7 @@ class FrontendMirrorTests(unittest.TestCase):
         return match.group(1)
 
     def test_scalar_ids_match(self) -> None:
-        for name in ("WEB_IMAGE_MODEL", "CODEX_IMAGE_MODEL", "GROK_IMAGINE_IMAGE_MODEL",
+        for name in ("WEB_IMAGE_MODEL", "WEB_IMAGE_MODEL_26", "CODEX_IMAGE_MODEL", "GROK_IMAGINE_IMAGE_MODEL",
                      "GROK_2_IMAGE_MODEL", "DOUBAO_IMAGE_MODEL"):
             self.assertEqual(self._const(name), getattr(registry, name), name)
 

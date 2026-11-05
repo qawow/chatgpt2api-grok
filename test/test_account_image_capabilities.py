@@ -172,6 +172,7 @@ class AccountCapabilityTests(unittest.TestCase):
 
     def test_split_image_model_supports_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2.5"), (None, "gpt-image-2.5"))
+        self.assertEqual(split_image_model("gpt-image-2.6"), (None, "gpt-image-2.6"))
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))
         self.assertEqual(split_image_model("plus-codex-gpt-image-2"), ("plus", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("team-codex-gpt-image-2"), ("team", "codex-gpt-image-2"))
@@ -180,26 +181,27 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertEqual(split_image_model("unknown-image-model"), (None, None))
 
     def test_web_image_model_renamed_to_2_5_with_legacy_alias(self) -> None:
-        """对外正名 gpt-image-2.5；老 id 仍收但不再对外列出，两者上游 slug 相同。"""
+        """对外正名 gpt-image-2.5 与 gpt-image-2.6；老 id 仍收但不再对外列出，两者上游 slug 相同。"""
         from services.openai_backend_api import OpenAIBackendAPI
         from utils.helper import (
             LEGACY_WEB_IMAGE_MODELS,
             PUBLIC_IMAGE_MODELS,
             WEB_IMAGE_MODEL,
+            WEB_IMAGE_MODEL_26,
             is_supported_image_model,
         )
 
         self.assertEqual(WEB_IMAGE_MODEL, "gpt-image-2.5")
+        self.assertEqual(WEB_IMAGE_MODEL_26, "gpt-image-2.6")
         self.assertIn(WEB_IMAGE_MODEL, PUBLIC_IMAGE_MODELS)
+        self.assertIn(WEB_IMAGE_MODEL_26, PUBLIC_IMAGE_MODELS)
         for legacy in LEGACY_WEB_IMAGE_MODELS:
             self.assertTrue(is_supported_image_model(legacy))
             self.assertNotIn(legacy, PUBLIC_IMAGE_MODELS)
 
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
-        # ``auto`` is the account default and the only slug that is both what
-        # the real client sends and present in the live /backend-api/models
-        # catalog; the retired ``gpt-5-3`` is no longer a valid target.
         self.assertEqual(backend._image_model_slug(WEB_IMAGE_MODEL), "auto")
+        self.assertEqual(backend._image_model_slug(WEB_IMAGE_MODEL_26), "auto")
         for legacy in LEGACY_WEB_IMAGE_MODELS:
             self.assertEqual(backend._image_model_slug(legacy), "auto")
         # Codex 链路的 tools[0].model 是上游 id，不跟着改名。
