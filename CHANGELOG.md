@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.8.15 - 2026-11-06
+
++ [新增] 公开图片模型 ID `gpt-image-2.6`，与 `gpt-image-2.5` 并行对外列出。两者上游 slug 同为 `auto` + `system_hints: ["picture_v2"]`，新增 ID **只改变对外名称与目录项，不改变请求内容**，也不构成上游已启用 2.6 的证明。前端 `web/src/lib/models.ts` 同步新增 `WEB_IMAGE_MODEL_26`。旧 `gpt-image-2` 仍作别名接受但不对外列出；**2.5 予以保留**（无证据表明上游已淘汰它，删除会打断在用客户端）。
++ [修复] **网页图片传输对齐抓取到的 v1 协议**（全部离线复现，未用真实账号生图）：
+  - 完整 SSE 帧解析：保留 `event`／`id`、多行 `data` 以 `\n` 连接、BOM／CRLF、严格 UTF-8，未终止的 EOF 帧按协议丢弃；对外保留旧字符串适配接口。
+  - 按网页 decoder 实现通道状态机：短字段 `c`／`p`／`o` 继承全局 prior、`v` 从不继承、各通道独立根、`~1`→`~0` 指针解码、`add`／`remove`／`replace`／`append`／`truncate`／nested patch，失败时深拷贝原子回滚；拒绝 `__proto__`／`constructor`／`prototype` 不安全指针。
+  - 收到新的 `delta_encoding: "v1"` 声明即重建 decoder 与基线；仅在没有新声明时才跨 resume 保留状态。
+  - 最多一次 `/backend-api/f/conversation/resume`：JSON body **仅** `conversation_id` 与 `offset`，最新流 token 以原值放 `X-Conduit-Token`；`offset` 计已确认的完整 non-response 事件（含 encoding／token 控制帧），**不是**字节、行数或 SSE id；初始与恢复共享同一个 monotonic 时间预算。
+  - 恢复候选使用统一开始时间、时间窗、排除集与原子 claim／checkpoint，不再盲猜「最新」或并列会话；关键词匹配仍只是启发式，不等于所有权证明或 exactly-once。
+  - 已拿到可信会话／输出 ID 后，断线、下载失败或后期 poll 超时不再改成换账号重提；只有输出 ID 而缺 conversation ID 时同样禁止自动重新生成；pending 错误不再谎称已有 CID。恢复到的 CID 会同步回后端标记。
+  - 输入参考图的 `input_message` 不再计入生成输出；取消、协议、终止性 HTTP、配额／策略与回调错误不伪装成传输恢复成功。`ToolCooldownError`／`ToolQuotaError` 在已有输出时不改判重试。
+  - resume 的 HTTP 4xx（除 `408`／`409`／`425`）直接抛出并保留原始诊断，不再被笼统重试覆盖。
+  - UTF-16 截断可能产生孤立代理项，最终 OpenAI／Anthropic SSE JSON 边界一律 `ensure_ascii=True` 转义。
++ [修复] 图片按 **PNG／JPEG／WebP／GIF** 真实格式嗅探：原字节保存、正确后缀与 WebDAV／HTTP `Content-Type`，保留 GIF 帧／duration／loop，兼容旧 PNG URL 内的其它格式，不迁移索引、不新增结果 JSON 字段。
++ [修复] **CI 会稳定失败导致镜像不构建**：[test/test_egress_locale.py](test/test_egress_locale.py) 硬断言洛杉矶九月 PDT `-07`，但 `_offset_parts` 取当前时间，冬令时返回 `-08`，于是 `test` job 失败、`docker` job 被跳过。改为季节无关断言（接受 `-0700`／`-0800`）。
++ [文档] 新增 [docs/chatgpt-images-2.6-reverse.md](docs/chatgpt-images-2.6-reverse.md)：记录 `POST /image-gen/gif/select_speed` 端点（`{conversation_id, message_id, asset_pointer, selected_speed}`，前端对 404／405 静默）及 GIF 判据（`mime_type == "image/gif"`、`metadata.generation.animation`、`gif_speed_variants`）。明确该端点语义是**生成后切换速度**而非生成 GIF 的参数。
++ [已知未验证] **GIF 是否可生成仍未验证**。2026-11-06 尝试真实生成：本地服务正常启动、请求进入上游，但 5 个注册免费账号 `access_token` 全部过期且刷新失败（`curl: (77)` 证书验证错误），接口返回 429，**未产出 GIF、未消费配额**。不要引用本次作为 GIF 或 2.6 可用性的证据。
++ [测试] 新增 `test/test_web_image_transport.py`（SSE 帧、v1 decoder、resume 契约、UTF-16 转义）与 `utils/image_media.py`；扩充 SSE 超时、图片存储与恢复回归用例。
++ [验证] 隔离 Python 3.14.4 + pytest 9.2.0、UTF-8 模式，全程离线（外部 socket 与 curl_cffi 传输被测试入口禁用，原生 HTTP 仅放行已核对的字面回环夹具，真实服务 v1 模块在 collection 前排除）。语法门禁通过；模型命名／路由专项 **122 passed，3 skipped**；扩展离线 suite **1380 passed，5 failed，274 subtests passed**。剩余 5 项均为 Windows 专有限制，在 Ubuntu CI 不适用：3 项 POSIX `0o600` 权限位断言、1 项临时 SQLite 清理 `WinError 32`、1 项替换打开文件 `WinError 5`。**未把整套 suite 记为通过**，未用伪造时间／权限或忽略断言掩盖。全程未刷新／注册真实账号、未消费生图配额、未调用真实 WebDAV。
+
 ## 1.8.14 - 2026-10-23
 
 + [新增] Grok 网页协议完整逆向（`docs/grok-web-protocol.md` 3600+ 行）。从 1367 个 Turbopack chunk（60 MB）静态提取 **250 个 `/rest/` 端点**并全量探测（403×178 / 400×11 / 200×8 / 404×5 / 401×4）。打通：网页生图（`build` 模型，图片在 `cardAttachment.image_chunk.imageUrl`）、直连模型 `imagine-image-gen`（比 `build` 快一倍）、**图生图** `mediaGenInput.imageToImage`（实测产出 768×1152 JPEG）、视频生成（`imagine-video-gen` 出 id）、语音合成（`text-to-speech`，产物 24kHz 单声道 128kbps MP3）、代码执行（`run-code`，CPython 3.12.3 / Node 24 / gVisor 沙箱 / uid 0 / DNS 通 TCP 拒）、模板库（20 个全 `creditCost: 0`）、模型目录（`POST /rest/models` 33 个模型）、提示词增强（`imagine-video-prompt-enhance`，**不耗媒体配额**）。
