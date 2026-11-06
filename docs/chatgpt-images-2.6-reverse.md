@@ -158,6 +158,8 @@ N.user_selected_reference_image_ids = [P.id]      // 选中的参考图文件 id
 // 另：library_folder_references / shared_library_file_references 在发送前被删除
 ```
 
+本批实现：当 `references` 非空时，在 `metadata` 中同时设置 `attachments` 和 `user_selected_reference_image_ids`，与捕获的客户端行为对齐。
+
 以及文件用途枚举，说明 mask 与普通上传走不同的 folder/useCase：
 
 ```js

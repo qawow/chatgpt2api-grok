@@ -1867,6 +1867,11 @@ class OpenAIBackendAPI:
                 "width": item["width"],
                 "height": item["height"],
             } for item in references]
+            # Captured client also stamps user_selected_reference_image_ids
+            # with the bare file id list when a reference is chosen (bundle
+            # 956483, module r3oB):
+            #   null!=P&&(N.user_selected_reference_image_ids=[P.id])
+            metadata["user_selected_reference_image_ids"] = [item["file_id"] for item in references]
         payload = {
             "action": "next",
             "messages": [{
