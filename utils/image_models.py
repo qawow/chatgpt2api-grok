@@ -12,11 +12,59 @@ Terminology:
 """
 from __future__ import annotations
 
+import threading
+from typing import Any
+
 # ── ChatGPT web (chatgpt.com, picture_v2) ────────────────────────────────────
 WEB_IMAGE_MODEL = "gpt-image-2.5"
 WEB_IMAGE_MODEL_26 = "gpt-image-2.6"
 # Pre-1.8.3 name. Still accepted so existing clients keep working; not listed.
 LEGACY_WEB_IMAGE_MODELS = frozenset({"gpt-image-2"})
+
+# Lazy-loaded extra web image models from config.json (see get_extra_web_models).
+# Avoid circular import: services.config is imported only on demand.
+_extra_web_models_cache: frozenset[str] = frozenset()
+_extra_web_models_lock = threading.Lock()
+_extra_web_models_loaded = False
+
+
+def get_extra_web_models() -> frozenset[str]:
+    """Return extra web image model IDs configured in config.json.
+
+    These are additional IDs (e.g. ``gpt-image-2.7``) that behave identically
+    to the built-in ``gpt-image-2.5`` / ``gpt-image-2.6``: same upstream slug
+    ``auto``, same ``system_hints:["picture_v2"]``.  They are listed in
+    ``/v1/models`` and accepted by routing.
+
+    The result is cached; call ``reload_extra_models()`` to re-read config.
+    """
+    global _extra_web_models_cache, _extra_web_models_loaded
+    if _extra_web_models_loaded:
+        return _extra_web_models_cache
+    with _extra_web_models_lock:
+        if _extra_web_models_loaded:
+            return _extra_web_models_cache
+        try:
+            from services.config import config
+
+            models = config.get_extra_web_image_models()
+            _extra_web_models_cache = frozenset(m for m in models if m)
+        except Exception:
+            _extra_web_models_cache = frozenset()
+        _extra_web_models_loaded = True
+        return _extra_web_models_cache
+
+
+def reload_extra_models() -> None:
+    """Force re-read of extra web image models from config on next access."""
+    global _extra_web_models_loaded
+    with _extra_web_models_lock:
+        _extra_web_models_loaded = False
+
+
+def all_web_image_models() -> frozenset[str]:
+    """Built-in web image models + extra models from config."""
+    return LEGACY_WEB_IMAGE_MODELS | {WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26} | get_extra_web_models()
 
 # ── Codex (Plus / Team / Pro only) ───────────────────────────────────────────
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
@@ -119,9 +167,7 @@ def image_model_provider(model: object) -> str | None:
         return PROVIDER_GROK
     name = _norm(model)
     if (
-        name == WEB_IMAGE_MODEL
-        or name == WEB_IMAGE_MODEL_26
-        or name in LEGACY_WEB_IMAGE_MODELS
+        name in all_web_image_models()
         or name == CODEX_IMAGE_MODEL
         or name in PREFIXED_CODEX_IMAGE_MODELS
     ):

@@ -17,6 +17,7 @@ from utils.image_models import (
     WEB_IMAGE_MODEL,
     WEB_IMAGE_MODEL_26,
     ZHITU360_IMAGE_MODELS,
+    get_extra_web_models,
 )
 
 _CODEX_PLANS = {"Plus": "plus", "Team": "team", "Pro": "pro"}
@@ -44,6 +45,10 @@ def chatgpt_image_models() -> list[str]:
     if not accounts:
         return []
     models = [WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26]
+    # Add extra web image models from config (e.g. gpt-image-2.7).
+    # Only extra models — legacy names (gpt-image-2) are accepted but not listed.
+    extra = sorted(get_extra_web_models())
+    models.extend(extra)
     codex_types = {
         normalized
         for account in accounts

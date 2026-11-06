@@ -592,6 +592,21 @@ class ConfigStore:
         with self._lock:
             return _normalize_doubao_settings(self.data.get("doubao"))
 
+    def get_extra_web_image_models(self) -> list[str]:
+        """从 config.json 读取额外 web 图片模型 ID。
+
+        返回值是字符串列表，例如 ["gpt-image-2.7", "gpt-image-2.8"]。
+        这些 ID 会加入 /v1/models 目录和路由匹配，与 gpt-image-2.5/2.6 同级。
+        配置不存在或非列表时返回空列表。
+        """
+        with self._lock:
+            raw = self.data.get("extra_web_image_models")
+            if isinstance(raw, list):
+                return [str(x).strip() for x in raw if x and str(x).strip()]
+            if isinstance(raw, str):
+                return [x.strip() for x in raw.split(",") if x.strip()]
+            return []
+
     def get_zhitu360_settings(self) -> dict[str, object]:
         with self._lock:
             return _normalize_zhitu360_settings(self.data.get("zhitu360"))

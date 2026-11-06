@@ -29,6 +29,7 @@ from utils.image_models import (  # noqa: E402
     PREFIXED_CODEX_IMAGE_MODELS,
     WEB_IMAGE_MODEL,
     WEB_IMAGE_MODEL_26,
+    all_web_image_models,
 )
 
 BASE_IMAGE_MODELS = {WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26, CODEX_IMAGE_MODEL} | LEGACY_WEB_IMAGE_MODELS
@@ -121,7 +122,7 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
     normalized = str(model or "").strip().lower()
     if not normalized:
         return None, None
-    if normalized in BASE_IMAGE_MODELS:
+    if normalized in BASE_IMAGE_MODELS or normalized in all_web_image_models():
         return None, normalized
     for plan_type in IMAGE_MODEL_PLAN_TYPES:
         prefix = f"{plan_type}-"

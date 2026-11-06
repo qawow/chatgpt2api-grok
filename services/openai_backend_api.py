@@ -38,7 +38,7 @@ from utils.helper import (
     new_uuid,
     split_image_model,
 )
-from utils.image_models import CODEX_IMAGE_MODEL, CODEX_RESPONSES_MODEL, CODEX_UPSTREAM_TOOL_MODEL
+from utils.image_models import CODEX_IMAGE_MODEL, CODEX_RESPONSES_MODEL, CODEX_UPSTREAM_TOOL_MODEL, all_web_image_models
 from utils.log import logger
 from utils.pow import (
     POW_CORES,
@@ -1383,7 +1383,7 @@ class OpenAIBackendAPI:
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto"
-        if base_model == WEB_IMAGE_MODEL or base_model == WEB_IMAGE_MODEL_26 or base_model in LEGACY_WEB_IMAGE_MODELS:
+        if base_model in all_web_image_models():
             return "auto"
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
