@@ -1662,17 +1662,9 @@ class GptRegisterService:
             "circuit_break": circuit_tripped,
             "circuit_break_threshold": circuit_threshold,
         }
-        self._patch_job(
-            job_id,
-            status=status,
-            finished_at=_now_iso(),
-            completed=completed,
-            success=success,
-            failed=failed,
-            added=added,
-            items=list(items),
-            summary=summary,
-        )
+        # --- 终局日志必须在 status=done 之前发布 ---
+        # 测试轮询 get_job() 只看 status==done 就断言日志已就绪；
+        # 先写日志再加状态，保证 consumer 看到 done 时日志已可读取。
         self._append_log(
             job_id,
             "任务结束 "
@@ -1702,6 +1694,17 @@ class GptRegisterService:
             items=items,
             error=None,
             settings=settings,
+            summary=summary,
+        )
+        self._patch_job(
+            job_id,
+            status=status,
+            finished_at=_now_iso(),
+            completed=completed,
+            success=success,
+            failed=failed,
+            added=added,
+            items=list(items),
             summary=summary,
         )
 
