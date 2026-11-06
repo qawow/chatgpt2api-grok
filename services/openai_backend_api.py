@@ -1772,8 +1772,15 @@ class OpenAIBackendAPI:
         payload = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
         return base64.b64decode(payload)
 
-    def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
-        """上传一张 base64 图片，返回底层文件元数据。"""
+    def _upload_image(self, image: str, file_name: str = "image.png",
+                      use_case: str = "multimodal") -> Dict[str, Any]:
+        """上传一张 base64 图片，返回底层文件元数据。
+
+        ``use_case`` 对应捕获代码中的 Y 变量（bundle 956483）：
+          - "multimodal"         — 默认文本对话
+          - "image_gen_upload_input" — 图生图参考输入（A?Y=...）
+          - "image_edit_mask"    — 编辑蒙版（_?Y=...）
+        """
         data = self._decode_image_base64(image)
         if (
                 image
@@ -1792,7 +1799,7 @@ class OpenAIBackendAPI:
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-            json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
+            json={"file_name": file_name, "file_size": len(data), "use_case": use_case, "width": width,
                   "height": height},
             timeout=60,
         )
@@ -2881,7 +2888,11 @@ class OpenAIBackendAPI:
         self._image_conversation_id = ""
         self._image_has_output = False
         self._report_progress("uploading")
-        references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        upload_use_case = "image_gen_upload_input" if dalle_operation else "multimodal"
+        references = [
+            self._upload_image(image, f"image_{idx}.png", use_case=upload_use_case)
+            for idx, image in enumerate(images, start=1)
+        ]
         response: Optional[requests.Response] = None
         turn_trace_id = new_uuid()
         for attempt in range(2):

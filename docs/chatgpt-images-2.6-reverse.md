@@ -163,12 +163,15 @@ N.user_selected_reference_image_ids = [P.id]      // 选中的参考图文件 id
 以及文件用途枚举，说明 mask 与普通上传走不同的 folder/useCase：
 
 ```js
-A ? Y="image_gen_upload_input"    // 普通图生图输入
+A ? Y="image_gen_upload_input"    // 图生图参考输入
   : _ ? Y="image_edit_mask"        // 编辑蒙版
+  : null!=h ? Y="artifacts_folder" // 素材库文件
   : …
 A ? Q="image_tag" : _ ? Q="dalle_agent" : Q="my_files"
 V = A ? "reference_image" : K
 ```
+
+本批实现：`_upload_image` 新增 `use_case` 参数，当有 `dalle_operation` 时上传使用 `image_gen_upload_input` 而非默认的 `multimodal`。`image_edit_mask` 尚未接入。
 
 **证据边界：** 以上均为静态读取，**未用真实账号验证**（本轮账号 `access_token` 全部失效、刷新失败）。不能据此断言上游一定会接受 `is_markup`、`image_edit_mask` 或上述 operation 组合，也不能断言它们属于某个版本新增。
 
