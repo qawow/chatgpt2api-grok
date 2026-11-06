@@ -171,7 +171,19 @@ A ? Q="image_tag" : _ ? Q="dalle_agent" : Q="my_files"
 V = A ? "reference_image" : K
 ```
 
-本批实现：`_upload_image` 新增 `use_case` 参数，当有 `dalle_operation` 时上传使用 `image_gen_upload_input` 而非默认的 `multimodal`。`image_edit_mask` 尚未接入。
+本批实现：`_upload_image` 新增 `use_case` 参数，当有 `dalle_operation` 时上传使用 `image_gen_upload_input` 而非默认的 `multimodal`。`image_edit_mask` 已接入 inpainting 路径。
+
+**蒙版编辑（inpainting）** 是第四种 operation，从编辑器选区内绘制触发：
+
+```js
+{type:"inpainting",
+ original_file_id: o.id,
+ mask_file_id: t.id,            // 上传为 use_case=image_edit_mask
+ original_gen_id: ...           // 可选源生成 id
+}
+```
+
+蒙版图由浏览器 canvas 生成（`createImageBitmap → canvas → toDataURL("image/png")`），以 `image-mask.png` 文件名上传。本批实现：`_stream_picture_conversation` 接受 `mask` 参数，自动上传蒙版并构造此 operation；不提供 mask 时行为不变。
 
 **证据边界：** 以上均为静态读取，**未用真实账号验证**（本轮账号 `access_token` 全部失效、刷新失败）。不能据此断言上游一定会接受 `is_markup`、`image_edit_mask` 或上述 operation 组合，也不能断言它们属于某个版本新增。
 
