@@ -63,6 +63,51 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(re.search(r"(?<![\w-])gpt-image-2(?![\w.])", registry.TEXT_MODELS_DISABLED))
 
 
+class ExtraWebModelTests(unittest.TestCase):
+    """config.json 的 extra_web_image_models 可扩展公开模型 ID，无需改代码。"""
+
+    def setUp(self) -> None:
+        self.addCleanup(registry.reload_extra_models)
+        self.addCleanup(registry.reload_extra_models)
+
+    def _with_extra(self, models: list[str]):
+        # Patch the name imported into openai_v1_models too: ``from x import y``
+        # binds a local reference, so patching only the source module would not
+        # affect the catalog builder.
+        p1 = mock.patch.object(registry, "get_extra_web_models", return_value=frozenset(models))
+        p2 = mock.patch.object(
+            openai_v1_models, "get_extra_web_models", return_value=frozenset(models),
+        )
+        p1.start()
+        p2.start()
+        self.addCleanup(p1.stop)
+        self.addCleanup(p2.stop)
+
+    def test_extra_ids_route_to_chatgpt(self) -> None:
+        self._with_extra(["gpt-image-2.7"])
+        self.assertEqual(registry.image_model_provider("gpt-image-2.7"), registry.PROVIDER_CHATGPT)
+        self.assertIn("gpt-image-2.7", registry.all_web_image_models())
+
+    def test_unknown_ids_still_unroutable(self) -> None:
+        self._with_extra(["gpt-image-2.7"])
+        self.assertIsNone(registry.image_model_provider("gpt-image-2.9"))
+
+    def test_extra_ids_are_listed_but_legacy_is_not(self) -> None:
+        self._with_extra(["gpt-image-2.7"])
+        ids = _list(accounts=[{"access_token": "t"}])
+        self.assertIn("gpt-image-2.7", ids)
+        self.assertIn(registry.WEB_IMAGE_MODEL, ids)
+        for legacy in registry.LEGACY_WEB_IMAGE_MODELS:
+            self.assertNotIn(legacy, ids)
+
+    def test_no_extra_keeps_builtin_catalog(self) -> None:
+        self._with_extra([])
+        ids = _list(accounts=[{"access_token": "t"}])
+        self.assertEqual(
+            ids, [registry.WEB_IMAGE_MODEL, registry.WEB_IMAGE_MODEL_26],
+        )
+
+
 class FrontendMirrorTests(unittest.TestCase):
     """web/src/lib/models.ts 必须与后端注册表保持一致。"""
 
