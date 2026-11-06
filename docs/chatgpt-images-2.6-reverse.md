@@ -117,6 +117,59 @@ PNG／JPEG／WebP／GIF 按原字节签名识别：
 - GIF speed UI 证明有后处理代码，不能证明它是生图触发条件或当前账号权限。
 - markup／layer 路径存在，不能证明它们是 2.6 新增，也不能证明 SVG 导出已成功。
 
+### 图片编辑协议 `dalle.from_client.operation`
+
+捕获模块 `r3oB`（[`956483.8b486f09f8.js`](<../.verify/cgpt26/js/956483.8b486f09f8.js>)）中，图片编辑走独立的 `dalle` 字段而不是 `picture_v2`。**三种 operation 形状**（按出现顺序）：
+
+```js
+// A. 透传客户端已有的 operation 对象（编辑器产出）
+dalle:{from_client:{operation:eY.operation}}
+
+// B. 同一路径的另一分支
+dalle:{from_client:{operation:eQ}}
+
+// C. 从已生成图片做变换（"编辑这张图"）
+{type:"transformation",
+ original_file_id: ad,
+ original_gen_id: nM?.chatGptImageMetadata?.generationId
+                ?? nM?.chatGptGenerationId ?? ""}
+
+// D. 标注画笔（markup）：额外带输入指针与 is_markup 标记
+{type:"transformation",
+ original_file_id: d.id,
+ original_gen_id: r.chatGptGenerationId ?? void 0,
+ input_image_asset_pointer: c.imageAssetPointer.asset_pointer,
+ is_markup: !0}
+```
+
+**关键语义 —— 二者互斥。** 捕获代码在附加 `dalle` 后立刻从 `system_hints` 里剔除 `picture_v2`：
+
+```js
+null!=eY&&(a_={...a_,dalle:{from_client:{operation:eY.operation}}})
+          .system_hints&&(a_.system_hints=a_.system_hints.filter(e=>"picture_v2"!==e))
+```
+
+所以同时发 `dalle` 和 `picture_v2` 与真实客户端行为矛盾。本批实现据此让 `dalle_operation` 非空时 `system_hints` 为空、`dalle` 键照发；不传该参数时请求体与之前**逐字节一致**。
+
+同一模块另有参考图选择字段，与 `dalle` 并列（**本批未实现**）：
+
+```js
+N.user_selected_reference_image_ids = [P.id]      // 选中的参考图文件 id
+// 另：library_folder_references / shared_library_file_references 在发送前被删除
+```
+
+以及文件用途枚举，说明 mask 与普通上传走不同的 folder/useCase：
+
+```js
+A ? Y="image_gen_upload_input"    // 普通图生图输入
+  : _ ? Y="image_edit_mask"        // 编辑蒙版
+  : …
+A ? Q="image_tag" : _ ? Q="dalle_agent" : Q="my_files"
+V = A ? "reference_image" : K
+```
+
+**证据边界：** 以上均为静态读取，**未用真实账号验证**（本轮账号 `access_token` 全部失效、刷新失败）。不能据此断言上游一定会接受 `is_markup`、`image_edit_mask` 或上述 operation 组合，也不能断言它们属于某个版本新增。
+
 ### GIF：端点已确认，可用性仍未验证
 
 捕获代码中的 GIF 端点为：

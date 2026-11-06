@@ -326,6 +326,59 @@ class PreparePayloadTests(unittest.TestCase):
         self.assertEqual(body["model"], "auto")
         self.assertEqual(body["system_hints"], ["picture_v2"])
 
+    def test_prepare_carries_dalle_operation_and_drops_picture_v2(self) -> None:
+        """捕获的网页客户端在带 dalle 操作时会把 picture_v2 从 system_hints 移除。
+
+        静态证据（bundle 956483，模块 r3oB）：
+            null!=eY&&(a_={...a_,dalle:{from_client:{operation:eY.operation}}})
+                      .system_hints&&(a_.system_hints=a_.system_hints.filter(
+                          e=>"picture_v2"!==e))
+        即 ``dalle`` 与 ``picture_v2`` 互斥。这条断言只覆盖请求体形状，
+        不证明上游接受该组合。
+        """
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        api = MagicMock()
+        api._image_model_slug = lambda m: "auto"
+        api.locale = MagicMock(offset_min=-540, timezone="Asia/Tokyo")
+        api.base_url = "https://chatgpt.com"
+        api._image_headers.return_value = {}
+        api.session.post.return_value = MagicMock(
+            status_code=200, json=lambda: {"conduit_token": "tok"}
+        )
+        operation = {
+            "type": "transformation",
+            "original_file_id": "file-abc",
+            "original_gen_id": "gen-123",
+        }
+
+        OpenAIBackendAPI._prepare_image_conversation(
+            api, "make it blue", MagicMock(), "gpt-image-2.5", dalle_operation=operation,
+        )
+
+        body = api.session.post.call_args.kwargs["json"]
+        self.assertEqual(body["dalle"], {"from_client": {"operation": operation}})
+        self.assertEqual(body["system_hints"], [])
+
+    def test_prepare_without_dalle_keeps_picture_v2(self) -> None:
+        """没有 dalle 操作时保持原有行为，不发 dalle 键。"""
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        api = MagicMock()
+        api._image_model_slug = lambda m: "auto"
+        api.locale = MagicMock(offset_min=-540, timezone="Asia/Tokyo")
+        api.base_url = "https://chatgpt.com"
+        api._image_headers.return_value = {}
+        api.session.post.return_value = MagicMock(
+            status_code=200, json=lambda: {"conduit_token": "tok"}
+        )
+
+        OpenAIBackendAPI._prepare_image_conversation(api, "cat", MagicMock(), "gpt-image-2.5")
+
+        body = api.session.post.call_args.kwargs["json"]
+        self.assertNotIn("dalle", body)
+        self.assertEqual(body["system_hints"], ["picture_v2"])
+
 
 if __name__ == "__main__":
     unittest.main()

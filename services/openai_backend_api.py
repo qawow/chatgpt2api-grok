@@ -1694,7 +1694,10 @@ class OpenAIBackendAPI:
         except Exception as error:
             raise RuntimeError(f"codex responses network error: {error}") from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    def _prepare_image_conversation(
+            self, prompt: str, requirements: ChatRequirements, model: str,
+            *, dalle_operation: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """为图片生成准备 conduit token。
 
         The real client's ``prepareCompletionStream`` always stamps two extra
@@ -1708,6 +1711,17 @@ class OpenAIBackendAPI:
         ``composer_editor_state`` / ``context_change`` / ``file_picker`` /
         ``gizmo_override``. A one-shot API call is a composer submit, so
         ``composer_editor_state`` is the matching source.
+
+        ``dalle_operation`` carries an image-edit/transformation operation
+        captured from the web client. When present the client strips
+        ``picture_v2`` from ``system_hints`` (bundle @956483, module ``r3oB``):
+
+            null!=eY&&(a_={...a_,dalle:{from_client:{operation:eY.operation}}})
+                      .system_hints&&(a_.system_hints=a_.system_hints.filter(
+                          e=>"picture_v2"!==e))
+
+        i.e. ``dalle`` and ``picture_v2`` are mutually exclusive hints; sending
+        both contradicts the captured behaviour.
         """
         path = "/backend-api/f/conversation/prepare"
         payload = {
@@ -1721,7 +1735,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": self.locale.offset_min,
             "timezone": self.locale.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
-            "system_hints": ["picture_v2"],
+            "system_hints": [] if dalle_operation else ["picture_v2"],
             "partial_query": {
                 "id": new_uuid(),
                 "author": {"role": "user"},
@@ -1731,6 +1745,9 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if dalle_operation:
+            # Captured client sends the edit operation and drops picture_v2.
+            payload["dalle"] = {"from_client": {"operation": dalle_operation}}
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements),
@@ -1816,7 +1833,8 @@ class OpenAIBackendAPI:
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None,
-                                *, turn_trace_id: str = "") -> requests.Response:
+                                *, turn_trace_id: str = "",
+                                dalle_operation: Optional[Dict[str, Any]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -1833,9 +1851,13 @@ class OpenAIBackendAPI:
             "developer_mode_connector_ids": [],
             "selected_github_repos": [],
             "selected_all_github_repos": False,
-            "system_hints": ["picture_v2"],
+            # Captured client strips picture_v2 whenever a dalle operation is
+            # present; the operation itself carries the edit intent.
+            "system_hints": [] if dalle_operation else ["picture_v2"],
             "serialization_metadata": {"custom_symbol_offsets": []},
         }
+        if dalle_operation:
+            metadata["dalle"] = {"from_client": {"operation": dalle_operation}}
         if references:
             metadata["attachments"] = [{
                 "id": item["file_id"],
@@ -1861,7 +1883,7 @@ class OpenAIBackendAPI:
             "timezone": self.locale.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
-            "system_hints": ["picture_v2"],
+            "system_hints": [] if dalle_operation else ["picture_v2"],
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": self._client_contextual_info(app_name=True, time_since_loaded=1200),
@@ -2700,10 +2722,13 @@ class OpenAIBackendAPI:
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
+            dalle_operation: Optional[Dict[str, Any]] = None,
     ) -> Iterator[str]:
         system_hints = system_hints or []
-        if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+        if "picture_v2" in system_hints or dalle_operation:
+            yield from self._stream_picture_conversation(
+                prompt, model, images or [], dalle_operation=dalle_operation,
+            )
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2843,6 +2868,8 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            *,
+            dalle_operation: Optional[Dict[str, Any]] = None,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
@@ -2858,11 +2885,14 @@ class OpenAIBackendAPI:
             self._report_progress("getting_token")
             requirements = self._get_chat_requirements(force=attempt > 0)
             self._report_progress("preparing_conversation")
-            conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+            conduit_token = self._prepare_image_conversation(
+                prompt, requirements, model, dalle_operation=dalle_operation,
+            )
             self._report_progress("starting_generation")
             try:
                 response = self._start_image_generation(
                     prompt, requirements, conduit_token, model, references, turn_trace_id=turn_trace_id,
+                    dalle_operation=dalle_operation,
                 )
                 break
             except UpstreamHTTPError as exc:
