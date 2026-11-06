@@ -16,4 +16,14 @@ def sniff_image_media(payload: bytes) -> tuple[str, str]:
         return "image/gif", ".gif"
     if len(payload) >= 12 and payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
         return "image/webp", ".webp"
+    # SVG: XML declaration, bare <svg, or DOCTYPE.  Check first 5 bytes to
+    # avoid false matches on HTML or arbitrary XML from other contexts.
+    if payload[:5] in {
+        b"<?xml",
+        b"<svg ",
+        b"<svg>",
+        b"<svg\n",
+        b"<!DOC",
+    }:
+        return "image/svg+xml", ".svg"
     return "image/png", ".png"

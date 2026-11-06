@@ -37,7 +37,7 @@ IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = {WEB_IMAGE_MODEL, WEB_IMAGE_MODEL_26, CODEX_IMAGE_MODEL} | PREFIXED_CODEX_IMAGE_MODELS
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
-SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
+SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif", "image/svg+xml"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
@@ -46,7 +46,11 @@ REMOTE_IMAGE_TIMEOUT_SECONDS = 20
 
 def _image_extension(mime_type: str) -> str:
     image_type = mime_type.split("/", 1)[1].split(";", 1)[0].lower() if "/" in mime_type else "png"
-    return "jpg" if image_type == "jpeg" else image_type or "png"
+    if image_type == "jpeg":
+        return "jpg"
+    if image_type == "svg+xml":
+        return "svg"
+    return image_type or "png"
 
 
 def _decode_json_image_string(value: str, index: int, filename: str | None = None, mime_type: str | None = None) -> tuple[bytes, str, str]:
