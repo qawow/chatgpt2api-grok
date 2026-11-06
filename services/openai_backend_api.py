@@ -2735,11 +2735,13 @@ class OpenAIBackendAPI:
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
             dalle_operation: Optional[Dict[str, Any]] = None,
+            mask: Optional[str] = None,
     ) -> Iterator[str]:
         system_hints = system_hints or []
-        if "picture_v2" in system_hints or dalle_operation:
+        if "picture_v2" in system_hints or dalle_operation or mask:
             yield from self._stream_picture_conversation(
-                prompt, model, images or [], dalle_operation=dalle_operation,
+                prompt, model, images or [],
+                dalle_operation=dalle_operation, mask=mask,
             )
             return
 
@@ -2882,17 +2884,29 @@ class OpenAIBackendAPI:
             images: list[str],
             *,
             dalle_operation: Optional[Dict[str, Any]] = None,
+            mask: Optional[str] = None,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         self._image_conversation_id = ""
         self._image_has_output = False
         self._report_progress("uploading")
-        upload_use_case = "image_gen_upload_input" if dalle_operation else "multimodal"
         references = [
-            self._upload_image(image, f"image_{idx}.png", use_case=upload_use_case)
+            self._upload_image(image, f"image_{idx}.png", use_case="image_gen_upload_input")
             for idx, image in enumerate(images, start=1)
         ]
+        # Captured inpainting path (bundle 956483, module r3oB): the editor
+        # uploads the mask as an image_edit_mask use_case, then sends a
+        # dalle operation with both original file id and mask file id:
+        #   {type:"inpainting", original_file_id:o.id,
+        #    mask_file_id:t.id, original_gen_id:...}
+        if mask and not dalle_operation and references:
+            mask_meta = self._upload_image(mask, "image-mask.png", use_case="image_edit_mask")
+            dalle_operation = {
+                "type": "inpainting",
+                "original_file_id": references[0]["file_id"],
+                "mask_file_id": mask_meta["file_id"],
+            }
         response: Optional[requests.Response] = None
         turn_trace_id = new_uuid()
         for attempt in range(2):

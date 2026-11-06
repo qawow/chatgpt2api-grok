@@ -360,6 +360,78 @@ class PreparePayloadTests(unittest.TestCase):
         self.assertEqual(body["dalle"], {"from_client": {"operation": operation}})
         self.assertEqual(body["system_hints"], [])
 
+    def test_stream_picture_conversation_builds_inpainting_operation_from_mask(self) -> None:
+        """提供蒙版时，_stream_picture_conversation 构造 inpainting operation。
+
+        捕获代码（bundle 956483，模块 r3oB）：
+            {type:"inpainting", original_file_id:o.id,
+             mask_file_id:t.id, original_gen_id:...}
+        蒙版以 image_edit_mask 用途上传，源图以 image_gen_upload_input 上传。
+        """
+        import base64
+        import io
+        from unittest import mock as _mock
+
+        from PIL import Image
+
+        import services.openai_backend_api as mod
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        api = MagicMock()
+        api.access_token = "tok"
+        api._image_model_slug = lambda m: "auto"
+        api.locale = MagicMock(offset_min=-540, timezone="Asia/Tokyo")
+        api.base_url = "https://chatgpt.com"
+        api._image_headers.return_value = {}
+        api._report_progress = lambda *_: None
+        api.session.post.return_value = MagicMock(status_code=200, json=lambda: {"conduit_token": "tok"})
+
+        buf = io.BytesIO()
+        Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
+        png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        api._upload_image = MagicMock(side_effect=[
+            {"file_id": "file-src", "file_name": "image_1.png", "file_size": 10,
+             "mime_type": "image/png", "width": 4, "height": 4},
+            {"file_id": "file-mask", "file_name": "image-mask.png", "file_size": 10,
+             "mime_type": "image/png", "width": 4, "height": 4},
+        ])
+        api._get_chat_requirements = MagicMock(return_value=MagicMock())
+        api._bootstrap = MagicMock()
+        api._start_image_generation = MagicMock(return_value=MagicMock())
+        # The generator body runs up to the first yield; we just need the
+        # dalle_operation construction before streaming starts. Give the
+        # response a shape that stops iteration after the start call.
+        api._request_timeout = MagicMock(return_value=60.0)
+
+        with _mock.patch.object(mod, "config", MagicMock(image_sse_total_timeout_secs=60)):
+            stream = OpenAIBackendAPI._stream_picture_conversation(
+                api, "fill the sky", "gpt-image-2.5",
+                [f"data:image/png;base64,{png_b64}"],
+                mask=f"data:image/png;base64,{png_b64}",
+            )
+            # _start_image_generation is mocked; iterating will call it then
+            # try to stream the mock response. Pull once to reach the start
+            # call, then stop.
+            try:
+                next(stream)
+            except StopIteration:
+                pass
+            except Exception:
+                # Any exception from streaming the mock is fine; the call to
+                # _start_image_generation already happened.
+                pass
+
+        _, kwargs = api._start_image_generation.call_args
+        op = kwargs["dalle_operation"]
+        self.assertIsNotNone(op)
+        self.assertEqual(op["type"], "inpainting")
+        self.assertEqual(op["original_file_id"], "file-src")
+        self.assertEqual(op["mask_file_id"], "file-mask")
+        upload_calls = [c[1]["use_case"] for c in api._upload_image.call_args_list]
+        self.assertIn("image_edit_mask", upload_calls)
+        self.assertIn("image_gen_upload_input", upload_calls)
+
     def test_prepare_without_dalle_keeps_picture_v2(self) -> None:
         """没有 dalle 操作时保持原有行为，不发 dalle 键。"""
         from services.openai_backend_api import OpenAIBackendAPI
