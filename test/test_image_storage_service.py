@@ -95,6 +95,30 @@ class ImageMediaTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertEqual(sniff_image_media(payload), ("image/png", ".png"))
 
+    def test_svg_payloads_are_detected_like_the_web_client(self):
+        """与网页客户端同一规则（bundle 337882）：前 512 字节 trim+lower 后
+        以 ``<svg`` 开头，或 XML 声明之后包含 ``<svg``。"""
+        for payload in (
+                b'<svg width="10" height="10"></svg>',
+                b"<SVG>",
+                b"  \n\t<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+                b'<?xml version="1.0" encoding="UTF-8"?><svg></svg>',
+                b'<?xml version="1.0"?>\n  <svg></svg>',
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(sniff_image_media(payload), ("image/svg+xml", ".svg"))
+
+    def test_non_svg_xml_and_html_are_not_labelled_svg(self):
+        """任意 XML/HTML 不能被当成 SVG，否则会以 image/svg+xml 回复。"""
+        for payload in (
+                b'<?xml version="1.0"?><rss version="2.0"></rss>',
+                b'<!DOCTYPE html><html><body></body></html>',
+                b'<?xml version="1.0"?>',
+                b"<?xml",
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(sniff_image_media(payload), ("image/png", ".png"))
+
 
 class ImageStorageServiceTests(unittest.TestCase):
     def setUp(self):
