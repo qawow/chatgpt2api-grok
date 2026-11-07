@@ -432,6 +432,68 @@ class PreparePayloadTests(unittest.TestCase):
         self.assertIn("image_edit_mask", upload_calls)
         self.assertIn("image_gen_upload_input", upload_calls)
 
+    def test_start_generation_sends_library_file_references(self) -> None:
+        """素材库附件在 metadata 中生成 mounted_library_file_references 与
+        library_chat_usage.file_resources（bundle 514085）。"""
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        api = MagicMock()
+        api._image_model_slug = lambda m: "auto"
+        api.locale = MagicMock(offset_min=-540, timezone="Asia/Tokyo")
+        api.base_url = "https://chatgpt.com"
+        api._image_headers.return_value = {}
+        api._client_contextual_info.return_value = {}
+        api._request_timeout = MagicMock(return_value=60.0)
+        api.session.post.return_value = MagicMock(status_code=200)
+
+        OpenAIBackendAPI._start_image_generation(
+            api, "use these files", MagicMock(), "conduit", "gpt-image-2.5", [],
+            library_files=[
+                {"id": "libfile_abc", "name": "notes.pdf"},
+                {"id": "libfile_def", "name": "chart.png"},
+                {"id": "", "name": "skipped-no-id"},
+            ],
+        )
+
+        metadata = api.session.post.call_args.kwargs["json"]["messages"][0]["metadata"]
+        self.assertEqual(
+            metadata["mounted_library_file_references"],
+            [
+                {"mounted_library_file_id": "libfile_abc", "name": "notes.pdf"},
+                {"mounted_library_file_id": "libfile_def", "name": "chart.png"},
+            ],
+        )
+        self.assertEqual(
+            metadata["library_chat_usage"]["file_resources"],
+            [
+                {"entrypoint": "composer_library_picker",
+                 "file_id": "libfile_abc", "resource_id": "libfile_abc"},
+                {"entrypoint": "composer_library_picker",
+                 "file_id": "libfile_def", "resource_id": "libfile_def"},
+            ],
+        )
+
+    def test_start_generation_omits_library_keys_without_files(self) -> None:
+        """没有素材库附件时不发这两个键，请求体与之前一致。"""
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        api = MagicMock()
+        api._image_model_slug = lambda m: "auto"
+        api.locale = MagicMock(offset_min=-540, timezone="Asia/Tokyo")
+        api.base_url = "https://chatgpt.com"
+        api._image_headers.return_value = {}
+        api._client_contextual_info.return_value = {}
+        api._request_timeout = MagicMock(return_value=60.0)
+        api.session.post.return_value = MagicMock(status_code=200)
+
+        OpenAIBackendAPI._start_image_generation(
+            api, "plain prompt", MagicMock(), "conduit", "gpt-image-2.5", [],
+        )
+
+        metadata = api.session.post.call_args.kwargs["json"]["messages"][0]["metadata"]
+        self.assertNotIn("mounted_library_file_references", metadata)
+        self.assertNotIn("library_chat_usage", metadata)
+
     def test_prepare_without_dalle_keeps_picture_v2(self) -> None:
         """没有 dalle 操作时保持原有行为，不发 dalle 键。"""
         from services.openai_backend_api import OpenAIBackendAPI

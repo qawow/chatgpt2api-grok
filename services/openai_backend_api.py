@@ -250,6 +250,25 @@ class _ImageStreamState:
     decoder: Optional[V1DeltaDecoder] = None
     completed: bool = False
 
+    def can_resume(self, *, allow_tokenless: bool = False) -> bool:
+        """Whether a resume attempt is legal in the current state.
+
+        Mirrors the captured client guard (bundle 418851, ``prepareRetry``):
+
+            !o || s?.aborted || !_ && null == T.resumeToken
+              || null == T.resumeToken && C > 0 || null == T.conversationId
+
+        A conversation id is always required. A resume token is required too,
+        unless the caller opts into tokenless resumes — and even then only
+        while ``offset`` is still zero: once events were consumed, replaying
+        from an implicit offset would be ambiguous, so the client refuses.
+        """
+        if not self.conversation_id:
+            return False
+        if self.resume_token:
+            return True
+        return bool(allow_tokenless) and self.offset == 0
+
 
 # Status codes the web client treats as transient when deciding whether to
 # resume a broken image stream (bundle 418851, module Ydv6):
@@ -1879,7 +1898,8 @@ class OpenAIBackendAPI:
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None,
                                 *, turn_trace_id: str = "",
-                                dalle_operation: Optional[Dict[str, Any]] = None) -> requests.Response:
+                                dalle_operation: Optional[Dict[str, Any]] = None,
+                                library_files: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         references = references or []
         parts = [{
@@ -1917,6 +1937,33 @@ class OpenAIBackendAPI:
             # 956483, module r3oB):
             #   null!=P&&(N.user_selected_reference_image_ids=[P.id])
             metadata["user_selected_reference_image_ids"] = [item["file_id"] for item in references]
+        if library_files:
+            # Captured library attachment path (bundle 514085):
+            #   metadata.mounted_library_file_references =
+            #     [{mounted_library_file_id, name}, ...]
+            #   metadata.library_chat_usage.file_resources =
+            #     [{entrypoint:"composer_library_picker", file_id, resource_id}]
+            # The client merges file_resources into any existing
+            # library_chat_usage and drops the key when it ends up empty.
+            mounted = [
+                {"mounted_library_file_id": str(entry.get("id") or ""),
+                 "name": str(entry.get("name") or "")}
+                for entry in library_files
+                if str(entry.get("id") or "")
+            ]
+            if mounted:
+                metadata["mounted_library_file_references"] = mounted
+                usage = metadata.get("library_chat_usage")
+                usage = dict(usage) if isinstance(usage, dict) else {}
+                usage["file_resources"] = [
+                    {
+                        "entrypoint": "composer_library_picker",
+                        "file_id": entry["mounted_library_file_id"],
+                        "resource_id": entry["mounted_library_file_id"],
+                    }
+                    for entry in mounted
+                ]
+                metadata["library_chat_usage"] = usage
         payload = {
             "action": "next",
             "messages": [{
@@ -2774,12 +2821,18 @@ class OpenAIBackendAPI:
             thinking_effort: str = "",
             dalle_operation: Optional[Dict[str, Any]] = None,
             mask: Optional[str] = None,
+            allow_tokenless_resume: bool = False,
+            initial_offset: int = 0,
+            library_files: Optional[list[Dict[str, Any]]] = None,
     ) -> Iterator[str]:
         system_hints = system_hints or []
-        if "picture_v2" in system_hints or dalle_operation or mask:
+        if "picture_v2" in system_hints or dalle_operation or mask or library_files:
             yield from self._stream_picture_conversation(
                 prompt, model, images or [],
                 dalle_operation=dalle_operation, mask=mask,
+                allow_tokenless_resume=allow_tokenless_resume,
+                initial_offset=initial_offset,
+                library_files=library_files,
             )
             return
 
@@ -2923,6 +2976,9 @@ class OpenAIBackendAPI:
             *,
             dalle_operation: Optional[Dict[str, Any]] = None,
             mask: Optional[str] = None,
+            allow_tokenless_resume: bool = False,
+            initial_offset: int = 0,
+            library_files: Optional[list[Dict[str, Any]]] = None,
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
@@ -2960,7 +3016,7 @@ class OpenAIBackendAPI:
             try:
                 response = self._start_image_generation(
                     prompt, requirements, conduit_token, model, references, turn_trace_id=turn_trace_id,
-                    dalle_operation=dalle_operation,
+                    dalle_operation=dalle_operation, library_files=library_files,
                 )
                 break
             except UpstreamHTTPError as exc:
@@ -2977,7 +3033,7 @@ class OpenAIBackendAPI:
         if response is None:
             raise RuntimeError("image generation did not start")
         self._report_progress("generating")
-        state = _ImageStreamState()
+        state = _ImageStreamState(offset=max(0, int(initial_offset or 0)))
         try:
             stream_budget = self._request_timeout(max(0.001, float(config.image_sse_total_timeout_secs or 420.0)))
         except BaseException:
@@ -3001,7 +3057,9 @@ class OpenAIBackendAPI:
                 if control is not None:
                     control.remaining()  # Cancellation/deadline is not resumable.
                 remaining = stream_deadline - time.monotonic()
-                if stream_attempt or not state.resume_token or not state.conversation_id or remaining <= 0:
+                if stream_attempt or remaining <= 0 or not state.can_resume(
+                    allow_tokenless=allow_tokenless_resume,
+                ):
                     raise
                 response.close()
                 # Match the captured client's backoff before resuming

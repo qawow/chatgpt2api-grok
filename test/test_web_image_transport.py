@@ -261,6 +261,29 @@ class WebImageTransportTests(unittest.TestCase):
         api.session.post.assert_not_called()
         self.assertTrue(initial.closed)
 
+    def test_tokenless_resume_guard_matches_the_web_client(self):
+        """捕获客户端 prepareRetry 的守卫：无 token 时仅 offset==0 可 resume。
+
+            !allowTokenlessResume && null == resumeToken
+              || null == resumeToken && offset > 0
+              || null == conversationId   -> 拒绝
+        """
+        from services.openai_backend_api import _ImageStreamState
+
+        # No conversation id: never resumable.
+        self.assertFalse(_ImageStreamState().can_resume(allow_tokenless=True))
+        # Token present: resumable regardless of offset.
+        self.assertTrue(_ImageStreamState(conversation_id="c", resume_token="t").can_resume())
+        self.assertTrue(
+            _ImageStreamState(conversation_id="c", resume_token="t", offset=5).can_resume()
+        )
+        # No token: refused by default, allowed only with the opt-in AND offset 0.
+        self.assertFalse(_ImageStreamState(conversation_id="c").can_resume())
+        self.assertTrue(_ImageStreamState(conversation_id="c").can_resume(allow_tokenless=True))
+        self.assertFalse(
+            _ImageStreamState(conversation_id="c", offset=1).can_resume(allow_tokenless=True)
+        )
+
     def test_resumable_statuses_match_the_web_client(self):
         """捕获客户端（bundle 418851）只在 408/409/425/429/502/504 时 resume。"""
         from services.openai_backend_api import RESUMABLE_HTTP_STATUSES
