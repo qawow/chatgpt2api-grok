@@ -251,8 +251,23 @@ class _ImageStreamState:
     completed: bool = False
 
 
+# Status codes the web client treats as transient when deciding whether to
+# resume a broken image stream (bundle 418851, module Ydv6):
+#   function D(e){return "network"===e.kind||"http"===e.kind&&(408===e.status
+#     ||409===e.status||425===e.status||429===e.status||502===e.status||504===e.status)}
+# Every other 4xx is terminal, except 403 and a couple of named codes which the
+# client classifies separately.
+RESUMABLE_HTTP_STATUSES = frozenset({408, 409, 425, 429, 502, 504})
+
+
 def is_resumable_image_stream_error(error: object) -> bool:
-    """Only body transport failures are recoverable, not HTTP/SDK/task errors."""
+    """Whether a broken image stream may be resumed on the same conversation.
+
+    Aligns with the captured web client (bundle 418851, module ``Ydv6``): a
+    transient network failure, or one of ``408/409/425/429/502/504``. Every
+    other HTTP status is terminal — retrying an auth, validation or policy
+    rejection cannot succeed and would only delay the real error.
+    """
     if isinstance(error, SseStreamTimeoutError):
         return True
     if not isinstance(error, requests.exceptions.RequestException):
@@ -260,8 +275,31 @@ def is_resumable_image_stream_error(error: object) -> bool:
     response = getattr(error, "response", None)
     for status in (getattr(error, "status_code", None), getattr(response, "status_code", None)):
         if isinstance(status, int) and status >= 400:
-            return False
+            return status in RESUMABLE_HTTP_STATUSES
     return True
+
+
+# Exponential backoff for image-stream resumes, matching the captured client:
+#   {maxRetryCount:12, minDelayMs:300, retryFactor:1.5}
+#   delay = min(minDelayMs * retryFactor**attempt, maxDelayMs) * jitter
+RESUME_MAX_RETRY_COUNT = 12
+RESUME_MIN_DELAY_SECS = 0.3
+RESUME_MAX_DELAY_SECS = 30.0
+RESUME_RETRY_FACTOR = 1.5
+
+
+def resume_backoff_secs(attempt: int, *, rng: Optional[random.Random] = None) -> float:
+    """Delay before resume attempt ``attempt`` (1-based), with full jitter.
+
+    ``attempt`` counts resumes already performed, so the first retry waits
+    ~0.3s and the twelfth is capped at ``RESUME_MAX_DELAY_SECS``.
+    """
+    exponent = max(1, int(attempt))
+    raw = RESUME_MIN_DELAY_SECS * (RESUME_RETRY_FACTOR ** exponent)
+    capped = min(raw, RESUME_MAX_DELAY_SECS)
+    source = rng or random
+    # Client uses l*(.5+.5*Math.random()) — half to full delay, never zero.
+    return capped * (0.5 + 0.5 * source.random())
 
 
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
@@ -2966,9 +3004,19 @@ class OpenAIBackendAPI:
                 if stream_attempt or not state.resume_token or not state.conversation_id or remaining <= 0:
                     raise
                 response.close()
+                # Match the captured client's backoff before resuming
+                # ({minDelayMs:300, retryFactor:1.5}, half-to-full jitter).
+                # This project still resumes at most once per turn, so the
+                # delay uses attempt=1; retrying more would risk duplicate
+                # outputs for a turn that may already have produced images.
+                backoff = resume_backoff_secs(1)
+                if backoff >= remaining:
+                    raise
+                if backoff > 0:
+                    time.sleep(backoff)
                 logger.info({
                     "event": "image_stream_resuming", "conversation_id": state.conversation_id,
-                    "offset": state.offset, "attempt": 1,
+                    "offset": state.offset, "attempt": 1, "backoff_secs": round(backoff, 3),
                 })
                 try:
                     response = self._resume_image_conversation(requirements, state, turn_trace_id, remaining)

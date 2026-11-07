@@ -13,6 +13,7 @@ from services.openai_backend_api import (
     ChatRequirements,
     OpenAIBackendAPI,
     ToolQuotaError,
+    is_resumable_image_stream_error,
 )
 from services.protocol import conversation
 from services.protocol.conversation import ConversationRequest
@@ -21,6 +22,16 @@ from utils.image_models import WEB_IMAGE_MODEL
 
 CID = "unit-image-conversation"
 FILE_ID = "file_00000000aaaabbbbccccddddeeeeffff"
+
+
+def _http_error(status: int) -> requests.exceptions.HTTPError:
+    """A transport error carrying an upstream HTTP status."""
+    response = Mock()
+    response.status_code = status
+    error = requests.exceptions.HTTPError(f"HTTP {status}")
+    error.response = response
+    error.status_code = status
+    return error
 
 
 def wire(event: str, data: object, *, multiline: bool = False) -> list[bytes]:
@@ -249,6 +260,43 @@ class WebImageTransportTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, SseStreamTimeoutError)
         api.session.post.assert_not_called()
         self.assertTrue(initial.closed)
+
+    def test_resumable_statuses_match_the_web_client(self):
+        """捕获客户端（bundle 418851）只在 408/409/425/429/502/504 时 resume。"""
+        from services.openai_backend_api import RESUMABLE_HTTP_STATUSES
+
+        self.assertEqual(RESUMABLE_HTTP_STATUSES, frozenset({408, 409, 425, 429, 502, 504}))
+        for status in RESUMABLE_HTTP_STATUSES:
+            with self.subTest(status=status):
+                self.assertTrue(is_resumable_image_stream_error(_http_error(status)))
+        for status in (400, 401, 403, 404, 405, 422, 500, 501, 503):
+            with self.subTest(status=status):
+                self.assertFalse(is_resumable_image_stream_error(_http_error(status)))
+
+    def test_resume_backoff_follows_client_curve(self):
+        """300ms × 1.5^attempt，上限 30s，抖动区间 [0.5, 1.0]。"""
+        import random as _random
+
+        from services.openai_backend_api import (
+            RESUME_MAX_DELAY_SECS,
+            RESUME_MIN_DELAY_SECS,
+            RESUME_RETRY_FACTOR,
+            resume_backoff_secs,
+        )
+
+        self.assertEqual(RESUME_MIN_DELAY_SECS, 0.3)
+        self.assertEqual(RESUME_RETRY_FACTOR, 1.5)
+        rng = _random.Random(7)
+        previous_cap = 0.0
+        for attempt in range(1, 13):
+            nominal = min(RESUME_MIN_DELAY_SECS * (RESUME_RETRY_FACTOR ** attempt), RESUME_MAX_DELAY_SECS)
+            value = resume_backoff_secs(attempt, rng=rng)
+            with self.subTest(attempt=attempt):
+                self.assertGreaterEqual(value, nominal * 0.5 - 1e-9)
+                self.assertLessEqual(value, nominal + 1e-9)
+            previous_cap = nominal
+        self.assertEqual(previous_cap, RESUME_MAX_DELAY_SECS)  # cap reached by attempt 12
+
 
     def test_exhausted_shared_budget_does_not_resume(self):
         initial = FakeSseResponse()
