@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.8.16 - 2026-11-07
+
++ [新增] **图片编辑协议 `dalle.from_client.operation`**（逆向 bundle 956483，模块 `r3oB`）。网页客户端的图片编辑走独立的 `dalle` 字段，且与 `picture_v2` **互斥** —— 捕获代码在附加 `dalle` 后立即执行 `system_hints.filter(e=>"picture_v2"!==e)`。本版让 `dalle_operation` 非空时 `system_hints` 为空、`dalle` 键照发；不传该参数时请求体逐字节不变。支持三种 operation：`transformation`（含 `is_markup` 标注画笔）与 `inpainting`（蒙版）。
++ [新增] **蒙版编辑（inpainting）**：`_stream_picture_conversation` 接受 `mask` 参数，以 `use_case=image_edit_mask` 上传蒙版后构造 `{type:"inpainting", original_file_id, mask_file_id}`。不提供 mask 时行为不变。
++ [新增] **参考图选择与上传用途**：参考图非空时在 metadata 同时发 `attachments` 与 `user_selected_reference_image_ids`；上传 `use_case` 区分 `image_gen_upload_input`（图生图）与 `multimodal`（默认）。
++ [新增] **素材库附件字段**：`mounted_library_file_references` 与 `library_chat_usage.file_resources`（`entrypoint=composer_library_picker`）。**只构造请求字段，不调用素材库 CRUD，不创建或删除用户资源**；空 id 条目跳过，无附件时不发这两个键。
++ [新增] **流恢复状态守卫**：`_ImageStreamState.can_resume()` 对齐客户端 `prepareRetry` —— 有 resume token 恒可恢复；无 token 仅在显式 `allow_tokenless_resume` 且 `offset == 0` 时允许（offset 已推进后拒绝，避免隐式重放歧义）。新增 `initial_offset` 作为 offset 计数器初值。
++ [修复] **图片流重试策略对齐客户端**（bundle 418851）：原实现把全部 `>=400` 视为不可恢复，导致 429 限流、502/504 网关错误直接失败。改为 `{408,409,425,429,502,504}` 可恢复，并按客户端曲线 `min(300ms × 1.5^attempt, 30s) × (0.5+0.5×random)` 退避后 resume 同一会话。仍保持每 turn 最多 resume 一次（重复 resume 有产出重复图片的风险）。
++ [修复] **SVG 格式支持**：`sniff_image_media` 原只看前 5 字节固定前缀，会漏掉带前导空白、XML 声明较长或大写的 SVG，且把未知字节一律当 PNG 保存。改为与网页客户端同一规则（bundle 337882）：读前 512 字节、trim + lower 后以 `<svg` 开头，或 XML 声明闭合并其后出现 `<svg`。非 SVG 的 XML（RSS/SOAP）与 HTML 不会被误判。同时补齐 `IMAGE_EXTENSIONS` 的 `.svg`（此前 SVG 在列表与清理中被忽略）与 `svg+xml → .svg` 扩展名推导。
++ [新增] **图片模型 ID 配置化**：`config.json` 新增 `extra_web_image_models`，可添加 `gpt-image-2.7` 等新 ID 而无需改代码。内置 `gpt-image-2.5` / `gpt-image-2.6` 保持默认，无配置时行为不变；旧别名 `gpt-image-2` 仍接受但不列出。
++ [修复] **注册任务终局日志竞态**：`_patch_job(status="done")` 原先先于「任务结束」日志与完成文件写入发布，导致 CI 上轮询到 `done` 时日志尚未就绪（`test_run_job_writes_summary_and_completion_file` 间歇失败），且后台线程在临时目录清理时仍在写盘（`OSError: Directory not empty`）。改为终局日志与完成文件先写、状态后发布，使 `done` 成为「收尾已完成」的可靠信号。
++ [测试] 新增 `test/test_web_image_transport.py` 的可恢复状态码集合、退避曲线与 tokenless 守卫断言；`test_image_storage_service.py` 新增 SVG 识别与非 SVG XML/HTML 排除；`test_image_models_registry.py` 新增 `extra_web_image_models` 扩展行为；`test_model_not_found.py` 新增 dalle/inpainting/素材库请求体断言。
++ [验证] 隔离 Python 3.14.4 + pytest 9.2.0、UTF-8 模式，全程离线。语法门禁通过；**1365 passed**，3 项失败均为 Windows 专有限制（POSIX `0o600` 权限位 ×2、临时 SQLite 清理 `WinError`），在 Ubuntu CI 不适用。**未把整套 suite 记为通过**。
++ [已知未验证] **全部协议均为静态逆向，未经真实账号验证**。5 个注册账号 `access_token` 全部过期且刷新失败（`curl: (77)` 证书错误），无法实测 `dalle`/`inpainting`/素材库字段是否被上游接受，也无法确认网页 GIF 生成能力。静态代码出现某条路径，不能证明它对当前账号开放或实际调用成功。
+
 ## 1.8.15 - 2026-11-06
 
 + [新增] 公开图片模型 ID `gpt-image-2.6`，与 `gpt-image-2.5` 并行对外列出。两者上游 slug 同为 `auto` + `system_hints: ["picture_v2"]`，新增 ID **只改变对外名称与目录项，不改变请求内容**，也不构成上游已启用 2.6 的证明。前端 `web/src/lib/models.ts` 同步新增 `WEB_IMAGE_MODEL_26`。旧 `gpt-image-2` 仍作别名接受但不对外列出；**2.5 予以保留**（无证据表明上游已淘汰它，删除会打断在用客户端）。
