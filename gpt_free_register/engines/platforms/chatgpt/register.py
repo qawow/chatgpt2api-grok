@@ -102,6 +102,9 @@ class SentinelPayload:
     # openai-sentinel-so-token (create_account / oauth_create_account).
     # Empty when SDK/VM did not produce a dedicated so field.
     so: str = ""
+    # True when produced by the official sdk.js in a Node vm
+    # (_sentinel_via_quickjs) rather than the synthetic Python generator.
+    quickjs: bool = False
 
 
 # ─── Sentinel helpers (ported from browser_register.py) ──────────
@@ -1234,14 +1237,96 @@ class RegistrationEngine:
             self._log(f"获取 Device ID 失败: {e}", "error")
             return None
 
+    def _sentinel_via_quickjs(self, did: str, flow: str) -> Optional[SentinelPayload]:
+        """Run the official sentinel sdk.js through a Node vm sandbox.
+
+        The OTP-dispatch backend verifies tokens by re-running the real SDK
+        server-side; synthetic p/t values pass the surface checks but fail
+        that deeper verification, which is the classic silent-drop path.
+        This path downloads the genuine ``sdk.js``, runs it in ``node:vm``
+        with a behavior simulation, and returns the same payload shape as
+        the Python fallback. Any failure returns None so
+        :meth:`_check_sentinel` can fall back without changing the flow.
+
+        Gated by ``OPENAI_SENTINEL_QUICKJS`` (default on); requires ``node``
+        on PATH (override with ``OPENAI_SENTINEL_NODE_PATH``).
+        """
+        if not _env_truthy("OPENAI_SENTINEL_QUICKJS", "1"):
+            return None
+        try:
+            from .sentinel_quickjs import get_sentinel_token_via_quickjs
+        except Exception as exc:
+            self._log(f"Sentinel QuickJS 不可用: {exc}", "warning")
+            return None
+
+        profile = getattr(self, "_browser_profile", None) or {}
+        p = profile or {}
+        ua = getattr(self.http_client, "user_agent", None) or self.http_client.default_headers.get("User-Agent", "")
+        try:
+            offset = int(p.get("timezone_offset_min") or 0)
+        except Exception:
+            offset = 0
+        tz_map = _SentinelTokenGenerator._TZ_NAMES
+        tz_name, _ = tz_map.get(offset, ("UTC", "Coordinated Universal Time"))
+        result = get_sentinel_token_via_quickjs(
+            self.http_client,
+            did,
+            flow=flow,
+            log=self._log,
+            user_agent=ua,
+            screen=f"{p.get('screen_width') or 1920}x{p.get('screen_height') or 1080}",
+            lang=(p.get("languages") or ["en-US"])[0] if p.get("languages") else "en-US",
+            lang_full=",".join(p.get("languages") or ["en-US", "en"]),
+            browser_type="chrome",
+            platform=p.get("navigator_platform") or "Win32",
+            vendor="Google Inc.",
+            hardware_concurrency=int(p.get("hardware_concurrency") or 8),
+            device_memory=p.get("device_memory"),
+            max_touch_points=int(p.get("max_touch_points") or 0),
+            device_pixel_ratio=float(p.get("device_pixel_ratio") or 1.0),
+            timezone=tz_name,
+            sec_ch_ua_full_version_list=str(p.get("sec_ch_ua_full_version_list") or ""),
+            sec_ch_ua_arch=str(p.get("sec_ch_ua_arch") or ""),
+            sec_ch_ua_bitness=str(p.get("sec_ch_ua_bitness") or ""),
+            sec_ch_ua_model=str(p.get("sec_ch_ua_model") or ""),
+            sec_ch_ua_platform_version=str(p.get("sec_ch_ua_platform_version") or ""),
+        )
+        if not result:
+            return None
+        sdk_token, so_token = result
+        self._log(
+            f"Sentinel QuickJS payload ready: flow={flow} "
+            f"token_len={len(sdk_token)} so_len={len(so_token)}"
+        )
+        return SentinelPayload(
+            p="",
+            c="",
+            flow=flow,
+            t=sdk_token,
+            so=so_token or sdk_token,
+            quickjs=True,
+        )
+
     def _check_sentinel(self, did: str, *, flow: str = "authorize_continue", attempts: int = 3) -> Optional[SentinelPayload]:
         """检查 Sentinel 拦截（动态生成 token + 处理 PoW），失败轻量重试。
+
+        Preferred path is the official ``sdk.js`` run inside a Node vm
+        (:meth:`_sentinel_via_quickjs`); the synthetic Python generator below
+        stays as the fallback for hosts without node or when the SDK run
+        fails. Both feed the same dual-header wire format:
 
         Fused with yukkcat/chatgpt2api behaviour:
         - create_account waits ~5s before Turnstile VM (official SDK collect)
         - Turnstile solve is preferred as openai-sentinel-so-token (not server so blob)
         - oai-sc cookie set to '0' + challenge token c
         """
+        quickjs = self._sentinel_via_quickjs(did, flow)
+        if quickjs is not None:
+            try:
+                _apply_oai_sc_cookie(self.session, quickjs.c or quickjs.t)
+            except Exception:
+                pass
+            return quickjs
         last_err = ""
         for attempt in range(1, max(1, attempts) + 1):
             try:

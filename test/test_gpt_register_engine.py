@@ -342,6 +342,90 @@ class BrowserProfileConsistencyTest(unittest.TestCase):
         self.assertEqual(p.so, "so-val")
         p2 = SentinelPayload(p="p", c="c", flow="authorize_continue")
         self.assertEqual(p2.so, "")
+        self.assertFalse(p2.quickjs)
+
+    def test_quickjs_payload_flagged_and_preferred(self):
+        """QuickJS 路径成功时 _check_sentinel 直接返回，不走 Python 生成器。"""
+        import os
+        from unittest import mock
+        from platforms.chatgpt import register as regmod
+        from platforms.chatgpt.register import RegistrationEngine, SentinelPayload
+
+        eng = RegistrationEngine.__new__(RegistrationEngine)
+        eng._log = lambda *a, **k: None
+        eng.http_client = mock.Mock()
+        eng.http_client.user_agent = "UA"
+        eng.http_client.default_headers = {}
+        eng.http_client.post = mock.Mock(side_effect=AssertionError("must not POST"))
+        eng.session = mock.Mock()
+        eng._browser_profile = {
+            "languages": ["en-US", "en"], "screen_width": 1920, "screen_height": 1080,
+            "hardware_concurrency": 12, "device_memory": 16, "timezone_offset_min": 540,
+            "navigator_platform": "Win32", "device_pixel_ratio": 1.5,
+        }
+
+        payload = SentinelPayload(p="", c="", flow="authorize_continue",
+                                  t="sdk-token", so="so-token", quickjs=True)
+        with mock.patch.dict(os.environ, {"OPENAI_SENTINEL_QUICKJS": "1"}):
+            with mock.patch.object(regmod, "_apply_oai_sc_cookie") as cookie:
+                with mock.patch.object(eng, "_sentinel_via_quickjs", return_value=payload) as qj:
+                    out = eng._check_sentinel("did", flow="authorize_continue")
+        qj.assert_called_once()
+        self.assertIs(out, payload)
+        cookie.assert_called_once()
+
+    def test_quickjs_failure_falls_back_to_python_generator(self):
+        """QuickJS 返回 None（node 缺失 / SDK 失败）时走原 Python 路径。"""
+        import os
+        from unittest import mock
+        from platforms.chatgpt import register as regmod
+        from platforms.chatgpt.register import RegistrationEngine
+
+        eng = RegistrationEngine.__new__(RegistrationEngine)
+        eng._log = lambda *a, **k: None
+        eng.http_client = mock.Mock()
+        eng.http_client.user_agent = "UA"
+        eng.http_client.default_headers = {}
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"token": "c-token", "proofofwork": {}, "turnstile": {}}
+        eng.http_client.post = mock.Mock(return_value=resp)
+        eng.session = mock.Mock()
+        eng._browser_profile = {}
+
+        with mock.patch.dict(os.environ, {"OPENAI_SENTINEL_QUICKJS": "1"}):
+            with mock.patch.object(eng, "_sentinel_via_quickjs", return_value=None):
+                out = eng._check_sentinel("did", flow="authorize_continue")
+        self.assertIsNotNone(out)
+        self.assertFalse(out.quickjs)
+        self.assertEqual(out.c, "c-token")
+
+    def test_quickjs_env_off_skips_the_path(self):
+        """OPENAI_SENTINEL_QUICKJS=0 时不进入 QuickJS 流程。"""
+        import os
+        from unittest import mock
+        from platforms.chatgpt import register as regmod
+        from platforms.chatgpt.register import RegistrationEngine
+
+        eng = RegistrationEngine.__new__(RegistrationEngine)
+        eng._log = lambda *a, **k: None
+        eng.http_client = mock.Mock()
+        eng.http_client.user_agent = "UA"
+        eng.http_client.default_headers = {}
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"token": "c-token", "proofofwork": {}, "turnstile": {}}
+        eng.http_client.post = mock.Mock(return_value=resp)
+        eng.session = mock.Mock()
+        eng._browser_profile = {}
+
+        import platforms.chatgpt.sentinel_quickjs as sq
+        with mock.patch.dict(os.environ, {"OPENAI_SENTINEL_QUICKJS": "0"}):
+            with mock.patch.object(sq, "get_sentinel_token_via_quickjs",
+                                   side_effect=AssertionError("must not run")):
+                out = eng._check_sentinel("did", flow="authorize_continue")
+        self.assertIsNotNone(out)
+        self.assertFalse(out.quickjs)
+        # Python fallback ran against the challenge response.
+        eng.http_client.post.assert_called_once()
 
     def test_random_delay_respects_disable_env(self):
         import os
