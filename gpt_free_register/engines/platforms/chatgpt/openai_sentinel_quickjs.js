@@ -444,15 +444,29 @@ const context = {
         iframeObject = genericElement('iframe');
         iframeObject._load = [];
         iframeObject.addEventListener = (type, cb) => {
-          if (type === 'load') iframeObject._load.push(cb);
+          if (type !== 'load' || typeof cb !== 'function') return;
+          iframeObject._load.push(cb);
+          // The SDK's ge() creates the frame via me() and only registers the
+          // load handler afterwards; it may attach the frame to head or
+          // documentElement rather than body, so the body-only hook above
+          // never fires and ge() hangs until its caller's timeout. This shim's
+          // frame is always loadable, so answer as soon as a handler appears.
+          setTimeout(() => {
+            try { cb(); } catch (_) {}
+          }, 0);
         };
         iframeObject.removeEventListener = () => {};
         iframeObject.contentWindow = {
           postMessage(message, origin) {
             capturedProof = message.p;
+            // The frame answers "init" with the proof it collected, and
+            // "token"/challenge requests with the cached chat requirements.
+            // Both need a reply or ge() blocks until the caller's timeout:
+            // ye() calls ge("token") whenever its per-flow cachedChatReq is
+            // empty, which is the normal case in a fresh process.
             const result = input.action === 'solve'
               ? { cachedChatReq: input.challenge, cachedProof: input.request_p || message.p }
-              : null;
+              : { cachedProof: message.p || input.request_p || '' };
             const ev = {
               source: iframeObject.contentWindow,
               data: { type: 'response', requestId: message.requestId, result },
