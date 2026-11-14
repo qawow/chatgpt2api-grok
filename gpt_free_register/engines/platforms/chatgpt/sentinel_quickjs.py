@@ -278,7 +278,12 @@ def get_sentinel_token_via_quickjs(
             "request_p": request_p,
             "challenge": challenge,
             "flow": flow,
-            "behavior_duration_ms": 4200,
+            # Behavior simulation floor. The event sequence (12-16 pointer
+            # moves + click + scrolls + keys) runs on its own clock; this only
+            # pads to a floor. 1800ms keeps the full sequence while cutting
+            # the old 4200ms dead wait — sentinel's SO collector consumes the
+            # dispatched events, not the wall clock between them.
+            "behavior_duration_ms": int(os.environ.get("OPENAI_QJS_BEHAVIOR_MS", "1800") or 1800),
         })
         solved = _run_quickjs_action(
             action="solve",

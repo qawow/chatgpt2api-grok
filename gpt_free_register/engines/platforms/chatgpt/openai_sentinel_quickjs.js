@@ -553,10 +553,16 @@ async function dispatchBehavior(durationMs) {
   const flow = String(input.flow || 'authorize_continue');
 
   if (action === 'requirements') {
+    // SDK.init() posts to the sentinel iframe and blocks until the frame
+    // replies with cachedChatReq. Under this shim the frame never answers
+    // during requirements (challenge data only exists after /sentinel/req),
+    // so waiting the full 8s buys nothing — the fallthrough to
+    // getRequirementsToken() is what real shim runs use anyway. A short
+    // grace period stays for a genuine frame response.
     try {
       await Promise.race([
         context.SentinelSDK.init(flow),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('init timeout')), 8000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('init timeout')), Number(input.init_timeout_ms || 300))),
       ]);
       if (capturedProof) {
         process.stdout.write(JSON.stringify({ request_p: capturedProof }));
