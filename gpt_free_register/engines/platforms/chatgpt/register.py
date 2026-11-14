@@ -326,6 +326,81 @@ class _SentinelTokenGenerator:
     def _b64(data) -> str:
         return base64.b64encode(json.dumps(data, separators=(",", ":")).encode("utf-8")).decode("ascii")
 
+    # Real Chrome reports `""+new Date` as
+    #   "Wed Nov 12 2026 20:41:07 GMT+0900 (Japan Standard Time)"
+    # The token used to emit a UTC string with a comma after the weekday and a
+    # fixed "Coordinated Universal Time" name, which contradicts the profile's
+    # own timezone offset and the browser's actual format.
+    _TZ_NAMES = {
+        -480: ("America/Los_Angeles", "Pacific Standard Time"),
+        -420: ("America/Denver", "Mountain Standard Time"),
+        -360: ("America/Chicago", "Central Standard Time"),
+        -300: ("America/New_York", "Eastern Standard Time"),
+        -240: ("America/Halifax", "Atlantic Standard Time"),
+        -180: ("America/Sao_Paulo", "Brasilia Standard Time"),
+        0: ("UTC", "Coordinated Universal Time"),
+        60: ("Europe/Berlin", "Central European Standard Time"),
+        120: ("Europe/Athens", "Eastern European Standard Time"),
+        180: ("Europe/Moscow", "Moscow Standard Time"),
+        240: ("Asia/Dubai", "Gulf Standard Time"),
+        330: ("Asia/Kolkata", "India Standard Time"),
+        420: ("Asia/Bangkok", "Indochina Time"),
+        480: ("Asia/Shanghai", "China Standard Time"),
+        540: ("Asia/Tokyo", "Japan Standard Time"),
+        600: ("Australia/Sydney", "Australian Eastern Standard Time"),
+    }
+
+    # Chrome exposes dozens of navigator members; the dx probe reads one at a
+    # time via Object.keys(navigator). A single constant answer is itself a
+    # fingerprint, so draw from a plausible pool per token.
+    _NAV_PROBES = (
+        "registerProtocolHandler\u2212function registerProtocolHandler() { [native code] }",
+        "storage\u2212[object StorageManager]",
+        "locks\u2212[object LockManager]",
+        "appCodeName\u2212Mozilla",
+        "permissions\u2212[object Permissions]",
+        "share\u2212function share() { [native code] }",
+        "webdriver\u2212false",
+        "managed\u2212[object NavigatorManagedData]",
+        "canShare\u2212function canShare() { [native code] }",
+        "vendor\u2212Google Inc.",
+        "mediaDevices\u2212[object MediaDevices]",
+        "vibrate\u2212function vibrate() { [native code] }",
+        "storageBuckets\u2212[object StorageBucketManager]",
+        "mediaCapabilities\u2212[object MediaCapabilities]",
+        "cookieEnabled\u2212true",
+        "product\u2212Gecko",
+        "mimeTypes\u2212[object MimeTypeArray]",
+        "credentials\u2212[object CredentialsContainer]",
+        "serviceWorker\u2212[object ServiceWorkerContainer]",
+        "keyboard\u2212[object Keyboard]",
+        "gpu\u2212[object GPU]",
+        "pdfViewerEnabled\u2212true",
+        "geolocation\u2212[object Geolocation]",
+        "userAgentData\u2212[object NavigatorUAData]",
+        "sendBeacon\u2212function sendBeacon() { [native code] }",
+    )
+
+    def _browser_date(self) -> str:
+        """`""+new Date` for the profile's own timezone offset."""
+        try:
+            offset = int((self.profile or {}).get("timezone_offset_min") or 0)
+        except Exception:
+            offset = 0
+        tz_name, tz_display = self._TZ_NAMES.get(
+            offset, ("UTC", "Coordinated Universal Time")
+        )
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name))
+        except Exception:
+            now = datetime.now(timezone.utc)
+        sign = "+" if offset >= 0 else "-"
+        abs_off = abs(offset)
+        stamp = now.strftime("%a %b %d %Y %H:%M:%S")
+        return f"{stamp} GMT{sign}{abs_off // 60:02d}{abs_off % 60:02d} ({tz_display})"
+
     def _config(self) -> list:
         perf_now = 1000 + random.random() * 49000
         p = self.profile or {}
@@ -342,7 +417,7 @@ class _SentinelTokenGenerator:
         heap = int(min(4294705152, max(2147483648, mem_gb * 268435456)))
         return [
             f"{sw}x{sh}",
-            time.strftime("%a, %d %b %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
+            self._browser_date(),
             heap,
             random.random(),
             self.user_agent,
@@ -352,7 +427,7 @@ class _SentinelTokenGenerator:
             lang,
             langs,
             random.random(),
-            "webkitTemporaryStorage\u2212undefined",
+            random.choice(self._NAV_PROBES),
             "location",
             "Object",
             perf_now,
@@ -397,6 +472,7 @@ class _SentinelTokenGenerator:
             p_token,
             user_agent=self.user_agent,
             sdk_url=SENTINEL_SDK_URL,
+            profile=self.profile,
         )
 
 
@@ -1215,7 +1291,8 @@ class RegistrationEngine:
                             from .sentinel_vm import solve_turnstile_dx
                             from .constants import SENTINEL_SDK_URL
                             t_value = solve_turnstile_dx(
-                                dx_b64, initial_p, user_agent=ua, sdk_url=SENTINEL_SDK_URL
+                                dx_b64, initial_p, user_agent=ua, sdk_url=SENTINEL_SDK_URL,
+                                profile=getattr(self, "_browser_profile", None),
                             )
                             self._log(f"Sentinel VM solved: t_len={len(t_value)} flow={flow}")
                         except Exception as vm_err:

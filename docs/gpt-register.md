@@ -508,6 +508,7 @@ curl -s "$BASE/api/accounts" -H "Authorization: Bearer $KEY" | jq 'keys'
 | Sentinel dual-header | `openai-sentinel-token` + `openai-sentinel-so-token`；`oai-sc=0{c}` cookie |
 | SO collect | **默认关闭**（0ms）。现网 `create_account` 的 VM 求解不需要等待；`OPENAI_SO_COLLECT_MS=5000` 可恢复旧行为（§6.7.1 有实测对比） |
 | VM so-token | 优先 VM 求解 `t`/`so`（日志 `src=vm_t`），失败再回退 |
+| VM 指纹同源 | Sentinel VM 的 navigator / screen / 时区 / 硬件 / canvas / WebGL / 语音全部由该号 profile 派生（§6.7.5），不再返回固定常量 |
 | 浏览器画像 | 每号独立 profile：TLS impersonate / UA / sec-ch-ua / 硬件一致；Windows 权重默认 70% |
 | CFD1 邮箱 | CFD1 建号/收信**不走** OpenAI 代理，避免 SOCKS 超时拖垮 OTP |
 | TLS 指纹 | 默认 `curl_cffi` `chrome142` + 匹配 Client Hints |
@@ -762,6 +763,45 @@ REGISTER_PROXY_DEFAULT=socks5h://USER:PASSWORD@proxy.example:2260
 > 并发轮询会让 tempmail 偶发 `Read timed out`。1.8.13 起传输层错误重试 3 次
 > （0.4/0.8 秒退避），4xx 不重试（那是真实应答）—— 此前一次读超时会直接打断
 > 等待循环并烧掉整个 OTP 窗口（实测 3 并发中 1 个因此失败，同账号串行时成功）。
+
+### 6.7.5 Sentinel SDK 指纹与画像同源
+
+`sentinel_vm.py` 执行 dx 字节码时会回答一批环境探针。这些回答**以前是固定常量**：
+所有账号共用同一个 canvas 哈希、同一块 Intel UHD 630、`localStorage` 里 17 个键全存 `'x'`、
+`Intl` 恒报 `Asia/Shanghai`、`crypto.getRandomValues` 原样返回数组（即全零）。
+单号看不出问题，但**同一批号共享同一组常量**就是直接的聚类依据，而且部分常量与**同一账号**的
+p-token 自相矛盾（p-token 用 profile 的随机核数/屏幕/语言，VM 却报 8 核/1920x1080/en-US）。
+
+现在 `_FakeWindow` 接收该号的 profile，所有可观测值都由它派生：
+
+| 探针 | 之前 | 现在 |
+| --- | --- | --- |
+| `navigator.hardwareConcurrency` / `deviceMemory` | 恒 8 / 8 | profile 值 |
+| `navigator.language(s)` | 恒 en-US | profile 的 `languages` |
+| `navigator.platform` | 按 UA 猜 | profile 的 `navigator_platform` |
+| `screen.*` / `devicePixelRatio` / `colorDepth` | 恒 1920x1080 / 1 / 24 | profile 值 |
+| `window.inner*` / `outer*` | 恒 1920x1080 / 1920x1120 | profile 值（inner < outer） |
+| `performance.memory` | 恒 35MB / 25MB | 按 `device_memory` 缩放 + 抖动 |
+| `Intl.DateTimeFormat().resolvedOptions().timeZone` | 恒 `Asia/Shanghai` | 由 `timezone_offset_min` 映射 |
+| `canvas.toDataURL()` | 恒同一 1×1 PNG | 按 profile seed 生成 |
+| `getImageData` / `createImageData` | 全零数组 | 按 seed 填充 |
+| WebGL `UNMASKED_VENDOR/RENDERER` | 恒 Intel UHD 630 | 8 组 GPU 画像中按 seed 选 |
+| `getSupportedExtensions()` | 恒 2 项 | 8 项常见扩展 |
+| `localStorage` | 17 键全 `'x'` | 真实形态：`oai-did` 为 v4 UUID、STATSIG 稳定 ID、`_dd_s`/`cf_clearance` 等按种子生成 |
+| `speechSynthesis.getVoices()` | 恒 2 个固定声音 | 按 seed 选 3–5 个，必含主语言 |
+| `crypto.getRandomValues` | 原样返回（全零） | 真实填充；新增 `randomUUID` |
+| `navigator.userAgentData` | 无 | 与 HTTP 层 Client Hints 一致 |
+
+同 profile 两次运行结果**完全一致**（种子来自 `profile.seed`，不再调用 `uuid.uuid4()`），
+不同 profile 之间 canvas / GPU / device id / 语音列表均不同。
+
+`_SentinelTokenGenerator` 同类修正：
+
+- `config[1]` 由恒 UTC 逗号格式改为该 profile 时区的真实 `""+new Date`
+  （`Sun Nov 15 2026 01:37:42 GMT+0900 (Japan Standard Time)`）；
+- `config[11]` 的 navigator 探针由单一常量改为 25 项候选池随机抽取。
+
+这些改动**不改协议形状、不改请求字段**，只让上报的指纹自洽且可分。
 
 ### 6.8 完成日志与排障输出
 

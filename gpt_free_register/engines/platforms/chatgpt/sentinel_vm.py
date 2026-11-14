@@ -87,49 +87,176 @@ def _make_obj(**kw):
     return o
 
 
-class _FakeWindow(_JSObj):
-    """Browser window mock with realistic API surface for sentinel VM."""
+def _tz_name_from_offset(offset_min: int) -> str:
+    """Map a profile UTC offset (minutes, east positive) to an IANA zone name.
 
-    def __init__(self, user_agent: str = "", sdk_url: str = ""):
+    ``browser_profile`` stores offsets in that convention (330 = India,
+    540 = Japan), and a browser reports whatever zone its machine is set to,
+    so the VM must not hard-code one.
+    """
+    try:
+        minutes_east = int(offset_min or 0)
+    except Exception:
+        minutes_east = 0
+    table = {
+        -480: "America/Los_Angeles",
+        -420: "America/Denver",
+        -360: "America/Chicago",
+        -300: "America/New_York",
+        -240: "America/Halifax",
+        -180: "America/Sao_Paulo",
+        0: "UTC",
+        60: "Europe/Berlin",
+        120: "Europe/Athens",
+        180: "Europe/Moscow",
+        240: "Asia/Dubai",
+        330: "Asia/Kolkata",
+        420: "Asia/Bangkok",
+        480: "Asia/Shanghai",
+        540: "Asia/Tokyo",
+        600: "Australia/Sydney",
+    }
+    if minutes_east in table:
+        return table[minutes_east]
+    # Nearest known zone keeps the reported name plausible for odd offsets.
+    return table[min(table, key=lambda k: abs(k - minutes_east))]
+
+
+def _deterministic_uuid(rng) -> str:
+    """A v4-shaped UUID drawn from the profile RNG, not the global one.
+
+    Using ``uuid.uuid4()`` here would make the same account report a different
+    device id on every VM run, which is exactly the inconsistency the profile
+    is supposed to remove.
+    """
+    bits = rng.getrandbits(128)
+    # Set version (4) and variant bits so the string is a valid v4 UUID.
+    bits &= ~(0xF000 << 64)
+    bits |= 0x4000 << 64
+    bits &= ~(0xC000 << 48)
+    bits |= 0x8000 << 48
+    hexed = f"{bits:032x}"
+    return f"{hexed[:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:]}"
+
+
+# Canvas / WebGL renderer strings real Chrome reports on common hardware.
+# One profile => one entry, so a batch of accounts does not all share the
+# single fixed fingerprint the VM used to emit.
+_GPU_PROFILES: tuple[tuple[str, str], ...] = (
+    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Apple Inc.", "ANGLE (Apple, Apple M1, OpenGL 4.1)"),
+    ("Google Inc. (Intel)", "ANGLE (Intel, Mesa Intel(R) Xe Graphics (TGL GT2), OpenGL 4.6 (Core Profile) Mesa 23.1.0)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (Qualcomm)", "ANGLE (Qualcomm, Adreno (TM) 650, OpenGL ES 3.2)"),
+)
+
+_SPEECH_VOICES: tuple[tuple[str, str], ...] = (
+    ("Google US English", "en-US"),
+    ("Microsoft David - English (United States)", "en-US"),
+    ("Microsoft Zira - English (United States)", "en-US"),
+    ("Google UK English Female", "en-GB"),
+    ("Daniel", "en-GB"),
+    ("Samantha", "en-US"),
+    ("Alex", "en-US"),
+)
+
+
+class _FakeWindow(_JSObj):
+    """Browser window mock with realistic API surface for sentinel VM.
+
+    Every observable value is derived from the account's browser profile, so
+    the VM cannot contradict the p-token / HTTP headers generated from that
+    same profile. Static answers here are a fingerprinting signal on their
+    own: a batch sharing one canvas hash or one GPU string clusters trivially.
+    """
+
+    def __init__(self, user_agent: str = "", sdk_url: str = "",
+                 profile: Optional[Dict[str, Any]] = None):
         super().__init__()
         import time as _time
 
+        p = profile or {}
+        # One deterministic RNG per profile: same account -> same fingerprint,
+        # different accounts -> different canvas/GPU/voice picks.
+        seed_src = str(p.get("seed") or p.get("profile_id") or user_agent or "sentinel")
+        rng = __import__("random").Random(seed_src)
+
         # Align navigator.platform with the UA we claim (Windows vs macOS).
         ua_l = (user_agent or "").lower()
-        if "windows" in ua_l:
+        prof_plat = str(p.get("navigator_platform") or "").strip()
+        if prof_plat:
+            nav_platform = prof_plat
+        elif "windows" in ua_l:
             nav_platform = "Win32"
         elif "android" in ua_l:
             nav_platform = "Linux armv8l"
         else:
             nav_platform = "MacIntel"
+
+        languages = [str(x) for x in (p.get("languages") or ["en-US", "en"]) if str(x).strip()]
+        if not languages:
+            languages = ["en-US", "en"]
+        primary_lang = languages[0]
+        # navigator.userAgentData mirrors the Client Hints the HTTP layer sends.
+        ua_data = None
+        if prof_plat and str(p.get("platform") or "").lower() in {"windows", "mac"}:
+            brands = []
+            full = str(p.get("chrome_full") or "")
+            major = str(p.get("chrome_major") or "")
+            if full and major:
+                brands = [
+                    _make_obj(brand="Chromium", version=major),
+                    _make_obj(brand="Google Chrome", version=major),
+                ]
+            ua_data = _make_obj(
+                brands=brands,
+                mobile=False,
+                platform=str(p.get("sec_ch_ua_platform") or "").strip('"') or ("Windows" if "windows" in ua_l else "macOS"),
+            )
+        hc = int(p.get("hardware_concurrency") or 8)
+        mem = int(p.get("device_memory") or 8)
+        screen_w = int(p.get("screen_width") or 1920)
+        screen_h = int(p.get("screen_height") or 1080)
+        dpr = float(p.get("device_pixel_ratio") or 1)
+        color_depth = int(p.get("color_depth") or 24)
+        tz_name = _tz_name_from_offset(p.get("timezone_offset_min") or 0)
         self.navigator = _make_obj(
             userAgent=user_agent,
-            language="en-US",
-            languages=["en-US", "en"],
-            hardwareConcurrency=8,
+            language=primary_lang,
+            languages=list(languages),
+            hardwareConcurrency=hc,
             platform=nav_platform,
-            maxTouchPoints=0,
+            maxTouchPoints=int(p.get("max_touch_points") or 0),
             cookieEnabled=True,
             webdriver=False,
             vendor="Google Inc.",
             appVersion=user_agent.replace("Mozilla/", "") if user_agent else "",
             product="Gecko",
             productSub="20030107",
-            deviceMemory=8,
+            deviceMemory=mem,
             connection=_make_obj(effectiveType="4g", rtt=50, downlink=10),
             plugins=_make_obj(length=5),
             mimeTypes=_make_obj(length=2),
             pdfViewerEnabled=True,
         )
+        if ua_data is not None:
+            self.navigator["userAgentData"] = ua_data
 
         _now_base = _time.time() * 1000
+        # Heap numbers scale with the profile's memory; a batch sharing exact
+        # byte counts is as identifying as a shared canvas hash.
+        _heap_used = 12000000 + (mem * 1200000) + rng.randint(0, 6000000)
+        _heap_total = _heap_used + 4000000 + rng.randint(0, 9000000)
         self.performance = _make_obj(
             timeOrigin=_now_base - 5000,
             now=lambda: _time.time() * 1000 - _now_base + 5000,
             memory=_make_obj(
                 jsHeapSizeLimit=4294705152,
-                totalJSHeapSize=35000000,
-                usedJSHeapSize=25000000,
+                totalJSHeapSize=_heap_total,
+                usedJSHeapSize=_heap_used,
             ),
         )
 
@@ -144,8 +271,16 @@ class _FakeWindow(_JSObj):
         )
 
         de = _make_obj(getAttribute=lambda name: None)
-        body = _make_obj(clientWidth=1920, clientHeight=1080)
+        body = _make_obj(clientWidth=screen_w, clientHeight=screen_h)
         scripts_list = [_make_obj(src=sdk_url)] if sdk_url else []
+
+        _gpu_vendor, _gpu_renderer = _GPU_PROFILES[rng.randrange(len(_GPU_PROFILES))]
+        # Per-profile canvas hash: real Chrome renders device-specific pixels,
+        # so a shared constant would cluster every account in one batch.
+        _canvas_pixels = bytes(rng.randrange(256) for _ in range(48))
+        _canvas_b64 = base64.b64encode(
+            b"\x89PNG\r\n\x1a\n" + _canvas_pixels
+        ).decode("ascii")
 
         def _make_canvas():
             _ctx2d = _make_obj(
@@ -163,9 +298,13 @@ class _FakeWindow(_JSObj):
                 createLinearGradient=lambda *a: _make_obj(addColorStop=lambda *a: None),
                 createRadialGradient=lambda *a: _make_obj(addColorStop=lambda *a: None),
                 drawImage=lambda *a: None,
-                getImageData=lambda x, y, w, h: _make_obj(data=[0]*(w*h*4)),
+                getImageData=lambda x, y, w, h: _make_obj(
+                    data=[rng.randrange(256) for _ in range(max(0, w * h * 4))]
+                ),
                 putImageData=lambda *a: None,
-                createImageData=lambda w, h: _make_obj(data=[0]*(w*h*4)),
+                createImageData=lambda w, h: _make_obj(
+                    data=[rng.randrange(256) for _ in range(max(0, w * h * 4))]
+                ),
                 canvas=None,
                 globalCompositeOperation="source-over",
                 globalAlpha=1.0,
@@ -182,9 +321,28 @@ class _FakeWindow(_JSObj):
                 UNMASKED_RENDERER_WEBGL=0x9246,
             )
             _webgl = _make_obj(
-                getParameter=lambda p: {0x9245: "Google Inc. (Intel)", 0x9246: "ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.1)", 0x1F01: "WebKit", 0x1F00: "WebKit WebGL", 0x8B8C: 256, 0x0D33: 16384}.get(p, 0),
+                getParameter=lambda p: {
+                    0x9245: _gpu_vendor,
+                    0x9246: _gpu_renderer,
+                    0x1F01: "WebKit",
+                    0x1F00: "WebKit WebGL",
+                    0x8B8C: 256,
+                    0x0D33: 16384,
+                    0x8B4D: 16,
+                    0x8869: 16,
+                    0x8DFB: 4096,
+                }.get(p, 0),
                 getExtension=lambda n: _webgl_ext if "WEBGL" in (n or "") else _make_obj(),
-                getSupportedExtensions=lambda: ["WEBGL_debug_renderer_info", "EXT_texture_filter_anisotropic"],
+                getSupportedExtensions=lambda: [
+                    "ANGLE_instanced_arrays",
+                    "EXT_blend_minmax",
+                    "EXT_clip_control",
+                    "EXT_color_buffer_half_float",
+                    "EXT_depth_clamp",
+                    "EXT_texture_filter_anisotropic",
+                    "WEBGL_debug_renderer_info",
+                    "WEBGL_polygon_mode",
+                ],
                 createBuffer=lambda: _make_obj(),
                 bindBuffer=lambda *a: None,
                 bufferData=lambda *a: None,
@@ -225,7 +383,7 @@ class _FakeWindow(_JSObj):
             c = _make_obj(
                 width=300, height=150,
                 getContext=_get_context,
-                toDataURL=lambda *a: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                toDataURL=lambda *a: f"data:image/png;base64,{_canvas_b64}",
                 toBlob=lambda cb, *a: cb(None) if callable(cb) else None,
                 style=_make_obj(),
             )
@@ -254,14 +412,14 @@ class _FakeWindow(_JSObj):
         )
 
         self.screen = _make_obj(
-            width=1920, height=1080,
-            availWidth=1920, availHeight=1040,
+            width=screen_w, height=screen_h,
+            availWidth=screen_w, availHeight=max(0, screen_h - rng.choice([40, 80, 120])),
             availLeft=0, availTop=0,
-            colorDepth=24, pixelDepth=24,
+            colorDepth=color_depth, pixelDepth=color_depth,
             orientation=_make_obj(type="landscape-primary", angle=0),
         )
 
-        self.history = _make_obj(length=2)
+        self.history = _make_obj(length=rng.choice([1, 2, 3]))
         class _Storage:
             def __init__(self): self._d = {}
             @property
@@ -273,31 +431,81 @@ class _FakeWindow(_JSObj):
             def clear(self): self._d.clear()
             def keys(self): return list(self._d.keys())
         self.localStorage = _Storage()
-        _ls_keys = [
-            'i18nextLng', 'ajs_anonymous_id', 'ajs_user_id',
-            'oai/apps/hasSeenOnboarding/chat',
-            'oai/apps/hasSeenReleaseAnnouncement/chat',
-            'oai/apps/capExposure/chat', 'oai/apps/cachedUser/chat',
-            'oai-did', 'oai-sc-ses', 'oai-hlib',
-            'intercom.intercom-state', 'STATSIG_LOCAL_STORAGE_INTERNAL_STORE_V5',
-            'STATSIG_LOCAL_STORAGE_STABLE_ID', 'STATSIG_LOCAL_STORAGE_LOGGING_REQUEST',
-            '_dd_s', 'cf_clearance', 'UiState.isNavigationCollapsed.chat',
-            'UiState.isSidebarExpanded.chat',
-        ]
+        # Real values, not a constant placeholder. A batch where every account
+        # stores literally "x" under oai-did is trivial to cluster; these also
+        # have to stay plausible in shape (UUID / 24-char hex / ms timestamp).
+        _stable_id = "{:016x}{:08x}".format(rng.getrandbits(64), rng.getrandbits(32))
+        _ls_values = {
+            "i18nextLng": primary_lang,
+            "ajs_anonymous_id": _deterministic_uuid(rng),
+            "ajs_user_id": "null",
+            "oai/apps/hasSeenOnboarding/chat": json.dumps(True),
+            "oai/apps/hasSeenReleaseAnnouncement/chat": "true",
+            "oai/apps/capExposure/chat": json.dumps(
+                {
+                    "is_exp": 0,
+                    "group": "control",
+                    "value": False,
+                    "cutoff_ts": int(_time.time() * 1000),
+                    "has_updated": True,
+                },
+                separators=(",", ":"),
+            ),
+            "oai/apps/cachedUser/chat": json.dumps({}),
+            "oai-did": _deterministic_uuid(rng),
+            "oai-sc-ses": json.dumps(
+                {"sessionId": _deterministic_uuid(rng)}, separators=(",", ":")
+            ),
+            "oai-hlib": json.dumps({"enabled": False}),
+            "intercom.intercom-state": json.dumps(
+                {"v": 2, "ts": int(_time.time() * 1000)}, separators=(",", ":")
+            ),
+            "STATSIG_LOCAL_STORAGE_INTERNAL_STORE_V5": json.dumps(
+                {"stableID": _stable_id, "customIDs": {}}, separators=(",", ":")
+            ),
+            "STATSIG_LOCAL_STORAGE_STABLE_ID": _stable_id,
+            "STATSIG_LOCAL_STORAGE_LOGGING_REQUEST": json.dumps(
+                {"successful": True}, separators=(",", ":")
+            ),
+            "_dd_s": "aid={}&rum=0&expire={}".format(
+                rng.randrange(10**15, 10**16), int(_time.time() * 1000)
+            ),
+            "cf_clearance": "{}{}".format(
+                "".join(rng.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(22)),
+                int(_time.time()),
+            ),
+            "UiState.isNavigationCollapsed.chat": "false",
+            "UiState.isSidebarExpanded.chat": "true",
+        }
+        _ls_keys = list(_ls_values.keys())
         for _k in _ls_keys:
-            self.localStorage.setItem(_k, 'x')
+            self.localStorage.setItem(_k, _ls_values[_k])
         self.sessionStorage = _Storage()
         self.indexedDB = _make_obj()
+        def _get_random_values(arr=None):
+            # Must actually fill the buffer: returning it untouched hands the
+            # bytecode an all-zero sequence, which real crypto never produces.
+            if arr is None:
+                return arr
+            try:
+                for _i in range(len(arr)):
+                    arr[_i] = rng.randrange(256)
+            except Exception:
+                pass
+            return arr
+
         self.crypto = _make_obj(
-            getRandomValues=lambda arr: arr,
+            getRandomValues=_get_random_values,
+            randomUUID=lambda: _deterministic_uuid(rng),
             subtle=_make_obj(),
         )
 
-        self.innerWidth = 1920
-        self.innerHeight = 1080
-        self.outerWidth = 1920
-        self.outerHeight = 1120
-        self.devicePixelRatio = 1
+        # Chrome window chrome overhead differs by OS; keep inner < outer.
+        self.innerWidth = screen_w
+        self.innerHeight = max(0, screen_h - rng.choice([80, 100, 120, 140]))
+        self.outerWidth = screen_w
+        self.outerHeight = screen_h
+        self.devicePixelRatio = dpr
         self.screenX = 0
         self.screenY = 0
         self.pageXOffset = 0
@@ -369,8 +577,14 @@ class _FakeWindow(_JSObj):
             now=lambda: int(_time.time() * 1000),
         )
         self.TextEncoder = type("TE", (), {"__call__": lambda self2: _make_obj(encode=lambda s: list(s.encode("utf-8")))})()
+        # The zone must follow the profile's own offset: a hard-coded Shanghai
+        # contradicted p-token date strings and random timezone_offset_min.
         self.Intl = _make_obj(
-            DateTimeFormat=lambda *a, **k: _make_obj(resolvedOptions=lambda: _make_obj(timeZone="Asia/Shanghai")),
+            DateTimeFormat=lambda *a, **k: _make_obj(
+                resolvedOptions=lambda: _make_obj(
+                    timeZone=tz_name, locale=primary_lang, calendar="gregory", numberingSystem="latn",
+                )
+            ),
         )
         self.setTimeout = lambda fn, ms, *a: None
         self.setInterval = lambda fn, ms, *a: None
@@ -437,11 +651,23 @@ class _FakeWindow(_JSObj):
         self.OfflineAudioContext = lambda *a: _make_audio_ctx()
         self.webkitOfflineAudioContext = lambda *a: _make_audio_ctx()
 
+        # Voice list varies by OS/browser build; a fixed pair is a clusterable
+        # constant. Pick a per-profile subset that always includes the primary
+        # language so it stays coherent with navigator.language.
+        _voice_pool = list(_SPEECH_VOICES)
+        rng.shuffle(_voice_pool)
+        _picked = [v for v in _voice_pool if v[1] == primary_lang][:1]
+        for _v in _voice_pool:
+            if len(_picked) >= rng.choice([3, 4, 5]):
+                break
+            if _v not in _picked:
+                _picked.append(_v)
+        _voice_objs = [
+            _make_obj(name=n, lang=l, localService=True, default=(i == 0), voiceURI=n)
+            for i, (n, l) in enumerate(_picked)
+        ]
         self.speechSynthesis = _make_obj(
-            getVoices=lambda: [
-                _make_obj(name="Google US English", lang="en-US", localService=False, default=True, voiceURI="Google US English"),
-                _make_obj(name="Google UK English Female", lang="en-GB", localService=False, default=False, voiceURI="Google UK English Female"),
-            ],
+            getVoices=lambda: list(_voice_objs),
             speak=lambda u: None,
             cancel=lambda: None,
         )
@@ -489,9 +715,10 @@ class _FakeWindow(_JSObj):
 class SentinelVM:
     """Execute dx bytecode to produce the turnstile 't' value."""
 
-    def __init__(self, user_agent: str = "", sdk_url: str = ""):
+    def __init__(self, user_agent: str = "", sdk_url: str = "",
+                 profile: Optional[Dict[str, Any]] = None):
         self.r: Dict[Any, Any] = {}  # registers
-        self._win = _FakeWindow(user_agent, sdk_url)
+        self._win = _FakeWindow(user_agent, sdk_url, profile=profile)
         self._done = False
         self._result: Optional[str] = None
         self._iter = 0
@@ -804,7 +1031,8 @@ class SentinelVM:
                     pass
 
 
-def solve_turnstile_dx(dx_b64: str, p_token: str, user_agent: str = "", sdk_url: str = "") -> str:
+def solve_turnstile_dx(dx_b64: str, p_token: str, user_agent: str = "", sdk_url: str = "",
+                       profile: Optional[Dict[str, Any]] = None) -> str:
     """Solve a Sentinel turnstile dx challenge.
 
     Args:
@@ -812,9 +1040,13 @@ def solve_turnstile_dx(dx_b64: str, p_token: str, user_agent: str = "", sdk_url:
         p_token: The 'p' requirements token sent in the sentinel/req request
         user_agent: Browser user agent string
         sdk_url: URL of the sentinel SDK script
+        profile: Browser profile for this account. The VM reads navigator,
+            screen, timezone and hardware values from it so the dx answers
+            cannot contradict the p-token and headers built from the same
+            profile.
 
     Returns:
         The 't' value for the sentinel token header
     """
-    vm = SentinelVM(user_agent=user_agent, sdk_url=sdk_url)
+    vm = SentinelVM(user_agent=user_agent, sdk_url=sdk_url, profile=profile)
     return vm.solve(dx_b64, p_token)
